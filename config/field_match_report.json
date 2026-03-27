@@ -1,0 +1,51 @@
+{
+  "platforms": {
+    "shared": {
+      "items": [
+        {
+          "platform": "shared",
+          "field": "active_days_max",
+          "value": 30,
+          "status": "supported"
+        },
+        {
+          "platform": "shared",
+          "field": "visual_review_cover_limit",
+          "value": 9,
+          "status": "supported"
+        }
+      ]
+    },
+    "instagram": {
+      "items": [
+        {
+          "platform": "instagram",
+          "field": "allowed_regions",
+          "value": [
+            "US"
+          ],
+          "status": "supported"
+        }
+      ]
+    },
+    "tiktok": {
+      "items": [
+        {
+          "platform": "tiktok",
+          "field": "min_avg_views",
+          "value": 10000,
+          "status": "supported"
+        },
+        {
+          "platform": "tiktok",
+          "field": "min_median_views",
+          "value": 8000,
+          "status": "supported"
+        }
+      ]
+    },
+    "youtube": {
+      "items": []
+    }
+  }
+}

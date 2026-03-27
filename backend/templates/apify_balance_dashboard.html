@@ -1,0 +1,771 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Apify Balance Board</title>
+    <style>
+      :root {
+        --bg: #f4efe6;
+        --bg-panel: rgba(255, 250, 242, 0.82);
+        --bg-panel-strong: rgba(255, 248, 236, 0.96);
+        --ink: #201913;
+        --muted: #6d6257;
+        --line: rgba(43, 31, 21, 0.12);
+        --line-strong: rgba(43, 31, 21, 0.24);
+        --accent: #b44c2a;
+        --accent-soft: rgba(180, 76, 42, 0.12);
+        --success: #1f7a45;
+        --warning: #9a5d12;
+        --danger: #8b2e25;
+        --shadow: 0 24px 60px rgba(49, 36, 25, 0.12);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        color: var(--ink);
+        background:
+          radial-gradient(circle at top left, rgba(180, 76, 42, 0.14), transparent 28rem),
+          radial-gradient(circle at right 18% top 18%, rgba(56, 96, 92, 0.10), transparent 24rem),
+          linear-gradient(180deg, #f8f3eb 0%, #f3ecdf 42%, #efe6d7 100%);
+        font-family: "Avenir Next", "PingFang SC", "Hiragino Sans GB", sans-serif;
+      }
+
+      body::before {
+        content: "";
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        background-image:
+          linear-gradient(rgba(32, 25, 19, 0.022) 1px, transparent 1px),
+          linear-gradient(90deg, rgba(32, 25, 19, 0.022) 1px, transparent 1px);
+        background-size: 24px 24px;
+        mask-image: linear-gradient(180deg, rgba(0, 0, 0, 0.52), transparent 82%);
+      }
+
+      .shell {
+        width: min(1180px, calc(100vw - 32px));
+        margin: 24px auto 40px;
+      }
+
+      .hero {
+        position: relative;
+        overflow: hidden;
+        padding: 28px;
+        border: 1px solid var(--line);
+        border-radius: 28px;
+        background:
+          linear-gradient(135deg, rgba(255, 252, 247, 0.94), rgba(249, 239, 225, 0.88)),
+          var(--bg-panel);
+        box-shadow: var(--shadow);
+      }
+
+      .hero::after {
+        content: "";
+        position: absolute;
+        inset: auto -8% -42% auto;
+        width: 18rem;
+        height: 18rem;
+        border-radius: 50%;
+        background: radial-gradient(circle, rgba(180, 76, 42, 0.18), transparent 68%);
+      }
+
+      .eyebrow {
+        display: inline-flex;
+        gap: 10px;
+        align-items: center;
+        padding: 8px 12px;
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        background: rgba(255, 255, 255, 0.52);
+        color: var(--muted);
+        font-size: 12px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .eyebrow .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--accent);
+        box-shadow: 0 0 0 6px rgba(180, 76, 42, 0.12);
+      }
+
+      .hero-grid {
+        display: grid;
+        grid-template-columns: minmax(0, 1.2fr) minmax(320px, 0.8fr);
+        gap: 20px;
+        margin-top: 18px;
+      }
+
+      .hero h1 {
+        margin: 0;
+        font-family: "Iowan Old Style", "Palatino Linotype", serif;
+        font-size: clamp(34px, 5vw, 58px);
+        line-height: 0.96;
+        letter-spacing: -0.04em;
+      }
+
+      .hero p {
+        max-width: 44rem;
+        margin: 16px 0 0;
+        color: var(--muted);
+        font-size: 15px;
+        line-height: 1.7;
+      }
+
+      .status-panel {
+        position: relative;
+        z-index: 1;
+        padding: 18px;
+        border: 1px solid var(--line);
+        border-radius: 22px;
+        background: rgba(255, 252, 248, 0.82);
+      }
+
+      .status-label {
+        color: var(--muted);
+        font-size: 12px;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+      }
+
+      .status-value {
+        margin-top: 10px;
+        font-size: 16px;
+        line-height: 1.6;
+      }
+
+      .toolbar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        align-items: center;
+        justify-content: space-between;
+        margin-top: 22px;
+      }
+
+      .meta {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 8px;
+      }
+
+      .pill {
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        padding: 10px 14px;
+        border-radius: 999px;
+        border: 1px solid var(--line);
+        background: rgba(255, 255, 255, 0.56);
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .button-row {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+      }
+
+      button {
+        appearance: none;
+        border: none;
+        cursor: pointer;
+        padding: 12px 18px;
+        border-radius: 999px;
+        background: var(--ink);
+        color: #fff7f1;
+        font: inherit;
+        font-size: 14px;
+        transition: transform 180ms ease, opacity 180ms ease, background 180ms ease;
+      }
+
+      button:hover {
+        transform: translateY(-1px);
+      }
+
+      button:disabled {
+        opacity: 0.56;
+        cursor: wait;
+        transform: none;
+      }
+
+      .button-secondary {
+        background: rgba(32, 25, 19, 0.08);
+        color: var(--ink);
+      }
+
+      .stats-grid {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 16px;
+        margin-top: 22px;
+      }
+
+      .stat {
+        padding: 18px;
+        border-radius: 24px;
+        border: 1px solid var(--line);
+        background: var(--bg-panel);
+        box-shadow: var(--shadow);
+      }
+
+      .stat-label {
+        color: var(--muted);
+        font-size: 12px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      .stat-value {
+        margin-top: 8px;
+        font-family: "Iowan Old Style", "Palatino Linotype", serif;
+        font-size: clamp(28px, 4vw, 42px);
+        letter-spacing: -0.05em;
+      }
+
+      .stat-sub {
+        margin-top: 10px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .panel {
+        margin-top: 18px;
+        padding: 18px;
+        border-radius: 26px;
+        border: 1px solid var(--line);
+        background: var(--bg-panel-strong);
+        box-shadow: var(--shadow);
+      }
+
+      .panel-header {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 12px;
+        align-items: end;
+        justify-content: space-between;
+        margin-bottom: 14px;
+      }
+
+      .panel-title {
+        margin: 0;
+        font-size: 22px;
+        font-family: "Iowan Old Style", "Palatino Linotype", serif;
+        letter-spacing: -0.03em;
+      }
+
+      .panel-note {
+        color: var(--muted);
+        font-size: 14px;
+      }
+
+      .table-wrap {
+        overflow: auto;
+        border: 1px solid var(--line);
+        border-radius: 20px;
+        background: rgba(255, 255, 255, 0.52);
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+        min-width: 860px;
+      }
+
+      thead th {
+        position: sticky;
+        top: 0;
+        z-index: 1;
+        background: rgba(247, 238, 225, 0.96);
+        color: var(--muted);
+        font-size: 12px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+      }
+
+      th, td {
+        padding: 14px 16px;
+        text-align: left;
+        border-bottom: 1px solid var(--line);
+        white-space: nowrap;
+      }
+
+      tbody tr:hover {
+        background: rgba(180, 76, 42, 0.05);
+      }
+
+      .token {
+        font-weight: 700;
+        letter-spacing: 0.04em;
+      }
+
+      .badge {
+        display: inline-flex;
+        align-items: center;
+        padding: 6px 10px;
+        border-radius: 999px;
+        background: var(--accent-soft);
+        color: var(--accent);
+        font-size: 12px;
+        font-weight: 700;
+      }
+
+      .tone-success {
+        color: var(--success);
+      }
+
+      .tone-warning {
+        color: var(--warning);
+      }
+
+      .tone-danger {
+        color: var(--danger);
+      }
+
+      .empty,
+      .error-box {
+        padding: 18px;
+        border-radius: 18px;
+        border: 1px dashed var(--line-strong);
+        color: var(--muted);
+        background: rgba(255, 255, 255, 0.45);
+      }
+
+      .error-box {
+        border-style: solid;
+        border-color: rgba(139, 46, 37, 0.24);
+        background: rgba(139, 46, 37, 0.08);
+        color: var(--danger);
+      }
+
+      .error-list {
+        display: grid;
+        gap: 10px;
+        margin-top: 12px;
+      }
+
+      .error-item {
+        padding: 12px 14px;
+        border-radius: 16px;
+        background: rgba(255, 255, 255, 0.6);
+        border: 1px solid rgba(139, 46, 37, 0.16);
+      }
+
+      @media (max-width: 920px) {
+        .hero-grid,
+        .stats-grid {
+          grid-template-columns: 1fr;
+        }
+
+        .shell {
+          width: min(100vw - 20px, 1180px);
+          margin-top: 10px;
+        }
+
+        .hero,
+        .panel,
+        .stat {
+          border-radius: 22px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    {% set summary = initial_payload.get("summary") or {} %}
+    {% set tokens = initial_payload.get("tokens") or [] %}
+    {% set errors = initial_payload.get("errors") or [] %}
+    {% set initial_success = initial_payload.get("success") and initial_status_code < 400 %}
+    <main class="shell">
+      <section class="hero">
+        <div class="eyebrow">
+          <span class="dot"></span>
+          <span>Live Apify Ledger</span>
+        </div>
+        <div class="hero-grid">
+          <div>
+            <h1>Apify 余额控制台</h1>
+            <p>
+              这个页面默认读取后端缓存，不会因为浏览器轮询而直接频繁请求 Apify。
+              后端会每 {{ refresh_interval_seconds }} 秒自动刷新一次缓存，你也可以手动立即刷新一次 Apify 实时数据。
+            </p>
+          </div>
+          <aside class="status-panel">
+            <div class="status-label">实时状态</div>
+            <div class="status-value" id="statusText">
+              {% if initial_success %}
+                查询成功，已检查 {{ initial_payload.get("checked_token_count", 0) }} 枚 token。
+              {% else %}
+                {{ initial_payload.get("error") or "等待首次加载" }}
+              {% endif %}
+            </div>
+          </aside>
+        </div>
+        <div class="toolbar">
+          <div class="meta">
+            <div class="pill">后端轮询 <strong id="refreshInterval">{{ refresh_interval_seconds }}s</strong></div>
+            <div class="pill">上次更新 <strong id="checkedAt">{{ initial_payload.get("checked_at") or "-" }}</strong></div>
+            <div class="pill">下次刷新 <strong id="countdown">{{ refresh_interval_seconds }}</strong></div>
+            <div class="pill">数据来源 <strong id="dataSource">{{ initial_payload.get("data_source") or "-" }}</strong></div>
+          </div>
+          <div class="button-row">
+            <button id="refreshButton" type="button">立即刷新缓存</button>
+            <button id="forceRefreshButton" class="button-secondary" type="button">立即刷新 Apify</button>
+            <button id="toggleAutoButton" class="button-secondary" type="button">暂停自动刷新</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="stats-grid">
+        <article class="stat">
+          <div class="stat-label">Token 数量</div>
+          <div class="stat-value" id="tokenPoolSize">{{ initial_payload.get("token_pool_size") if initial_payload.get("token_pool_size") is not none else "-" }}</div>
+          <div class="stat-sub">当前识别到的 token 池规模</div>
+        </article>
+        <article class="stat">
+          <div class="stat-label">总月额度</div>
+          <div class="stat-value" id="maxTotalUsd">
+            {% if summary.get("max_monthly_usage_usd_total") is not none %}
+              {{ "%.6f USD"|format(summary.get("max_monthly_usage_usd_total")) }}
+            {% else %}
+              -
+            {% endif %}
+          </div>
+          <div class="stat-sub">所有 token 的 maxMonthlyUsageUsd 汇总</div>
+        </article>
+        <article class="stat">
+          <div class="stat-label">已使用</div>
+          <div class="stat-value tone-warning" id="usedTotalUsd">
+            {% if summary.get("monthly_usage_usd_total") is not none %}
+              {{ "%.6f USD"|format(summary.get("monthly_usage_usd_total")) }}
+            {% else %}
+              -
+            {% endif %}
+          </div>
+          <div class="stat-sub">当前月周期累计消耗</div>
+        </article>
+        <article class="stat">
+          <div class="stat-label">剩余额度</div>
+          <div class="stat-value tone-success" id="remainingTotalUsd">
+            {% if summary.get("remaining_monthly_usage_usd_total") is not none %}
+              {{ "%.6f USD"|format(summary.get("remaining_monthly_usage_usd_total")) }}
+            {% else %}
+              -
+            {% endif %}
+          </div>
+          <div class="stat-sub">当前仍可用的总额度</div>
+        </article>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">Token 明细</h2>
+            <div class="panel-note">按后端返回顺序展示，每行对应一枚 token 的当前月度预算状态。</div>
+          </div>
+          <div class="badge" id="resultBadge">
+            {% if initial_success %}
+              已更新 {{ initial_payload.get("checked_token_count", 0) }}/{{ initial_payload.get("token_pool_size", 0) }}
+            {% else %}
+              查询失败
+            {% endif %}
+          </div>
+        </div>
+        <div id="errorBox" class="error-box" {% if initial_success %}hidden{% endif %}>
+          {{ initial_payload.get("error") or "" }}
+        </div>
+        <div class="table-wrap" id="tableWrap" {% if not tokens %}hidden{% endif %}>
+          <table>
+            <thead>
+              <tr>
+                <th>Token</th>
+                <th>月额度上限</th>
+                <th>已使用</th>
+                <th>剩余</th>
+                <th>周期开始</th>
+                <th>周期结束</th>
+                <th>查询时间</th>
+              </tr>
+            </thead>
+            <tbody id="tokenTableBody">
+              {% for item in tokens %}
+                {% set ratio = (item.remaining_monthly_usage_usd / item.max_monthly_usage_usd) if item.max_monthly_usage_usd else none %}
+                <tr>
+                  <td class="token">{{ item.token_masked or "-" }}</td>
+                  <td>{{ "%.6f USD"|format(item.max_monthly_usage_usd or 0) }}</td>
+                  <td>{{ "%.6f USD"|format(item.monthly_usage_usd or 0) }}</td>
+                  <td class="{% if ratio is not none and ratio <= 0.2 %}tone-danger{% elif ratio is not none and ratio <= 0.5 %}tone-warning{% elif ratio is not none %}tone-success{% endif %}">
+                    {{ "%.6f USD"|format(item.remaining_monthly_usage_usd or 0) }}
+                  </td>
+                  <td>{{ item.monthly_usage_cycle_start_at or "-" }}</td>
+                  <td>{{ item.monthly_usage_cycle_end_at or "-" }}</td>
+                  <td>{{ item.checked_at or "-" }}</td>
+                </tr>
+              {% endfor %}
+            </tbody>
+          </table>
+        </div>
+        <div id="emptyState" class="empty" {% if tokens %}hidden{% endif %}>
+          {% if initial_payload.get("error") %}
+            当前没有可展示的 token 明细。
+          {% else %}
+            等待数据返回。
+          {% endif %}
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">错误回执</h2>
+            <div class="panel-note">如果某些 token 查询失败，会在这里保留脱敏后的错误信息。</div>
+          </div>
+        </div>
+        {% if errors %}
+          <div id="errorList" class="error-list">
+            {% for item in errors %}
+              <div class="error-item">
+                <strong>{{ item.token_masked or "unknown token" }}</strong>
+                <div>{{ item.error or "未知错误" }}</div>
+              </div>
+            {% endfor %}
+          </div>
+        {% else %}
+          <div id="errorList" class="empty">当前没有错误。</div>
+        {% endif %}
+      </section>
+    </main>
+
+    <script>
+      const apiBalancePath = {{ api_balance_path | tojson }};
+      const apiRefreshPath = {{ api_refresh_path | tojson }};
+      const refreshIntervalSeconds = {{ refresh_interval_seconds | tojson }};
+      const initialBalancePayload = {{ initial_payload | tojson }};
+      const initialStatusCode = {{ initial_status_code | tojson }};
+      const state = {
+        autoRefresh: true,
+        countdown: refreshIntervalSeconds,
+        timerId: null,
+        countdownId: null,
+      };
+
+      const statusText = document.getElementById("statusText");
+      const checkedAt = document.getElementById("checkedAt");
+      const countdown = document.getElementById("countdown");
+      const refreshButton = document.getElementById("refreshButton");
+      const forceRefreshButton = document.getElementById("forceRefreshButton");
+      const toggleAutoButton = document.getElementById("toggleAutoButton");
+      const tokenPoolSize = document.getElementById("tokenPoolSize");
+      const maxTotalUsd = document.getElementById("maxTotalUsd");
+      const usedTotalUsd = document.getElementById("usedTotalUsd");
+      const remainingTotalUsd = document.getElementById("remainingTotalUsd");
+      const dataSource = document.getElementById("dataSource");
+      const resultBadge = document.getElementById("resultBadge");
+      const errorBox = document.getElementById("errorBox");
+      const tableWrap = document.getElementById("tableWrap");
+      const emptyState = document.getElementById("emptyState");
+      const tokenTableBody = document.getElementById("tokenTableBody");
+      const errorList = document.getElementById("errorList");
+
+      function formatUsd(value) {
+        const numeric = Number(value);
+        if (!Number.isFinite(numeric)) {
+          return "-";
+        }
+        return `${numeric.toFixed(6)} USD`;
+      }
+
+      function formatDate(value) {
+        if (!value) {
+          return "-";
+        }
+        const date = new Date(value);
+        if (Number.isNaN(date.getTime())) {
+          return String(value);
+        }
+        return new Intl.DateTimeFormat("zh-CN", {
+          year: "numeric",
+          month: "2-digit",
+          day: "2-digit",
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit",
+          hour12: false,
+        }).format(date);
+      }
+
+      function usageTone(remaining, max) {
+        const left = Number(remaining);
+        const total = Number(max);
+        if (!Number.isFinite(left) || !Number.isFinite(total) || total <= 0) {
+          return "";
+        }
+        const ratio = left / total;
+        if (ratio <= 0.2) {
+          return "tone-danger";
+        }
+        if (ratio <= 0.5) {
+          return "tone-warning";
+        }
+        return "tone-success";
+      }
+
+      function setLoading(isLoading, action = "cache") {
+        refreshButton.disabled = isLoading;
+        forceRefreshButton.disabled = isLoading;
+        if (isLoading) {
+          statusText.textContent = action === "live" ? "正在直接请求 Apify..." : "正在读取最新缓存...";
+        }
+      }
+
+      function renderSummary(payload) {
+        const summary = payload.summary || {};
+        tokenPoolSize.textContent = payload.token_pool_size ?? "-";
+        maxTotalUsd.textContent = formatUsd(summary.max_monthly_usage_usd_total);
+        usedTotalUsd.textContent = formatUsd(summary.monthly_usage_usd_total);
+        remainingTotalUsd.textContent = formatUsd(summary.remaining_monthly_usage_usd_total);
+        checkedAt.textContent = formatDate(payload.checked_at);
+        dataSource.textContent = payload.data_source || "-";
+        resultBadge.textContent = payload.success ? `已更新 ${payload.checked_token_count}/${payload.token_pool_size}` : "查询失败";
+      }
+
+      function renderTable(tokens) {
+        tokenTableBody.innerHTML = "";
+        if (!tokens || !tokens.length) {
+          tableWrap.hidden = true;
+          emptyState.hidden = false;
+          emptyState.textContent = "当前没有可展示的 token 明细。";
+          return;
+        }
+
+        for (const item of tokens) {
+          const row = document.createElement("tr");
+          const toneClass = usageTone(item.remaining_monthly_usage_usd, item.max_monthly_usage_usd);
+          row.innerHTML = `
+            <td class="token">${item.token_masked || "-"}</td>
+            <td>${formatUsd(item.max_monthly_usage_usd)}</td>
+            <td>${formatUsd(item.monthly_usage_usd)}</td>
+            <td class="${toneClass}">${formatUsd(item.remaining_monthly_usage_usd)}</td>
+            <td>${formatDate(item.monthly_usage_cycle_start_at)}</td>
+            <td>${formatDate(item.monthly_usage_cycle_end_at)}</td>
+            <td>${formatDate(item.checked_at)}</td>
+          `;
+          tokenTableBody.appendChild(row);
+        }
+
+        tableWrap.hidden = false;
+        emptyState.hidden = true;
+      }
+
+      function renderErrors(errors) {
+        if (!errors || !errors.length) {
+          errorList.className = "empty";
+          errorList.textContent = "当前没有错误。";
+          return;
+        }
+
+        errorList.className = "error-list";
+        errorList.innerHTML = errors.map((item) => `
+          <div class="error-item">
+            <strong>${item.token_masked || "unknown token"}</strong>
+            <div>${item.error || "未知错误"}</div>
+          </div>
+        `).join("");
+      }
+
+      function renderPage(payload, statusCode) {
+        renderSummary(payload);
+        renderTable(payload.tokens || []);
+        renderErrors(payload.errors || []);
+
+        if (statusCode >= 400 || payload.success === false) {
+          errorBox.hidden = false;
+          errorBox.textContent = payload.error || "查询失败";
+          statusText.textContent = "查询失败，已保留最近一次回执。";
+        } else {
+          errorBox.hidden = true;
+          errorBox.textContent = "";
+          statusText.textContent = payload.data_source === "live"
+            ? `Apify 实时刷新成功，已检查 ${payload.checked_token_count} 枚 token。`
+            : `缓存读取成功，已检查 ${payload.checked_token_count} 枚 token。`;
+        }
+      }
+
+      async function fetchBalance({ forceRefresh = false } = {}) {
+        setLoading(true, forceRefresh ? "live" : "cache");
+        try {
+          const response = await fetch(forceRefresh ? apiRefreshPath : apiBalancePath, {
+            method: forceRefresh ? "POST" : "GET",
+            cache: "no-store",
+          });
+          const payload = await response.json();
+          renderPage(payload, response.status);
+        } catch (error) {
+          renderPage({
+            success: false,
+            error: `页面请求失败：${error.message}`,
+            token_pool_size: "-",
+            checked_token_count: 0,
+            summary: {},
+            tokens: [],
+            errors: [],
+          }, 500);
+        } finally {
+          setLoading(false);
+          resetCountdown();
+        }
+      }
+
+      function resetCountdown() {
+        state.countdown = refreshIntervalSeconds;
+        countdown.textContent = String(state.countdown);
+      }
+
+      function startAutoRefresh() {
+        clearInterval(state.timerId);
+        clearInterval(state.countdownId);
+        state.timerId = window.setInterval(() => {
+          if (state.autoRefresh) {
+            fetchBalance();
+          }
+        }, refreshIntervalSeconds * 1000);
+        state.countdownId = window.setInterval(() => {
+          if (!state.autoRefresh) {
+            countdown.textContent = "paused";
+            return;
+          }
+          state.countdown = Math.max(0, state.countdown - 1);
+          countdown.textContent = String(state.countdown);
+        }, 1000);
+      }
+
+      refreshButton.addEventListener("click", () => {
+        fetchBalance({ forceRefresh: false });
+      });
+
+      forceRefreshButton.addEventListener("click", () => {
+        fetchBalance({ forceRefresh: true });
+      });
+
+      toggleAutoButton.addEventListener("click", () => {
+        state.autoRefresh = !state.autoRefresh;
+        toggleAutoButton.textContent = state.autoRefresh ? "暂停自动刷新" : "恢复自动刷新";
+        if (state.autoRefresh) {
+          resetCountdown();
+        }
+      });
+
+      renderPage(initialBalancePayload, initialStatusCode);
+      resetCountdown();
+      startAutoRefresh();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,14 @@
+.DS_Store
+.env
+.env.local
+.env.*
+!.env.example
+.planning/
+.codex/
+__pycache__/
+*.py[cod]
+backend/.venv/
+downloads/
+exports/
+temp/
+data/
