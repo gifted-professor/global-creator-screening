@@ -63,6 +63,55 @@ class MainCliTests(unittest.TestCase):
         self.assertEqual(args.input, "/tmp/creators.xlsx")
         self.assertEqual(args.output_prefix, "exports/out")
 
+    def test_prepare_duplicate_review_parser_keeps_sample_options(self) -> None:
+        args = self.parser.parse_args(
+            [
+                "prepare-duplicate-review",
+                "--input",
+                "/tmp/high.xlsx",
+                "--db-path",
+                "/tmp/email_sync.db",
+                "--output-prefix",
+                "temp/sample",
+                "--group-key",
+                "last_mail_message_id:2",
+                "--sample-limit",
+                "2",
+            ]
+        )
+        self.assertEqual(args.command, "prepare-duplicate-review")
+        self.assertEqual(args.input, "/tmp/high.xlsx")
+        self.assertEqual(args.db_path, "/tmp/email_sync.db")
+        self.assertEqual(args.output_prefix, "temp/sample")
+        self.assertEqual(args.group_key, ["last_mail_message_id:2"])
+        self.assertEqual(args.sample_limit, 2)
+
+    def test_review_duplicate_groups_parser_keeps_llm_options(self) -> None:
+        args = self.parser.parse_args(
+            [
+                "review-duplicate-groups",
+                "--input",
+                "/tmp/high.xlsx",
+                "--output-prefix",
+                "temp/review",
+                "--sample-limit",
+                "2",
+                "--base-url",
+                "https://example.com/v1",
+                "--api-key",
+                "sk-test",
+                "--model",
+                "gpt-test",
+            ]
+        )
+        self.assertEqual(args.command, "review-duplicate-groups")
+        self.assertEqual(args.input, "/tmp/high.xlsx")
+        self.assertEqual(args.output_prefix, "temp/review")
+        self.assertEqual(args.sample_limit, 2)
+        self.assertEqual(args.base_url, "https://example.com/v1")
+        self.assertEqual(args.api_key, "sk-test")
+        self.assertEqual(args.model, "gpt-test")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -44,6 +44,41 @@ python3 -m feishu_screening_bridge --help
 python3 -m email_sync --help
 ```
 
+先把 enrichment 结果里的重复 `last_mail` 组整理成 sample-first 复核输入：
+
+```bash
+PYTHONPYCACHEPREFIX=/tmp/pycache python3 -m email_sync prepare-duplicate-review \
+  --input "data/task_upload_mail_sync/MINISO/exports/测试达人库_MINISO_匹配结果_高置信.xlsx" \
+  --db-path "data/task_upload_mail_sync/MINISO/email_sync.db" \
+  --output-prefix "temp/miniso_duplicate_review_sample" \
+  --sample-limit 3
+```
+
+对少量重复组做 group-level LLM 归属裁决：
+
+```bash
+PYTHONPYCACHEPREFIX=/tmp/pycache python3 -m email_sync review-duplicate-groups \
+  --env-file .env \
+  --input "data/task_upload_mail_sync/MINISO/exports/测试达人库_MINISO_匹配结果_高置信.xlsx" \
+  --db-path "data/task_upload_mail_sync/MINISO/email_sync.db" \
+  --output-prefix "temp/miniso_duplicate_review_live" \
+  --sample-limit 3
+```
+
+这条 review 命令会自动叠加读取 `.env.local`，并输出：
+
+- `*_audit.json`：按邮件组保留 decision、reason、raw_text
+- `*_annotated.csv`
+- `*_annotated.xlsx`
+- `*_review_summary.json`
+
+真实 MINISO 的 3 组 sample 结果已经落在：
+
+- `temp/miniso_duplicate_review_live_audit.json`
+- `temp/miniso_duplicate_review_live_annotated.csv`
+- `temp/miniso_duplicate_review_live_annotated.xlsx`
+- `temp/miniso_duplicate_review_live_review_summary.json`
+
 把模板规则和达人名单写入筛号输入状态：
 
 ```bash

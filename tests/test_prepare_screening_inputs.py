@@ -31,6 +31,27 @@ def build_creator_workbook(path: Path) -> None:
     workbook.save(path)
 
 
+def build_sending_list_workbook(path: Path) -> None:
+    workbook = Workbook()
+    first_sheet = workbook.active
+    first_sheet.title = "TikTokPool"
+    first_sheet.append(["Country", "Creator", "邮箱地址", "IGlink"])
+    first_sheet.append(["US", "Creator TikTok", "tiktok@example.com", "https://www.tiktok.com/@creatorbeta"])
+    first_sheet.append(["US", "Creator Insta", "insta@example.com", "https://www.instagram.com/creatoralpha/"])
+
+    second_sheet = workbook.create_sheet("Mixed")
+    second_sheet.append(["国家", "Creator", "邮箱地址", "IGlink", "TTlink", "YTlink"])
+    second_sheet.append([
+        "US",
+        "Creator Mixed",
+        "mixed@example.com",
+        "https://www.instagram.com/creatormixed/",
+        "@creatormixed",
+        "https://www.youtube.com/@creatormixed",
+    ])
+    workbook.save(path)
+
+
 @unittest.skipIf(prepare_screening_inputs is None, f"screening deps unavailable: {IMPORT_ERROR}")
 class PrepareScreeningInputsTests(unittest.TestCase):
     def test_prepare_screening_inputs_persists_rulespec_and_upload_metadata(self) -> None:
@@ -75,6 +96,44 @@ class PrepareScreeningInputsTests(unittest.TestCase):
 
             self.assertTrue(summary_json.exists(), summary_json)
 
+    def test_prepare_screening_inputs_normalizes_sending_list_workbook(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            sending_list_workbook = tmp_path / "sending_list.xlsx"
+            screening_data_dir = tmp_path / "screening_data"
+            config_dir = tmp_path / "config"
+            temp_dir = tmp_path / "temp"
+            template_output_dir = tmp_path / "parsed_outputs"
+
+            build_sending_list_workbook(sending_list_workbook)
+
+            summary = prepare_screening_inputs(
+                creator_workbook=sending_list_workbook,
+                template_workbook=FIXTURE_TEMPLATE,
+                template_output_dir=template_output_dir,
+                screening_data_dir=screening_data_dir,
+                config_dir=config_dir,
+                temp_dir=temp_dir,
+            )
+
+            self.assertEqual(summary["upload"]["parsed_source_kind"], "sending_list", summary)
+            self.assertTrue(summary["upload"]["normalized_upload_source_path"], summary)
+            self.assertTrue(Path(summary["upload"]["normalized_upload_source_path"]).exists(), summary)
+            self.assertEqual(summary["upload"]["metadata_count_by_platform"]["instagram"], 2, summary)
+            self.assertEqual(summary["upload"]["metadata_count_by_platform"]["tiktok"], 2, summary)
+            self.assertEqual(summary["upload"]["metadata_count_by_platform"]["youtube"], 1, summary)
+
+            instagram_metadata_path = Path(summary["upload"]["upload_metadata_paths"]["instagram"])
+            tiktok_metadata_path = Path(summary["upload"]["upload_metadata_paths"]["tiktok"])
+            youtube_metadata_path = Path(summary["upload"]["upload_metadata_paths"]["youtube"])
+            instagram_metadata = json.loads(instagram_metadata_path.read_text(encoding="utf-8"))
+            tiktok_metadata = json.loads(tiktok_metadata_path.read_text(encoding="utf-8"))
+            youtube_metadata = json.loads(youtube_metadata_path.read_text(encoding="utf-8"))
+
+            self.assertEqual(instagram_metadata["creatoralpha"]["email"], "insta@example.com", instagram_metadata)
+            self.assertEqual(tiktok_metadata["creatormixed"]["email"], "mixed@example.com", tiktok_metadata)
+            self.assertEqual(youtube_metadata["creatormixed"]["region"], "US", youtube_metadata)
+
     def test_prepare_screening_inputs_can_source_task_upload_assets(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp_path = Path(tmpdir)
@@ -84,7 +143,7 @@ class PrepareScreeningInputsTests(unittest.TestCase):
             temp_dir = tmp_path / "temp"
             summary_json = tmp_path / "summary.json"
 
-            build_creator_workbook(creator_workbook)
+            build_sending_list_workbook(creator_workbook)
 
             fake_task_source = {
                 "recordId": "rec-task-miniso",
@@ -115,8 +174,10 @@ class PrepareScreeningInputsTests(unittest.TestCase):
             mocked_resolver.assert_called_once()
             self.assertEqual(summary["taskSource"]["taskName"], "MINISO", summary)
             self.assertEqual(summary["rulespec"]["source"], "task_upload_template", summary)
-            self.assertEqual(summary["upload"]["metadata_count_by_platform"]["instagram"], 1, summary)
-            self.assertEqual(summary["upload"]["metadata_count_by_platform"]["tiktok"], 1, summary)
+            self.assertEqual(summary["upload"]["parsed_source_kind"], "sending_list", summary)
+            self.assertEqual(summary["upload"]["metadata_count_by_platform"]["instagram"], 2, summary)
+            self.assertEqual(summary["upload"]["metadata_count_by_platform"]["tiktok"], 2, summary)
+            self.assertEqual(summary["upload"]["metadata_count_by_platform"]["youtube"], 1, summary)
             self.assertTrue(summary_json.exists(), summary_json)
 
 

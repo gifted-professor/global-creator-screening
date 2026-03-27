@@ -88,7 +88,10 @@ def compute_platform_quotas(counts: dict[str, int], total: int) -> dict[str, int
 
 
 def select_sample_rows(source_path: Path, sample_size: int) -> tuple[pd.DataFrame, dict[str, object]]:
-    frame = pd.read_excel(source_path)
+    if source_path.suffix.lower() == ".csv":
+        frame = pd.read_csv(source_path, encoding="utf-8-sig")
+    else:
+        frame = pd.read_excel(source_path)
     frame = frame.copy()
     frame["__platform_key"] = frame["Platform"].map(normalize_source_platform)
     frame["__handle_key"] = frame["@username"].map(normalize_handle)
@@ -328,7 +331,7 @@ def default_output_root() -> Path:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a real screening smoke test against the local backend stack.")
-    parser.add_argument("--source-workbook", default=str(DEFAULT_SOURCE_WORKBOOK), help="高置信达人名单 xlsx。")
+    parser.add_argument("--source-workbook", default=str(DEFAULT_SOURCE_WORKBOOK), help="高置信达人名单 xlsx/csv。")
     parser.add_argument("--template-workbook", default=str(DEFAULT_TEMPLATE_WORKBOOK), help="需求模板 xlsx。")
     parser.add_argument("--sample-size", type=int, default=10, help="总共抽多少个账号做 smoke run。")
     parser.add_argument("--output-root", default="", help="输出目录；默认写到 temp/screening_smoke_<timestamp>。")

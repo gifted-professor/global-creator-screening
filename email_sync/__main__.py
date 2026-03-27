@@ -9,6 +9,7 @@ from typing import List, Optional
 
 from .config import Settings
 from .creator_enrichment import enrich_creator_workbook
+from .creator_review import prepare_duplicate_review, review_duplicate_groups
 from .db import Database, MessageQuery
 from .imap_sync import connect, discover_mailboxes, sync_mailboxes
 from .relation_index import rebuild_relation_index
@@ -79,6 +80,33 @@ def _build_parser() -> argparse.ArgumentParser:
         default="exports/达人邮件可获取信息_v1",
         help="输出文件前缀，默认 exports/达人邮件可获取信息_v1",
     )
+
+    review = subparsers.add_parser("prepare-duplicate-review", help="把共享同一 last_mail 的重复达人组整理成 sample-first 审核输入")
+    review.add_argument("--env-file", default=".env", help="配置文件路径，默认 ./.env")
+    review.add_argument("--input", required=True, help="高置信 enrichment xlsx 路径")
+    review.add_argument("--db-path", help="覆盖邮件库 SQLite 路径；默认沿用 .env 里的 DB_PATH / DATA_DIR")
+    review.add_argument(
+        "--output-prefix",
+        default="temp/duplicate_review_sample",
+        help="输出文件前缀，默认 temp/duplicate_review_sample",
+    )
+    review.add_argument("--group-key", action="append", help="只准备指定 duplicate group key，可重复传入")
+    review.add_argument("--sample-limit", type=int, default=3, help="默认只选前 N 个重复组，避免一次性全量跑")
+
+    adjudicate = subparsers.add_parser("review-duplicate-groups", help="对 sample duplicate groups 做 group-level LLM 审核")
+    adjudicate.add_argument("--env-file", default=".env", help="配置文件路径，默认 ./.env")
+    adjudicate.add_argument("--input", required=True, help="高置信 enrichment xlsx 路径")
+    adjudicate.add_argument("--db-path", help="覆盖邮件库 SQLite 路径；默认沿用 .env 里的 DB_PATH / DATA_DIR")
+    adjudicate.add_argument(
+        "--output-prefix",
+        default="temp/duplicate_review_run",
+        help="输出文件前缀，默认 temp/duplicate_review_run",
+    )
+    adjudicate.add_argument("--group-key", action="append", help="只审核指定 duplicate group key，可重复传入")
+    adjudicate.add_argument("--sample-limit", type=int, default=3, help="默认只审核前 N 个 duplicate groups")
+    adjudicate.add_argument("--base-url", help="覆盖 LLM base url；默认从 .env/.env.local 读取")
+    adjudicate.add_argument("--api-key", help="覆盖 LLM api key；默认从 .env/.env.local 读取")
+    adjudicate.add_argument("--model", help="覆盖 LLM model；默认从 .env/.env.local 读取")
 
     return parser
 
@@ -424,6 +452,79 @@ def _cmd_enrich_creators(settings: Settings, input_path: str, output_prefix: str
     return 0
 
 
+def _cmd_prepare_duplicate_review(
+    settings: Settings,
+    input_path: str,
+    output_prefix: str,
+    sample_limit: int,
+    group_keys: Optional[List[str]],
+    db_path_override: Optional[str],
+) -> int:
+    db_path = Path(db_path_override).expanduser() if db_path_override else settings.db_path
+    db = Database(db_path)
+    try:
+        result = prepare_duplicate_review(
+            db=db,
+            input_path=Path(input_path),
+            output_prefix=Path(output_prefix),
+            sample_limit=sample_limit,
+            group_keys=group_keys,
+        )
+    finally:
+        db.close()
+
+    print(
+        f"duplicate review prepared: selected_groups={result['selected_group_count']} "
+        f"duplicate_groups={result['stats']['duplicate_group_count']} "
+        f"singleton_groups={result['stats']['singleton_group_count']}"
+    )
+    print(f"selected group keys: {', '.join(result['selected_group_keys']) or '-'}")
+    print(f"groups json: {result['groups_json_path']}")
+    print(f"summary json: {result['summary_json_path']}")
+    return 0
+
+
+def _cmd_review_duplicate_groups(
+    settings: Settings,
+    input_path: str,
+    output_prefix: str,
+    sample_limit: int,
+    group_keys: Optional[List[str]],
+    db_path_override: Optional[str],
+    env_file: str,
+    base_url: Optional[str],
+    api_key: Optional[str],
+    model: Optional[str],
+) -> int:
+    db_path = Path(db_path_override).expanduser() if db_path_override else settings.db_path
+    db = Database(db_path)
+    try:
+        result = review_duplicate_groups(
+            db=db,
+            input_path=Path(input_path),
+            output_prefix=Path(output_prefix),
+            env_path=env_file,
+            sample_limit=sample_limit,
+            group_keys=group_keys,
+            base_url=base_url,
+            api_key=api_key,
+            model=model,
+        )
+    finally:
+        db.close()
+
+    print(
+        f"duplicate review run finished: selected_groups={result['selected_group_count']} "
+        f"duplicate_groups={result['stats']['duplicate_group_count']}"
+    )
+    print(f"selected group keys: {', '.join(result['selected_group_keys']) or '-'}")
+    print(f"audit json: {result['audit_json_path']}")
+    print(f"annotated csv: {result['annotated_csv_path']}")
+    print(f"annotated xlsx: {result['annotated_xlsx_path']}")
+    print(f"summary json: {result['review_summary_json_path']}")
+    return 0
+
+
 def main() -> int:
     parser = _build_parser()
     args = parser.parse_args()
@@ -467,6 +568,28 @@ def main() -> int:
             return _cmd_thread(settings, args.thread_key, args.json)
         if args.command == "enrich-creators":
             return _cmd_enrich_creators(settings, args.input, args.output_prefix)
+        if args.command == "prepare-duplicate-review":
+            return _cmd_prepare_duplicate_review(
+                settings,
+                args.input,
+                args.output_prefix,
+                args.sample_limit,
+                args.group_key,
+                args.db_path,
+            )
+        if args.command == "review-duplicate-groups":
+            return _cmd_review_duplicate_groups(
+                settings,
+                args.input,
+                args.output_prefix,
+                args.sample_limit,
+                args.group_key,
+                args.db_path,
+                args.env_file,
+                args.base_url,
+                args.api_key,
+                args.model,
+            )
         raise ValueError(f"未知命令: {args.command}")
     except Exception as exc:  # noqa: BLE001
         print(f"[error] {exc}", file=sys.stderr)

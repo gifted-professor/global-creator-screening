@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,25 @@ from workbook_template_parser import compile_workbook
 
 DEFAULT_TEMPLATE_OUTPUT_DIR = REPO_ROOT / "downloads" / "task_upload_attachments" / "parsed_outputs"
 DEFAULT_TASK_UPLOAD_DOWNLOAD_DIR = REPO_ROOT / "downloads" / "task_upload_attachments"
+NORMALIZED_UPLOAD_OUTPUT_DIRNAME = "normalized_upload_workbooks"
+
+CANONICAL_UPLOAD_EXPORT_COLUMNS = [
+    "Platform",
+    "@username",
+    "URL",
+    "nickname",
+    "Region",
+    "email",
+]
+SENDING_LIST_COUNTRY_ALIASES = ("country", "国家", "region", "地区")
+SENDING_LIST_CREATOR_ALIASES = ("creator", "nickname", "达人", "红人", "博主")
+SENDING_LIST_EMAIL_ALIASES = ("邮箱地址", "邮箱", "email", "emailaddress", "mail")
+SENDING_LIST_GENERIC_LINK_ALIASES = ("link", "url", "主页链接", "账号链接", "profilelink", "profileurl")
+SENDING_LIST_PLATFORM_LINK_ALIASES = {
+    "instagram": ("iglink", "igurl", "instagramlink", "instagramurl", "inslink", "insurl"),
+    "tiktok": ("ttlink", "tturl", "tiktoklink", "tiktokurl", "douyinlink"),
+    "youtube": ("ytlink", "yturl", "youtubelink", "youtubeurl", "channelurl", "channellink"),
+}
 
 
 def configure_backend_runtime(
@@ -128,6 +148,203 @@ def load_upload_frames(source_path: Path) -> list[Any]:
     return backend_app.load_canonical_upload_workbook_frames(str(source_path))
 
 
+def normalize_source_column_name(name: Any) -> str:
+    return re.sub(r"[\s_\-./（）()]+", "", str(name or "").strip().lower())
+
+
+def resolve_source_column(columns: list[Any], aliases: tuple[str, ...]) -> Any:
+    normalized_aliases = {normalize_source_column_name(alias) for alias in aliases if str(alias or "").strip()}
+    for column in columns:
+        if normalize_source_column_name(column) in normalized_aliases:
+            return column
+    return None
+
+
+def clean_source_cell(value: Any) -> str:
+    cleaned = backend_app.clean_upload_metadata_value(value)
+    return str(cleaned).strip() if cleaned not in ("", None) else ""
+
+
+def infer_platform_from_value(value: Any) -> str:
+    text = clean_source_cell(value).lower()
+    if not text:
+        return ""
+    if "instagram.com" in text:
+        return "instagram"
+    if "tiktok.com" in text:
+        return "tiktok"
+    if "youtube.com" in text or "youtu.be/" in text:
+        return "youtube"
+    return ""
+
+
+def infer_platform_from_series(series: Any, limit: int = 20) -> str:
+    hits: dict[str, int] = {}
+    checked = 0
+    for value in series.tolist():
+        platform = infer_platform_from_value(value)
+        if platform:
+            hits[platform] = hits.get(platform, 0) + 1
+        if clean_source_cell(value):
+            checked += 1
+        if checked >= limit:
+            break
+    if not hits:
+        return ""
+    return max(hits.items(), key=lambda item: item[1])[0]
+
+
+def resolve_sending_list_link_columns(frame: Any) -> list[tuple[Any, str]]:
+    resolved: list[tuple[Any, str]] = []
+    seen_columns: set[Any] = set()
+    normalized_generic_aliases = {
+        normalize_source_column_name(alias)
+        for alias in SENDING_LIST_GENERIC_LINK_ALIASES
+    }
+    normalized_platform_aliases = {
+        platform: {
+            normalize_source_column_name(alias)
+            for alias in aliases
+        }
+        for platform, aliases in SENDING_LIST_PLATFORM_LINK_ALIASES.items()
+    }
+
+    for column in frame.columns:
+        if str(column).startswith("__") or column in seen_columns:
+            continue
+        normalized_column = normalize_source_column_name(column)
+        explicit_platform = ""
+        for platform, aliases in normalized_platform_aliases.items():
+            if normalized_column in aliases:
+                explicit_platform = platform
+                break
+        inferred_platform = infer_platform_from_series(frame[column])
+        if explicit_platform or inferred_platform or normalized_column in normalized_generic_aliases:
+            resolved.append((column, inferred_platform or explicit_platform))
+            seen_columns.add(column)
+    return resolved
+
+
+def build_canonical_upload_from_sending_list(
+    source_path: Path,
+    frames: list[Any],
+) -> tuple[Any | None, dict[str, Any]]:
+    records_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    input_row_count = 0
+    skipped_row_count = 0
+    matched_link_count = 0
+    sheet_summaries: list[dict[str, Any]] = []
+
+    for frame in frames:
+        if frame is None or frame.empty:
+            continue
+        columns = list(frame.columns)
+        country_column = resolve_source_column(columns, SENDING_LIST_COUNTRY_ALIASES)
+        creator_column = resolve_source_column(columns, SENDING_LIST_CREATOR_ALIASES)
+        email_column = resolve_source_column(columns, SENDING_LIST_EMAIL_ALIASES)
+        link_columns = resolve_sending_list_link_columns(frame)
+        if not link_columns:
+            continue
+
+        sample_sheet_name = "Sheet1"
+        if "__sheet_name" in frame.columns and not frame.empty:
+            sample_sheet_name = clean_source_cell(frame.iloc[0].get("__sheet_name")) or "Sheet1"
+        sheet_converted_count = 0
+        sheet_skipped_count = 0
+
+        for _, row_series in frame.iterrows():
+            row_dict = row_series.to_dict()
+            if backend_app.is_empty_upload_row(row_dict):
+                continue
+            input_row_count += 1
+            nickname = clean_source_cell(row_dict.get(creator_column)) if creator_column else ""
+            region = clean_source_cell(row_dict.get(country_column)) if country_column else ""
+            email = clean_source_cell(row_dict.get(email_column)) if email_column else ""
+            row_seen_keys: set[tuple[str, str]] = set()
+
+            for link_column, default_platform in link_columns:
+                raw_link_value = clean_source_cell(row_dict.get(link_column))
+                if not raw_link_value:
+                    continue
+                platform = infer_platform_from_value(raw_link_value) or default_platform
+                if not platform:
+                    continue
+                identifier = (
+                    backend_app.screening.extract_platform_identifier(platform, raw_link_value)
+                    or backend_app.screening.extract_platform_identifier(platform, nickname)
+                )
+                if not identifier:
+                    continue
+                record_key = (platform, identifier)
+                if record_key in row_seen_keys:
+                    continue
+                row_seen_keys.add(record_key)
+                matched_link_count += 1
+                sheet_converted_count += 1
+
+                canonical_url = raw_link_value
+                if "://" not in canonical_url:
+                    canonical_url = backend_app.screening.build_canonical_profile_url(platform, identifier)
+                existing = records_by_key.get(record_key)
+                if existing is None:
+                    records_by_key[record_key] = {
+                        "Platform": backend_app.UPLOAD_PLATFORM_RESPONSE_LABELS.get(platform, platform),
+                        "@username": identifier,
+                        "URL": canonical_url,
+                        "nickname": nickname,
+                        "Region": region,
+                        "email": email,
+                    }
+                    continue
+                if not existing.get("URL") and canonical_url:
+                    existing["URL"] = canonical_url
+                if not existing.get("nickname") and nickname:
+                    existing["nickname"] = nickname
+                if not existing.get("Region") and region:
+                    existing["Region"] = region
+                if not existing.get("email") and email:
+                    existing["email"] = email
+
+            if not row_seen_keys:
+                skipped_row_count += 1
+                sheet_skipped_count += 1
+
+        sheet_summaries.append({
+            "sheetName": sample_sheet_name,
+            "linkColumns": [
+                {
+                    "column": str(column),
+                    "defaultPlatform": platform,
+                }
+                for column, platform in link_columns
+            ],
+            "convertedLinks": sheet_converted_count,
+            "skippedRows": sheet_skipped_count,
+        })
+
+    if not records_by_key:
+        return None, {}
+
+    dataframe = backend_app.pd.DataFrame(list(records_by_key.values()), columns=CANONICAL_UPLOAD_EXPORT_COLUMNS)
+    return dataframe, {
+        "sourceType": "sending_list",
+        "sourcePath": str(source_path),
+        "inputRowCount": input_row_count,
+        "recordCount": len(records_by_key),
+        "matchedLinkCount": matched_link_count,
+        "skippedRowCount": skipped_row_count,
+        "sheetSummaries": sheet_summaries,
+    }
+
+
+def persist_normalized_upload_dataframe(source_path: Path, dataframe: Any) -> Path:
+    output_dir = Path(backend_app.TEMP_DIR) / NORMALIZED_UPLOAD_OUTPUT_DIRNAME
+    output_dir.mkdir(parents=True, exist_ok=True)
+    output_path = output_dir / f"{source_path.stem}__canonical_upload.csv"
+    dataframe.to_csv(output_path, index=False, encoding="utf-8-sig")
+    return output_path
+
+
 def _raise_upload_error(error_response: Any) -> None:
     response, _status_code = error_response
     payload = response.get_json(silent=True) or {}
@@ -152,6 +369,20 @@ def prepare_upload_metadata(source_path: Path) -> dict[str, Any]:
         raise ValueError(f"上传名单为空或无法读取: {source_path}")
 
     dataframe = backend_app.pd.concat(frames, ignore_index=True)
+    parsed_source_kind = "canonical_upload"
+    normalized_upload_source_path = ""
+    normalized_upload_summary: dict[str, Any] = {}
+
+    resolved_columns, missing = backend_app.resolve_canonical_upload_columns(dataframe.columns)
+    if missing:
+        normalized_dataframe, normalized_upload_summary = build_canonical_upload_from_sending_list(source_path, frames)
+        if normalized_dataframe is not None:
+            parsed_source_kind = "sending_list"
+            normalized_upload_source_path = str(
+                persist_normalized_upload_dataframe(source_path, normalized_dataframe)
+            )
+            dataframe = normalized_dataframe
+
     with backend_app.app.app_context():
         parsed, error_response = backend_app.parse_canonical_upload_workbook(dataframe, source_path.name)
     if error_response:
@@ -162,6 +393,9 @@ def prepare_upload_metadata(source_path: Path) -> dict[str, Any]:
 
     return {
         "source_path": str(source_path),
+        "parsed_source_kind": parsed_source_kind,
+        "normalized_upload_source_path": normalized_upload_source_path,
+        "normalized_upload_summary": normalized_upload_summary,
         "stats": dict(parsed["stats"]),
         "grouped_count_by_platform": {
             platform: len(parsed["grouped_data"].get(platform, []))
