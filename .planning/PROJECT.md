@@ -25,18 +25,21 @@
 - [x] 视觉复核默认并发已按 2026-03-27 benchmark 调整为 `6`
 - [x] 当前仓库已经包含 `scripts/prepare_screening_inputs.py`，可把模板解析产物和达人匹配名单直接写入筛号后端当前输入状态
 - [x] `MINISO` 模板 rulespec 和高置信达人名单已实写到当前仓库 `config/active_rulespec.json` 与 `data/*/*_upload_metadata.json`
+- [x] 当前仓库已经包含 backend-owned 的视觉 provider snapshot / preflight / structured early failure 诊断能力，并写进 health 与 runner summary
+- [x] 当前仓库已经用显式 `openai` provider 成功跑通一轮真实 bounded `MINISO instagram` visual review，从 scrape 一直到 final export
 
 ### Active
 
-- [ ] 保留与外部全量 `email` 项目的兼容，避免一次性重写现有导入链路
-- [ ] 把报价结果也正式接入 `筛号` 或其他后续链路
-- [ ] 用当前仓库已写入的 `MINISO` 输入状态继续跑下游抓取 / 预筛 / 视觉复核
-- [ ] 让当前仓库成为统一的 `.env` 承载位置，减少跨项目手工同步
+- [ ] 让操作人可以从任务上传起点用单入口跑到最终导出，而不是手工串多个命令
+- [ ] 继续减少全流程对外部全量 `email` 项目和隐式本地状态的依赖
+- [ ] 决定报价结果是否需要在下一里程碑正式接入 `筛号` 运行态或导出
+- [ ] 让当前仓库成为统一的 `.env` 与运行诊断承载位置，减少跨项目手工同步
 
 ### Out of Scope
 
 - 彻底重写 `email_sync` 或 `筛号` 业务逻辑 — 当前目标是迁移与整合，不是重构旧系统
 - 云端部署或生产化打包 — 目前是本地工作流整合
+- 在没有明确业务需要前重做视觉复核算法本身 — 当前优先级是把现有链路编排成单入口、可复跑的闭环
 
 ## Context
 
@@ -45,36 +48,33 @@
 - `任务上传 -> 员工信息 -> 模板下载/解析 -> 按任务抓取邮箱文件夹邮件 -> 达人匹配 -> duplicate review -> keep-list`
 - `keep-list -> 筛号运行态 -> Apify 抓取 -> 预筛 -> 视觉复核调用 -> 导出`
 
-真实 `MINISO` 验证已经证明 keep-list 主线能下探到导出，但当前视觉 provider 仍可能因为鉴权问题返回 `auth_not_found`。桥接层里依赖 workbook / dashboard / project-home 的旧流程，暂时仍默认指向外部全量 `email` 项目。
+当前仓库已经分别验证过两段真实业务链：
+
+- `任务上传 -> 员工信息 -> 模板下载/解析 -> 按任务抓取邮箱文件夹邮件 -> 达人匹配 -> duplicate review -> keep-list`
+- `keep-list -> 筛号运行态 -> Apify 抓取 -> 预筛 -> 视觉复核 -> 导出`
+
+`v1.1.0` 已证明此前的 `auth_not_found` 不是“现在 apikey 没填好”，而是旧 provider 路径不稳定；当前显式 `openai` 路径已经 real run 成功。接下来真正缺的是把这两段链拼成一个 repo-local 的单入口 E2E，而不是继续单点修视觉。
 
 ## Current State
 
-- `v1.0.0` 已交付一个 repo-local 的创作者筛选主线，不再需要跨多个 sibling 工程手工拼核心步骤
-- `MINISO` 已完成真实 duplicate review 产物链，并生成最终 keep workbook
-- keep-list 已经正式接入当前仓库 `筛号` 主链，并做过 bounded live downstream validation
-- 当前剩余主要问题不是链路缺失，而是视觉 provider 鉴权与少数历史兼容点
+- `v1.0.0` 已交付 repo-local 的创作者筛选主线，核心模块不再散落在多个 sibling 工程里
+- `v1.1.0` 已交付视觉 provider 诊断、显式 provider 选择、live probe，以及一轮真实 non-error bounded visual validation
+- `MINISO` 已具备真实 duplicate review 产物链和 keep workbook，下游也已证明能从 scrape 跑到 final export
+- 当前最大的缺口不是某一段链跑不通，而是还没有一个“从任务上传起点到最终导出”的单入口 repo-local orchestration
 
 ## Next Milestone Goals
 
-- 修复视觉 provider 鉴权，让 bounded visual review 不再返回 `auth_not_found`
-- 决定是否把报价结果正式接入 `筛号` 运行态或最终导出链
-- 继续减少对外部全量 `email` 项目的 workbook / dashboard / project-home 依赖
-- 视业务需要补做 milestone audit、cross-phase verification 或后续生产化整理
-
-## Current Milestone: v1.1.0 Visual Provider Reliability and Downstream Hardening
-
-**Goal:** 收稳当前 keep-list -> visual-review -> export 主线，优先修掉视觉 provider 鉴权和排障体验。
-
-**Target features:**
-- 让视觉 provider 的鉴权解析路径可诊断、可预检
-- 让 bounded visual review 不再因 `auth_not_found` 失败
-- 把视觉配置与验证命令写进 repo 文档和 summary 产物
+- 把 `任务上传 -> mail sync -> enrichment / duplicate review -> keep-list -> screening -> export` 编排成单入口 E2E
+- 为单入口运行补齐中间产物契约、早失败诊断和 resume 点
+- 用真实 `MINISO` 跑一轮 bounded end-to-end proof，并留下机器可读 summary
+- 决定报价结果接入与 legacy 外部依赖收口，哪些是本 milestone 必做，哪些继续延期
 
 ## Constraints
 
 - **Compatibility**: 迁移后仍需兼容现有 sibling 项目结构 — 旧的 `抓取邮件/email_sync` 目录短期内仍是依赖方
 - **Scope**: 只搬运已经验证过的飞书桥接能力 — 暂不顺手扩展新功能
 - **Security**: `.env.example` 不应继续携带真实密钥 — 示例文件只保留结构和安全默认值
+- **Workflow**: 里程碑收尾与新里程碑启动要分开提交 — 归档 tag 应对应真实 shipped 状态，而不是混入后续规划
 
 ## Key Decisions
 
@@ -91,6 +91,7 @@
 | `筛号` 后端按整包迁移到当前仓库 | 用户要的是完整可用链路，不是分散读取若干零件 | ✓ Good |
 | 视觉复核默认并发设为 `6` | 2026-03-27 冷缓存 8 位达人 benchmark 下，`6` 在速度与稳定性间最优 | ✓ Good |
 | 上游产物先写入筛号当前输入状态 | 当前最缺的是把已拿到的模板规则和达人名单真正喂给后端，而不是继续只停留在文件输出 | ✓ Good |
+| 下一阶段把“全流程跑通”定义成 orchestration 与 runtime contract 问题 | `v1.1.0` 已证明下游视觉链可用，下一缺口是单入口 E2E，而不是继续怀疑 apikey | — Pending |
 
 ---
-*Last updated: 2026-03-28 after v1.1.0 milestone initialization*
+*Last updated: 2026-03-28 after v1.1.0 milestone archive*

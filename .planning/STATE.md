@@ -2,16 +2,16 @@
 gsd_state_version: 1.0
 milestone: v1.1.0
 milestone_name: Visual Provider Reliability and Downstream Hardening
-status: active
-stopped_at: Phase 14 planned; next workflow step is execute 14-01
-last_updated: "2026-03-28T00:15:21.486Z"
-last_activity: 2026-03-28 — planned Phase 14 with backend vision-provider diagnostics and runner-side preflight summary work split across 14-01 and 14-02
+status: completed
+stopped_at: Milestone shipped and archived; next workflow step is start new milestone
+last_updated: "2026-03-28T02:10:00.000Z"
+last_activity: 2026-03-28 — archived milestone v1.1.0 after provider diagnostics and a real non-error bounded MINISO Instagram visual validation using explicit provider `openai`
 progress:
   total_phases: 2
-  completed_phases: 0
-  total_plans: 2
-  completed_plans: 0
-  percent: 0
+  completed_phases: 2
+  total_plans: 4
+  completed_plans: 4
+  percent: 100
 ---
 
 # Project State
@@ -21,22 +21,22 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-28)
 
 **Core value:** 在不打断现有本地工作流的前提下，把飞书内容获取、筛选导入和相关配置集中到一个可持续维护的仓库里。
-**Current focus:** 执行 Phase 14，先做 backend 视觉 provider 诊断/预检，再把诊断字段写进 keep-list runner summary
+**Current focus:** `v1.1.0` 已归档，等待启动下一 milestone 处理单入口 E2E 路径
 
 ## Current Position
 
-Phase: 14 of 15 (Stabilize visual provider config and preflight)
-Plan: 0 of 2 in current phase
-Status: Phase 14 planned and ready to execute
-Last activity: 2026-03-28 — created 14-CONTEXT plus 14-01/14-02 plans for visual provider diagnostics and bounded preflight validation
+Phase: Complete (milestone archived)
+Plan: —
+Status: `v1.1.0` shipped
+Last activity: 2026-03-28 — archived `v1.1.0` and prepared to start the next milestone
 
-Progress: [░░░░░░░░░░] 0%
+Progress: [██████████] 100%
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 4
+- Total plans completed: 6
 - Average duration: n/a
 - Total execution time: n/a
 
@@ -53,6 +53,8 @@ Progress: [░░░░░░░░░░] 0%
 | 7 | 1 | n/a | n/a |
 | 8 | 1 | n/a | n/a |
 | 9 | 1 | n/a | n/a |
+| 14 | 2 | n/a | n/a |
+| 15 | 2 | n/a | n/a |
 
 **Recent Trend:**
 
@@ -98,19 +100,23 @@ Recent decisions affecting current work:
 - Phase 11 added: Resolve duplicate creator matches with group-level LLM review
 - Phase 12 added: Align production duplicate-review pipeline with keep-list outputs
 - Phase 13 added: Wire keep-list outputs into screening pipeline
+- Phase 14 added: Stabilize visual provider config and preflight
+- Phase 15 added: Validate non-error bounded visual review flow
 
 ### Pending Todos
 
-- 执行 14-01，补 backend 视觉 provider snapshot / preflight / 早失败诊断
-- 决定是否要把当前视觉 provider 配置修好，再补一轮 non-error 的 bounded visual validation
-- 决定是否要把当前 `.env.local` 的 998Code 配置切回可用状态，还是正式切到其他 OpenAI-compatible provider
+- 启动下一个 milestone，把“全流程跑通”定义为单入口 repo-local E2E
+- 决定报价结果接入和 legacy 外部依赖收口，哪些是下个 milestone 的必做项
+- 决定是否在 `openai` 之外继续补其他 provider 的 live proof run
 
 ### Blockers/Concerns
 
 - `feishu_screening_bridge` 的 workbook / dashboard / project-home 旧流程仍依赖外部全量 `email` 项目
 - 报价结果还没有正式灌入 `筛号` 后端的数据入口
-- 当前 keep-list 主链已能触发 visual-review，但活动 provider 仍可能返回 `openai: HTTP 500 auth_not_found: no auth available`
+- 当前只对 `openai` 留下了真实 non-error proof run；其他 provider 还没有 live 可用性证明
 - 当前 998Code provider 对长跑真实 review 不稳定，可能在 `chat_completions` 侧返回 520 或长时间挂起
+- 当前 Phase 15 的成功验证是 bounded 的 `instagram 1`，不是全量批次稳定性证明
+- `v1.1.0` 归档前没有单独补 milestone audit 文件，这被接受为流程债
 
 ### Quick Tasks Completed
 
@@ -139,9 +145,13 @@ Recent decisions affecting current work:
 - 2026-03-27: Complete Phase 12 12-02 by generating real `llm_review / reviewed / keep` outputs; live validation succeeded with the legacy DeepSeek provider after the current 998Code endpoint proved unstable
 - 2026-03-28: Complete Phase 13 13-01 by accepting reviewed keep workbooks as staging input, adding `scripts/run_keep_list_screening_pipeline.py`, and validating real MINISO staged counts (`TikTok 122 / Instagram 146 / YouTube 15`)
 - 2026-03-28: Complete Phase 13 13-02 by running a bounded real MINISO keep-list downstream validation (`instagram` 1 identifier), reaching scrape, prescreen, visual-review invocation, and export download under `temp/keep_list_bounded_live_validation_escalated`
+- 2026-03-28: Complete Phase 14 14-01 by adding backend vision provider snapshot/preflight diagnostics, exposing them through `/api/health`, and returning structured preflight errors on visual-review start
+- 2026-03-28: Complete Phase 14 14-02 by wiring backend `vision_preflight` into keep-list/smoke summaries, updating README operator docs, and leaving a fresh diagnostic artifact under `temp/keep_list_visual_diagnostic_phase14`
+- 2026-03-28: Complete Phase 15 15-01 by adding explicit visual provider selection, a lightweight live provider probe endpoint, and runner support for `--vision-provider` / `--probe-vision-provider-only`
+- 2026-03-28: Complete Phase 15 15-02 by proving a real bounded MINISO Instagram run with explicit `openai` completes scrape, prescreen, visual review, and export without `auth_not_found`, leaving artifacts under `temp/phase15_bounded_openai_live`
 
 ## Session Continuity
 
-Last session: 2026-03-28 23:52
-Stopped at: Phase 14 planned; next workflow step is execute 14-01
+Last session: 2026-03-28 02:10
+Stopped at: `v1.1.0` archived; next workflow step is start new milestone
 Resume file: None

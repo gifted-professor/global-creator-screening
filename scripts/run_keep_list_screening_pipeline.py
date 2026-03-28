@@ -110,8 +110,10 @@ def run_keep_list_screening_pipeline(
     output_root: Path | None = None,
     summary_json: Path | None = None,
     platform_filters: list[str] | None = None,
+    vision_provider: str = "",
     max_identifiers_per_platform: int = 0,
     poll_interval: float = 5.0,
+    probe_vision_provider_only: bool = False,
     skip_scrape: bool = False,
     skip_visual: bool = False,
 ) -> dict[str, Any]:
@@ -159,21 +161,45 @@ def run_keep_list_screening_pipeline(
         "summary_json": str(run_summary_path),
         "staging_summary_json": str(staging_summary_path),
         "requested_platforms": requested_platforms,
+        "requested_vision_provider": str(vision_provider or "").strip().lower(),
         "max_identifiers_per_platform": int(max_identifiers_per_platform),
         "skip_scrape": bool(skip_scrape),
         "skip_visual": bool(skip_visual),
+        "probe_vision_provider_only": bool(probe_vision_provider_only),
         "vision_providers": backend_app.get_available_vision_provider_names(),
+        "vision_preflight": backend_app.build_vision_preflight(vision_provider),
         "staging": staging_summary,
         "platforms": {},
     }
 
     client = backend_app.app.test_client()
+    if not skip_visual or probe_vision_provider_only:
+        probe_response = client.post("/api/vision/providers/probe", json={"provider": vision_provider or ""})
+        probe_payload = probe_response.get_json(silent=True) or {
+            "success": False,
+            "error": f"unexpected HTTP {probe_response.status_code}",
+        }
+        summary["vision_probe"] = probe_payload
+        summary["vision_preflight"] = probe_payload.get("vision_preflight") or summary["vision_preflight"]
+        if probe_response.status_code >= 400 or probe_payload.get("success") is False:
+            summary["status"] = "vision_probe_failed"
+            summary["finished_at"] = backend_app.iso_now()
+            backend_app.write_json_file(str(run_summary_path), summary)
+            return summary
+    if probe_vision_provider_only:
+        summary["status"] = "vision_probe_only"
+        summary["finished_at"] = backend_app.iso_now()
+        backend_app.write_json_file(str(run_summary_path), summary)
+        return summary
+
     for platform in requested_platforms:
         requested_identifiers = select_platform_identifiers(platform, max(0, int(max_identifiers_per_platform)))
         platform_summary: dict[str, Any] = {
             "staged_identifier_count": len(backend_app.load_upload_metadata(platform)),
             "requested_identifier_count": len(requested_identifiers),
             "requested_identifier_preview": requested_identifiers[:10],
+            "requested_vision_provider": str(vision_provider or "").strip().lower(),
+            "vision_preflight": backend_app.build_vision_preflight(vision_provider),
         }
 
         if not requested_identifiers:
@@ -185,6 +211,13 @@ def run_keep_list_screening_pipeline(
         if skip_scrape:
             platform_summary["status"] = "staged_only"
             platform_summary["scrape_job"] = {"status": "skipped", "reason": "skip_scrape flag set"}
+            platform_summary["visual_gate"] = {
+                "executed": False,
+                "reason": "scrape skipped before visual review",
+                "preflight_status": platform_summary["vision_preflight"]["status"],
+                "runnable_provider_names": platform_summary["vision_preflight"]["runnable_provider_names"],
+                "selected_provider": platform_summary["vision_preflight"].get("preferred_provider") or "",
+            }
             summary["platforms"][platform] = platform_summary
             backend_app.write_json_file(str(run_summary_path), summary)
             continue
@@ -204,12 +237,22 @@ def run_keep_list_screening_pipeline(
 
         pass_count = count_passed_profiles(scrape_job)
         platform_summary["prescreen_pass_count"] = pass_count
+        platform_summary["visual_gate"] = {
+            "executed": False,
+            "skip_visual_flag": bool(skip_visual),
+            "preflight_status": platform_summary["vision_preflight"]["status"],
+            "runnable_provider_names": platform_summary["vision_preflight"]["runnable_provider_names"],
+            "configured_provider_names": platform_summary["vision_preflight"]["configured_provider_names"],
+            "selected_provider": platform_summary["vision_preflight"].get("preferred_provider") or "",
+        }
         if skip_visual:
             platform_summary["visual_job"] = {"status": "skipped", "reason": "skip_visual flag set"}
         elif pass_count <= 0:
             platform_summary["visual_job"] = {"status": "skipped", "reason": "no Prescreen=Pass targets"}
-        elif backend_app.get_available_vision_provider_names():
+        elif backend_app.get_available_vision_provider_names(vision_provider):
             visual_payload_body = build_visual_payload(platform, requested_identifiers)
+            if vision_provider:
+                visual_payload_body["provider"] = str(vision_provider).strip().lower()
             visual_payload = require_success(
                 client.post("/api/jobs/visual-review", json={"platform": platform, "payload": visual_payload_body}),
                 f"{platform} visual start",
@@ -220,8 +263,14 @@ def run_keep_list_screening_pipeline(
                 f"{platform} visual poll",
                 max(1.0, float(poll_interval)),
             )
+            platform_summary["visual_gate"]["executed"] = True
         else:
-            platform_summary["visual_job"] = {"status": "skipped", "reason": "missing vision provider config"}
+            platform_summary["visual_job"] = {
+                "status": "skipped",
+                "reason": platform_summary["vision_preflight"]["message"],
+                "error_code": platform_summary["vision_preflight"]["error_code"],
+                "vision_preflight": platform_summary["vision_preflight"],
+            }
 
         platform_summary["artifact_status"] = require_success(
             client.get(f"/api/artifacts/{platform}/status"),
@@ -249,8 +298,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", default="", help="输出目录；默认写到 temp/keep_list_screening_<timestamp>。")
     parser.add_argument("--summary-json", default="", help="最终 run summary.json 输出路径。")
     parser.add_argument("--platform", action="append", help="只跑指定平台，可重复传入：tiktok / instagram / youtube。")
+    parser.add_argument("--vision-provider", default="", help="指定视觉 provider，例如 openai / quan2go / lemonapi。")
     parser.add_argument("--max-identifiers-per-platform", type=int, default=0, help="每个平台最多跑多少个账号；0 表示不截断。")
     parser.add_argument("--poll-interval", type=float, default=5.0, help="轮询 job 状态的秒数。")
+    parser.add_argument("--probe-vision-provider-only", action="store_true", help="只做视觉 provider live probe，不继续 scrape/visual/export。")
     parser.add_argument("--skip-scrape", action="store_true", help="只做 staging，不触发 scrape/visual/export。")
     parser.add_argument("--skip-visual", action="store_true", help="跑 scrape 和导出，但跳过视觉复核。")
     return parser
@@ -268,8 +319,10 @@ def main(argv: list[str] | None = None) -> int:
         output_root=Path(args.output_root) if args.output_root else None,
         summary_json=Path(args.summary_json) if args.summary_json else None,
         platform_filters=args.platform,
+        vision_provider=args.vision_provider or "",
         max_identifiers_per_platform=max(0, int(args.max_identifiers_per_platform)),
         poll_interval=max(1.0, float(args.poll_interval)),
+        probe_vision_provider_only=bool(args.probe_vision_provider_only),
         skip_scrape=bool(args.skip_scrape),
         skip_visual=bool(args.skip_visual),
     )

@@ -154,6 +154,15 @@ def main():
     health_payload = health.get_json()
     assert health.status_code == 200, health_payload
     assert health_payload["status"] == "ok", health_payload
+    vision_preflight = health_payload["checks"]["vision_preflight"]
+    assert isinstance(vision_preflight, dict), health_payload
+    assert "status" in vision_preflight, vision_preflight
+    assert "providers" in vision_preflight, vision_preflight
+    assert isinstance(vision_preflight["providers"], list), vision_preflight
+    if vision_preflight["providers"]:
+        first_provider = vision_preflight["providers"][0]
+        for key in ("name", "api_key_present", "base_url", "model", "api_style", "runnable"):
+            assert key in first_provider, first_provider
 
     dashboard = client.get("/apify/balance")
     assert dashboard.status_code == 200, dashboard.status_code
@@ -315,7 +324,10 @@ def main():
     assert first_start["reused_guard"] is False, first_start
     assert second_start["reused_guard"] is True, second_start
 
-    print("Runtime validation checks passed.")
+    print(json.dumps({
+        "vision_preflight": vision_preflight,
+        "status": "Runtime validation checks passed.",
+    }, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":

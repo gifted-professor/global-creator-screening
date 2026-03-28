@@ -205,6 +205,9 @@ class MainCliTests(unittest.TestCase):
                 "instagram",
                 "--platform",
                 "tiktok",
+                "--vision-provider",
+                "openai",
+                "--probe-vision-provider-only",
                 "--max-identifiers-per-platform",
                 "25",
                 "--skip-scrape",
@@ -215,6 +218,8 @@ class MainCliTests(unittest.TestCase):
         self.assertEqual(args.template_workbook, "downloads/miniso_template.xlsx")
         self.assertEqual(args.task_name, "MINISO")
         self.assertEqual(args.platform, ["instagram", "tiktok"])
+        self.assertEqual(args.vision_provider, "openai")
+        self.assertTrue(args.probe_vision_provider_only)
         self.assertEqual(args.max_identifiers_per_platform, 25)
         self.assertTrue(args.skip_scrape)
         self.assertTrue(args.skip_visual)

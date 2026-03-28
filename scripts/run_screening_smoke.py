@@ -273,6 +273,7 @@ def run_smoke(
         },
         "upload": upload_payload,
         "vision_providers": backend_app.get_available_vision_provider_names(),
+        "vision_preflight": backend_app.build_vision_preflight(),
         "platforms": {},
     }
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -284,7 +285,9 @@ def run_smoke(
     ]
 
     for platform in active_platforms:
-        platform_summary: dict[str, object] = {}
+        platform_summary: dict[str, object] = {
+            "vision_preflight": backend_app.build_vision_preflight(),
+        }
         scrape_payload = require_success(
             client.post("/api/jobs/scrape", json={"platform": platform, "payload": {}}),
             f"{platform} scrape start",
@@ -296,6 +299,13 @@ def run_smoke(
 
         pass_count = count_passed_profiles(scrape_job)
         platform_summary["prescreen_pass_count"] = pass_count
+        platform_summary["visual_gate"] = {
+            "executed": False,
+            "skip_visual_flag": bool(skip_visual),
+            "preflight_status": platform_summary["vision_preflight"]["status"],
+            "runnable_provider_names": platform_summary["vision_preflight"]["runnable_provider_names"],
+            "configured_provider_names": platform_summary["vision_preflight"]["configured_provider_names"],
+        }
 
         if skip_visual:
             platform_summary["visual_job"] = {"status": "skipped", "reason": "skip_visual flag set"}
@@ -308,8 +318,14 @@ def run_smoke(
             )
             visual_job = poll_job(client, visual_payload["job"]["id"], f"{platform} visual poll", poll_interval)
             platform_summary["visual_job"] = visual_job
+            platform_summary["visual_gate"]["executed"] = True
         else:
-            platform_summary["visual_job"] = {"status": "skipped", "reason": "missing vision provider config"}
+            platform_summary["visual_job"] = {
+                "status": "skipped",
+                "reason": platform_summary["vision_preflight"]["message"],
+                "error_code": platform_summary["vision_preflight"]["error_code"],
+                "vision_preflight": platform_summary["vision_preflight"],
+            }
 
         platform_summary["artifact_status"] = require_success(
             client.get(f"/api/artifacts/{platform}/status"),

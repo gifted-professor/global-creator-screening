@@ -29,21 +29,37 @@ from backend import screening
 
 
 BASE_DIR = Path(__file__).resolve().parents[1]
+DOTENV_LOCAL_PATH = BASE_DIR / ".env.local"
 
 
-def load_dotenv_local():
-    env_path = BASE_DIR / ".env.local"
-    if not env_path.exists():
-        return
-    for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+def parse_dotenv_file(path):
+    parsed = {}
+    if not path.exists():
+        return parsed
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
         key = key.strip()
         value = value.strip().strip('"').strip("'")
+        if key:
+            parsed[key] = value
+    return parsed
+
+
+ENV_KEYS_BEFORE_DOTENV_LOCAL = set(os.environ.keys())
+DOTENV_LOCAL_VALUES = parse_dotenv_file(DOTENV_LOCAL_PATH)
+DOTENV_LOCAL_LOADED_KEYS = set()
+
+
+def load_dotenv_local():
+    if not DOTENV_LOCAL_PATH.exists():
+        return
+    for key, value in DOTENV_LOCAL_VALUES.items():
         if key and key not in os.environ:
             os.environ[key] = value
+            DOTENV_LOCAL_LOADED_KEYS.add(key)
 
 
 load_dotenv_local()
@@ -165,7 +181,8 @@ UPLOAD_METADATA_EXPORT_FIELDS = (
     ("upload_avg_collects", "avg_collects"),
 )
 VISION_REQUEST_TIMEOUT = int(os.getenv("VISION_REQUEST_TIMEOUT", "60"))
-VISION_MODEL = os.getenv("VISION_MODEL", "gpt-5.4")
+DEFAULT_VISION_MODEL = "gpt-5.4"
+VISION_MODEL = os.getenv("VISION_MODEL", DEFAULT_VISION_MODEL)
 VISION_API_STYLE_RESPONSES = "responses"
 VISION_API_STYLE_CHAT_COMPLETIONS = "chat_completions"
 VISUAL_REVIEW_REQUEST_COVER_LIMIT = max(1, int(os.getenv("VISUAL_REVIEW_REQUEST_COVER_LIMIT", "9")))
@@ -190,24 +207,27 @@ VISUAL_REVIEW_RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504}
 VISION_PROVIDER_CONFIGS = (
     {
         "name": "openai",
-        "base_url": os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1"),
+        "base_url_env_key": "OPENAI_BASE_URL",
+        "default_base_url": "https://api.openai.com/v1",
         "env_key": "OPENAI_API_KEY",
         "api_style": VISION_API_STYLE_RESPONSES,
-        "model": os.getenv("OPENAI_VISION_MODEL", "").strip(),
+        "model_env_key": "OPENAI_VISION_MODEL",
     },
     {
         "name": "quan2go",
-        "base_url": os.getenv("VISION_QUAN2GO_BASE_URL", "https://capi.quan2go.com/openai"),
+        "base_url_env_key": "VISION_QUAN2GO_BASE_URL",
+        "default_base_url": "https://capi.quan2go.com/openai",
         "env_key": "VISION_QUAN2GO_API_KEY",
         "api_style": VISION_API_STYLE_RESPONSES,
-        "model": os.getenv("VISION_QUAN2GO_MODEL", "").strip(),
+        "model_env_key": "VISION_QUAN2GO_MODEL",
     },
     {
         "name": "lemonapi",
-        "base_url": os.getenv("VISION_LEMONAPI_BASE_URL", "https://new.lemonapi.site/v1"),
+        "base_url_env_key": "VISION_LEMONAPI_BASE_URL",
+        "default_base_url": "https://new.lemonapi.site/v1",
         "env_key": "VISION_LEMONAPI_API_KEY",
         "api_style": VISION_API_STYLE_CHAT_COMPLETIONS,
-        "model": os.getenv("VISION_LEMONAPI_MODEL", "").strip(),
+        "model_env_key": "VISION_LEMONAPI_MODEL",
     },
 )
 VISION_PROMPT = """你是达人筛号流程中的视觉复核员。输入是同一位博主最近若干条内容的封面图，请综合全部图片一起判断。
@@ -912,32 +932,210 @@ def normalize_vision_provider_name(provider_name):
     return str(provider_name or "").strip().lower()
 
 
+def resolve_vision_provider_request(provider_name=None):
+    explicit_provider = normalize_vision_provider_name(provider_name)
+    if explicit_provider:
+        return explicit_provider, "explicit"
+    env_provider = normalize_vision_provider_name(os.getenv("VISION_PROVIDER_PREFERENCE", ""))
+    if env_provider:
+        return env_provider, "env"
+    return "", "default"
+
+
+def resolve_env_source(env_key):
+    cleaned_key = str(env_key or "").strip()
+    if not cleaned_key:
+        return "static"
+    value = str(os.getenv(cleaned_key, "") or "").strip()
+    if not value:
+        return "missing"
+    if cleaned_key in DOTENV_LOCAL_LOADED_KEYS:
+        return "env.local"
+    return "process_env"
+
+
+def build_env_resolution_details(env_key):
+    cleaned_key = str(env_key or "").strip()
+    value = str(os.getenv(cleaned_key, "") or "").strip()
+    return {
+        "env_key": cleaned_key,
+        "source": resolve_env_source(cleaned_key),
+        "present": bool(value),
+        "dotenv_local_path": str(DOTENV_LOCAL_PATH),
+        "dotenv_local_exists": DOTENV_LOCAL_PATH.exists(),
+        "dotenv_local_has_key": cleaned_key in DOTENV_LOCAL_VALUES,
+        "dotenv_local_loaded": cleaned_key in DOTENV_LOCAL_LOADED_KEYS,
+        "process_env_present_at_boot": cleaned_key in ENV_KEYS_BEFORE_DOTENV_LOCAL,
+    }
+
+
 def resolve_vision_provider_api_key(provider):
     env_key = str((provider or {}).get("env_key") or "").strip()
     return str(os.getenv(env_key, "") or "").strip()
 
 
+def resolve_vision_provider_base_url(provider):
+    base_url_env_key = str((provider or {}).get("base_url_env_key") or "").strip()
+    default_base_url = str((provider or {}).get("default_base_url") or "").strip()
+    base_url = str(os.getenv(base_url_env_key, default_base_url) or "").strip()
+    return base_url.rstrip("/")
+
+
 def resolve_vision_provider_model(provider):
-    model = str((provider or {}).get("model") or "").strip()
-    return model or VISION_MODEL
+    model_env_key = str((provider or {}).get("model_env_key") or "").strip()
+    provider_model = str(os.getenv(model_env_key, "") or "").strip()
+    if provider_model:
+        return provider_model
+    return str(os.getenv("VISION_MODEL", DEFAULT_VISION_MODEL) or "").strip() or DEFAULT_VISION_MODEL
 
 
-def get_available_vision_providers():
+def build_vision_provider_snapshot(provider):
+    normalized_name = normalize_vision_provider_name((provider or {}).get("name"))
+    api_key = resolve_vision_provider_api_key(provider)
+    base_url = resolve_vision_provider_base_url(provider)
+    api_style = str((provider or {}).get("api_style") or VISION_API_STYLE_RESPONSES).strip().lower()
+    model_env_key = str((provider or {}).get("model_env_key") or "").strip()
+    provider_model = str(os.getenv(model_env_key, "") or "").strip()
+    model = resolve_vision_provider_model(provider)
+    issues = []
+    parsed_base_url = urlparse(base_url) if base_url else None
+    if not api_key:
+        issues.append("missing_api_key")
+    if not base_url:
+        issues.append("missing_base_url")
+    elif parsed_base_url.scheme not in {"http", "https"} or not parsed_base_url.netloc:
+        issues.append("invalid_base_url")
+    if api_style not in {VISION_API_STYLE_RESPONSES, VISION_API_STYLE_CHAT_COMPLETIONS}:
+        issues.append("unsupported_api_style")
+    if not model:
+        issues.append("missing_model")
+
+    runnable = not issues
+    status = "runnable" if runnable else ("configured_with_issues" if api_key else "missing_config")
+    model_source_key = model_env_key if provider_model else "VISION_MODEL"
+    model_source = resolve_env_source(model_source_key)
+    if model_source == "missing":
+        model_source = "default"
+    base_url_env_key = str((provider or {}).get("base_url_env_key") or "").strip()
+    base_url_source = resolve_env_source(base_url_env_key)
+    if base_url_source == "missing" and base_url == str((provider or {}).get("default_base_url") or "").strip():
+        base_url_source = "default"
+    return {
+        "name": normalized_name,
+        "status": status,
+        "runnable": runnable,
+        "env_key": str((provider or {}).get("env_key") or "").strip(),
+        "api_key_present": bool(api_key),
+        "api_key_masked": mask_apify_token(api_key),
+        "api_key_source": resolve_env_source((provider or {}).get("env_key")),
+        "api_key_resolution": build_env_resolution_details((provider or {}).get("env_key")),
+        "base_url": base_url,
+        "base_url_env_key": base_url_env_key,
+        "base_url_source": base_url_source,
+        "base_url_resolution": build_env_resolution_details(base_url_env_key) if base_url_env_key else {},
+        "model": model,
+        "model_env_key": model_source_key,
+        "model_source": model_source,
+        "model_uses_global_fallback": not bool(provider_model),
+        "model_resolution": build_env_resolution_details(model_source_key),
+        "api_style": api_style,
+        "issues": issues,
+    }
+
+
+def build_vision_provider_snapshots():
+    return [build_vision_provider_snapshot(provider) for provider in VISION_PROVIDER_CONFIGS]
+
+
+def build_vision_preflight(provider_name=None):
+    providers = build_vision_provider_snapshots()
+    configured_provider_names = [item["name"] for item in providers if item.get("api_key_present")]
+    runnable_provider_names = [item["name"] for item in providers if item.get("runnable")]
+    requested_provider, provider_request_source = resolve_vision_provider_request(provider_name)
+    requested_provider_declared = bool(requested_provider and requested_provider in {item["name"] for item in providers})
+    requested_provider_runnable = bool(requested_provider and requested_provider in runnable_provider_names)
+    selected_provider = ""
+    if requested_provider_runnable:
+        selected_provider = requested_provider
+    elif runnable_provider_names:
+        selected_provider = runnable_provider_names[0]
+
+    if requested_provider and not requested_provider_declared:
+        status = "degraded" if runnable_provider_names else "unconfigured"
+        error_code = "UNKNOWN_VISION_PROVIDER"
+        message = f"指定视觉 provider 不存在：{requested_provider}"
+    elif requested_provider and not requested_provider_runnable:
+        status = "degraded" if configured_provider_names else "unconfigured"
+        error_code = "VISION_PROVIDER_NOT_RUNNABLE"
+        message = f"指定视觉 provider 当前不可运行：{requested_provider}"
+    elif runnable_provider_names:
+        status = "configured"
+        error_code = ""
+        message = f"视觉模型已就绪：{selected_provider or ', '.join(runnable_provider_names)}"
+    elif configured_provider_names:
+        status = "degraded"
+        error_code = "VISION_PROVIDER_PREFLIGHT_FAILED"
+        message = "视觉模型预检未通过：已检测到 provider key，但当前没有可运行 provider。请检查 base_url、api_style 和 model。"
+    else:
+        status = "unconfigured"
+        error_code = "MISSING_VISION_CONFIG"
+        message = "缺少视觉模型配置：请设置 OPENAI_API_KEY、VISION_QUAN2GO_API_KEY 或 VISION_LEMONAPI_API_KEY。"
+    return {
+        "status": status,
+        "error_code": error_code,
+        "message": message,
+        "provider_names": [item["name"] for item in providers],
+        "configured_provider_names": configured_provider_names,
+        "runnable_provider_names": runnable_provider_names,
+        "preferred_provider": selected_provider,
+        "requested_provider": requested_provider,
+        "requested_provider_source": provider_request_source,
+        "requested_provider_declared": requested_provider_declared,
+        "requested_provider_runnable": requested_provider_runnable,
+        "providers": providers,
+        "backend_env_bootstrap": {
+            "dotenv_local_path": str(DOTENV_LOCAL_PATH),
+            "dotenv_local_exists": DOTENV_LOCAL_PATH.exists(),
+            "dotenv_local_declared_keys": sorted(DOTENV_LOCAL_VALUES.keys()),
+            "dotenv_local_loaded_keys": sorted(DOTENV_LOCAL_LOADED_KEYS),
+        },
+    }
+
+
+def build_vision_preflight_error_payload(provider_name=None):
+    preflight = build_vision_preflight(provider_name)
+    return {
+        "success": False,
+        "error_code": preflight.get("error_code") or "VISION_PROVIDER_PREFLIGHT_FAILED",
+        "error": preflight.get("message") or "视觉模型预检未通过",
+        "vision_preflight": preflight,
+    }
+
+
+def get_available_vision_providers(provider_name=None):
+    snapshots = {item["name"]: item for item in build_vision_provider_snapshots()}
+    requested_provider, _provider_request_source = resolve_vision_provider_request(provider_name)
     providers = []
     for provider in VISION_PROVIDER_CONFIGS:
-        api_key = resolve_vision_provider_api_key(provider)
-        if not api_key:
+        normalized_name = normalize_vision_provider_name(provider.get("name"))
+        if requested_provider and normalized_name != requested_provider:
+            continue
+        snapshot = snapshots.get(normalized_name) or {}
+        if not snapshot.get("runnable"):
             continue
         providers.append({
             **provider,
-            "name": normalize_vision_provider_name(provider.get("name")),
-            "api_key": api_key,
+            "name": normalized_name,
+            "api_key": resolve_vision_provider_api_key(provider),
+            "base_url": snapshot.get("base_url") or resolve_vision_provider_base_url(provider),
+            "model": snapshot.get("model") or resolve_vision_provider_model(provider),
+            "api_style": snapshot.get("api_style") or str(provider.get("api_style") or VISION_API_STYLE_RESPONSES).strip().lower(),
         })
     return providers
 
 
-def get_available_vision_provider_names():
-    return [provider["name"] for provider in get_available_vision_providers()]
+def get_available_vision_provider_names(provider_name=None):
+    return [provider["name"] for provider in get_available_vision_providers(provider_name)]
 
 
 def strip_code_fences(text):
@@ -1387,6 +1585,74 @@ def call_vision_provider(provider, platform, username, cover_urls):
     return parsed
 
 
+def build_vision_provider_probe_request(provider):
+    provider_name = normalize_vision_provider_name((provider or {}).get("name"))
+    api_style = str((provider or {}).get("api_style") or VISION_API_STYLE_RESPONSES).strip().lower()
+    base_url = str((provider or {}).get("base_url") or "").rstrip("/")
+    if not base_url:
+        raise VisionProviderError(provider_name, "base_url 未配置")
+    headers = {
+        "Authorization": f"Bearer {provider['api_key']}",
+        "Content-Type": "application/json",
+    }
+    prompt = "Reply with a short ok."
+    if api_style == VISION_API_STYLE_CHAT_COMPLETIONS:
+        return {
+            "provider_name": provider_name,
+            "api_style": api_style,
+            "url": f"{base_url}/chat/completions",
+            "headers": headers,
+            "body": {
+                "model": str((provider or {}).get("model") or resolve_vision_provider_model(provider)),
+                "messages": [{"role": "user", "content": prompt}],
+            },
+        }
+    return {
+        "provider_name": provider_name,
+        "api_style": api_style,
+        "url": f"{base_url}/responses",
+        "headers": headers,
+        "body": {
+            "model": str((provider or {}).get("model") or resolve_vision_provider_model(provider)),
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
+        },
+    }
+
+
+def probe_vision_provider(provider):
+    request_payload = build_vision_provider_probe_request(provider)
+    try:
+        response = requests.post(
+            request_payload["url"],
+            headers=request_payload["headers"],
+            json=request_payload["body"],
+            timeout=min(VISION_REQUEST_TIMEOUT, 20),
+        )
+    except requests.exceptions.RequestException as exc:
+        raise VisionProviderError(request_payload["provider_name"], str(exc), retryable=True) from exc
+    if response.status_code >= 400:
+        raise VisionProviderError(
+            request_payload["provider_name"],
+            f"HTTP {response.status_code} {extract_apify_response_error(response)}",
+            status_code=response.status_code,
+            retryable=response.status_code in VISUAL_REVIEW_RETRYABLE_STATUS_CODES,
+        )
+    try:
+        payload = response.json()
+    except ValueError:
+        payload = {}
+    raw_text = extract_vision_response_text(payload) if isinstance(payload, dict) else ""
+    return {
+        "success": True,
+        "provider": request_payload["provider_name"],
+        "api_style": request_payload["api_style"],
+        "base_url": str((provider or {}).get("base_url") or "").rstrip("/"),
+        "model": str((provider or {}).get("model") or resolve_vision_provider_model(provider)),
+        "checked_at": iso_now(),
+        "response_excerpt": str(raw_text or "").strip()[:160],
+    }
+
+
 def evaluate_profile_visual_review(platform, review_item):
     identifier = screening.resolve_profile_review_identifier(platform, review_item)
     cover_urls = build_visual_review_candidate_cover_urls(platform, review_item)
@@ -1830,13 +2096,11 @@ def resolve_visual_review_targets(platform, payload):
 
 
 def perform_visual_review(platform, payload, progress_callback=None, cancel_check=None):
-    providers = get_available_vision_providers()
+    requested_provider = normalize_vision_provider_name((payload or {}).get("provider"))
+    preflight = build_vision_preflight(requested_provider)
+    providers = get_available_vision_providers(requested_provider)
     if not providers:
-        return {
-            "success": False,
-            "error_code": "MISSING_VISION_CONFIG",
-            "error": "缺少视觉模型配置：请设置 OPENAI_API_KEY、VISION_QUAN2GO_API_KEY 或 VISION_LEMONAPI_API_KEY。",
-        }
+        return build_vision_preflight_error_payload(requested_provider)
 
     targets = resolve_visual_review_targets(platform, payload)
     if not targets:
@@ -1855,7 +2119,8 @@ def perform_visual_review(platform, payload, progress_callback=None, cancel_chec
             "正在准备视觉复核任务",
             done=0,
             total=len(targets),
-            providers=get_available_vision_provider_names(),
+            providers=get_available_vision_provider_names(requested_provider),
+            selected_provider=preflight.get("preferred_provider"),
             max_workers=max_workers,
             **build_target_preview(target_identifiers),
         )
@@ -1878,7 +2143,8 @@ def perform_visual_review(platform, payload, progress_callback=None, cancel_chec
                 f"已提交视觉复核：{identifier}",
                 done=completed,
                 total=len(targets),
-                provider_candidates=get_available_vision_provider_names(),
+                provider_candidates=get_available_vision_provider_names(requested_provider),
+                selected_provider=preflight.get("preferred_provider"),
                 current_identifier=identifier,
                 max_workers=max_workers,
             )
@@ -2624,16 +2890,45 @@ def workbook_bytes_from_sheets(sheet_payloads):
 def health_check():
     ensure_runtime_dirs()
     token_pool = get_apify_token_pool()
+    vision_preflight = build_vision_preflight()
     return jsonify({
         "status": "ok",
         "smoke_ready": True,
         "checks": {
             "apify": "configured" if token_pool else "unconfigured",
             "apify_token_pool_size": len(token_pool),
-            "vision": "configured" if get_available_vision_provider_names() else "unconfigured",
-            "vision_providers": get_available_vision_provider_names(),
+            "vision": vision_preflight.get("status"),
+            "vision_providers": vision_preflight.get("runnable_provider_names") or [],
+            "vision_preflight": vision_preflight,
             "origins": BACKEND_ALLOWED_ORIGINS,
         },
+    })
+
+
+@app.route("/api/vision/providers/probe", methods=["POST"])
+def probe_vision_provider_api():
+    payload = request.get_json(silent=True) or {}
+    requested_provider = normalize_vision_provider_name(payload.get("provider"))
+    preflight = build_vision_preflight(requested_provider)
+    providers = get_available_vision_providers(requested_provider)
+    if not providers:
+        return jsonify(build_vision_preflight_error_payload(requested_provider)), 400
+    selected_provider = providers[0]
+    try:
+        probe_result = probe_vision_provider(selected_provider)
+    except Exception as exc:
+        return jsonify({
+            "success": False,
+            "error_code": "VISION_PROVIDER_PROBE_FAILED",
+            "error": str(exc),
+            "provider": selected_provider["name"],
+            "vision_preflight": preflight,
+        }), 502
+    return jsonify({
+        "success": True,
+        "provider": selected_provider["name"],
+        "probe": probe_result,
+        "vision_preflight": preflight,
     })
 
 
@@ -2756,12 +3051,9 @@ def start_visual_review_job():
         return jsonify({"success": False, "error": "平台参数无效"}), 400
     if not isinstance(data, dict):
         return jsonify({"success": False, "error": "payload 必须是对象"}), 400
-    if not get_available_vision_providers():
-        return jsonify({
-            "success": False,
-            "error_code": "MISSING_VISION_CONFIG",
-            "error": "缺少视觉模型配置：请设置 OPENAI_API_KEY、VISION_QUAN2GO_API_KEY 或 VISION_LEMONAPI_API_KEY。",
-        }), 400
+    requested_provider = normalize_vision_provider_name((data or {}).get("provider"))
+    if not get_available_vision_providers(requested_provider):
+        return jsonify(build_vision_preflight_error_payload(requested_provider)), 400
 
     job = create_job("visual-review", platform=platform, message="视觉复核任务已创建")
     start_background_job(job, lambda progress_callback, cancel_check: perform_visual_review(platform, data, progress_callback, cancel_check))
