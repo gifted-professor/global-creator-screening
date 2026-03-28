@@ -60,14 +60,16 @@
 - `v1.0.0` 已交付 repo-local 的创作者筛选主线，核心模块不再散落在多个 sibling 工程里
 - `v1.1.0` 已交付视觉 provider 诊断、显式 provider 选择、live probe，以及一轮真实 non-error bounded visual validation
 - `MINISO` 已具备真实 duplicate review 产物链和 keep workbook，下游也已证明能从 scrape 跑到 final export
-- 当前最大的缺口不是某一段链跑不通，而是还没有一个“从任务上传起点到最终导出”的单入口 repo-local orchestration
+- 当前 active milestone 是 `v1.2.0`，目标是补上“从任务上传起点到最终导出”的单入口 repo-local orchestration
 
-## Next Milestone Goals
+## Current Milestone: v1.2.0 End-to-End Single-Entry Pipeline Verification
 
-- 把 `任务上传 -> mail sync -> enrichment / duplicate review -> keep-list -> screening -> export` 编排成单入口 E2E
-- 为单入口运行补齐中间产物契约、早失败诊断和 resume 点
-- 用真实 `MINISO` 跑一轮 bounded end-to-end proof，并留下机器可读 summary
-- 决定报价结果接入与 legacy 外部依赖收口，哪些是本 milestone 必做，哪些继续延期
+**Goal:** 把已经分别验证过的上游链和下游链收成一个单入口 repo-local E2E，并在真实 `MINISO` 上留下一轮 bounded proof run。
+
+**Target features:**
+- 单入口 runner 从任务上传起点一路编排到 keep-list 与最终导出
+- 全流程 summary、handoff contract、early failure 和 resume 点
+- 真实 bounded MINISO E2E artifact 与可复跑 operator 路径
 
 ## Constraints
 
@@ -94,4 +96,4 @@
 | 下一阶段把“全流程跑通”定义成 orchestration 与 runtime contract 问题 | `v1.1.0` 已证明下游视觉链可用，下一缺口是单入口 E2E，而不是继续怀疑 apikey | — Pending |
 
 ---
-*Last updated: 2026-03-28 after v1.1.0 milestone archive*
+*Last updated: 2026-03-28 after v1.2.0 milestone start*

@@ -1,17 +1,17 @@
 ---
 gsd_state_version: 1.0
-milestone: v1.1.0
-milestone_name: Visual Provider Reliability and Downstream Hardening
-status: completed
-stopped_at: Milestone shipped and archived; next workflow step is start new milestone
-last_updated: "2026-03-28T02:10:00.000Z"
-last_activity: 2026-03-28 — archived milestone v1.1.0 after provider diagnostics and a real non-error bounded MINISO Instagram visual validation using explicit provider `openai`
+milestone: v1.2.0
+milestone_name: End-to-End Single-Entry Pipeline Verification
+status: active
+stopped_at: Phase 16 planned; next workflow step is discuss or plan Phase 16
+last_updated: "2026-03-28T02:30:00.000Z"
+last_activity: 2026-03-28 — started milestone v1.2.0 to unify the validated upstream and downstream chains into one repo-local end-to-end runner
 progress:
-  total_phases: 2
-  completed_phases: 2
-  total_plans: 4
-  completed_plans: 4
-  percent: 100
+  total_phases: 3
+  completed_phases: 0
+  total_plans: 6
+  completed_plans: 0
+  percent: 0
 ---
 
 # Project State
@@ -21,16 +21,16 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-28)
 
 **Core value:** 在不打断现有本地工作流的前提下，把飞书内容获取、筛选导入和相关配置集中到一个可持续维护的仓库里。
-**Current focus:** `v1.1.0` 已归档，等待启动下一 milestone 处理单入口 E2E 路径
+**Current focus:** 定义并计划 Phase 16，把 task-upload 起点到 keep-list 生成编排成单入口 orchestration
 
 ## Current Position
 
-Phase: Complete (milestone archived)
-Plan: —
-Status: `v1.1.0` shipped
-Last activity: 2026-03-28 — archived `v1.1.0` and prepared to start the next milestone
+Phase: 16 of 18 (Build single-entry task-to-keep-list orchestrator)
+Plan: 0 of 2 in current phase
+Status: Phase 16 planned and ready for discussion/planning
+Last activity: 2026-03-28 — started `v1.2.0` with single-entry E2E as the next mainline objective
 
-Progress: [██████████] 100%
+Progress: [░░░░░░░░░░] 0%
 
 ## Performance Metrics
 
@@ -102,11 +102,15 @@ Recent decisions affecting current work:
 - Phase 13 added: Wire keep-list outputs into screening pipeline
 - Phase 14 added: Stabilize visual provider config and preflight
 - Phase 15 added: Validate non-error bounded visual review flow
+- Phase 16 added: Build single-entry task-to-keep-list orchestrator
+- Phase 17 added: Close repo-local runtime dependency gaps
+- Phase 18 added: Validate real bounded end-to-end pipeline
 
 ### Pending Todos
 
-- 启动下一个 milestone，把“全流程跑通”定义为单入口 repo-local E2E
-- 决定报价结果接入和 legacy 外部依赖收口，哪些是下个 milestone 的必做项
+- 讨论并规划 Phase 16，锁定单入口 orchestration 的输入、输出和 resume contract
+- 决定报价结果接入是不是 `v1.2.0` 的 committed scope，还是继续延到后续 milestone
+- 决定 legacy 外部 `email` 依赖是本 milestone 必须消除，还是先做显式诊断与边界说明
 - 决定是否在 `openai` 之外继续补其他 provider 的 live proof run
 
 ### Blockers/Concerns
@@ -117,6 +121,7 @@ Recent decisions affecting current work:
 - 当前 998Code provider 对长跑真实 review 不稳定，可能在 `chat_completions` 侧返回 520 或长时间挂起
 - 当前 Phase 15 的成功验证是 bounded 的 `instagram 1`，不是全量批次稳定性证明
 - `v1.1.0` 归档前没有单独补 milestone audit 文件，这被接受为流程债
+- 当前仍缺少“从任务上传起点到最终导出”的单入口 orchestration，operator 还需要手工拼接两段已验证链路
 
 ### Quick Tasks Completed
 
@@ -152,6 +157,6 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-Last session: 2026-03-28 02:10
-Stopped at: `v1.1.0` archived; next workflow step is start new milestone
+Last session: 2026-03-28 02:30
+Stopped at: `v1.2.0` started; next workflow step is discuss/plan Phase 16
 Resume file: None
