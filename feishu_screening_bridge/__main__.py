@@ -4,6 +4,8 @@ import argparse
 import json
 import sys
 
+from email_sync.date_windows import resolve_sync_sent_since
+
 from .attachment_download import download_bitable_attachments
 from .bitable_export import export_bitable_view
 from .bridge import (
@@ -136,7 +138,7 @@ def _build_parser() -> argparse.ArgumentParser:
     mail_sync_parser.add_argument("--limit", type=int, default=0, help="只抓最新 N 封用于测试，不推进增量游标")
     mail_sync_parser.add_argument("--workers", type=int, default=1, help="并发抓取 worker 数，默认 1")
     mail_sync_parser.add_argument("--reset-state", action="store_true", help="忽略本地游标，重新全量扫描")
-    mail_sync_parser.add_argument("--sent-since", default="", help="只抓这个日期及之后的邮件，格式 YYYY-MM-DD")
+    mail_sync_parser.add_argument("--sent-since", default="", help="只抓这个日期及之后的邮件，格式 YYYY-MM-DD；默认最近 3 个月")
     mail_sync_parser.add_argument("--imap-host", default="", help="IMAP Host，默认 imap.qq.com")
     mail_sync_parser.add_argument("--imap-port", type=int, default=0, help="IMAP Port，默认 993")
     mail_sync_parser.add_argument("--feishu-app-id", default="", help="飞书自建应用 app_id")
@@ -467,7 +469,9 @@ def _cmd_sync_task_upload_mail(args: argparse.Namespace) -> int:
         limit=args.limit if args.limit > 0 else None,
         workers=args.workers,
         reset_state=bool(args.reset_state),
-        sent_since=get_preferred_value(args.sent_since, env_values, "TASK_UPLOAD_MAIL_SENT_SINCE") or None,
+        sent_since=resolve_sync_sent_since(
+            get_preferred_value(args.sent_since, env_values, "TASK_UPLOAD_MAIL_SENT_SINCE") or None
+        ).isoformat(),
         imap_host=get_preferred_value(args.imap_host, env_values, "IMAP_HOST", "imap.qq.com"),
         imap_port=int(get_preferred_value(args.imap_port if args.imap_port > 0 else "", env_values, "IMAP_PORT", "993") or "993"),
     )

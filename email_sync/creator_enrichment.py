@@ -147,6 +147,23 @@ APPENDED_HEADERS = [
     "latest_quote_time",
     "latest_quote_text",
 ]
+CANONICAL_SOURCE_HEADERS = [
+    "Platform",
+    "@username",
+    "URL",
+    "nickname",
+    "Region",
+    "Email",
+]
+SENDING_LIST_COUNTRY_ALIASES = ("country", "国家", "region", "地区")
+SENDING_LIST_CREATOR_ALIASES = ("creator", "nickname", "达人", "红人", "博主")
+SENDING_LIST_EMAIL_ALIASES = ("邮箱地址", "邮箱", "email", "emailaddress", "mail")
+SENDING_LIST_GENERIC_LINK_ALIASES = ("link", "url", "主页链接", "账号链接", "profilelink", "profileurl")
+SENDING_LIST_PLATFORM_LINK_ALIASES = {
+    "instagram": ("iglink", "igurl", "instagramlink", "instagramurl", "inslink", "insurl"),
+    "tiktok": ("ttlink", "tturl", "tiktoklink", "tiktokurl", "douyinlink"),
+    "youtube": ("ytlink", "yturl", "youtubelink", "youtubeurl", "channelurl", "channellink"),
+}
 
 
 @dataclass(frozen=True)
@@ -717,6 +734,170 @@ def _stringify(value: Any) -> str:
     return str(value).strip()
 
 
+def _normalize_source_column_name(name: Any) -> str:
+    return re.sub(r"[\s_\-./（）()]+", "", str(name or "").strip().lower())
+
+
+def _resolve_source_column(columns: Sequence[Any], aliases: Sequence[str]) -> Any:
+    normalized_aliases = {_normalize_source_column_name(alias) for alias in aliases if str(alias or "").strip()}
+    for column in columns:
+        if _normalize_source_column_name(column) in normalized_aliases:
+            return column
+    return None
+
+
+def _clean_source_cell(value: Any) -> str:
+    return _stringify(value)
+
+
+def _infer_platform_from_value(value: Any) -> str:
+    text = _clean_source_cell(value).lower()
+    if not text:
+        return ""
+    if "instagram.com" in text:
+        return "instagram"
+    if "tiktok.com" in text:
+        return "tiktok"
+    if "youtube.com" in text or "youtu.be/" in text:
+        return "youtube"
+    return ""
+
+
+def _platform_label(platform: str) -> str:
+    mapping = {
+        "instagram": "Instagram",
+        "tiktok": "TikTok",
+        "youtube": "YouTube",
+    }
+    return mapping.get(platform, platform)
+
+
+def _resolve_sending_list_link_columns(columns: Sequence[Any], rows: Sequence[dict[str, Any]]) -> list[tuple[Any, str]]:
+    resolved: list[tuple[Any, str]] = []
+    normalized_generic_aliases = {
+        _normalize_source_column_name(alias)
+        for alias in SENDING_LIST_GENERIC_LINK_ALIASES
+    }
+    normalized_platform_aliases = {
+        platform: {
+            _normalize_source_column_name(alias)
+            for alias in aliases
+        }
+        for platform, aliases in SENDING_LIST_PLATFORM_LINK_ALIASES.items()
+    }
+
+    for column in columns:
+        normalized_column = _normalize_source_column_name(column)
+        explicit_platform = ""
+        for platform, aliases in normalized_platform_aliases.items():
+            if normalized_column in aliases:
+                explicit_platform = platform
+                break
+
+        inferred_platform = ""
+        if not explicit_platform:
+            checked = 0
+            hits: dict[str, int] = {}
+            for row in rows:
+                platform = _infer_platform_from_value(row.get(column))
+                if platform:
+                    hits[platform] = hits.get(platform, 0) + 1
+                if _clean_source_cell(row.get(column)):
+                    checked += 1
+                if checked >= 20:
+                    break
+            if hits:
+                inferred_platform = max(hits.items(), key=lambda item: item[1])[0]
+
+        if explicit_platform or inferred_platform or normalized_column in normalized_generic_aliases:
+            resolved.append((column, explicit_platform or inferred_platform))
+    return resolved
+
+
+def _has_canonical_creator_columns(headers: Sequence[str]) -> bool:
+    normalized = {_normalize_source_column_name(header) for header in headers}
+    required = {_normalize_source_column_name(header) for header in ("Platform", "@username", "URL")}
+    return required.issubset(normalized)
+
+
+def _iter_sending_list_rows(input_path: Path) -> Iterator[dict[str, Any]]:
+    _, load_workbook = _load_workbook()
+    workbook = load_workbook(filename=input_path, read_only=True, data_only=True)
+    try:
+        records_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+        for sheet in workbook.worksheets:
+            rows = sheet.iter_rows(values_only=True)
+            header_row = next(rows, ())
+            headers = [_clean_text(cell) for cell in header_row]
+            if not any(headers):
+                continue
+
+            parsed_rows: list[dict[str, Any]] = []
+            for row_number, values in enumerate(rows, start=2):
+                row_dict: dict[str, Any] = {"sheet_name": sheet.title, "source_row_number": row_number}
+                for index, header in enumerate(headers):
+                    if not header:
+                        continue
+                    row_dict[header] = values[index] if index < len(values) else ""
+                parsed_rows.append(row_dict)
+
+            columns = [header for header in headers if header]
+            country_column = _resolve_source_column(columns, SENDING_LIST_COUNTRY_ALIASES)
+            creator_column = _resolve_source_column(columns, SENDING_LIST_CREATOR_ALIASES)
+            email_column = _resolve_source_column(columns, SENDING_LIST_EMAIL_ALIASES)
+            link_columns = _resolve_sending_list_link_columns(columns, parsed_rows)
+            if not link_columns:
+                continue
+
+            for row_dict in parsed_rows:
+                nickname = _clean_source_cell(row_dict.get(creator_column)) if creator_column else ""
+                region = _clean_source_cell(row_dict.get(country_column)) if country_column else ""
+                email = _clean_source_cell(row_dict.get(email_column)) if email_column else ""
+                row_seen_keys: set[tuple[str, str]] = set()
+
+                for link_column, default_platform in link_columns:
+                    raw_link_value = _clean_source_cell(row_dict.get(link_column))
+                    if not raw_link_value:
+                        continue
+                    platform = _infer_platform_from_value(raw_link_value) or default_platform
+                    if not platform:
+                        continue
+                    identifier = _normalize_handle(raw_link_value) or _normalize_handle(nickname)
+                    if not identifier:
+                        continue
+                    record_key = (platform, identifier)
+                    if record_key in row_seen_keys:
+                        continue
+                    row_seen_keys.add(record_key)
+
+                    existing = records_by_key.get(record_key)
+                    if existing is None:
+                        records_by_key[record_key] = {
+                            "Platform": _platform_label(platform),
+                            "@username": identifier,
+                            "URL": raw_link_value,
+                            "nickname": nickname,
+                            "Region": region,
+                            "Email": email,
+                            "sheet_name": row_dict["sheet_name"],
+                            "source_row_number": row_dict["source_row_number"],
+                        }
+                        continue
+                    if not existing.get("URL") and raw_link_value:
+                        existing["URL"] = raw_link_value
+                    if not existing.get("nickname") and nickname:
+                        existing["nickname"] = nickname
+                    if not existing.get("Region") and region:
+                        existing["Region"] = region
+                    if not existing.get("Email") and email:
+                        existing["Email"] = email
+
+        for row in records_by_key.values():
+            yield row
+    finally:
+        workbook.close()
+
+
 def _build_output_row(source_row: dict[str, Any], match: Optional[MatchResult], index: MailIndex) -> dict[str, Any]:
     output = dict(source_row)
     output["sheet_name"] = source_row.get("sheet_name", "")
@@ -861,6 +1042,14 @@ def enrich_creator_workbook(
 
     output_prefix.parent.mkdir(parents=True, exist_ok=True)
     source_headers = _source_headers(input_path)
+    source_kind = "canonical_upload"
+    source_rows: Iterable[dict[str, Any]]
+    if _has_canonical_creator_columns(source_headers):
+        source_rows = _iter_sheet_rows(input_path, source_headers)
+    else:
+        source_kind = "sending_list"
+        source_headers = list(CANONICAL_SOURCE_HEADERS)
+        source_rows = _iter_sending_list_rows(input_path)
     output_headers = list(source_headers) + APPENDED_HEADERS
 
     csv_path = output_prefix.with_suffix(".csv")
@@ -888,7 +1077,7 @@ def enrich_creator_workbook(
         all_writer.writeheader()
         high_writer.writeheader()
 
-        for source_row in _iter_sheet_rows(input_path, source_headers):
+        for source_row in source_rows:
             match = _select_match(index, source_row)
             if match is not None:
                 matched_rows += 1
@@ -906,6 +1095,7 @@ def enrich_creator_workbook(
     high_workbook.save(high_xlsx_path)
 
     return {
+        "source_kind": source_kind,
         "rows": rows,
         "matched_rows": matched_rows,
         "high_confidence_rows": high_confidence_rows,

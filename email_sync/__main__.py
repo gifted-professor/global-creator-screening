@@ -7,11 +7,17 @@ from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import List, Optional
 
+from feishu_screening_bridge import download_task_upload_screening_assets
+from feishu_screening_bridge.feishu_api import DEFAULT_FEISHU_BASE_URL, FeishuOpenClient
+from feishu_screening_bridge.local_env import get_preferred_value, load_local_env
+
 from .config import Settings
 from .creator_enrichment import enrich_creator_workbook
 from .creator_review import prepare_duplicate_review, review_duplicate_groups
+from .date_windows import resolve_sync_sent_since
 from .db import Database, MessageQuery
 from .imap_sync import connect, discover_mailboxes, sync_mailboxes
+from .llm_review import prepare_llm_review_candidates, run_and_apply_llm_review
 from .relation_index import rebuild_relation_index
 
 
@@ -31,7 +37,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--limit", type=int, help="只抓最新 N 封用于测试，不推进增量游标")
     sync.add_argument("--reset-state", action="store_true", help="忽略本地游标，重新全量扫描")
     sync.add_argument("--workers", type=int, default=1, help="并发抓取 worker 数，默认 1")
-    sync.add_argument("--sent-since", help="只抓这个日期及之后的邮件，格式 YYYY-MM-DD")
+    sync.add_argument("--sent-since", help="只抓这个日期及之后的邮件，格式 YYYY-MM-DD；默认最近 3 个月")
 
     stats = subparsers.add_parser("stats", help="查看本地 SQLite 里的统计")
     stats.add_argument("--env-file", default=".env", help="配置文件路径，默认 ./.env")
@@ -74,7 +80,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
     enrich = subparsers.add_parser("enrich-creators", help="把达人库和本地邮件库做映射，补齐最后一封邮件和报价")
     enrich.add_argument("--env-file", default=".env", help="配置文件路径，默认 ./.env")
-    enrich.add_argument("--input", required=True, help="达人库 xlsx 路径")
+    enrich.add_argument("--input", help="达人库或发信名单 xlsx 路径")
+    enrich.add_argument("--task-name", help="任务名。提供后优先从任务上传下载发信名单作为匹配源。")
+    enrich.add_argument("--task-upload-url", help="飞书任务上传 wiki/base 链接；不传时可从 .env 里的 TASK_UPLOAD_URL 读取。")
+    enrich.add_argument("--task-download-dir", help="任务上传附件下载目录，默认 ./downloads/task_upload_attachments。")
+    enrich.add_argument("--feishu-app-id", default="", help="飞书自建应用 app_id。")
+    enrich.add_argument("--feishu-app-secret", default="", help="飞书自建应用 app_secret。")
+    enrich.add_argument("--feishu-base-url", default="", help="飞书 OpenAPI Base URL。")
+    enrich.add_argument("--timeout-seconds", type=float, default=0.0, help="飞书请求超时时间，默认读取 .env 或 30 秒。")
+    enrich.add_argument("--db-path", help="覆盖邮件库 SQLite 路径；默认沿用 .env 里的 DB_PATH / DATA_DIR。")
     enrich.add_argument(
         "--output-prefix",
         default="exports/达人邮件可获取信息_v1",
@@ -108,6 +122,30 @@ def _build_parser() -> argparse.ArgumentParser:
     adjudicate.add_argument("--api-key", help="覆盖 LLM api key；默认从 .env/.env.local 读取")
     adjudicate.add_argument("--model", help="覆盖 LLM model；默认从 .env/.env.local 读取")
 
+    llm_candidates = subparsers.add_parser(
+        "prepare-llm-review-candidates",
+        help="从高置信 workbook 生成生产 duplicate review 的按我们去重/去重/candidates 产物",
+    )
+    llm_candidates.add_argument("--env-file", default=".env", help="配置文件路径，默认 ./.env")
+    llm_candidates.add_argument("--input", required=True, help="高置信 enrichment xlsx 路径")
+    llm_candidates.add_argument("--db-path", help="覆盖邮件库 SQLite 路径；默认沿用 .env 里的 DB_PATH / DATA_DIR")
+    llm_candidates.add_argument(
+        "--output-prefix",
+        default="exports/duplicate_review",
+        help="输出文件前缀，默认 exports/duplicate_review",
+    )
+
+    llm_review = subparsers.add_parser(
+        "run-llm-review",
+        help="读取生产 llm_candidates，执行 LLM 审核并输出 reviewed/keep workbooks",
+    )
+    llm_review.add_argument("--env-file", default=".env", help="配置文件路径，默认 ./.env")
+    llm_review.add_argument("--input-prefix", required=True, help="production duplicate review 前缀，例如 exports/xxx_按我们去重")
+    llm_review.add_argument("--base-url", help="覆盖 LLM base url；默认优先从 .env 的 OPENAI_BASE_URL 读取")
+    llm_review.add_argument("--api-key", help="覆盖 LLM api key；默认优先从 .env 的 OPENAI_API_KEY 读取")
+    llm_review.add_argument("--model", help="覆盖 LLM model；默认优先从 .env 的 OPENAI_MODEL 读取")
+    llm_review.add_argument("--wire-api", help="覆盖 LLM wire API；支持 responses 或 chat_completions")
+
     return parser
 
 
@@ -140,7 +178,7 @@ def _cmd_sync(
         raise ValueError("--limit 必须是大于 0 的整数。")
     if workers <= 0:
         raise ValueError("--workers 必须是大于 0 的整数。")
-    sent_since_date = date.fromisoformat(sent_since) if sent_since else None
+    sent_since_date = resolve_sync_sent_since(sent_since)
 
     settings.ensure_directories()
     db = Database(settings.db_path)
@@ -430,21 +468,117 @@ def _cmd_thread(settings: Settings, thread_key: str, as_json: bool) -> int:
     return 0
 
 
-def _cmd_enrich_creators(settings: Settings, input_path: str, output_prefix: str) -> int:
-    db = Database(settings.db_path)
+def _resolve_task_upload_sending_list_source(
+    *,
+    env_file: str,
+    task_name: str,
+    task_upload_url: Optional[str],
+    task_download_dir: Optional[str],
+    feishu_app_id: str,
+    feishu_app_secret: str,
+    feishu_base_url: str,
+    timeout_seconds: float,
+) -> Path:
+    env_values = load_local_env(env_file)
+    app_id = get_preferred_value(feishu_app_id, env_values, "FEISHU_APP_ID")
+    app_secret = get_preferred_value(feishu_app_secret, env_values, "FEISHU_APP_SECRET")
+    if not app_id:
+        raise ValueError("缺少 FEISHU_APP_ID，请在本地 .env 或参数里填写。")
+    if not app_secret:
+        raise ValueError("缺少 FEISHU_APP_SECRET，请在本地 .env 或参数里填写。")
+
+    resolved_task_upload_url = (
+        get_preferred_value(task_upload_url or "", env_values, "TASK_UPLOAD_URL")
+        or get_preferred_value(task_upload_url or "", env_values, "FEISHU_SOURCE_URL")
+    )
+    if not resolved_task_upload_url:
+        raise ValueError("缺少 TASK_UPLOAD_URL，请在本地 .env 或参数里填写。")
+
+    resolved_download_dir = Path(
+        get_preferred_value(
+            task_download_dir or "",
+            env_values,
+            "TASK_UPLOAD_DOWNLOAD_DIR",
+            "./downloads/task_upload_attachments",
+        )
+    ).expanduser()
+    resolved_timeout_seconds = float(
+        get_preferred_value(
+            timeout_seconds if timeout_seconds > 0 else "",
+            env_values,
+            "TIMEOUT_SECONDS",
+            "30",
+        )
+    )
+    client = FeishuOpenClient(
+        app_id=app_id,
+        app_secret=app_secret,
+        base_url=get_preferred_value(
+            feishu_base_url,
+            env_values,
+            "FEISHU_OPEN_BASE_URL",
+            DEFAULT_FEISHU_BASE_URL,
+        ),
+        timeout_seconds=resolved_timeout_seconds,
+    )
+    result = download_task_upload_screening_assets(
+        client=client,
+        task_upload_url=resolved_task_upload_url,
+        task_name=task_name,
+        download_dir=resolved_download_dir,
+        download_template=False,
+        download_sending_list=True,
+    )
+    return Path(result["sendingListDownloadedPath"]).expanduser()
+
+
+def _cmd_enrich_creators(
+    settings: Settings,
+    input_path: Optional[str],
+    output_prefix: str,
+    env_file: str,
+    task_name: Optional[str],
+    task_upload_url: Optional[str],
+    task_download_dir: Optional[str],
+    feishu_app_id: str,
+    feishu_app_secret: str,
+    feishu_base_url: str,
+    timeout_seconds: float,
+    db_path_override: Optional[str],
+) -> int:
+    normalized_task_name = str(task_name or "").strip()
+    if normalized_task_name:
+        resolved_input_path = _resolve_task_upload_sending_list_source(
+            env_file=env_file,
+            task_name=normalized_task_name,
+            task_upload_url=task_upload_url,
+            task_download_dir=task_download_dir,
+            feishu_app_id=feishu_app_id,
+            feishu_app_secret=feishu_app_secret,
+            feishu_base_url=feishu_base_url,
+            timeout_seconds=timeout_seconds,
+        )
+    elif input_path:
+        resolved_input_path = Path(input_path)
+    else:
+        raise ValueError("至少提供 --input，或提供 --task-name 使用飞书发信名单作为匹配源。")
+
+    db_path = Path(db_path_override).expanduser() if db_path_override else settings.db_path
+    db = Database(db_path)
     try:
         result = enrich_creator_workbook(
             db=db,
-            input_path=Path(input_path),
+            input_path=resolved_input_path,
             output_prefix=Path(output_prefix),
         )
     finally:
         db.close()
 
     print(
-        f"creator enrichment finished: rows={result['rows']} matched={result['matched_rows']} "
+        f"creator enrichment finished: source={result['source_kind']} rows={result['rows']} matched={result['matched_rows']} "
         f"high_confidence={result['high_confidence_rows']}"
     )
+    print(f"input: {resolved_input_path}")
     print(f"all csv: {result['csv_path']}")
     print(f"all xlsx: {result['xlsx_path']}")
     print(f"high csv: {result['high_csv_path']}")
@@ -525,6 +659,60 @@ def _cmd_review_duplicate_groups(
     return 0
 
 
+def _cmd_prepare_llm_review_candidates(
+    settings: Settings,
+    input_path: str,
+    output_prefix: str,
+    db_path_override: Optional[str],
+) -> int:
+    db_path = Path(db_path_override).expanduser() if db_path_override else settings.db_path
+    db = Database(db_path)
+    try:
+        result = prepare_llm_review_candidates(
+            db=db,
+            input_path=Path(input_path),
+            output_prefix=Path(output_prefix),
+        )
+    finally:
+        db.close()
+
+    print(
+        f"llm review candidates prepared: source_rows={result['source_row_count']} "
+        f"deduped_rows={result['deduped_row_count']} candidate_groups={result['llm_candidate_group_count']}"
+    )
+    print(f"prep xlsx: {result['prep_xlsx_path']}")
+    print(f"deduped xlsx: {result['deduped_xlsx_path']}")
+    print(f"candidates jsonl: {result['llm_candidates_jsonl_path']}")
+    return 0
+
+
+def _cmd_run_llm_review(
+    input_prefix: str,
+    env_file: str,
+    base_url: Optional[str],
+    api_key: Optional[str],
+    model: Optional[str],
+    wire_api: Optional[str],
+) -> int:
+    result = run_and_apply_llm_review(
+        input_prefix=Path(input_prefix),
+        env_path=env_file,
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        wire_api=wire_api,
+    )
+
+    print(
+        f"llm review finished: groups={result['review_group_count']} reviewed_rows={result['reviewed_row_count']} "
+        f"keep_rows={result['keep_row_count']}"
+    )
+    print(f"review jsonl: {result['llm_review_jsonl_path']}")
+    print(f"reviewed xlsx: {result['llm_reviewed_xlsx_path']}")
+    print(f"keep xlsx: {result['llm_reviewed_keep_xlsx_path']}")
+    return 0
+
+
 def main() -> int:
     parser = _build_parser()
     args = parser.parse_args()
@@ -567,7 +755,20 @@ def main() -> int:
         if args.command == "thread":
             return _cmd_thread(settings, args.thread_key, args.json)
         if args.command == "enrich-creators":
-            return _cmd_enrich_creators(settings, args.input, args.output_prefix)
+            return _cmd_enrich_creators(
+                settings,
+                args.input,
+                args.output_prefix,
+                args.env_file,
+                args.task_name,
+                args.task_upload_url,
+                args.task_download_dir,
+                args.feishu_app_id,
+                args.feishu_app_secret,
+                args.feishu_base_url,
+                args.timeout_seconds,
+                args.db_path,
+            )
         if args.command == "prepare-duplicate-review":
             return _cmd_prepare_duplicate_review(
                 settings,
@@ -589,6 +790,22 @@ def main() -> int:
                 args.base_url,
                 args.api_key,
                 args.model,
+            )
+        if args.command == "prepare-llm-review-candidates":
+            return _cmd_prepare_llm_review_candidates(
+                settings,
+                args.input,
+                args.output_prefix,
+                args.db_path,
+            )
+        if args.command == "run-llm-review":
+            return _cmd_run_llm_review(
+                args.input_prefix,
+                args.env_file,
+                args.base_url,
+                args.api_key,
+                args.model,
+                args.wire_api,
             )
         raise ValueError(f"未知命令: {args.command}")
     except Exception as exc:  # noqa: BLE001

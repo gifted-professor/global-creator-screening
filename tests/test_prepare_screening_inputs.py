@@ -52,6 +52,57 @@ def build_sending_list_workbook(path: Path) -> None:
     workbook.save(path)
 
 
+def build_keep_workbook(path: Path) -> None:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "results"
+    sheet.append([
+        "Project",
+        "nickname",
+        "@username",
+        "Region",
+        "Platform",
+        "URL",
+        "Email",
+        "creator_dedupe_key",
+        "llm_review_decision",
+    ])
+    sheet.append([
+        "MINISO",
+        "Creator Alpha",
+        "@creatoralpha",
+        "US",
+        "Instagram",
+        "https://www.instagram.com/creatoralpha/",
+        "insta@example.com",
+        "instagram:creatoralpha",
+        "match_all",
+    ])
+    sheet.append([
+        "MINISO",
+        "Creator Beta",
+        "@creatorbeta",
+        "US",
+        "TikTok",
+        "https://www.tiktok.com/@creatorbeta",
+        "tiktok@example.com",
+        "tiktok:creatorbeta",
+        "match_all",
+    ])
+    sheet.append([
+        "MINISO",
+        "Creator Gamma",
+        "@creatoryt",
+        "US",
+        "YouTube",
+        "https://www.youtube.com/@creatoryt",
+        "yt@example.com",
+        "youtube:creatoryt",
+        "match_all",
+    ])
+    workbook.save(path)
+
+
 @unittest.skipIf(prepare_screening_inputs is None, f"screening deps unavailable: {IMPORT_ERROR}")
 class PrepareScreeningInputsTests(unittest.TestCase):
     def test_prepare_screening_inputs_persists_rulespec_and_upload_metadata(self) -> None:
@@ -133,6 +184,36 @@ class PrepareScreeningInputsTests(unittest.TestCase):
             self.assertEqual(instagram_metadata["creatoralpha"]["email"], "insta@example.com", instagram_metadata)
             self.assertEqual(tiktok_metadata["creatormixed"]["email"], "mixed@example.com", tiktok_metadata)
             self.assertEqual(youtube_metadata["creatormixed"]["region"], "US", youtube_metadata)
+
+    def test_prepare_screening_inputs_accepts_keep_workbook_and_reports_row_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            keep_workbook = tmp_path / "miniso_llm_reviewed_keep.xlsx"
+            screening_data_dir = tmp_path / "screening_data"
+            config_dir = tmp_path / "config"
+            temp_dir = tmp_path / "temp"
+            summary_json = tmp_path / "summary.json"
+
+            build_keep_workbook(keep_workbook)
+
+            summary = prepare_screening_inputs(
+                creator_workbook=keep_workbook,
+                template_workbook=FIXTURE_TEMPLATE,
+                screening_data_dir=screening_data_dir,
+                config_dir=config_dir,
+                temp_dir=temp_dir,
+                summary_json=summary_json,
+            )
+
+            self.assertEqual(summary["creator_workbook"], str(keep_workbook), summary)
+            self.assertEqual(summary["parsed_source_kind"], "keep_list", summary)
+            self.assertEqual(summary["input_row_count"], 3, summary)
+            self.assertEqual(summary["upload"]["parsed_source_kind"], "keep_list", summary)
+            self.assertEqual(summary["upload"]["input_row_count"], 3, summary)
+            self.assertEqual(summary["upload"]["metadata_count_by_platform"]["instagram"], 1, summary)
+            self.assertEqual(summary["upload"]["metadata_count_by_platform"]["tiktok"], 1, summary)
+            self.assertEqual(summary["upload"]["metadata_count_by_platform"]["youtube"], 1, summary)
+            self.assertTrue(summary_json.exists(), summary_json)
 
     def test_prepare_screening_inputs_can_source_task_upload_assets(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -345,6 +345,35 @@ def persist_normalized_upload_dataframe(source_path: Path, dataframe: Any) -> Pa
     return output_path
 
 
+def count_non_empty_upload_rows(frames: list[Any]) -> int:
+    row_count = 0
+    for frame in frames:
+        if frame is None or frame.empty:
+            continue
+        for _, row_series in frame.iterrows():
+            row_dict = row_series.to_dict()
+            if backend_app.is_empty_upload_row(row_dict):
+                continue
+            row_count += 1
+    return row_count
+
+
+def infer_creator_source_kind(source_path: Path, dataframe: Any) -> str:
+    normalized_name = normalize_source_column_name(source_path.stem)
+    normalized_columns = {
+        normalize_source_column_name(column)
+        for column in list(dataframe.columns)
+        if not str(column).startswith("__")
+    }
+    if (
+        "llmreviewedkeep" in normalized_name
+        or "reviewedkeep" in normalized_name
+        or {"llmreviewstatus", "llmreviewdecision", "llmkeep", "creatordedupekey"} & normalized_columns
+    ):
+        return "keep_list"
+    return "canonical_upload"
+
+
 def _raise_upload_error(error_response: Any) -> None:
     response, _status_code = error_response
     payload = response.get_json(silent=True) or {}
@@ -369,7 +398,8 @@ def prepare_upload_metadata(source_path: Path) -> dict[str, Any]:
         raise ValueError(f"上传名单为空或无法读取: {source_path}")
 
     dataframe = backend_app.pd.concat(frames, ignore_index=True)
-    parsed_source_kind = "canonical_upload"
+    input_row_count = count_non_empty_upload_rows(frames)
+    parsed_source_kind = infer_creator_source_kind(source_path, dataframe)
     normalized_upload_source_path = ""
     normalized_upload_summary: dict[str, Any] = {}
 
@@ -382,6 +412,7 @@ def prepare_upload_metadata(source_path: Path) -> dict[str, Any]:
                 persist_normalized_upload_dataframe(source_path, normalized_dataframe)
             )
             dataframe = normalized_dataframe
+            input_row_count = int(normalized_upload_summary.get("inputRowCount") or input_row_count)
 
     with backend_app.app.app_context():
         parsed, error_response = backend_app.parse_canonical_upload_workbook(dataframe, source_path.name)
@@ -393,7 +424,9 @@ def prepare_upload_metadata(source_path: Path) -> dict[str, Any]:
 
     return {
         "source_path": str(source_path),
+        "creator_workbook": str(source_path),
         "parsed_source_kind": parsed_source_kind,
+        "input_row_count": input_row_count,
         "normalized_upload_source_path": normalized_upload_source_path,
         "normalized_upload_summary": normalized_upload_summary,
         "stats": dict(parsed["stats"]),
@@ -500,7 +533,10 @@ def prepare_screening_inputs(
         }
 
     if resolved_creator_workbook is not None:
+        summary["creator_workbook"] = str(resolved_creator_workbook)
         summary["upload"] = prepare_upload_metadata(resolved_creator_workbook)
+        summary["parsed_source_kind"] = summary["upload"].get("parsed_source_kind", "")
+        summary["input_row_count"] = int(summary["upload"].get("input_row_count") or 0)
 
     if summary_json is not None:
         backend_app.write_json_file(str(summary_json), summary)

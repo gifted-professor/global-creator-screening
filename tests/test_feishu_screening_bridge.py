@@ -342,6 +342,55 @@ class FeishuScreeningBridgeTests(unittest.TestCase):
         self.assertEqual(kwargs["limit"], 3)
         self.assertEqual(kwargs["sent_since"], date(2026, 3, 1))
 
+    def test_sync_task_upload_mail_cli_defaults_to_recent_three_months_when_omitted(self) -> None:
+        mail_data_dir = self.base_path / "task-mail-data-default-window"
+        env_path = self.base_path / "mail.env"
+        env_path.write_text(
+            "\n".join(
+                [
+                    "FEISHU_APP_ID=test_app",
+                    "FEISHU_APP_SECRET=test_secret",
+                    "TASK_UPLOAD_URL=https://example.com/task",
+                    "EMPLOYEE_INFO_URL=https://example.com/employee",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+        parser = __import__("feishu_screening_bridge.__main__", fromlist=["_build_parser"])._build_parser()
+        args = parser.parse_args(
+            [
+                "sync-task-upload-mail",
+                "--env-file",
+                str(env_path),
+                "--task-name",
+                "duet",
+                "--download-dir",
+                str(self.base_path / "downloads"),
+                "--mail-data-dir",
+                str(mail_data_dir),
+            ]
+        )
+
+        with (
+            patch("feishu_screening_bridge.__main__.FeishuOpenClient", return_value=object()),
+            patch("feishu_screening_bridge.__main__.resolve_sync_sent_since", return_value=date(2025, 12, 27)),
+            patch(
+                "feishu_screening_bridge.__main__.sync_task_upload_mailboxes",
+                return_value={
+                    "selectedCount": 1,
+                    "syncedCount": 1,
+                    "failedCount": 0,
+                    "mailDataDir": str(mail_data_dir),
+                    "items": [],
+                },
+            ) as sync_mock,
+        ):
+            __import__("feishu_screening_bridge.__main__", fromlist=["_cmd_sync_task_upload_mail"])._cmd_sync_task_upload_mail(args)
+
+        _, kwargs = sync_mock.call_args
+        self.assertEqual(kwargs["sent_since"], "2025-12-27")
+
     def test_local_env_loader_parses_key_values(self) -> None:
         env_path = self.base_path / ".env.local"
         env_path.write_text(

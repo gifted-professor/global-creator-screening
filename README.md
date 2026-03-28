@@ -44,7 +44,61 @@ python3 -m feishu_screening_bridge --help
 python3 -m email_sync --help
 ```
 
-先把 enrichment 结果里的重复 `last_mail` 组整理成 sample-first 复核输入：
+邮件抓取如果不显式传 `--sent-since`，默认只抓最近 `3` 个自然月内的邮件；例如在 `2026-03-27` 运行时，默认等价于 `--sent-since 2025-12-27`。如果要改窗口，显式传 `--sent-since YYYY-MM-DD` 即可覆盖默认值。
+
+以后达人匹配默认应直接使用任务上传里的飞书 `发信名单`，而不是本地测试达人库 workbook。可以直接按任务名下载 `发信名单` 并做匹配：
+
+```bash
+python3 -m email_sync enrich-creators \
+  --env-file .env \
+  --task-name "MINISO" \
+  --db-path "data/task_upload_mail_sync/MINISO/email_sync.db" \
+  --output-prefix "data/task_upload_mail_sync/MINISO/exports/发信名单_MINISO_匹配结果"
+```
+
+当前 duplicate review 有两条链：
+
+- 旧的 sample-first sidecar：`prepare-duplicate-review` / `review-duplicate-groups`
+- 新的生产 keep-list 链：`prepare-llm-review-candidates` / `run-llm-review`
+
+生产链先把高置信 workbook 整理成“按我们去重 / 去重 / llm_candidates”三份产物：
+
+```bash
+python3 -m email_sync prepare-llm-review-candidates \
+  --input "data/task_upload_mail_sync/MINISO/exports/测试达人库_MINISO_匹配结果_高置信.xlsx" \
+  --db-path "data/task_upload_mail_sync/MINISO/email_sync.db" \
+  --output-prefix "exports/测试达人库_MINISO_匹配结果_高置信_按我们去重"
+```
+
+然后直接基于 `*_llm_candidates.jsonl` 跑正式 LLM 审核并回填 reviewed / keep：
+
+```bash
+python3 -m email_sync run-llm-review \
+  --env-file .env \
+  --input-prefix "exports/测试达人库_MINISO_匹配结果_高置信_按我们去重"
+```
+
+这条生产 review 命令会输出：
+
+- `*_llm_review.jsonl`
+- `*_llm_reviewed.xlsx`
+- `*_llm_reviewed_keep.xlsx`
+
+如果你要切 provider，例如换成千问，不改代码，只改 `.env` 里的这些键：
+
+- `OPENAI_API_KEY`
+- `OPENAI_BASE_URL`
+- `OPENAI_MODEL`
+- `OPENAI_WIRE_API`
+- `OPENAI_PROVIDER_NAME`
+- `OPENAI_REASONING_EFFORT`
+
+其中 `OPENAI_WIRE_API` 目前支持：
+
+- `chat_completions`
+- `responses`
+
+下面这条仍然保留，作为旧的 sample-first 复核入口：
 
 ```bash
 PYTHONPYCACHEPREFIX=/tmp/pycache python3 -m email_sync prepare-duplicate-review \
@@ -96,3 +150,40 @@ backend/.venv/bin/python scripts/prepare_screening_inputs.py \
   --task-upload-url "$TASK_UPLOAD_URL" \
   --summary-json "temp/miniso_task_driven_prep_summary.json"
 ```
+
+如果上游已经完成 production duplicate review，也可以直接从 `keep` 名单进入当前 `筛号` 主链。推荐入口是：
+
+```bash
+backend/.venv/bin/python scripts/run_keep_list_screening_pipeline.py \
+  --keep-workbook "exports/测试达人库_MINISO_匹配结果_高置信_按我们去重_llm_reviewed_keep.xlsx" \
+  --template-workbook "downloads/task_upload_attachments/recveXGV2i3BS0/需求上传（excel 格式）/miniso-星战红人筛号需求模板(1).xlsx" \
+  --summary-json "temp/keep_list_pipeline_summary.json" \
+  --platform instagram \
+  --max-identifiers-per-platform 20 \
+  --skip-visual
+```
+
+这条 keep-list runner 会先做两件事：
+
+- 把 `*_llm_reviewed_keep.xlsx` 写成 `data/<platform>/<platform>_upload_metadata.json`
+- 把模板编译并写入 `config/active_rulespec.json`
+
+然后再按边界控制参数决定是否继续往下跑：
+
+- `--platform`：只跑指定平台，可重复传入
+- `--max-identifiers-per-platform`：每个平台最多跑多少个账号，适合 bounded validation
+- `--skip-scrape`：只做 staging，不触发 Apify / prescreen / export
+- `--skip-visual`：跑 scrape 和导出，但跳过视觉复核
+
+summary 会明确记录：
+
+- keep workbook 路径
+- 实际 staged 数量和分平台计数
+- 是否执行 scrape
+- 是否执行 visual review，或为什么跳过
+- 每个平台导出产物路径
+
+这条入口和 `scripts/run_screening_smoke.py` 的区别是：
+
+- `run_keep_list_screening_pipeline.py`：面向 reviewed keep-list，作为正式下游入口
+- `run_screening_smoke.py`：面向 sample workbook 的 smoke / benchmark / runtime validation
