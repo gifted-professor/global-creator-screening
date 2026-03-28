@@ -18,7 +18,7 @@
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 14. Stabilize visual provider config and preflight | 0/0 | Not Started | |
+| 14. Stabilize visual provider config and preflight | 0/2 | Planned | |
 | 15. Validate non-error bounded visual review flow | 0/0 | Not Started | |
 
 ### Phase 14: Stabilize visual provider config and preflight
@@ -30,7 +30,11 @@
   1. 当前仓库能稳定解析视觉复核使用的 provider / model / base URL / auth 来源，不要求改业务代码
   2. 缺失或错误鉴权会在 preflight 或早期执行阶段给出明确错误，不再只表现为尾部 `auth_not_found`
   3. keep-list downstream summary 会记录视觉 provider 相关诊断字段，便于人工定位
-**Plans**: 0 plans
+**Plans**: 2 plans
+
+Plans:
+- [ ] 14-01: Add backend vision provider snapshot, preflight, and early failure diagnostics
+- [ ] 14-02: Surface vision diagnostics in runner summaries/docs and leave a bounded diagnostic validation artifact
 
 ### Phase 15: Validate non-error bounded visual review flow
 

@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v1.1.0
 milestone_name: Visual Provider Reliability and Downstream Hardening
 status: active
-stopped_at: Phase 14 not started; next workflow step is discuss or plan the new milestone entry phase
+stopped_at: Phase 14 planned; next workflow step is execute 14-01
 last_updated: "2026-03-28T00:15:21.486Z"
-last_activity: 2026-03-28 — initialized milestone v1.1.0 to stabilize visual provider auth and complete a non-error bounded visual validation
+last_activity: 2026-03-28 — planned Phase 14 with backend vision-provider diagnostics and runner-side preflight summary work split across 14-01 and 14-02
 progress:
   total_phases: 2
   completed_phases: 0
-  total_plans: 0
+  total_plans: 2
   completed_plans: 0
   percent: 0
 ---
@@ -21,14 +21,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-28)
 
 **Core value:** 在不打断现有本地工作流的前提下，把飞书内容获取、筛选导入和相关配置集中到一个可持续维护的仓库里。
-**Current focus:** 开始 `v1.1.0`，先处理视觉 provider 鉴权、预检和 bounded visual validation
+**Current focus:** 执行 Phase 14，先做 backend 视觉 provider 诊断/预检，再把诊断字段写进 keep-list runner summary
 
 ## Current Position
 
 Phase: 14 of 15 (Stabilize visual provider config and preflight)
-Plan: Not started
-Status: Defining requirements and roadmap for v1.1.0
-Last activity: 2026-03-28 — milestone v1.1.0 initialized with phases 14-15 around visual provider reliability
+Plan: 0 of 2 in current phase
+Status: Phase 14 planned and ready to execute
+Last activity: 2026-03-28 — created 14-CONTEXT plus 14-01/14-02 plans for visual provider diagnostics and bounded preflight validation
 
 Progress: [░░░░░░░░░░] 0%
 
@@ -101,7 +101,7 @@ Recent decisions affecting current work:
 
 ### Pending Todos
 
-- 规划 Phase 14，锁定视觉 provider 配置面、预检口径和 summary 诊断字段
+- 执行 14-01，补 backend 视觉 provider snapshot / preflight / 早失败诊断
 - 决定是否要把当前视觉 provider 配置修好，再补一轮 non-error 的 bounded visual validation
 - 决定是否要把当前 `.env.local` 的 998Code 配置切回可用状态，还是正式切到其他 OpenAI-compatible provider
 
@@ -143,5 +143,5 @@ Recent decisions affecting current work:
 ## Session Continuity
 
 Last session: 2026-03-28 23:52
-Stopped at: milestone v1.1.0 initialized; next workflow step is discuss or plan Phase 14
+Stopped at: Phase 14 planned; next workflow step is execute 14-01
 Resume file: None
