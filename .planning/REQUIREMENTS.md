@@ -1,0 +1,52 @@
+# Requirements: chuhaihai
+
+**Defined:** 2026-03-28
+**Core Value:** 在不打断现有本地工作流的前提下，把飞书内容获取、筛选导入和相关配置集中到一个可持续维护的仓库里。
+
+## v1 Requirements
+
+### Visual Provider Reliability
+
+- [ ] **VIS-01**: 操作人可以在不改代码的前提下，为视觉复核链路配置并解析可用的 provider 鉴权
+- [ ] **VIS-02**: 视觉复核在鉴权缺失或错误时，会在 bounded run 早期给出明确、可定位的预检或运行错误，而不是只留下模糊失败
+- [ ] **VIS-03**: 当前仓库可以对真实 keep-list 跑出一轮 non-error 的 bounded visual review，不再返回 `auth_not_found`
+
+### Screening Runtime Hardening
+
+- [ ] **SCR-03**: keep-list runner 的 summary 明确记录视觉 provider 配置来源、预检结果和最终视觉统计，便于复跑与排障
+- [ ] **DOC-01**: README 和 planning 文档明确给出新的视觉配置/验证入口，操作人可直接按文档完成 bounded validation
+
+## v2 Requirements
+
+### Deferred Follow-Ups
+
+- **QTE-01**: 把报价结果正式接入 `筛号` 运行态或最终导出链
+- **CMP-01**: 继续减少 workbook / dashboard / project-home 对外部全量 `email` 项目的依赖
+- **OPS-01**: 为 milestone 增补 audit / cross-phase verification 规范，减少“未审计即归档”
+
+## Out of Scope
+
+| Feature | Reason |
+|---------|--------|
+| 重写整套视觉复核业务逻辑 | 当前问题是 provider 鉴权与运行稳定性，不是算法重构 |
+| 重做 `email_sync` / `筛号` 主链架构 | `v1.0.0` 已证明主线可用，当前优先级是修复运行缺口 |
+| 云端部署或服务化改造 | 目前仍以本地工作流闭环为主 |
+
+## Traceability
+
+| Requirement | Phase | Status |
+|-------------|-------|--------|
+| VIS-01 | Phase 14 | Pending |
+| VIS-02 | Phase 14 | Pending |
+| SCR-03 | Phase 14 | Pending |
+| VIS-03 | Phase 15 | Pending |
+| DOC-01 | Phase 15 | Pending |
+
+**Coverage:**
+- v1 requirements: 5 total
+- Mapped to phases: 5
+- Unmapped: 0
+
+---
+*Requirements defined: 2026-03-28*
+*Last updated: 2026-03-28 after v1.1.0 milestone definition*
