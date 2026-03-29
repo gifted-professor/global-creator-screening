@@ -14,7 +14,7 @@ from .bridge import (
     DEFAULT_UPLOAD_ENDPOINT_URL,
     import_screening_workbook_from_feishu,
 )
-from .email_project import DEFAULT_EMAIL_PROJECT_ROOT, inspect_email_project_dependency
+from .email_project import inspect_email_project_dependency
 from .feishu_api import DEFAULT_FEISHU_BASE_URL, FeishuOpenClient
 from .local_env import get_preferred_value, load_local_env
 from .task_upload_sync import inspect_task_upload_assignments, sync_task_upload_mailboxes, sync_task_upload_view_to_email_project
@@ -35,9 +35,9 @@ def _build_parser() -> argparse.ArgumentParser:
     import_parser.add_argument(
         "--email-project-root",
         default="",
-        help="email 项目根目录，默认 /Users/a1234/Desktop/Coding/网红/email",
+        help="兼容模式下 legacy email 项目根目录；不填则优先提示当前仓库 repo-local 主线",
     )
-    import_parser.add_argument("--email-env-file", default="", help="email 项目的配置文件路径，默认相对 email 项目根目录的 .env")
+    import_parser.add_argument("--email-env-file", default="", help="兼容模式下 legacy email 项目的配置文件路径，默认相对 legacy 根目录的 .env")
     import_parser.add_argument("--feishu-app-id", default="", help="飞书自建应用 app_id")
     import_parser.add_argument("--feishu-app-secret", default="", help="飞书自建应用 app_secret")
     import_parser.add_argument("--feishu-base-url", default="", help="飞书 OpenAPI Base URL")
@@ -47,7 +47,7 @@ def _build_parser() -> argparse.ArgumentParser:
     import_parser.add_argument("--download-dir", default="", help="下载到本地的目录，默认 ./downloads")
     import_parser.add_argument("--download-name", help="覆盖飞书返回的文件名")
     import_parser.add_argument("--overwrite-download", action="store_true", help="如果本地已存在同名文件则覆盖")
-    import_parser.add_argument("--dashboard-output", help="导出 dashboard HTML 的目标路径，默认 email 项目 exports/index.html")
+    import_parser.add_argument("--dashboard-output", help="导出 dashboard HTML 的目标路径；兼容模式下默认 legacy 项目 exports/index.html")
     import_parser.add_argument(
         "--manual-update-endpoint-url",
         default="",
@@ -94,8 +94,8 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sync_parser.add_argument("--env-file", default=".env", help="本地 env 文件路径，默认当前目录 ./.env")
     sync_parser.add_argument("--url", default="", help="飞书任务上传 wiki/base 链接")
-    sync_parser.add_argument("--email-project-root", default="", help="email 项目根目录")
-    sync_parser.add_argument("--email-env-file", default="", help="email 项目的配置文件路径")
+    sync_parser.add_argument("--email-project-root", default="", help="兼容模式下 legacy email 项目根目录；不填则优先提示当前仓库 repo-local 主线")
+    sync_parser.add_argument("--email-env-file", default="", help="兼容模式下 legacy email 项目的配置文件路径")
     sync_parser.add_argument("--feishu-app-id", default="", help="飞书自建应用 app_id")
     sync_parser.add_argument("--feishu-app-secret", default="", help="飞书自建应用 app_secret")
     sync_parser.add_argument("--feishu-base-url", default="", help="飞书 OpenAPI Base URL")
@@ -162,15 +162,28 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _cmd_import_from_feishu(args: argparse.Namespace) -> int:
     env_values = load_local_env(args.env_file)
-    legacy_dependency = _require_legacy_email_project_dependency(
-        command_name="import-from-feishu",
-        env_values=env_values,
-        email_project_root=args.email_project_root,
-        email_env_file=args.email_env_file,
-        json_output=bool(args.json),
-    )
-    if legacy_dependency is None:
-        return 2
+    resolved_legacy_root = get_preferred_value(args.email_project_root, env_values, "EMAIL_PROJECT_ROOT")
+    resolved_legacy_env_file = get_preferred_value(args.email_env_file, env_values, "EMAIL_ENV_FILE", ".env")
+    if resolved_legacy_root:
+        legacy_dependency = _require_legacy_email_project_dependency(
+            command_name="import-from-feishu",
+            env_values=env_values,
+            email_project_root=args.email_project_root,
+            email_env_file=args.email_env_file,
+            json_output=bool(args.json),
+        )
+        if legacy_dependency is None:
+            return 2
+    else:
+        legacy_dependency = {
+            "email_project_root": "",
+            "email_env_file": resolved_legacy_env_file,
+            "diagnostic": inspect_email_project_dependency(
+                "",
+                resolved_legacy_env_file,
+                validate_import=False,
+            ),
+        }
     app_id = get_preferred_value(args.feishu_app_id, env_values, "FEISHU_APP_ID")
     app_secret = get_preferred_value(args.feishu_app_secret, env_values, "FEISHU_APP_SECRET")
     if not app_id:
@@ -237,7 +250,8 @@ def _cmd_import_from_feishu(args: argparse.Namespace) -> int:
         f"project={import_result['projectCode']}/{import_result['projectName']}  "
         f"saved={result['savedWorkbookPath']}  "
         f"rows={import_result['compiledRowCount']}  "
-        f"html={result['dashboardOutput']}"
+        f"summary={result.get('summaryJson') or import_result.get('summaryJson') or '-'}  "
+        f"dashboard={result['dashboardOutput']}"
     )
     return 0
 
@@ -337,15 +351,28 @@ def _cmd_download_bitable_attachments(args: argparse.Namespace) -> int:
 
 def _cmd_sync_task_upload_view(args: argparse.Namespace) -> int:
     env_values = load_local_env(args.env_file)
-    legacy_dependency = _require_legacy_email_project_dependency(
-        command_name="sync-task-upload-view",
-        env_values=env_values,
-        email_project_root=args.email_project_root,
-        email_env_file=args.email_env_file,
-        json_output=bool(args.json),
-    )
-    if legacy_dependency is None:
-        return 2
+    resolved_legacy_root = get_preferred_value(args.email_project_root, env_values, "EMAIL_PROJECT_ROOT")
+    resolved_legacy_env_file = get_preferred_value(args.email_env_file, env_values, "EMAIL_ENV_FILE", ".env")
+    if resolved_legacy_root:
+        legacy_dependency = _require_legacy_email_project_dependency(
+            command_name="sync-task-upload-view",
+            env_values=env_values,
+            email_project_root=args.email_project_root,
+            email_env_file=args.email_env_file,
+            json_output=bool(args.json),
+        )
+        if legacy_dependency is None:
+            return 2
+    else:
+        legacy_dependency = {
+            "email_project_root": "",
+            "email_env_file": resolved_legacy_env_file,
+            "diagnostic": inspect_email_project_dependency(
+                "",
+                resolved_legacy_env_file,
+                validate_import=False,
+            ),
+        }
     app_id = get_preferred_value(args.feishu_app_id, env_values, "FEISHU_APP_ID")
     app_secret = get_preferred_value(args.feishu_app_secret, env_values, "FEISHU_APP_SECRET")
     if not app_id:
@@ -390,6 +417,7 @@ def _cmd_sync_task_upload_view(args: argparse.Namespace) -> int:
         "task upload synced: "
         f"records={result['recordCount']}  "
         f"imported={result['importedCount']}  "
+        f"summary={result.get('summaryJson') or '-'}  "
         f"dashboard={result['dashboardOutput']}"
     )
     return 0
@@ -563,7 +591,6 @@ def _require_legacy_email_project_dependency(
         email_project_root,
         env_values,
         "EMAIL_PROJECT_ROOT",
-        str(DEFAULT_EMAIL_PROJECT_ROOT),
     )
     resolved_env_file = get_preferred_value(
         email_env_file,

@@ -120,7 +120,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--source-workbook",
-        default="/Users/a1234/Desktop/Coding/网红/chuhai/【测试】达人库.xlsx",
+        required=True,
+        help="源 workbook 路径；请显式传入当前仓库可访问的输入文件",
     )
     parser.add_argument(
         "--sample-output",

@@ -7,6 +7,7 @@ from typing import Any
 
 from .email_project import load_email_project, resolve_email_env_file, resolve_email_project_root
 from .feishu_api import DEFAULT_FEISHU_BASE_URL, FeishuOpenClient
+from .repo_local_runtime import build_repo_local_workbook_runtime, safe_path_component
 
 
 DEFAULT_MANUAL_UPDATE_ENDPOINT_URL = "http://127.0.0.1:8765/api/project-workbench/manual-update"
@@ -32,6 +33,49 @@ def import_screening_workbook_from_feishu(
     feishu_base_url: str = DEFAULT_FEISHU_BASE_URL,
     timeout_seconds: float = 30.0,
 ) -> dict[str, Any]:
+    if not str(email_project_root or "").strip():
+        client = FeishuOpenClient(
+            app_id=feishu_app_id,
+            app_secret=feishu_app_secret,
+            base_url=feishu_base_url,
+            timeout_seconds=timeout_seconds,
+        )
+        downloaded = client.download_file(file_token_or_url, desired_name=download_name)
+
+        download_root = Path(download_dir).expanduser()
+        download_root.mkdir(parents=True, exist_ok=True)
+        saved_workbook_path = _write_downloaded_workbook(
+            download_root,
+            downloaded.file_name,
+            downloaded.content,
+            overwrite=overwrite_download,
+        )
+        runtime_root = download_root / "_repo_local" / safe_path_component(project_code or saved_workbook_path.stem)
+        repo_local_summary = build_repo_local_workbook_runtime(
+            workbook_path=saved_workbook_path,
+            runtime_root=runtime_root,
+            project_code=project_code,
+            primary_category=primary_category,
+            owner_name=owner_name,
+            source_url=downloaded.source_url,
+            dashboard_output=dashboard_output,
+        )
+        return {
+            "ok": True,
+            "mode": "repo_local",
+            "emailProjectRoot": "",
+            "emailEnvFile": str(email_env_file or ".env"),
+            "dbPath": "",
+            "dashboardOutput": repo_local_summary["dashboardOutput"],
+            "summaryJson": repo_local_summary["summaryJson"],
+            "projectStatePath": repo_local_summary["projectStatePath"],
+            "fileToken": downloaded.file_token,
+            "downloadedFileName": downloaded.file_name,
+            "savedWorkbookPath": str(saved_workbook_path),
+            "feishuSourceUrl": downloaded.source_url,
+            "importResult": repo_local_summary,
+        }
+
     resolved_project_root = resolve_email_project_root(email_project_root)
     resolved_env_file = resolve_email_env_file(resolved_project_root, email_env_file)
     modules = load_email_project(resolved_project_root)

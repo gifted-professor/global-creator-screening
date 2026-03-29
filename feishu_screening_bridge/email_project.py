@@ -9,9 +9,9 @@ import sys
 from typing import Any, Callable
 
 
-DEFAULT_EMAIL_PROJECT_ROOT = Path("/Users/a1234/Desktop/Coding/网红/email")
 REPO_LOCAL_UPSTREAM_RUNNER = "scripts/run_task_upload_to_keep_list_pipeline.py"
 REPO_LOCAL_DOWNSTREAM_RUNNER = "scripts/run_keep_list_screening_pipeline.py"
+REPO_LOCAL_FINAL_RUNNER = "scripts/run_task_upload_to_final_export_pipeline.py"
 
 
 class EmailProjectImportError(RuntimeError):
@@ -47,8 +47,9 @@ class EmailProjectModules:
 
 def _legacy_email_project_remediation() -> str:
     return (
-        "如需继续旧 bridge 命令，请通过 `--email-project-root` 或 `EMAIL_PROJECT_ROOT` 指向外部 full `email` 项目；"
-        f"如果要走当前仓库主线，请改用 `{REPO_LOCAL_UPSTREAM_RUNNER}`，下游筛号再接 `{REPO_LOCAL_DOWNSTREAM_RUNNER}`。"
+        "当前仓库默认主线入口依次是 "
+        f"`{REPO_LOCAL_UPSTREAM_RUNNER}`、`{REPO_LOCAL_DOWNSTREAM_RUNNER}`、`{REPO_LOCAL_FINAL_RUNNER}`；"
+        "只有在明确需要兼容旧 bridge 命令时，才通过 `--email-project-root` 或 `EMAIL_PROJECT_ROOT` 显式指向外部 full `email` 项目。"
     )
 
 
@@ -58,28 +59,45 @@ def inspect_email_project_dependency(
     *,
     validate_import: bool = False,
 ) -> dict[str, Any]:
-    resolved_root = Path(email_project_root or DEFAULT_EMAIL_PROJECT_ROOT).expanduser().resolve()
-    package_dir = resolved_root / "email_sync"
-    resolved_env_file = resolve_email_env_file(resolved_root, env_file)
+    requested_root = str(email_project_root or "").strip()
+    requested_env_file = str(env_file or ".env").strip()
     diagnostic: dict[str, Any] = {
         "dependency_kind": "external_full_email_project",
         "available": False,
-        "default_root": str(DEFAULT_EMAIL_PROJECT_ROOT),
-        "resolved_root": str(resolved_root),
-        "root_exists": resolved_root.exists(),
-        "email_sync_package_dir": str(package_dir),
-        "email_sync_package_exists": package_dir.exists(),
-        "email_env_file": str(resolved_env_file),
-        "email_env_file_exists": resolved_env_file.exists(),
-        "uses_default_root": resolved_root == DEFAULT_EMAIL_PROJECT_ROOT.expanduser().resolve(),
+        "legacy_mode_requested": bool(requested_root),
+        "default_root": "",
+        "resolved_root": "",
+        "root_exists": False,
+        "email_sync_package_dir": "",
+        "email_sync_package_exists": False,
+        "email_env_file": requested_env_file,
+        "email_env_file_exists": False,
+        "uses_default_root": False,
         "repo_local_entrypoints": [
             REPO_LOCAL_UPSTREAM_RUNNER,
             REPO_LOCAL_DOWNSTREAM_RUNNER,
+            REPO_LOCAL_FINAL_RUNNER,
         ],
         "error_code": "",
         "message": "",
         "remediation": _legacy_email_project_remediation(),
     }
+    if not requested_root:
+        diagnostic["error_code"] = "EMAIL_PROJECT_ROOT_NOT_PROVIDED"
+        diagnostic["message"] = (
+            "legacy bridge 命令不再隐式依赖外部 full `email` 项目；"
+            "如需兼容旧链路，请显式提供 `--email-project-root` 或 `EMAIL_PROJECT_ROOT`。"
+        )
+        return diagnostic
+    resolved_root = Path(requested_root).expanduser().resolve()
+    package_dir = resolved_root / "email_sync"
+    resolved_env_file = resolve_email_env_file(resolved_root, env_file)
+    diagnostic["resolved_root"] = str(resolved_root)
+    diagnostic["root_exists"] = resolved_root.exists()
+    diagnostic["email_sync_package_dir"] = str(package_dir)
+    diagnostic["email_sync_package_exists"] = package_dir.exists()
+    diagnostic["email_env_file"] = str(resolved_env_file)
+    diagnostic["email_env_file_exists"] = resolved_env_file.exists()
     if not diagnostic["root_exists"]:
         diagnostic["error_code"] = "EMAIL_PROJECT_ROOT_MISSING"
         diagnostic["message"] = f"legacy bridge 依赖的外部 email 项目目录不存在: {resolved_root}"

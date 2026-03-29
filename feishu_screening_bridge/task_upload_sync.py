@@ -17,6 +17,7 @@ from workbook_template_parser import compile_workbook
 from .bitable_export import resolve_bitable_view_from_url
 from .email_project import load_email_project, resolve_email_env_file, resolve_email_project_root
 from .feishu_api import FeishuApiError, FeishuOpenClient
+from .repo_local_runtime import build_repo_local_workbook_runtime, safe_path_component, write_dashboard_html, write_json
 
 
 CANONICAL_SECTION_BASIC = "A. 基本信息"
@@ -504,6 +505,99 @@ def sync_task_upload_view_to_email_project(
     default_primary_category: str = "lifestyle",
     category_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
+    if not str(email_project_root or "").strip():
+        download_root = Path(download_dir).expanduser()
+        download_root.mkdir(parents=True, exist_ok=True)
+        runtime_root = download_root / "_repo_local"
+        runtime_root.mkdir(parents=True, exist_ok=True)
+
+        entries = _fetch_task_upload_entries(client, task_upload_url)
+        imported_items: list[dict[str, Any]] = []
+        latest_project_code = ""
+        for entry in entries:
+            saved_path = _download_task_upload_workbook(client, entry, download_root)
+            project_code = _build_project_code(entry.task_name, prefix=project_code_prefix)
+            primary_category = _resolve_primary_category(
+                workbook_path=saved_path,
+                task_name=entry.task_name,
+                overrides=category_overrides or {},
+                default_primary_category=default_primary_category,
+            )
+            item_runtime_root = runtime_root / safe_path_component(project_code or entry.task_name or entry.record_id)
+            repo_local_summary = build_repo_local_workbook_runtime(
+                workbook_path=saved_path,
+                runtime_root=item_runtime_root,
+                project_code=project_code,
+                primary_category=primary_category,
+                owner_name=entry.owner_name,
+                task_name=entry.task_name,
+                record_id=entry.record_id,
+                linked_bitable_url=entry.linked_bitable_url,
+            )
+            latest_project_code = project_code
+            imported_items.append(
+                {
+                    "recordId": entry.record_id,
+                    "taskName": entry.task_name,
+                    "projectCode": project_code,
+                    "projectName": repo_local_summary["projectName"],
+                    "primaryCategory": primary_category,
+                    "ownerName": entry.owner_name,
+                    "linkedBitableUrl": entry.linked_bitable_url,
+                    "savedWorkbookPath": str(saved_path),
+                    "compiledRowCount": repo_local_summary["compiledRowCount"],
+                    "platforms": list(repo_local_summary["platforms"]),
+                    "summaryJson": repo_local_summary["summaryJson"],
+                    "projectStatePath": repo_local_summary["projectStatePath"],
+                    "dashboardOutput": repo_local_summary["dashboardOutput"],
+                    "templateParseArtifacts": dict(repo_local_summary["templateParseArtifacts"]),
+                }
+            )
+
+        aggregate_dashboard_path = (
+            Path(dashboard_output).expanduser().resolve()
+            if dashboard_output is not None
+            else runtime_root / "dashboard.html"
+        )
+        aggregate_summary_path = runtime_root / "summary.json"
+        aggregate_project_state_path = runtime_root / "project_state_index.json"
+        aggregate_summary = {
+            "ok": True,
+            "mode": "repo_local",
+            "taskUploadUrl": task_upload_url,
+            "emailProjectRoot": "",
+            "emailEnvFile": str(email_env_file or ".env"),
+            "dbPath": "",
+            "dashboardOutput": str(aggregate_dashboard_path),
+            "summaryJson": str(aggregate_summary_path),
+            "projectStatePath": str(aggregate_project_state_path),
+            "recordCount": len(entries),
+            "importedCount": len(imported_items),
+            "latestProjectCode": latest_project_code,
+            "items": imported_items,
+        }
+        write_json(aggregate_project_state_path, {"items": imported_items, "latestProjectCode": latest_project_code})
+        write_json(aggregate_summary_path, aggregate_summary)
+        write_dashboard_html(
+            aggregate_dashboard_path,
+            {
+                "projectCode": latest_project_code,
+                "projectName": "task-upload-sync",
+                "savedWorkbookPath": download_root,
+                "summaryJson": str(aggregate_summary_path),
+                "projectStatePath": str(aggregate_project_state_path),
+                "templateParseArtifacts": {},
+                "nextSteps": [
+                    {
+                        "label": "inspect_repo_local_sync_summary",
+                        "description": "查看聚合 summary 和每个任务的 repo-local project-state。",
+                        "path": str(aggregate_summary_path),
+                    }
+                ],
+            },
+        )
+        return aggregate_summary
+
     resolved_project_root = resolve_email_project_root(email_project_root)
     resolved_env_file = resolve_email_env_file(resolved_project_root, email_env_file)
     modules = load_email_project(resolved_project_root)

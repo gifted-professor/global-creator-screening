@@ -40,10 +40,10 @@
 
 ### Active
 
-- [ ] `DEP-01`: workbook 入口不再依赖 external full `email` 项目
-- [ ] `DEP-02`: dashboard 入口不再依赖 external full `email` 项目
-- [ ] `DEP-03`: project-home 入口不再依赖 external full `email` 项目
-- [ ] `DEP-04`: legacy dependency diagnostics 全部收口为 repo-local remediation
+- [x] `DEP-01`: workbook 入口不再依赖 external full `email` 项目
+- [x] `DEP-02`: dashboard 入口不再依赖 external full `email` 项目
+- [x] `DEP-03`: project-home 入口不再依赖 external full `email` 项目
+- [x] `DEP-04`: legacy dependency diagnostics 全部收口为 repo-local remediation
 - [ ] `SAF-01`: decoupling 后 `task upload -> final export` bounded runner 无回归
 - [ ] `SAF-02`: 迁移具备明确的兼容与回退策略
 
@@ -83,6 +83,16 @@
 - legacy `feishu_screening_bridge` 命令现在会在入口显式诊断外部 full `email` 依赖，缺失时直接返回 remediation，而不是中途模糊失败
 - `scripts/run_task_upload_to_final_export_pipeline.py` 已交付为最终单入口 surface，并保留 `keep-list` 作为内部 canonical resume boundary
 - `v1.2.0` 已正式归档，`v1.3.0` 已启动并锁定 `DEP-01` 为 committed 主轴
+- Phase 20 已完成：external dependency surface inventory 已落盘到 `.planning/phases/20-baseline-legacy-dependency-surfaces-and-lock-repo-local-replacement-contract/20-LEGACY-DEPENDENCY-INVENTORY.md`
+- legacy bridge contract 现在是 repo-local-first：
+  - 不再隐式默认外部 `email` 项目根目录
+  - 缺少 legacy root 时会返回 `EMAIL_PROJECT_ROOT_NOT_PROVIDED`
+  - docs / sample / tests 不再内置本机 `/Users/...` 路径
+- Phase 21 已完成：`import-from-feishu` / `sync-task-upload-view` 默认已切到 repo-local runtime
+  - 默认分支会生成 repo-local `summary.json`
+  - 默认分支会生成 repo-local `project_state.json`
+  - 默认分支会生成本地 `dashboard.html`
+  - external `email` root 只保留为显式 compatibility mode
 - Phase 19 已把 upstream shared-email final review 升级为 primary / secondary / tertiary candidate 可重试、可 failover 的 transport contract，summary 会显式保留 `selected_provider`、`selected_model`、`provider_attempts`、`absorbed_failures`
 - Phase 19 已把 downstream scrape 状态收紧成 live、stageful、partial-result-aware contract；`scrape_failed` 只代表零输出失败，partial salvage 会落成 `scrape_partial` 或 `scrape_poll_failed_with_partial`
 - Phase 19 已让 final wrapper 保留 `delivery_status` 与 `platform_statuses`，所以 `completed_with_partial_scrape` 这类可交付状态不会再被顶层误判为纯失败
@@ -143,4 +153,4 @@
 | `v1.3.0` 只锁定 `DEP-01` 作为 committed 主轴 | 先收口 external dependency 风险，再处理 `QTE-01` / `REL-01`，避免三类改动相互污染验证结果 | ✓ Good |
 
 ---
-*Last updated: 2026-03-29 after v1.3.0 milestone initialization*
+*Last updated: 2026-03-29 after Phase 21 completion*

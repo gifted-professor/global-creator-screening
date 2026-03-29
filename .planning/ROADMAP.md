@@ -21,8 +21,8 @@
 
 | Phase | Plans Complete | Status | Completed |
 |-------|----------------|--------|-----------|
-| 20. Baseline legacy dependency surfaces and lock repo-local replacement contract | 0/0 | Not Started | — |
-| 21. Replace workbook/dashboard/project-home runtime paths with repo-local implementations | 0/0 | Not Started | — |
+| 20. Baseline legacy dependency surfaces and lock repo-local replacement contract | 2/2 | Completed | 2026-03-29 |
+| 21. Replace workbook/dashboard/project-home runtime paths with repo-local implementations | 2/2 | Completed | 2026-03-29 |
 | 22. Validate decoupled runtime stability and operator fallback contract | 0/0 | Not Started | — |
 
 ### Phase 20: Baseline legacy dependency surfaces and lock repo-local replacement contract
@@ -37,8 +37,8 @@
 **Plans**: 2 plans
 
 Plans:
-- [ ] 20-01: Inventory external dependency surfaces and runtime callsites across workbook/dashboard/project-home
-- [ ] 20-02: Define replacement contract and update operator diagnostics/remediation language for repo-local execution
+- [x] 20-01: Inventory external dependency surfaces and runtime callsites across workbook/dashboard/project-home
+- [x] 20-02: Define replacement contract and update operator diagnostics/remediation language for repo-local execution
 
 ### Phase 21: Replace workbook/dashboard/project-home runtime paths with repo-local implementations
 
@@ -52,8 +52,8 @@ Plans:
 **Plans**: 2 plans
 
 Plans:
-- [ ] 21-01: Implement repo-local dependency replacement for workbook and dashboard runtime paths
-- [ ] 21-02: Implement repo-local dependency replacement for project-home runtime paths and remove hard-coded external fallbacks
+- [x] 21-01: Implement repo-local dependency replacement for workbook and dashboard runtime paths
+- [x] 21-02: Implement repo-local dependency replacement for project-home runtime paths and remove hard-coded external fallbacks
 
 ### Phase 22: Validate decoupled runtime stability and operator fallback contract
 

@@ -54,7 +54,7 @@
 
 ## 本地运行
 
-筛号后端依赖在 [backend/requirements.txt](/Users/a1234/Desktop/Coding/网红/chuhai/chuhaihai/backend/requirements.txt)：
+筛号后端依赖在 `backend/requirements.txt`：
 
 ```bash
 python3 -m venv backend/.venv
@@ -418,7 +418,7 @@ Phase 15 已经单独证明过 `openai` 视觉链本身可以真实进入 visual
 
 如果后面要继续做视觉 prompt / fallback 优化，可以直接参考外部 benchmark：
 
-- 参考文档：`/Users/a1234/Desktop/Coding/网红/chuhai/筛号/docs/2026-03-29-qwen-prompt-benchmark.md`
+- 参考文档：外部 sibling `筛号/docs/2026-03-29-qwen-prompt-benchmark.md`
 - 当前最实用的结论不是“继续靠 prompt 追平 GPT”，而是保留 `gpt-5.4` 原始 prompt，给 `qwen-vl-max` 单独使用最佳 `v2` prompt
 - 推荐路由顺序：`gpt-5.4 -> qwen-vl-max`
 - 推荐方法：固定 benchmark 样本、分 provider prompt 文件、允许 `SKIP_OPENAI=1` 只迭代 fallback，并把结果持续落盘做横向对比

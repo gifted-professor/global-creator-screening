@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
 from datetime import date
@@ -27,7 +28,14 @@ from feishu_screening_bridge.feishu_api import FeishuOpenClient
 from feishu_screening_bridge.local_env import get_preferred_value, load_local_env
 
 
-EMAIL_PROJECT_ROOT = Path("/Users/a1234/Desktop/Coding/网红/email")
+LEGACY_EMAIL_PROJECT_ROOT_ENV = "CHUHAI_LEGACY_EMAIL_PROJECT_ROOT"
+
+
+def _require_legacy_email_project_root() -> Path:
+    raw = str(os.environ.get(LEGACY_EMAIL_PROJECT_ROOT_ENV, "") or "").strip()
+    if not raw:
+        raise unittest.SkipTest(f"set {LEGACY_EMAIL_PROJECT_ROOT_ENV} to run legacy email integration coverage")
+    return Path(raw).expanduser().resolve()
 
 
 class _FakeUrlopenResponse:
@@ -70,9 +78,10 @@ class FeishuScreeningBridgeTests(unittest.TestCase):
         self.temp_dir.cleanup()
 
     def test_import_screening_workbook_from_feishu_downloads_writes_and_reexports_dashboard(self) -> None:
+        legacy_email_project_root = _require_legacy_email_project_root()
         with patch("urllib.request.urlopen", side_effect=self._fake_urlopen):
             result = import_screening_workbook_from_feishu(
-                email_project_root=EMAIL_PROJECT_ROOT,
+                email_project_root=legacy_email_project_root,
                 email_env_file=self.env_path,
                 feishu_app_id="cli_test",
                 feishu_app_secret="secret_test",
@@ -107,6 +116,31 @@ class FeishuScreeningBridgeTests(unittest.TestCase):
                 ("GET", "https://unit-test.feishu.mock/open-apis/drive/v1/files/boxcn-test-workbook/download"),
             ],
         )
+
+    def test_import_screening_workbook_from_feishu_defaults_to_repo_local_runtime_without_legacy_root(self) -> None:
+        with patch("urllib.request.urlopen", side_effect=self._fake_urlopen):
+            result = import_screening_workbook_from_feishu(
+                email_project_root=None,
+                email_env_file=self.env_path,
+                feishu_app_id="cli_test",
+                feishu_app_secret="secret_test",
+                file_token_or_url="boxcn-test-workbook",
+                project_code="P-FEISHU-LOCAL",
+                primary_category="smart_home",
+                owner_name="pm.local",
+                download_dir=self.download_dir,
+                feishu_base_url=self.feishu_base_url,
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["mode"], "repo_local")
+        self.assertEqual(result["dbPath"], "")
+        self.assertTrue(Path(result["summaryJson"]).exists(), result)
+        self.assertTrue(Path(result["projectStatePath"]).exists(), result)
+        self.assertTrue(Path(result["dashboardOutput"]).exists(), result)
+        self.assertEqual(result["importResult"]["projectCode"], "P-FEISHU-LOCAL")
+        self.assertGreaterEqual(result["importResult"]["compiledRowCount"], 1)
+        self.assertIn("rulespec_json", result["importResult"]["templateParseArtifacts"])
 
     def test_extract_file_token_supports_feishu_file_url(self) -> None:
         self.assertEqual(
@@ -165,6 +199,7 @@ class FeishuScreeningBridgeTests(unittest.TestCase):
         self.assertEqual(saved_paths[1].read_bytes(), b"file-b")
 
     def test_sync_task_upload_view_to_email_project_imports_new_template_variant(self) -> None:
+        legacy_email_project_root = _require_legacy_email_project_root()
         email_env_path = self.base_path / "email.env"
         email_data_dir = self.base_path / "email_data"
         email_db_path = email_data_dir / "email_sync.db"
@@ -177,7 +212,7 @@ class FeishuScreeningBridgeTests(unittest.TestCase):
         result = sync_task_upload_view_to_email_project(
             client=_FakeTaskUploadClient(self._build_new_template_workbook_bytes()),
             task_upload_url="https://bcnorxdfy50v.feishu.cn/wiki/S0bbwTnlZiJlVMk1Q04ctPXBnje?table=tblYvtOYLoGWCRna&view=vewNwYvkQL",
-            email_project_root=EMAIL_PROJECT_ROOT,
+            email_project_root=legacy_email_project_root,
             email_env_file=email_env_path,
             download_dir=self.base_path / "downloads",
             dashboard_output=dashboard_output,
@@ -194,6 +229,32 @@ class FeishuScreeningBridgeTests(unittest.TestCase):
         self.assertEqual(item["platforms"], ["instagram", "youtube"])
         self.assertTrue(email_db_path.exists())
         self.assertTrue(dashboard_output.exists())
+
+    def test_sync_task_upload_view_to_email_project_defaults_to_repo_local_runtime_without_legacy_root(self) -> None:
+        result = sync_task_upload_view_to_email_project(
+            client=_FakeTaskUploadClient(self._build_new_template_workbook_bytes()),
+            task_upload_url="https://bcnorxdfy50v.feishu.cn/wiki/S0bbwTnlZiJlVMk1Q04ctPXBnje?table=tblYvtOYLoGWCRna&view=vewNwYvkQL",
+            email_project_root=None,
+            email_env_file=self.env_path,
+            download_dir=self.base_path / "downloads",
+            dashboard_output=self.base_path / "repo_local_dashboard.html",
+            project_code_prefix="P-FSH-",
+            default_primary_category="lifestyle",
+            category_overrides={"duet": "lifestyle"},
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["mode"], "repo_local")
+        self.assertEqual(result["dbPath"], "")
+        self.assertEqual(result["importedCount"], 1)
+        self.assertTrue(Path(result["summaryJson"]).exists(), result)
+        self.assertTrue(Path(result["projectStatePath"]).exists(), result)
+        self.assertTrue(Path(result["dashboardOutput"]).exists(), result)
+        item = result["items"][0]
+        self.assertEqual(item["projectCode"], "P-FSH-DUET")
+        self.assertEqual(item["platforms"], ["instagram", "youtube"])
+        self.assertTrue(Path(item["summaryJson"]).exists(), item)
+        self.assertTrue(Path(item["projectStatePath"]).exists(), item)
 
     def test_inspect_task_upload_assignments_matches_employee_and_downloads_template(self) -> None:
         download_dir = self.base_path / "downloads"
@@ -482,12 +543,13 @@ class FeishuScreeningBridgeTests(unittest.TestCase):
         self.assertEqual(get_preferred_value("override", values, "PROJECT_CODE"), "override")
 
     def test_import_uses_env_file_directory_for_relative_data_dir(self) -> None:
+        legacy_email_project_root = _require_legacy_email_project_root()
         relative_env_path = self.base_path / "relative.env"
         relative_env_path.write_text("DATA_DIR=./relative-data\n", encoding="utf-8")
 
         with patch("urllib.request.urlopen", side_effect=self._fake_urlopen):
             result = import_screening_workbook_from_feishu(
-                email_project_root=EMAIL_PROJECT_ROOT,
+                email_project_root=legacy_email_project_root,
                 email_env_file=relative_env_path,
                 feishu_app_id="cli_test",
                 feishu_app_secret="secret_test",

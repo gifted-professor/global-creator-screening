@@ -8,10 +8,10 @@
 
 ### Dependency Decoupling
 
-- [ ] **DEP-01**: 操作人可以在当前仓库直接完成 workbook 相关流程，不再要求 external full `email` 项目存在
-- [ ] **DEP-02**: 操作人可以在当前仓库直接完成 dashboard 相关流程，不再要求 external full `email` 项目存在
-- [ ] **DEP-03**: 操作人可以在当前仓库直接完成 project-home 相关流程，不再要求 external full `email` 项目存在
-- [ ] **DEP-04**: 所有 legacy external dependency 检查点都改为 repo-local contract，错误信息只给出当前仓库内可执行 remediation
+- [x] **DEP-01**: 操作人可以在当前仓库直接完成 workbook 相关流程，不再要求 external full `email` 项目存在
+- [x] **DEP-02**: 操作人可以在当前仓库直接完成 dashboard 相关流程，不再要求 external full `email` 项目存在
+- [x] **DEP-03**: 操作人可以在当前仓库直接完成 project-home 相关流程，不再要求 external full `email` 项目存在
+- [x] **DEP-04**: 所有 legacy external dependency 检查点都改为 repo-local contract，错误信息只给出当前仓库内可执行 remediation
 
 ### Runtime Safety
 
@@ -37,10 +37,10 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
-| DEP-04 | Phase 20 | Pending |
-| DEP-01 | Phase 21 | Pending |
-| DEP-02 | Phase 21 | Pending |
-| DEP-03 | Phase 21 | Pending |
+| DEP-04 | Phase 20 | Completed |
+| DEP-01 | Phase 21 | Completed |
+| DEP-02 | Phase 21 | Completed |
+| DEP-03 | Phase 21 | Completed |
 | SAF-01 | Phase 22 | Pending |
 | SAF-02 | Phase 22 | Pending |
 
@@ -51,4 +51,4 @@
 
 ---
 *Requirements defined: 2026-03-29*
-*Last updated: 2026-03-29 after milestone v1.3.0 initialization*
+*Last updated: 2026-03-29 after Phase 21 completion*

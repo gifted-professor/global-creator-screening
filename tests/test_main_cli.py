@@ -331,7 +331,7 @@ class MainCliTests(unittest.TestCase):
         self.assertEqual(build_scrape_payload("tiktok", ["beta"]), {"profiles": ["beta"]})
         self.assertEqual(build_scrape_payload("youtube", ["https://youtube.com/@gamma"]), {"urls": ["https://youtube.com/@gamma"]})
 
-    def test_feishu_bridge_import_command_returns_structured_legacy_dependency_failure(self) -> None:
+    def test_feishu_bridge_import_command_defaults_to_repo_local_runtime_without_legacy_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"
             env_path.write_text(
@@ -357,29 +357,37 @@ class MainCliTests(unittest.TestCase):
             captured = StringIO()
             with (
                 patch(
-                    "feishu_screening_bridge.__main__.inspect_email_project_dependency",
-                    return_value={
-                        "available": False,
-                        "error_code": "EMAIL_PROJECT_ROOT_MISSING",
-                        "message": "legacy bridge 依赖的外部 email 项目目录不存在: /tmp/email",
-                        "remediation": "set EMAIL_PROJECT_ROOT",
-                    },
-                ),
-                patch(
                     "feishu_screening_bridge.__main__.import_screening_workbook_from_feishu",
-                    side_effect=AssertionError("should not reach legacy import"),
-                ),
+                    return_value={
+                        "ok": True,
+                        "mode": "repo_local",
+                        "dashboardOutput": f"{temp_dir}/downloads/_repo_local/P-001/dashboard.html",
+                        "summaryJson": f"{temp_dir}/downloads/_repo_local/P-001/summary.json",
+                        "savedWorkbookPath": f"{temp_dir}/downloads/test.xlsx",
+                        "importResult": {
+                            "projectCode": "P-001",
+                            "projectName": "MINISO",
+                            "compiledRowCount": 2,
+                            "summaryJson": f"{temp_dir}/downloads/_repo_local/P-001/summary.json",
+                        },
+                    },
+                ) as import_mock,
                 redirect_stdout(captured),
             ):
                 exit_code = _cmd_import_from_feishu(args)
 
         payload = json.loads(captured.getvalue())
-        self.assertEqual(exit_code, 2)
-        self.assertFalse(payload["ok"])
-        self.assertEqual(payload["error_code"], "EMAIL_PROJECT_ROOT_MISSING")
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["mode"], "repo_local")
+        self.assertFalse(payload["legacyDependency"]["legacy_mode_requested"])
+        self.assertEqual(payload["legacyDependency"]["resolved_root"], "")
+        self.assertEqual(payload["importResult"]["projectCode"], "P-001")
+        self.assertIn("summary.json", payload["summaryJson"])
         self.assertIn("legacyDependency", payload)
+        self.assertEqual(import_mock.call_args.kwargs["email_project_root"], "")
 
-    def test_feishu_bridge_sync_task_upload_view_returns_structured_legacy_dependency_failure(self) -> None:
+    def test_feishu_bridge_sync_task_upload_view_defaults_to_repo_local_runtime_without_legacy_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             env_path = Path(temp_dir) / ".env"
             env_path.write_text(
@@ -403,6 +411,54 @@ class MainCliTests(unittest.TestCase):
             captured = StringIO()
             with (
                 patch(
+                    "feishu_screening_bridge.__main__.sync_task_upload_view_to_email_project",
+                    return_value={
+                        "ok": True,
+                        "mode": "repo_local",
+                        "recordCount": 1,
+                        "importedCount": 1,
+                        "dashboardOutput": f"{temp_dir}/downloads/_repo_local/dashboard.html",
+                        "summaryJson": f"{temp_dir}/downloads/_repo_local/summary.json",
+                        "items": [],
+                    },
+                ) as sync_mock,
+                redirect_stdout(captured),
+            ):
+                exit_code = _cmd_sync_task_upload_view(args)
+
+        payload = json.loads(captured.getvalue())
+        self.assertEqual(exit_code, 0)
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["mode"], "repo_local")
+        self.assertEqual(payload["command"] if "command" in payload else "sync-task-upload-view", "sync-task-upload-view")
+        self.assertFalse(payload["legacyDependency"]["legacy_mode_requested"])
+        self.assertEqual(sync_mock.call_args.kwargs["email_project_root"], "")
+
+    def test_feishu_bridge_sync_task_upload_view_legacy_mode_failure_still_returns_structured_payload(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "FEISHU_APP_ID=test_app",
+                        "FEISHU_APP_SECRET=test_secret",
+                        "TASK_UPLOAD_URL=https://example.com/task",
+                        "EMAIL_PROJECT_ROOT=/tmp/email",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            args = self.feishu_bridge_parser.parse_args(
+                [
+                    "sync-task-upload-view",
+                    "--env-file",
+                    str(env_path),
+                    "--json",
+                ]
+            )
+            captured = StringIO()
+            with (
+                patch(
                     "feishu_screening_bridge.__main__.inspect_email_project_dependency",
                     return_value={
                         "available": False,
@@ -410,10 +466,6 @@ class MainCliTests(unittest.TestCase):
                         "message": "legacy bridge 指向的目录缺少 email_sync 包: /tmp/email/email_sync",
                         "remediation": "fix email project root",
                     },
-                ),
-                patch(
-                    "feishu_screening_bridge.__main__.sync_task_upload_view_to_email_project",
-                    side_effect=AssertionError("should not reach legacy sync"),
                 ),
                 redirect_stdout(captured),
             ):

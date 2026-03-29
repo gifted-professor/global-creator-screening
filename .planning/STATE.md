@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v1.3.0
 milestone_name: external-email-dependency-decoupling
 status: phase_ready_for_discuss
-stopped_at: `v1.3.0` initialized on 2026-03-29; next workflow step is `$gsd-discuss-phase 20`
-last_updated: "2026-03-29T08:16:13+08:00"
+stopped_at: Phase 21 completed on 2026-03-29; next workflow step is `$gsd-discuss-phase 22`
+last_updated: "2026-03-29T18:24:00+08:00"
 progress:
   total_phases: 3
-  completed_phases: 0
-  total_plans: 0
-  completed_plans: 0
+  completed_phases: 2
+  total_plans: 4
+  completed_plans: 4
 ---
 
 # Project State
@@ -19,14 +19,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-29)
 
 **Core value:** 在不打断现有本地工作流的前提下，把飞书内容获取、筛选导入和相关配置集中到一个可持续维护的仓库里。
-**Current focus:** milestone `v1.3.0` phase kickoff — start Phase 20 to baseline external dependency surfaces and lock repo-local replacement contract
+**Current focus:** Phase 22 discussion prep — validate decoupled runtime stability and operator fallback contract
 
 ## Current Position
 
-Phase: Not started (ready to discuss Phase 20)
+Phase: 22 of 22 (ready to discuss)
 Plan: —
-Status: Defining phase context for dependency decoupling
-Last activity: 2026-03-29 — Milestone `v1.3.0 External Email Dependency Decoupling` started
+Status: Ready to discuss
+Last activity: 2026-03-29 — Completed Phase 21 repo-local replacement work for workbook / dashboard / project-home
 
 ## Performance Metrics
 
@@ -70,6 +70,17 @@ Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
 - [Milestone v1.3.0]: committed scope 先锁定 `DEP-01`（external dependency decoupling）；`QTE-01` 与 `REL-01` 继续 deferred，避免范围耦合
+- [Phase 20 Review Intake]: 2026-03-29 的补充建议里，`self-contained repo / 清理 hard-coded external paths / repo-local-first remediation` 被收进当前 decoupling 主线；`backend/app.py` 模块化、shared settings、`pipeline_runtime.py`、SQLite WAL/FTS、upload/job hardening、LLM config consolidation、`pyproject.toml`/lint/typecheck、以及 workbook handle cleanup 先记为 deferred technical debt
+- [Phase 20 Verification]: 在当前 checkout 上，`python3 -m unittest tests.test_main_cli tests.test_feishu_screening_bridge -v` 于 2026-03-29 通过；所以外部路径问题当前更像 portability / self-containment debt，而不是这组 targeted tests 的即时红灯
+- [Phase 20]: legacy bridge commands 不再隐式默认外部 `email` 项目根目录；compatibility mode 现在必须显式提供 `--email-project-root` / `EMAIL_PROJECT_ROOT`
+- [Phase 20]: legacy integration coverage 不再偷偷依赖某台机器上的 sibling checkout；现在只有显式设置 `CHUHAI_LEGACY_EMAIL_PROJECT_ROOT` 时才会跑相关 integration tests
+- [Phase 21]: `import-from-feishu` / `sync-task-upload-view` 默认执行路径应切到 repo-local artifact ownership；external `email` root 只保留为显式 compatibility mode
+- [Phase 21]: workbook / dashboard / project-home 的 repo-local replacement 不要求 byte-for-byte 重建旧 external read-model stack；machine-readable manifest / summary + current-repo runtime state 是可接受交付面
+- [Phase 21]: "输入任务名即运行" 的单入口 orchestration API 和薄 UI 确认有价值，但在当前 workflow 中继续 deferred，等 decoupling 和 Phase 22 bounded validation 完成后再开新里程碑
+- [Phase 21 Plan]: `21-01` 先把 workbook import / task-upload sync 的默认 ownership 切到 repo-local，并以 summary/manifest 取代 external dashboard 作为默认可见面
+- [Phase 21 Plan]: `21-02` 再移除默认 external project-home/workbench rebuild 依赖，用 repo-local project-state artifact 完成 `DEP-03`
+- [Phase 21]: `import-from-feishu` / `sync-task-upload-view` 默认分支现在会直接生成 repo-local `summary.json`、`project_state.json` 和本地 `dashboard.html`
+- [Phase 21]: 默认 workbook/dashboard/project-home path 已不再要求 external full `email` project 存在；external root 只保留为显式 compatibility mode
 - [Reference Intake]: 外部 `筛号/docs/2026-03-29-qwen-prompt-benchmark.md` 可作为后续视觉优化基线；优先保留 `gpt-5.4` 原 prompt，给 `qwen-vl-max` 单独挂 `v2`，并按 `gpt-5.4 -> qwen-vl-max` 路由，而不是继续强行用单 prompt 逼近 GPT
 - [Reference Intake]: 外部 `apify` 项目的 handoff 文档模式可直接复用到当前仓库；开发接手应先看 `README + .planning`，再从 `scripts/run_task_upload_to_final_export_pipeline.py`、`scripts/run_task_upload_to_keep_list_pipeline.py`、`scripts/run_keep_list_screening_pipeline.py`、`backend/app.py` 4 个入口下钻
 - [Phase 1]: 先补最小 `.planning` 再迁移代码
@@ -132,10 +143,9 @@ Recent decisions affecting current work:
 
 ### Pending Todos
 
-- Phase 20: 盘点 workbook / dashboard / project-home 触达 external full `email` 的调用点与依赖路径
-- Phase 20: 收口 repo-local replacement contract 和统一 early diagnostics 文案
-- Phase 21: 分入口替换 external 依赖并移除硬编码 fallback
+- Phase 21: 分入口替换 workbook / dashboard / project-home 的 external runtime 依赖并移除剩余硬编码 fallback
 - Phase 22: 完成 decoupled bounded 回归、整理 fallback/runbook，并确认无关键回归
+- Deferred debt intake: `backend/app.py` 模块化 + app factory、shared settings loader、`pipeline_runtime.py` 抽取、SQLite WAL/FTS、upload/job hardening、LLM config consolidation、`pyproject.toml`/lint/typecheck、以及 workbook handle cleanup
 
 ### Blockers/Concerns
 
@@ -192,9 +202,11 @@ Recent decisions affecting current work:
 - 2026-03-29: Clarify in README/PROJECT that the Phase 18 bounded proof only proves the repo-local single-entry mainline, not full-batch or multi-platform stability, full legacy-entry decoupling, or non-`openai` provider readiness
 - 2026-03-29: Intake external qwen prompt benchmark into local context: future visual tuning should prefer dual-prompt routing (`gpt-5.4` original + `qwen-vl-max` v2) with fixed benchmark harness instead of more blind prompt chasing
 - 2026-03-29: Add docs-first developer handoff guidance modeled on the external `apify` project: docs explain the full chain, while 4 code entrypoints are enough to start safe changes
+- 2026-03-29: Complete Phase 20 20-01 by inventorying every remaining workbook / dashboard / project-home external dependency surface and splitting current decoupling scope from deferred engineering debt
+- 2026-03-29: Complete Phase 20 20-02 by making legacy diagnostics repo-local-first, removing private absolute-path defaults from docs/sample/tests, and gating legacy integration coverage behind explicit `CHUHAI_LEGACY_EMAIL_PROJECT_ROOT`
 
 ## Session Continuity
 
-Last session: 2026-03-29 08:16
-Stopped at: `v1.3.0` initialized on 2026-03-29; next workflow step is `$gsd-discuss-phase 20`
+Last session: 2026-03-29 18:24
+Stopped at: Phase 21 completed on 2026-03-29; next workflow step is `$gsd-discuss-phase 22`
 Resume file: None
