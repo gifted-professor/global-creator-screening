@@ -1,15 +1,15 @@
 ---
 gsd_state_version: 1.0
-milestone: none
-milestone_name: between-milestones
-status: milestone_complete
-stopped_at: `v1.2.0` archived on 2026-03-29; next workflow step is `$gsd-new-milestone`
-last_updated: "2026-03-29T08:00:00+08:00"
+milestone: v1.3.0
+milestone_name: external-email-dependency-decoupling
+status: phase_ready_for_discuss
+stopped_at: `v1.3.0` initialized on 2026-03-29; next workflow step is `$gsd-discuss-phase 20`
+last_updated: "2026-03-29T08:16:13+08:00"
 progress:
-  total_phases: 5
-  completed_phases: 5
-  total_plans: 11
-  completed_plans: 11
+  total_phases: 3
+  completed_phases: 0
+  total_plans: 0
+  completed_plans: 0
 ---
 
 # Project State
@@ -19,12 +19,14 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-29)
 
 **Core value:** 在不打断现有本地工作流的前提下，把飞书内容获取、筛选导入和相关配置集中到一个可持续维护的仓库里。
-**Current focus:** between milestones; decide next committed scope from `DEP-01`, `QTE-01`, and `REL-01`
+**Current focus:** milestone `v1.3.0` phase kickoff — start Phase 20 to baseline external dependency surfaces and lock repo-local replacement contract
 
 ## Current Position
 
-No active phase.
-Last shipped milestone: `v1.2.0 End-to-End Single-Entry Pipeline Verification` — archived 2026-03-29 with audit status `tech_debt`.
+Phase: Not started (ready to discuss Phase 20)
+Plan: —
+Status: Defining phase context for dependency decoupling
+Last activity: 2026-03-29 — Milestone `v1.3.0 External Email Dependency Decoupling` started
 
 ## Performance Metrics
 
@@ -67,6 +69,9 @@ Last shipped milestone: `v1.2.0 End-to-End Single-Entry Pipeline Verification` �
 Decisions are logged in PROJECT.md Key Decisions table.
 Recent decisions affecting current work:
 
+- [Milestone v1.3.0]: committed scope 先锁定 `DEP-01`（external dependency decoupling）；`QTE-01` 与 `REL-01` 继续 deferred，避免范围耦合
+- [Reference Intake]: 外部 `筛号/docs/2026-03-29-qwen-prompt-benchmark.md` 可作为后续视觉优化基线；优先保留 `gpt-5.4` 原 prompt，给 `qwen-vl-max` 单独挂 `v2`，并按 `gpt-5.4 -> qwen-vl-max` 路由，而不是继续强行用单 prompt 逼近 GPT
+- [Reference Intake]: 外部 `apify` 项目的 handoff 文档模式可直接复用到当前仓库；开发接手应先看 `README + .planning`，再从 `scripts/run_task_upload_to_final_export_pipeline.py`、`scripts/run_task_upload_to_keep_list_pipeline.py`、`scripts/run_keep_list_screening_pipeline.py`、`backend/app.py` 4 个入口下钻
 - [Phase 1]: 先补最小 `.planning` 再迁移代码
 - [Phase 2]: 迁移以整包复制旧仓库的飞书桥接实现为主，避免遗漏
 - [Phase 2]: 暂不切换默认 `EMAIL_PROJECT_ROOT`，保持现有可工作路径
@@ -121,23 +126,22 @@ Recent decisions affecting current work:
 - Phase 17 added: Close repo-local runtime dependency gaps
 - Phase 18 added: Validate real bounded end-to-end pipeline
 - Phase 19 added: Integrate reusable Apify client abstraction into repo-local total pipeline
+- Phase 20 added: Baseline legacy dependency surfaces and lock repo-local replacement contract
+- Phase 21 added: Replace workbook/dashboard/project-home runtime paths with repo-local implementations
+- Phase 22 added: Validate decoupled runtime stability and operator fallback contract
 
 ### Pending Todos
 
-- 决定何时对多平台或更大样本补下一轮 live stability proof，而不只停留在 bounded validation
-- 决定报价结果接入是不是下一里程碑的 committed scope，还是继续延后
-- 决定是否在 `openai` 之外继续补其他 provider 的 live proof run
-- 在下一次 `$workflow` 里决定是否直接启动 `$gsd-new-milestone`
+- Phase 20: 盘点 workbook / dashboard / project-home 触达 external full `email` 的调用点与依赖路径
+- Phase 20: 收口 repo-local replacement contract 和统一 early diagnostics 文案
+- Phase 21: 分入口替换 external 依赖并移除硬编码 fallback
+- Phase 22: 完成 decoupled bounded 回归、整理 fallback/runbook，并确认无关键回归
 
 ### Blockers/Concerns
 
-- `feishu_screening_bridge` 的 workbook / dashboard / project-home 旧流程仍依赖外部全量 `email` 项目，但现在已经有显式 early diagnostics 和 remediation
-- 报价结果还没有正式灌入 `筛号` 后端的数据入口
-- 当前只对 `openai` 留下了真实 non-error proof run；其他 provider 还没有 live 可用性证明
-- 当前 998Code / Apify 侧的瞬时网络抖动已经有 repo-local retry / salvage / fallback contract，但还没有多平台或大样本 live proof
-- 当前真实 proof 仍然主要是 bounded 的 `instagram 1` 或局部 live rerun；它证明的是主链 contract 与恢复语义，不是全量批次稳定性证明
-- `v1.1.0` 归档前没有单独补 milestone audit 文件，这被接受为流程债
-- 当前 16 + 16.1 + 17 + 18 + 19 已经解决了“单入口 bounded E2E proof + reliability contract”的主要编排、fast-path 融合、resume contract、runtime resolution、early diagnostics 和 partial-delivery semantics；后续主线更偏向 milestone closeout 和更大样本验证
+- workbook / dashboard / project-home 历史路径仍有 external full `email` 耦合，Phase 21 改动面较广，需避免误伤已稳定的单入口链路
+- 当前里程碑故意 deferred 了 `QTE-01` 与 `REL-01`，如果中途混入会导致验证边界失焦
+- `v1.2.0` 的 bounded proof 与 reliability contract 是当前回归基线；拆依赖期间必须持续对齐这组 contract
 
 ### Quick Tasks Completed
 
@@ -185,9 +189,12 @@ Recent decisions affecting current work:
 - 2026-03-29: Complete Phase 19 19-01 by hardening Apify lifecycle salvage semantics, persisting live downstream platform stages, and reserving `scrape_failed` for true no-output failures
 - 2026-03-29: Complete Phase 19 19-02 by adding multi-candidate upstream LLM fallback, selected provider/model observability, and absorbed-failure reporting to keep-list summary
 - 2026-03-29: Complete Phase 19 19-03 by tightening visual preferred-pool retry behavior, normalizing model diagnostics, preserving `completed_with_partial_scrape` in the final wrapper, and aligning README/operator docs
+- 2026-03-29: Clarify in README/PROJECT that the Phase 18 bounded proof only proves the repo-local single-entry mainline, not full-batch or multi-platform stability, full legacy-entry decoupling, or non-`openai` provider readiness
+- 2026-03-29: Intake external qwen prompt benchmark into local context: future visual tuning should prefer dual-prompt routing (`gpt-5.4` original + `qwen-vl-max` v2) with fixed benchmark harness instead of more blind prompt chasing
+- 2026-03-29: Add docs-first developer handoff guidance modeled on the external `apify` project: docs explain the full chain, while 4 code entrypoints are enough to start safe changes
 
 ## Session Continuity
 
-Last session: 2026-03-29 00:00
-Stopped at: `v1.2.0` archived on 2026-03-29; next workflow step is `$gsd-new-milestone`
+Last session: 2026-03-29 08:16
+Stopped at: `v1.3.0` initialized on 2026-03-29; next workflow step is `$gsd-discuss-phase 20`
 Resume file: None

@@ -27,6 +27,31 @@
 - `data/`：邮件、筛号和本地运行产物
 - `temp/`：样本、benchmark 和临时导出
 
+## 开发接手最短路径
+
+如果新开发要快速接手这个仓库，建议按下面顺序看：
+
+1. 先看这份 `README.md`
+   重点是：
+   - `当前主链路`
+   - 上游两条正式路径：`legacy-enrichment` / `brand-keyword-fast-path`
+   - 单入口 `task upload -> final export`
+   - `视觉 provider 诊断`
+2. 再看 planning 文档
+   - `.planning/PROJECT.md`：当前系统边界、已验证能力、里程碑决策
+   - `.planning/ROADMAP.md`：当前 milestone 的 phase 和后续实现顺序
+
+如果只是理解整体链路，这两层文档已经够了。
+
+如果要开始改代码，再打开这 4 个入口文件就够了：
+
+- `scripts/run_task_upload_to_final_export_pipeline.py`
+- `scripts/run_task_upload_to_keep_list_pipeline.py`
+- `scripts/run_keep_list_screening_pipeline.py`
+- `backend/app.py`
+
+通常做法应该是：先靠文档理解系统怎么跑，再从这 4 个入口顺着调用链往下看，而不是一上来全仓库搜索。
+
 ## 本地运行
 
 筛号后端依赖在 [backend/requirements.txt](/Users/a1234/Desktop/Coding/网红/chuhai/chuhaihai/backend/requirements.txt)：
@@ -383,13 +408,20 @@ backend/.venv/bin/python scripts/run_keep_list_screening_pipeline.py \
   --poll-interval 5.0
 ```
 
-要注意，这个 proof 是 bounded validation，不等价于：
+要注意，这个 proof 证明的是“repo-local 单入口主线已经可跑通”，但它有三层明确限定：
 
-- 全量批次稳定性证明
-- 多平台稳定性证明
-- Apify client abstraction 已经完成
+- 这是 bounded validation，不等价于任意任务、任意批量、任意平台都已经完成稳定性证明
+- 这是单入口 mainline runner 的 proof，不等价于 legacy workbook / dashboard / project-home 入口已经全部脱离 external full `email` 依赖
+- 这轮 proof 主要证明了当前 `openai` 路径和现有 orchestration contract 可用，不等价于其他 provider 或更大样本也已完成 live 可用性证明
 
-Phase 15 已经单独证明过 `openai` 视觉链本身可以真实进入 visual review；Phase 18 证明的是单入口 `task upload -> final export` 在 repo-local 主线里已经真实跑通。
+Phase 15 已经单独证明过 `openai` 视觉链本身可以真实进入 visual review；Phase 18 证明的是单入口 `task upload -> final export` 在 repo-local 主线里已经真实跑通，但不应把这轮 bounded proof 误读成“所有入口、所有 provider、所有规模都已 fully proven”。
+
+如果后面要继续做视觉 prompt / fallback 优化，可以直接参考外部 benchmark：
+
+- 参考文档：`/Users/a1234/Desktop/Coding/网红/chuhai/筛号/docs/2026-03-29-qwen-prompt-benchmark.md`
+- 当前最实用的结论不是“继续靠 prompt 追平 GPT”，而是保留 `gpt-5.4` 原始 prompt，给 `qwen-vl-max` 单独使用最佳 `v2` prompt
+- 推荐路由顺序：`gpt-5.4 -> qwen-vl-max`
+- 推荐方法：固定 benchmark 样本、分 provider prompt 文件、允许 `SKIP_OPENAI=1` 只迭代 fallback，并把结果持续落盘做横向对比
 
 把模板规则和达人名单写入筛号输入状态：
 

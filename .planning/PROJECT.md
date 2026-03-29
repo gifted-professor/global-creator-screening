@@ -8,6 +8,15 @@
 
 在不打断现有本地工作流的前提下，把飞书内容获取、筛选导入和相关配置集中到一个可持续维护的仓库里。
 
+## Current Milestone: v1.3.0 External Email Dependency Decoupling
+
+**Goal:** 把 workbook / dashboard / project-home 对 external full `email` 项目的剩余运行依赖从主线中拆除，并保持单入口链路可回归。
+
+**Target features:**
+- workbook 相关入口默认走 repo-local 依赖解析，不再要求外部全量 `email` 项目
+- dashboard 与 project-home 的运行路径切到当前仓库 contract，并给出统一 early diagnostics
+- decoupling 后的 bounded 主链回归与 operator fallback/runbook 对齐
+
 ## Requirements
 
 ### Validated
@@ -31,10 +40,12 @@
 
 ### Active
 
-- [ ] 移除 legacy workbook / dashboard / project-home 对外部全量 `email` 项目的剩余依赖
-- [ ] 把报价结果正式接入 `筛号` 运行态或最终导出链
-- [ ] 为多平台或更大批量补充稳定性证明，而不只停留在 bounded validation
-- [ ] 规划下一里程碑应该优先做 dependency removal、quote integration，还是更大样本的 live proof
+- [ ] `DEP-01`: workbook 入口不再依赖 external full `email` 项目
+- [ ] `DEP-02`: dashboard 入口不再依赖 external full `email` 项目
+- [ ] `DEP-03`: project-home 入口不再依赖 external full `email` 项目
+- [ ] `DEP-04`: legacy dependency diagnostics 全部收口为 repo-local remediation
+- [ ] `SAF-01`: decoupling 后 `task upload -> final export` bounded runner 无回归
+- [ ] `SAF-02`: 迁移具备明确的兼容与回退策略
 
 ### Out of Scope
 
@@ -56,6 +67,8 @@
 
 `v1.1.0` 已证明此前的 `auth_not_found` 不是“现在 apikey 没填好”，而是旧 provider 路径不稳定；当前显式 `openai` 路径已经 real run 成功。与此同时，用户还提供了一条在 `MINISO` 三个月真实邮件上验证过的更快上游路径：按品牌关键词筛信、邮箱精确匹配总表、按 IGlink 去重、拆唯一/共享邮箱、共享邮箱先看邮件内容再决定，只有极少数尾部交给 LLM / 人工。`16.1` 已经把这条 fast-path 泛化并串进单入口上游 runner；`18-01` 则进一步把它和 keep-list 下游串成一个 thin final wrapper，并在 `temp/phase18_real_bounded_e2e_final2` 留下了一轮真实 bounded `task upload -> final export` proof。
 
+另外，`/Users/a1234/Desktop/Coding/网红/chuhai/筛号/docs/2026-03-29-qwen-prompt-benchmark.md` 里已经沉淀了一轮独立的视觉 prompt benchmark，可作为后续视觉优化参考：当前更实用的路线不是继续强行用 prompt 追平 GPT，而是保留 `gpt-5.4` 原始 prompt，给 `qwen-vl-max` 单独使用最佳 `v2` prompt，并按 `gpt-5.4 -> qwen-vl-max` 顺序路由。该 benchmark 还验证了 provider-specific prompt file、`SKIP_OPENAI=1`、`REFERENCE_RUN_PATH` 与结果落盘 harness，这些做法如果未来重新开启视觉优化或 fallback 调优，可以直接复用。
+
 ## Current State
 
 - `v1.0.0` 已交付 repo-local 的创作者筛选主线，核心模块不再散落在多个 sibling 工程里
@@ -69,27 +82,31 @@
 - 单入口上游 runner 现在显式支持 `legacy-enrichment` 与 `brand-keyword-fast-path` 两条策略；fast-path 会输出 `manual_tail.xlsx` 与最终 `final_keep.xlsx`
 - legacy `feishu_screening_bridge` 命令现在会在入口显式诊断外部 full `email` 依赖，缺失时直接返回 remediation，而不是中途模糊失败
 - `scripts/run_task_upload_to_final_export_pipeline.py` 已交付为最终单入口 surface，并保留 `keep-list` 作为内部 canonical resume boundary
-- `v1.2.0` 已正式归档，当前仓库处于“等待下一里程碑定义”的 between-milestones 状态
+- `v1.2.0` 已正式归档，`v1.3.0` 已启动并锁定 `DEP-01` 为 committed 主轴
 - Phase 19 已把 upstream shared-email final review 升级为 primary / secondary / tertiary candidate 可重试、可 failover 的 transport contract，summary 会显式保留 `selected_provider`、`selected_model`、`provider_attempts`、`absorbed_failures`
 - Phase 19 已把 downstream scrape 状态收紧成 live、stageful、partial-result-aware contract；`scrape_failed` 只代表零输出失败，partial salvage 会落成 `scrape_partial` 或 `scrape_poll_failed_with_partial`
 - Phase 19 已让 final wrapper 保留 `delivery_status` 与 `platform_statuses`，所以 `completed_with_partial_scrape` 这类可交付状态不会再被顶层误判为纯失败
 - Phase 19 已把 visual review trace 标准化为 `configured_model` / `requested_model` / `response_model` / `effective_model`，并让 preferred pool 在 retryable fault 后继续尝试健康候选
+- 外部 `筛号/docs` 的 2026-03-29 benchmark 已额外证明：视觉 prompt 优化更适合作为“双模型 + 双 prompt + 固定 benchmark harness”问题来做，而不是继续试图用单一 fallback prompt 逼近 GPT
 - 真实 bounded `MINISO` proof 已完成：
   - 顶层 artifact root: `temp/phase18_real_bounded_e2e_final2`
   - top-level `status = completed`
   - upstream `final_keep_row_count = 325`
   - downstream `instagram` bounded run 成功产出 `instagram_final_review.xlsx`
-- 当前没有 active milestone；下一步应通过 `$gsd-new-milestone` 决定是先处理 `DEP-01` / `QTE-01`，还是补 `REL-01` 的更大样本 live proof
+- 这轮 proof 证明的是 repo-local 单入口主线 contract 已成立，但有三层限定：
+  - 它是 bounded validation，不等价于任意任务、任意批量、任意平台都已经完成稳定性证明
+  - 它证明的是 mainline runner，不等价于 legacy workbook / dashboard / project-home 入口已经完全摆脱 external full `email` 依赖
+  - 它主要证明了当前 `openai` 路径和既有 orchestration contract 可用，不等价于其他 provider 或更大样本也已完成 live proof
+- 当前 active milestone 是 `v1.3.0`，范围聚焦 external dependency decoupling；`QTE-01` 与 `REL-01` 暂不纳入本轮 committed scope
 
-## Next Milestone Candidates
+## Milestone Scope Decision
 
-`v1.2.0` 已归档完成。下一里程碑更合理的候选方向有三类：
+本轮里程碑（`v1.3.0`）采用单主轴策略，明确先做 `DEP-01`，避免把三类风险耦合到同一次交付：
 
-- 先处理 `DEP-01`，把 legacy workbook / dashboard / project-home 的剩余 external dependency 拆掉
-- 先处理 `QTE-01`，把报价结果接进 screening runtime / final export，让链路从“筛选”走向“可执行交付”
-- 先处理 `REL-01`，补更大样本或多平台 live proof，把当前 bounded-first 证据扩成更强的稳定性证明
+- 本轮 committed: `DEP-01`（external dependency decoupling）
+- 本轮 deferred: `QTE-01`（报价接入）与 `REL-01`（更大样本/多平台稳定性证明）
 
-建议在新 milestone 里只选其中一个作为 committed 主轴，避免把 dependency removal、data integration 和 broad live proof 混成一个模糊里程碑。
+这样可以先把运行时依赖边界收口，再在后续里程碑引入数据接入与大样本稳定性验证，降低回归面。
 
 ## Constraints
 
@@ -123,6 +140,7 @@
 | Phase 19 的 Apify reliability contract 继续保留在 `backend/app.py` 和 runner summary surface，而不是急着拆成新模块 | 现有 guard、job 状态和 partial salvage 已经深度耦合在 backend runtime；先收口 reusable contract，再考虑物理拆分更稳妥 | ✓ Good |
 | `scrape_failed` 只保留给“没有任何可用 scrape 输出”的情况 | 这样 operator 才能严格区分 true failure 和 partial salvage，不会把可恢复 run 误当成全损 | ✓ Good |
 | final wrapper 必须把 `completed_with_partial_scrape` 当作可交付状态 | 顶层 operator surface 不能再把已有导出的 partial delivery run 扁平成 opaque `failed` | ✓ Good |
+| `v1.3.0` 只锁定 `DEP-01` 作为 committed 主轴 | 先收口 external dependency 风险，再处理 `QTE-01` / `REL-01`，避免三类改动相互污染验证结果 | ✓ Good |
 
 ---
-*Last updated: 2026-03-29 after v1.2.0 milestone archive*
+*Last updated: 2026-03-29 after v1.3.0 milestone initialization*
