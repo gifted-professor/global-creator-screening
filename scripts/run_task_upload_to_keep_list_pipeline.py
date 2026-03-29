@@ -1,0 +1,1307 @@
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Sequence
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+
+def _load_runtime_dependencies():
+    from email_sync.brand_keyword_match import match_brand_keyword
+    from email_sync.config import Settings
+    from email_sync.creator_enrichment import enrich_creator_workbook
+    from email_sync.db import Database
+    from email_sync.llm_review import prepare_llm_review_candidates, run_and_apply_llm_review
+    from email_sync.date_windows import resolve_sync_sent_since
+    from email_sync.shared_email_resolution import resolve_shared_email_candidates, run_shared_email_final_review
+    from feishu_screening_bridge.feishu_api import DEFAULT_FEISHU_BASE_URL, FeishuOpenClient
+    from feishu_screening_bridge.local_env import get_preferred_value, load_local_env
+    from feishu_screening_bridge.task_upload_sync import (
+        download_task_upload_screening_assets,
+        sync_task_upload_mailboxes,
+    )
+
+    return {
+        "Settings": Settings,
+        "Database": Database,
+        "FeishuOpenClient": FeishuOpenClient,
+        "DEFAULT_FEISHU_BASE_URL": DEFAULT_FEISHU_BASE_URL,
+        "download_task_upload_screening_assets": download_task_upload_screening_assets,
+        "sync_task_upload_mailboxes": sync_task_upload_mailboxes,
+        "match_brand_keyword": match_brand_keyword,
+        "resolve_shared_email_candidates": resolve_shared_email_candidates,
+        "run_shared_email_final_review": run_shared_email_final_review,
+        "enrich_creator_workbook": enrich_creator_workbook,
+        "prepare_llm_review_candidates": prepare_llm_review_candidates,
+        "run_and_apply_llm_review": run_and_apply_llm_review,
+        "resolve_sync_sent_since": resolve_sync_sent_since,
+        "load_local_env": load_local_env,
+        "get_preferred_value": get_preferred_value,
+    }
+
+
+STOP_AFTER_CHOICES = (
+    "task-assets",
+    "mail-sync",
+    "enrichment",
+    "llm-candidates",
+    "brand-match",
+    "shared-resolution",
+    "keep-list",
+)
+MATCHING_STRATEGIES = ("legacy-enrichment", "brand-keyword-fast-path")
+CONTRACT_VERSION = "phase16.keep-list.v2"
+
+
+def default_output_root() -> Path:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return REPO_ROOT / "temp" / f"task_upload_to_keep_list_{timestamp}"
+
+
+def iso_now() -> str:
+    return datetime.now().astimezone().isoformat()
+
+
+def _safe_name(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "task"
+    cleaned = []
+    for ch in text:
+        if ch.isalnum() or ch in {"-", "_"}:
+            cleaned.append(ch)
+        else:
+            cleaned.append("_")
+    normalized = "".join(cleaned).strip("_")
+    return normalized or "task"
+
+
+def _parse_mapping_overrides(values: Sequence[str] | str | None) -> dict[str, str]:
+    if isinstance(values, str):
+        chunks = [values]
+    else:
+        chunks = list(values or [])
+    result: dict[str, str] = {}
+    for chunk in chunks:
+        for item in str(chunk or "").split(","):
+            normalized_item = item.strip()
+            if not normalized_item or ":" not in normalized_item:
+                continue
+            key, value = normalized_item.split(":", 1)
+            normalized_key = key.strip()
+            normalized_value = value.strip()
+            if normalized_key and normalized_value:
+                result[normalized_key] = normalized_value
+    return result
+
+
+def _json_clone(payload: Any) -> Any:
+    return json.loads(json.dumps(payload, ensure_ascii=False))
+
+
+def _write_summary(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _build_failure_payload(
+    *,
+    stage: str,
+    error_code: str,
+    message: str,
+    remediation: str,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "stage": stage,
+        "error_code": error_code,
+        "message": message,
+        "remediation": remediation,
+        "details": details or {},
+    }
+
+
+def _classify_failure(exc: Exception, *, failed_step: str) -> dict[str, Any]:
+    message = str(exc) or exc.__class__.__name__
+    stage = failed_step or "preflight"
+    error_code = "TASK_UPLOAD_KEEP_LIST_PIPELINE_FAILED"
+    remediation = "检查 summary 里的 resolved_inputs、preflight 和失败步骤产物后重试。"
+    if "缺少 FEISHU_APP_ID" in message:
+        error_code = "FEISHU_APP_ID_MISSING"
+        remediation = "在 `.env` 或 `--feishu-app-id` 里填写 FEISHU_APP_ID。"
+    elif "缺少 FEISHU_APP_SECRET" in message:
+        error_code = "FEISHU_APP_SECRET_MISSING"
+        remediation = "在 `.env` 或 `--feishu-app-secret` 里填写 FEISHU_APP_SECRET。"
+    elif "缺少 TASK_UPLOAD_URL" in message:
+        error_code = "TASK_UPLOAD_URL_MISSING"
+        remediation = "在 `.env` 或 `--task-upload-url` 里填写 TASK_UPLOAD_URL。"
+    elif "缺少 EMPLOYEE_INFO_URL" in message:
+        error_code = "EMPLOYEE_INFO_URL_MISSING"
+        remediation = "在 `.env` 或 `--employee-info-url` 里填写 EMPLOYEE_INFO_URL。"
+    elif "没有产生 mail sync 结果" in message:
+        error_code = "MAIL_SYNC_RESULT_MISSING"
+        remediation = "检查任务上传任务名、员工映射和 IMAP 文件夹解析是否命中。"
+    elif "mail sync failed" in message:
+        error_code = "MAIL_SYNC_FAILED"
+        remediation = "检查 `mail_sync` step 的 `mail_sync_error`、员工邮箱映射和 IMAP 配置。"
+    return _build_failure_payload(
+        stage=stage,
+        error_code=error_code,
+        message=message,
+        remediation=remediation,
+        details={
+            "exception_type": exc.__class__.__name__,
+            "failed_step": failed_step,
+        },
+    )
+
+
+def _load_existing_summary(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _step_artifacts_exist(step_payload: dict[str, Any], artifact_keys: tuple[str, ...]) -> bool:
+    artifacts = step_payload.get("artifacts")
+    if not isinstance(artifacts, dict):
+        return False
+    for key in artifact_keys:
+        value = str(artifacts.get(key) or "").strip()
+        if not value or not Path(value).exists():
+            return False
+    return True
+
+
+def _compact_refs(payload: dict[str, Any]) -> dict[str, Any]:
+    refs: dict[str, Any] = {}
+    for key, value in payload.items():
+        if value is None:
+            continue
+        if isinstance(value, str):
+            if not value.strip():
+                continue
+            refs[key] = value
+            continue
+        refs[key] = value
+    return refs
+
+
+def _resolve_cli_env_value(
+    cli_value: object,
+    env_values: dict[str, str],
+    env_key: str,
+    default: str = "",
+) -> tuple[str, str]:
+    candidate = str(cli_value or "").strip()
+    if candidate:
+        return candidate, "cli"
+    env_candidate = str(env_values.get(env_key, "") or "").strip()
+    if env_candidate:
+        return env_candidate, "env_file"
+    return str(default or "").strip(), "default"
+
+
+def _path_summary(path: Path | None, *, source: str, kind: str) -> dict[str, Any]:
+    if path is None:
+        return {
+            "kind": kind,
+            "path": "",
+            "exists": False,
+            "source": source,
+        }
+    expanded = path.expanduser()
+    return {
+        "kind": kind,
+        "path": str(expanded.resolve()),
+        "exists": expanded.exists(),
+        "source": source,
+    }
+
+
+def _resolve_execution_details(
+    *,
+    reused: bool,
+    existing_summary_accepted: bool,
+    rerun_reason: str,
+) -> tuple[str, str]:
+    if reused:
+        return "reused", "existing_summary_artifacts_present"
+    if existing_summary_accepted:
+        return "rerun", rerun_reason
+    return "produced", "fresh_run"
+
+
+def _annotate_step_payload(
+    payload: dict[str, Any],
+    *,
+    execution_mode: str,
+    execution_reason: str,
+    input_refs: dict[str, Any],
+    owned_artifact_keys: Sequence[str],
+    resume_point_key: str,
+    reuse_supported: bool,
+    stage_policy: str,
+) -> dict[str, Any]:
+    annotated = _json_clone(payload)
+    annotated["execution_mode"] = execution_mode
+    annotated["execution_reason"] = execution_reason
+    annotated["input_refs"] = _compact_refs(input_refs)
+    annotated["owned_artifact_keys"] = list(owned_artifact_keys)
+    annotated["resume_policy"] = {
+        "reuse_supported": bool(reuse_supported),
+        "stage_policy": stage_policy,
+        "resume_point_key": resume_point_key,
+    }
+    return annotated
+
+
+def _resolve_downstream_reuse(
+    *,
+    existing_summary_accepted: bool,
+    task_assets_reused: bool,
+    reset_state: bool,
+    mail_fetched_count: int,
+) -> tuple[bool, str]:
+    if not existing_summary_accepted:
+        return False, "no_accepted_existing_summary"
+    if not task_assets_reused:
+        return False, "task_assets_reran_or_changed"
+    if reset_state:
+        return False, "mail_sync_reset_state_requested"
+    if int(mail_fetched_count) > 0:
+        return False, "mail_sync_fetched_new_mail"
+    return True, "upstream_inputs_unchanged"
+
+
+def _build_feishu_client(
+    *,
+    env_file: str,
+    feishu_app_id: str,
+    feishu_app_secret: str,
+    feishu_base_url: str,
+    timeout_seconds: float,
+) -> tuple[Any, dict[str, str], dict[str, Any]]:
+    runtime = _load_runtime_dependencies()
+    load_local_env = runtime["load_local_env"]
+    get_preferred_value = runtime["get_preferred_value"]
+    FeishuOpenClient = runtime["FeishuOpenClient"]
+
+    env_values = load_local_env(env_file)
+    app_id, app_id_source = _resolve_cli_env_value(feishu_app_id, env_values, "FEISHU_APP_ID")
+    app_secret, app_secret_source = _resolve_cli_env_value(feishu_app_secret, env_values, "FEISHU_APP_SECRET")
+    if not app_id:
+        raise ValueError("缺少 FEISHU_APP_ID，请在本地 .env 或参数里填写。")
+    if not app_secret:
+        raise ValueError("缺少 FEISHU_APP_SECRET，请在本地 .env 或参数里填写。")
+
+    resolved_timeout_value, timeout_source = _resolve_cli_env_value(
+        timeout_seconds if timeout_seconds > 0 else "",
+        env_values,
+        "TIMEOUT_SECONDS",
+        "30",
+    )
+    resolved_timeout_seconds = float(resolved_timeout_value)
+    base_url, base_url_source = _resolve_cli_env_value(
+        feishu_base_url,
+        env_values,
+        "FEISHU_OPEN_BASE_URL",
+        runtime["DEFAULT_FEISHU_BASE_URL"],
+    )
+    client = FeishuOpenClient(
+        app_id=app_id,
+        app_secret=app_secret,
+        base_url=base_url,
+        timeout_seconds=resolved_timeout_seconds,
+    )
+    return client, env_values, {
+        "base_url": base_url,
+        "base_url_source": base_url_source,
+        "timeout_seconds": resolved_timeout_seconds,
+        "timeout_seconds_source": timeout_source,
+        "feishu_app_id_source": app_id_source,
+        "feishu_app_secret_source": app_secret_source,
+    }
+
+
+def run_task_upload_to_keep_list_pipeline(
+    *,
+    task_name: str,
+    env_file: str = ".env",
+    task_upload_url: str = "",
+    employee_info_url: str = "",
+    output_root: Path | None = None,
+    summary_json: Path | None = None,
+    task_download_dir: str | Path = "",
+    mail_data_dir: str | Path = "",
+    feishu_app_id: str = "",
+    feishu_app_secret: str = "",
+    feishu_base_url: str = "",
+    timeout_seconds: float = 0.0,
+    folder_prefixes: list[str] | None = None,
+    owner_email_overrides: dict[str, str] | None = None,
+    folder_overrides: dict[str, str] | None = None,
+    imap_host: str = "",
+    imap_port: int = 0,
+    mail_limit: int = 0,
+    mail_workers: int = 1,
+    sent_since: str = "",
+    reset_state: bool = False,
+    stop_after: str = "",
+    reuse_existing: bool = True,
+    matching_strategy: str = "legacy-enrichment",
+    brand_keyword: str = "",
+    brand_match_include_from: bool = False,
+    base_url: str = "",
+    api_key: str = "",
+    model: str = "",
+    wire_api: str = "",
+) -> dict[str, Any]:
+    runtime = _load_runtime_dependencies()
+    get_preferred_value = runtime["get_preferred_value"]
+    resolve_sync_sent_since = runtime["resolve_sync_sent_since"]
+    download_task_upload_screening_assets = runtime["download_task_upload_screening_assets"]
+    sync_task_upload_mailboxes = runtime["sync_task_upload_mailboxes"]
+    Database = runtime["Database"]
+    match_brand_keyword = runtime["match_brand_keyword"]
+    resolve_shared_email_candidates = runtime["resolve_shared_email_candidates"]
+    run_shared_email_final_review = runtime["run_shared_email_final_review"]
+    enrich_creator_workbook = runtime["enrich_creator_workbook"]
+    prepare_llm_review_candidates = runtime["prepare_llm_review_candidates"]
+    run_and_apply_llm_review = runtime["run_and_apply_llm_review"]
+
+    normalized_task_name = str(task_name or "").strip()
+    if not normalized_task_name:
+        raise ValueError("缺少 task_name。")
+    normalized_matching_strategy = str(matching_strategy or "").strip().lower() or MATCHING_STRATEGIES[0]
+    if normalized_matching_strategy not in MATCHING_STRATEGIES:
+        raise ValueError(f"不支持的 matching_strategy: {matching_strategy}")
+    resolved_brand_keyword = str(brand_keyword or "").strip() or normalized_task_name
+    normalized_stop_after = str(stop_after or "").strip().lower()
+    if normalized_stop_after and normalized_stop_after not in STOP_AFTER_CHOICES:
+        raise ValueError(f"不支持的 stop_after: {stop_after}")
+    resolved_sent_since = resolve_sync_sent_since(sent_since or None).isoformat()
+
+    resolved_output_root = (output_root or default_output_root()).expanduser().resolve()
+    resolved_output_root.mkdir(parents=True, exist_ok=True)
+    run_summary_path = (
+        summary_json.expanduser().resolve() if summary_json else resolved_output_root / "summary.json"
+    )
+    summary_path_exists = run_summary_path.exists()
+    existing_summary = _load_existing_summary(run_summary_path) if reuse_existing else None
+    resume_reset_reason = ""
+    if reuse_existing:
+        if existing_summary and str(existing_summary.get("matching_strategy") or MATCHING_STRATEGIES[0]).strip().lower() != normalized_matching_strategy:
+            existing_summary = None
+            resume_reset_reason = "matching_strategy_changed"
+        elif existing_summary:
+            resume_reset_reason = ""
+        elif summary_path_exists:
+            resume_reset_reason = "existing_summary_unreadable"
+        else:
+            resume_reset_reason = "no_existing_summary"
+    else:
+        resume_reset_reason = "reuse_disabled"
+    existing_summary_accepted = existing_summary is not None
+
+    task_slug = _safe_name(normalized_task_name)
+    downloads_dir = (
+        Path(task_download_dir).expanduser().resolve()
+        if str(task_download_dir or "").strip()
+        else (resolved_output_root / "downloads").resolve()
+    )
+    mail_root = (
+        Path(mail_data_dir).expanduser().resolve()
+        if str(mail_data_dir or "").strip()
+        else (resolved_output_root / "mail_sync").resolve()
+    )
+    exports_dir = (resolved_output_root / "exports").resolve()
+    exports_dir.mkdir(parents=True, exist_ok=True)
+    enrichment_prefix = exports_dir / f"{task_slug}_匹配结果"
+    llm_prefix = exports_dir / f"{task_slug}_匹配结果_高置信_按我们去重"
+    brand_match_prefix = exports_dir / f"{task_slug}_brand_keyword_match"
+    shared_resolution_prefix = exports_dir / f"{task_slug}_shared_email_resolution"
+    step_order = (
+        ["task_assets", "mail_sync", "brand_match", "shared_resolution", "final_review"]
+        if normalized_matching_strategy == "brand-keyword-fast-path"
+        else ["task_assets", "mail_sync", "enrichment", "llm_candidates", "llm_review"]
+    )
+
+    summary: dict[str, Any] = {
+        "started_at": iso_now(),
+        "finished_at": "",
+        "status": "running",
+        "task_name": normalized_task_name,
+        "matching_strategy": normalized_matching_strategy,
+        "brand_keyword": resolved_brand_keyword,
+        "env_file": str(env_file),
+        "output_root": str(resolved_output_root),
+        "summary_json": str(run_summary_path),
+        "stop_after": normalized_stop_after,
+        "reuse_existing": bool(reuse_existing),
+        "inputs": {
+            "task_upload_url": str(task_upload_url or "").strip(),
+            "employee_info_url": str(employee_info_url or "").strip(),
+            "task_download_dir": str(task_download_dir or "").strip(),
+            "mail_data_dir": str(mail_data_dir or "").strip(),
+            "mail_limit": int(max(0, int(mail_limit))),
+            "mail_workers": int(max(1, int(mail_workers))),
+            "sent_since": str(sent_since or "").strip(),
+            "reset_state": bool(reset_state),
+            "matching_strategy": normalized_matching_strategy,
+            "brand_keyword": resolved_brand_keyword,
+            "brand_match_include_from": bool(brand_match_include_from),
+        },
+        "resolved_paths": {
+            "downloads_dir": str(downloads_dir),
+            "mail_root": str(mail_root),
+            "exports_dir": str(exports_dir),
+            "enrichment_prefix": str(enrichment_prefix),
+            "llm_review_prefix": str(llm_prefix),
+            "brand_match_prefix": str(brand_match_prefix),
+            "shared_resolution_prefix": str(shared_resolution_prefix),
+        },
+        "resolved_inputs": {
+            "env_file": {
+                "path": str(Path(env_file).expanduser().resolve()),
+                "exists": Path(env_file).expanduser().exists(),
+                "source": "cli_or_default",
+            },
+            "paths": {
+                "downloads_dir": _path_summary(downloads_dir, source=("cli" if str(task_download_dir or "").strip() else "output_root_default"), kind="dir"),
+                "mail_root": _path_summary(mail_root, source=("cli" if str(mail_data_dir or "").strip() else "output_root_default"), kind="dir"),
+                "exports_dir": _path_summary(exports_dir, source="output_root", kind="dir"),
+            },
+            "mail_sync": {
+                "sent_since": resolved_sent_since,
+                "sent_since_source": "cli" if str(sent_since or "").strip() else "default_recent_3_calendar_months",
+                "mail_limit": int(max(0, int(mail_limit))),
+                "mail_workers": int(max(1, int(mail_workers))),
+                "folder_prefixes": list(folder_prefixes or ["其他文件夹"]),
+                "owner_email_overrides": dict(owner_email_overrides or {}),
+                "folder_overrides": dict(folder_overrides or {}),
+            },
+        },
+        "preflight": {
+            "canonical_boundary": "keep-list",
+            "downloads_dir_ready": True,
+            "mail_root_ready": True,
+            "exports_dir_ready": True,
+            "ready": False,
+            "errors": [],
+        },
+        "contract": {
+            "contract_version": CONTRACT_VERSION,
+            "scope": "task-upload-to-keep-list",
+            "step_order": step_order,
+            "canonical_boundary": "keep-list",
+            "canonical_resume_point": "keep_list",
+            "downstream_runner": "scripts/run_keep_list_screening_pipeline.py",
+        },
+        "resume_context": {
+            "reuse_requested": bool(reuse_existing),
+            "existing_summary_found": bool(summary_path_exists),
+            "existing_summary_accepted": bool(existing_summary_accepted),
+            "reset_reason": resume_reset_reason,
+            "mail_sync_policy": "always_rerun_incremental",
+            "downstream_reuse_allowed": False,
+            "downstream_reuse_reason": "pending_mail_sync",
+        },
+        "steps": {},
+        "artifacts": {},
+        "resume_points": {},
+        "canonical_artifacts": {},
+        "downstream_handoff": {},
+    }
+    _write_summary(run_summary_path, summary)
+
+    def finalize(status: str, **extra: Any) -> dict[str, Any]:
+        summary["status"] = status
+        summary["finished_at"] = iso_now()
+        summary.update(extra)
+        _write_summary(run_summary_path, summary)
+        return summary
+
+    def mark_stop(step_name: str) -> dict[str, Any]:
+        return finalize(
+            f"stopped_after_{step_name}",
+            stopped_after=step_name,
+        )
+
+    try:
+        client, env_values, feishu_resolution = _build_feishu_client(
+            env_file=env_file,
+            feishu_app_id=feishu_app_id,
+            feishu_app_secret=feishu_app_secret,
+            feishu_base_url=feishu_base_url,
+            timeout_seconds=timeout_seconds,
+        )
+        resolved_task_upload_url, task_upload_url_source = _resolve_cli_env_value(
+            task_upload_url,
+            env_values,
+            "TASK_UPLOAD_URL",
+        )
+        if not resolved_task_upload_url:
+            resolved_task_upload_url, task_upload_url_source = _resolve_cli_env_value(
+                task_upload_url,
+                env_values,
+                "FEISHU_SOURCE_URL",
+            )
+        if not resolved_task_upload_url:
+            raise ValueError("缺少 TASK_UPLOAD_URL，请在本地 .env 或参数里填写。")
+        resolved_employee_info_url, employee_info_url_source = _resolve_cli_env_value(
+            employee_info_url,
+            env_values,
+            "EMPLOYEE_INFO_URL",
+        )
+        if not resolved_employee_info_url:
+            resolved_employee_info_url, employee_info_url_source = _resolve_cli_env_value(
+                employee_info_url,
+                env_values,
+                "FEISHU_SOURCE_URL",
+            )
+        if not resolved_employee_info_url:
+            raise ValueError("缺少 EMPLOYEE_INFO_URL，请在本地 .env 或参数里填写。")
+        resolved_imap_host, imap_host_source = _resolve_cli_env_value(
+            imap_host,
+            env_values,
+            "IMAP_HOST",
+            "imap.qq.com",
+        )
+        resolved_imap_port_raw, imap_port_source = _resolve_cli_env_value(
+            imap_port if int(imap_port) > 0 else "",
+            env_values,
+            "IMAP_PORT",
+            "993",
+        )
+        resolved_imap_port = int(resolved_imap_port_raw or "993")
+
+        downloads_dir.mkdir(parents=True, exist_ok=True)
+        mail_root.mkdir(parents=True, exist_ok=True)
+        summary["resolved_urls"] = {
+            "task_upload_url": resolved_task_upload_url,
+            "employee_info_url": resolved_employee_info_url,
+            "feishu_base_url": feishu_resolution["base_url"],
+        }
+        summary["resolved_inputs"]["feishu"] = {
+            "task_upload_url": resolved_task_upload_url,
+            "task_upload_url_source": task_upload_url_source,
+            "employee_info_url": resolved_employee_info_url,
+            "employee_info_url_source": employee_info_url_source,
+            "feishu_base_url": feishu_resolution["base_url"],
+            "feishu_base_url_source": feishu_resolution["base_url_source"],
+            "timeout_seconds": feishu_resolution["timeout_seconds"],
+            "timeout_seconds_source": feishu_resolution["timeout_seconds_source"],
+            "feishu_app_id": {
+                "present": True,
+                "source": feishu_resolution["feishu_app_id_source"],
+            },
+            "feishu_app_secret": {
+                "present": True,
+                "source": feishu_resolution["feishu_app_secret_source"],
+            },
+        }
+        summary["resolved_inputs"]["mail_sync"].update({
+            "imap_host": resolved_imap_host,
+            "imap_host_source": imap_host_source,
+            "imap_port": resolved_imap_port,
+            "imap_port_source": imap_port_source,
+        })
+        summary["preflight"].update({
+            "ready": True,
+            "task_upload_url_present": True,
+            "employee_info_url_present": True,
+            "imap_ready": True,
+            "errors": [],
+        })
+
+        task_assets_step = existing_summary.get("steps", {}).get("task_assets", {}) if existing_summary else {}
+        task_assets_reused = bool(
+            reuse_existing
+            and existing_summary_accepted
+            and _step_artifacts_exist(task_assets_step, ("template_workbook", "sending_list_workbook"))
+        )
+        if task_assets_reused:
+            task_assets = _json_clone(task_assets_step)
+            task_assets["status"] = "reused"
+            task_assets["reused"] = True
+        else:
+            task_assets_result = download_task_upload_screening_assets(
+                client=client,
+                task_upload_url=resolved_task_upload_url,
+                task_name=normalized_task_name,
+                download_dir=downloads_dir,
+                download_template=True,
+                download_sending_list=True,
+            )
+            task_assets = {
+                "status": "completed",
+                "reused": False,
+                "record_id": task_assets_result.get("recordId", ""),
+                "linked_bitable_url": task_assets_result.get("linkedBitableUrl", ""),
+                "artifacts": {
+                    "template_workbook": str(task_assets_result.get("templateDownloadedPath") or ""),
+                    "sending_list_workbook": str(task_assets_result.get("sendingListDownloadedPath") or ""),
+                },
+                "raw": task_assets_result,
+            }
+        task_assets_mode, task_assets_reason = _resolve_execution_details(
+            reused=task_assets_reused,
+            existing_summary_accepted=existing_summary_accepted,
+            rerun_reason="task_assets_missing_or_invalid_for_resume",
+        )
+        task_assets = _annotate_step_payload(
+            task_assets,
+            execution_mode=task_assets_mode,
+            execution_reason=task_assets_reason,
+            input_refs={
+                "task_upload_url": resolved_task_upload_url,
+                "download_dir": str(downloads_dir),
+            },
+            owned_artifact_keys=("template_workbook", "sending_list_workbook"),
+            resume_point_key="task_assets",
+            reuse_supported=True,
+            stage_policy="reuse_if_artifacts_exist",
+        )
+        summary["steps"]["task_assets"] = task_assets
+        summary["artifacts"]["template_workbook"] = task_assets["artifacts"]["template_workbook"]
+        summary["artifacts"]["sending_list_workbook"] = task_assets["artifacts"]["sending_list_workbook"]
+        summary["resume_points"]["task_assets"] = {
+            "template_workbook": task_assets["artifacts"]["template_workbook"],
+            "sending_list_workbook": task_assets["artifacts"]["sending_list_workbook"],
+        }
+        summary["canonical_artifacts"]["task_assets"] = _json_clone(summary["resume_points"]["task_assets"])
+        _write_summary(run_summary_path, summary)
+        if normalized_stop_after == "task-assets":
+            return mark_stop("task-assets")
+
+        mail_sync_result = sync_task_upload_mailboxes(
+            client=client,
+            task_upload_url=resolved_task_upload_url,
+            employee_info_url=resolved_employee_info_url,
+            download_dir=downloads_dir,
+            mail_data_dir=mail_root,
+            task_names=[normalized_task_name],
+            owner_email_overrides=owner_email_overrides or {},
+            folder_overrides=folder_overrides or {},
+            folder_prefixes=folder_prefixes or ["其他文件夹"],
+            limit=int(mail_limit) if int(mail_limit) > 0 else None,
+            workers=max(1, int(mail_workers)),
+            reset_state=bool(reset_state),
+            sent_since=resolved_sent_since,
+            imap_host=resolved_imap_host,
+            imap_port=resolved_imap_port,
+        )
+        mail_item = next(iter(mail_sync_result.get("items") or []), {})
+        if not mail_item:
+            raise RuntimeError(f"任务 {normalized_task_name!r} 没有产生 mail sync 结果。")
+        downstream_reuse_allowed, downstream_reuse_reason = _resolve_downstream_reuse(
+            existing_summary_accepted=existing_summary_accepted,
+            task_assets_reused=task_assets_reused,
+            reset_state=bool(reset_state),
+            mail_fetched_count=int(mail_item.get("mailFetchedCount") or 0),
+        )
+        mail_sync_step = {
+            "status": "completed" if mail_item.get("mailSyncOk") else "failed",
+            "reused": False,
+            "selected_count": mail_sync_result.get("selectedCount", 0),
+            "synced_count": mail_sync_result.get("syncedCount", 0),
+            "failed_count": mail_sync_result.get("failedCount", 0),
+            "task": {
+                "task_name": mail_item.get("taskName", ""),
+                "employee_name": mail_item.get("employeeName", ""),
+                "resolved_folder": mail_item.get("resolvedFolder", ""),
+                "mail_fetched_count": mail_item.get("mailFetchedCount", 0),
+                "mail_sync_error": mail_item.get("mailSyncError", ""),
+            },
+            "artifacts": {
+                "mail_db_path": str(mail_item.get("mailDbPath") or ""),
+                "mail_raw_dir": str(mail_item.get("mailRawDir") or ""),
+                "mail_data_dir": str(mail_item.get("mailDataDir") or ""),
+            },
+            "raw": mail_sync_result,
+        }
+        mail_sync_mode, mail_sync_reason = _resolve_execution_details(
+            reused=False,
+            existing_summary_accepted=existing_summary_accepted,
+            rerun_reason="mail_sync_is_incremental_and_owned_by_current_run",
+        )
+        mail_sync_step = _annotate_step_payload(
+            mail_sync_step,
+            execution_mode=mail_sync_mode,
+            execution_reason=mail_sync_reason,
+            input_refs={
+                "sending_list_workbook": summary["artifacts"]["sending_list_workbook"],
+                "mail_data_dir": str(mail_root),
+                "sent_since": resolve_sync_sent_since(sent_since or None).isoformat(),
+                "reset_state": bool(reset_state),
+            },
+            owned_artifact_keys=("mail_db_path", "mail_raw_dir", "mail_data_dir"),
+            resume_point_key="mail_sync",
+            reuse_supported=False,
+            stage_policy="always_rerun_incremental",
+        )
+        if not mail_item.get("mailSyncOk"):
+            raise RuntimeError(str(mail_item.get("mailSyncError") or "mail sync failed"))
+        summary["steps"]["mail_sync"] = mail_sync_step
+        summary["artifacts"]["mail_db_path"] = mail_sync_step["artifacts"]["mail_db_path"]
+        summary["resume_points"]["mail_sync"] = {
+            "mail_db_path": mail_sync_step["artifacts"]["mail_db_path"],
+            "sending_list_workbook": summary["artifacts"]["sending_list_workbook"],
+        }
+        summary["canonical_artifacts"]["mail_sync"] = _json_clone(summary["resume_points"]["mail_sync"])
+        summary["resume_context"]["downstream_reuse_allowed"] = bool(downstream_reuse_allowed)
+        summary["resume_context"]["downstream_reuse_reason"] = downstream_reuse_reason
+        _write_summary(run_summary_path, summary)
+        if normalized_stop_after == "mail-sync":
+            return mark_stop("mail-sync")
+
+        if normalized_matching_strategy == "brand-keyword-fast-path":
+            brand_match_existing = existing_summary.get("steps", {}).get("brand_match", {}) if existing_summary else {}
+            brand_match_reused = bool(
+                reuse_existing
+                and downstream_reuse_allowed
+                and _step_artifacts_exist(
+                    brand_match_existing,
+                    ("all_xlsx", "deduped_xlsx", "unique_xlsx", "shared_xlsx"),
+                )
+            )
+            if brand_match_reused:
+                brand_match_step = _json_clone(brand_match_existing)
+                brand_match_step["status"] = "reused"
+                brand_match_step["reused"] = True
+            else:
+                db = Database(Path(mail_sync_step["artifacts"]["mail_db_path"]))
+                try:
+                    brand_match_result = match_brand_keyword(
+                        db=db,
+                        input_path=Path(summary["artifacts"]["sending_list_workbook"]),
+                        output_prefix=brand_match_prefix,
+                        keyword=resolved_brand_keyword,
+                        include_from=bool(brand_match_include_from),
+                    )
+                finally:
+                    db.close()
+                brand_match_step = {
+                    "status": "completed",
+                    "reused": False,
+                    "stats": {
+                        "source_kind": brand_match_result.get("source_kind", ""),
+                        "message_hit_count": brand_match_result.get("message_hit_count", 0),
+                        "matched_email_count": brand_match_result.get("matched_email_count", 0),
+                        "email_direct_match_row_count": brand_match_result.get("email_direct_match_row_count", 0),
+                        "profile_deduped_row_count": brand_match_result.get("profile_deduped_row_count", 0),
+                        "unique_email_row_count": brand_match_result.get("unique_email_row_count", 0),
+                        "shared_email_row_count": brand_match_result.get("shared_email_row_count", 0),
+                        "shared_email_group_count": brand_match_result.get("shared_email_group_count", 0),
+                    },
+                    "artifacts": {
+                        "all_xlsx": str(brand_match_result.get("xlsx_path") or ""),
+                        "deduped_xlsx": str(brand_match_result.get("deduped_xlsx_path") or ""),
+                        "unique_xlsx": str(brand_match_result.get("unique_xlsx_path") or ""),
+                        "shared_xlsx": str(brand_match_result.get("shared_xlsx_path") or ""),
+                    },
+                }
+            brand_match_mode, brand_match_reason = _resolve_execution_details(
+                reused=brand_match_reused,
+                existing_summary_accepted=existing_summary_accepted,
+                rerun_reason="brand_match_inputs_changed_or_resume_artifacts_missing",
+            )
+            brand_match_step = _annotate_step_payload(
+                brand_match_step,
+                execution_mode=brand_match_mode,
+                execution_reason=brand_match_reason,
+                input_refs={
+                    "mail_db_path": mail_sync_step["artifacts"]["mail_db_path"],
+                    "sending_list_workbook": summary["artifacts"]["sending_list_workbook"],
+                },
+                owned_artifact_keys=("all_xlsx", "deduped_xlsx", "unique_xlsx", "shared_xlsx"),
+                resume_point_key="brand_match",
+                reuse_supported=True,
+                stage_policy="reuse_if_mail_db_and_sending_list_unchanged",
+            )
+            summary["steps"]["brand_match"] = brand_match_step
+            summary["artifacts"]["brand_match_deduped_xlsx"] = brand_match_step["artifacts"]["deduped_xlsx"]
+            summary["artifacts"]["brand_match_unique_xlsx"] = brand_match_step["artifacts"]["unique_xlsx"]
+            summary["artifacts"]["brand_match_shared_xlsx"] = brand_match_step["artifacts"]["shared_xlsx"]
+            summary["resume_points"]["brand_match"] = {
+                "deduped_workbook": brand_match_step["artifacts"]["deduped_xlsx"],
+                "unique_email_workbook": brand_match_step["artifacts"]["unique_xlsx"],
+                "shared_email_workbook": brand_match_step["artifacts"]["shared_xlsx"],
+            }
+            _write_summary(run_summary_path, summary)
+            if normalized_stop_after == "brand-match":
+                return mark_stop("brand-match")
+
+            shared_resolution_existing = existing_summary.get("steps", {}).get("shared_resolution", {}) if existing_summary else {}
+            shared_resolution_reused = bool(
+                reuse_existing
+                and downstream_reuse_allowed
+                and brand_match_reused
+                and _step_artifacts_exist(
+                    shared_resolution_existing,
+                    ("resolved_xlsx", "unresolved_xlsx", "llm_candidates_jsonl"),
+                )
+            )
+            if shared_resolution_reused:
+                shared_resolution_step = _json_clone(shared_resolution_existing)
+                shared_resolution_step["status"] = "reused"
+                shared_resolution_step["reused"] = True
+            else:
+                db = Database(Path(mail_sync_step["artifacts"]["mail_db_path"]))
+                try:
+                    shared_resolution_result = resolve_shared_email_candidates(
+                        db=db,
+                        input_path=Path(brand_match_step["artifacts"]["shared_xlsx"]),
+                        output_prefix=shared_resolution_prefix,
+                    )
+                finally:
+                    db.close()
+                shared_resolution_step = {
+                    "status": "completed",
+                    "reused": False,
+                    "stats": {
+                        "resolved_group_count": shared_resolution_result.get("resolved_group_count", 0),
+                        "resolved_row_count": shared_resolution_result.get("resolved_row_count", 0),
+                        "unresolved_group_count": shared_resolution_result.get("unresolved_group_count", 0),
+                        "unresolved_row_count": shared_resolution_result.get("unresolved_row_count", 0),
+                        "llm_candidate_group_count": shared_resolution_result.get("llm_candidate_group_count", 0),
+                    },
+                    "artifacts": {
+                        "resolved_xlsx": str(shared_resolution_result.get("resolved_xlsx_path") or ""),
+                        "unresolved_xlsx": str(shared_resolution_result.get("unresolved_xlsx_path") or ""),
+                        "llm_candidates_jsonl": str(shared_resolution_result.get("llm_candidates_jsonl_path") or ""),
+                    },
+                }
+            shared_resolution_mode, shared_resolution_reason = _resolve_execution_details(
+                reused=shared_resolution_reused,
+                existing_summary_accepted=existing_summary_accepted,
+                rerun_reason="shared_resolution_inputs_changed_or_resume_artifacts_missing",
+            )
+            shared_resolution_step = _annotate_step_payload(
+                shared_resolution_step,
+                execution_mode=shared_resolution_mode,
+                execution_reason=shared_resolution_reason,
+                input_refs={
+                    "mail_db_path": mail_sync_step["artifacts"]["mail_db_path"],
+                    "shared_email_workbook": brand_match_step["artifacts"]["shared_xlsx"],
+                },
+                owned_artifact_keys=("resolved_xlsx", "unresolved_xlsx", "llm_candidates_jsonl"),
+                resume_point_key="shared_resolution",
+                reuse_supported=True,
+                stage_policy="reuse_only_if_brand_match_reused",
+            )
+            summary["steps"]["shared_resolution"] = shared_resolution_step
+            summary["artifacts"]["content_resolved_xlsx"] = shared_resolution_step["artifacts"]["resolved_xlsx"]
+            summary["artifacts"]["content_unresolved_xlsx"] = shared_resolution_step["artifacts"]["unresolved_xlsx"]
+            summary["resume_points"]["shared_resolution"] = {
+                "resolved_workbook": shared_resolution_step["artifacts"]["resolved_xlsx"],
+                "unresolved_workbook": shared_resolution_step["artifacts"]["unresolved_xlsx"],
+                "llm_candidates_jsonl": shared_resolution_step["artifacts"]["llm_candidates_jsonl"],
+            }
+            _write_summary(run_summary_path, summary)
+            if normalized_stop_after == "shared-resolution":
+                return mark_stop("shared-resolution")
+
+            final_review_existing = existing_summary.get("steps", {}).get("final_review", {}) if existing_summary else {}
+            final_review_reused = bool(
+                reuse_existing
+                and downstream_reuse_allowed
+                and brand_match_reused
+                and shared_resolution_reused
+                and _step_artifacts_exist(
+                    final_review_existing,
+                    ("llm_review_jsonl", "manual_tail_xlsx", "keep_xlsx"),
+                )
+            )
+            if final_review_reused:
+                final_review_step = _json_clone(final_review_existing)
+                final_review_step["status"] = "reused"
+                final_review_step["reused"] = True
+            else:
+                final_review_result = run_shared_email_final_review(
+                    input_prefix=shared_resolution_prefix,
+                    env_path=env_file,
+                    auto_keep_paths=[
+                        Path(brand_match_step["artifacts"]["unique_xlsx"]),
+                        Path(shared_resolution_step["artifacts"]["resolved_xlsx"]),
+                    ],
+                    base_url=str(base_url or "").strip() or None,
+                    api_key=str(api_key or "").strip() or None,
+                    model=str(model or "").strip() or None,
+                    wire_api=str(wire_api or "").strip() or None,
+                )
+                final_review_step = {
+                    "status": "completed",
+                    "reused": False,
+                    "stats": {
+                        "review_group_count": final_review_result.get("review_group_count", 0),
+                        "llm_resolved_row_count": final_review_result.get("llm_resolved_row_count", 0),
+                        "manual_row_count": final_review_result.get("manual_row_count", 0),
+                        "final_keep_row_count": final_review_result.get("final_keep_row_count", 0),
+                        "retryable_failure_count": final_review_result.get("retryable_failure_count", 0),
+                    },
+                    "selected_provider": str(final_review_result.get("selected_provider") or ""),
+                    "selected_model": str(final_review_result.get("selected_model") or ""),
+                    "selected_wire_api": str(final_review_result.get("selected_wire_api") or ""),
+                    "provider_attempts": list(final_review_result.get("provider_attempts") or []),
+                    "absorbed_failures": list(final_review_result.get("absorbed_failures") or []),
+                    "artifacts": {
+                        "llm_review_jsonl": str(final_review_result.get("llm_review_jsonl_path") or ""),
+                        "llm_resolved_xlsx": str(final_review_result.get("llm_resolved_xlsx_path") or ""),
+                        "manual_tail_xlsx": str(final_review_result.get("manual_tail_xlsx_path") or ""),
+                        "keep_xlsx": str(final_review_result.get("final_keep_xlsx_path") or ""),
+                    },
+                }
+            final_review_mode, final_review_reason = _resolve_execution_details(
+                reused=final_review_reused,
+                existing_summary_accepted=existing_summary_accepted,
+                rerun_reason="final_review_inputs_changed_or_resume_artifacts_missing",
+            )
+            final_review_step = _annotate_step_payload(
+                final_review_step,
+                execution_mode=final_review_mode,
+                execution_reason=final_review_reason,
+                input_refs={
+                    "unique_email_workbook": brand_match_step["artifacts"]["unique_xlsx"],
+                    "resolved_workbook": shared_resolution_step["artifacts"]["resolved_xlsx"],
+                    "llm_candidates_jsonl": shared_resolution_step["artifacts"]["llm_candidates_jsonl"],
+                },
+                owned_artifact_keys=("llm_review_jsonl", "llm_resolved_xlsx", "manual_tail_xlsx", "keep_xlsx"),
+                resume_point_key="keep_list",
+                reuse_supported=True,
+                stage_policy="reuse_only_if_shared_resolution_reused",
+            )
+            summary["steps"]["final_review"] = final_review_step
+            summary["artifacts"]["manual_tail_xlsx"] = final_review_step["artifacts"]["manual_tail_xlsx"]
+            summary["artifacts"]["keep_workbook"] = final_review_step["artifacts"]["keep_xlsx"]
+        else:
+            enrichment_existing = existing_summary.get("steps", {}).get("enrichment", {}) if existing_summary else {}
+            enrichment_reused = bool(
+                reuse_existing
+                and downstream_reuse_allowed
+                and _step_artifacts_exist(
+                    enrichment_existing,
+                    ("all_xlsx", "high_xlsx"),
+                )
+            )
+            if enrichment_reused:
+                enrichment_step = _json_clone(enrichment_existing)
+                enrichment_step["status"] = "reused"
+                enrichment_step["reused"] = True
+            else:
+                db = Database(Path(mail_sync_step["artifacts"]["mail_db_path"]))
+                try:
+                    enrichment_result = enrich_creator_workbook(
+                        db=db,
+                        input_path=Path(summary["artifacts"]["sending_list_workbook"]),
+                        output_prefix=enrichment_prefix,
+                    )
+                finally:
+                    db.close()
+                enrichment_step = {
+                    "status": "completed",
+                    "reused": False,
+                    "stats": {
+                        "source_kind": enrichment_result.get("source_kind", ""),
+                        "rows": enrichment_result.get("rows", 0),
+                        "matched_rows": enrichment_result.get("matched_rows", 0),
+                        "high_confidence_rows": enrichment_result.get("high_confidence_rows", 0),
+                    },
+                    "artifacts": {
+                        "all_csv": str(enrichment_result.get("csv_path") or ""),
+                        "all_xlsx": str(enrichment_result.get("xlsx_path") or ""),
+                        "high_csv": str(enrichment_result.get("high_csv_path") or ""),
+                        "high_xlsx": str(enrichment_result.get("high_xlsx_path") or ""),
+                    },
+                }
+            enrichment_mode, enrichment_reason = _resolve_execution_details(
+                reused=enrichment_reused,
+                existing_summary_accepted=existing_summary_accepted,
+                rerun_reason="enrichment_inputs_changed_or_resume_artifacts_missing",
+            )
+            enrichment_step = _annotate_step_payload(
+                enrichment_step,
+                execution_mode=enrichment_mode,
+                execution_reason=enrichment_reason,
+                input_refs={
+                    "mail_db_path": mail_sync_step["artifacts"]["mail_db_path"],
+                    "sending_list_workbook": summary["artifacts"]["sending_list_workbook"],
+                },
+                owned_artifact_keys=("all_csv", "all_xlsx", "high_csv", "high_xlsx"),
+                resume_point_key="enrichment",
+                reuse_supported=True,
+                stage_policy="reuse_if_mail_db_and_sending_list_unchanged",
+            )
+            summary["steps"]["enrichment"] = enrichment_step
+            summary["artifacts"]["enrichment_high_xlsx"] = enrichment_step["artifacts"]["high_xlsx"]
+            summary["resume_points"]["enrichment"] = {
+                "high_confidence_workbook": enrichment_step["artifacts"]["high_xlsx"],
+            }
+            _write_summary(run_summary_path, summary)
+            if normalized_stop_after == "enrichment":
+                return mark_stop("enrichment")
+
+            llm_candidates_existing = existing_summary.get("steps", {}).get("llm_candidates", {}) if existing_summary else {}
+            llm_candidates_reused = bool(
+                reuse_existing
+                and downstream_reuse_allowed
+                and enrichment_reused
+                and _step_artifacts_exist(
+                    llm_candidates_existing,
+                    ("prep_xlsx", "deduped_xlsx", "llm_candidates_jsonl"),
+                )
+            )
+            if llm_candidates_reused:
+                llm_candidates_step = _json_clone(llm_candidates_existing)
+                llm_candidates_step["status"] = "reused"
+                llm_candidates_step["reused"] = True
+            else:
+                db = Database(Path(mail_sync_step["artifacts"]["mail_db_path"]))
+                try:
+                    llm_candidates_result = prepare_llm_review_candidates(
+                        db=db,
+                        input_path=Path(summary["artifacts"]["enrichment_high_xlsx"]),
+                        output_prefix=llm_prefix,
+                    )
+                finally:
+                    db.close()
+                llm_candidates_step = {
+                    "status": "completed",
+                    "reused": False,
+                    "stats": {
+                        "source_row_count": llm_candidates_result.get("source_row_count", 0),
+                        "prep_row_count": llm_candidates_result.get("prep_row_count", 0),
+                        "deduped_row_count": llm_candidates_result.get("deduped_row_count", 0),
+                        "llm_candidate_group_count": llm_candidates_result.get("llm_candidate_group_count", 0),
+                    },
+                    "artifacts": {
+                        "prep_xlsx": str(llm_candidates_result.get("prep_xlsx_path") or ""),
+                        "deduped_xlsx": str(llm_candidates_result.get("deduped_xlsx_path") or ""),
+                        "llm_candidates_jsonl": str(llm_candidates_result.get("llm_candidates_jsonl_path") or ""),
+                    },
+                }
+            llm_candidates_mode, llm_candidates_reason = _resolve_execution_details(
+                reused=llm_candidates_reused,
+                existing_summary_accepted=existing_summary_accepted,
+                rerun_reason="llm_candidates_inputs_changed_or_resume_artifacts_missing",
+            )
+            llm_candidates_step = _annotate_step_payload(
+                llm_candidates_step,
+                execution_mode=llm_candidates_mode,
+                execution_reason=llm_candidates_reason,
+                input_refs={
+                    "high_confidence_workbook": summary["artifacts"]["enrichment_high_xlsx"],
+                    "mail_db_path": mail_sync_step["artifacts"]["mail_db_path"],
+                },
+                owned_artifact_keys=("prep_xlsx", "deduped_xlsx", "llm_candidates_jsonl"),
+                resume_point_key="llm_candidates",
+                reuse_supported=True,
+                stage_policy="reuse_only_if_enrichment_reused",
+            )
+            summary["steps"]["llm_candidates"] = llm_candidates_step
+            summary["artifacts"]["llm_review_input_prefix"] = str(llm_prefix)
+            summary["resume_points"]["llm_candidates"] = {
+                "llm_review_input_prefix": str(llm_prefix),
+                "llm_candidates_jsonl": llm_candidates_step["artifacts"]["llm_candidates_jsonl"],
+            }
+            _write_summary(run_summary_path, summary)
+            if normalized_stop_after == "llm-candidates":
+                return mark_stop("llm-candidates")
+
+            llm_review_existing = existing_summary.get("steps", {}).get("llm_review", {}) if existing_summary else {}
+            llm_review_reused = bool(
+                reuse_existing
+                and downstream_reuse_allowed
+                and enrichment_reused
+                and llm_candidates_reused
+                and _step_artifacts_exist(
+                    llm_review_existing,
+                    ("review_jsonl", "reviewed_xlsx", "keep_xlsx"),
+                )
+            )
+            if llm_review_reused:
+                llm_review_step = _json_clone(llm_review_existing)
+                llm_review_step["status"] = "reused"
+                llm_review_step["reused"] = True
+            else:
+                llm_review_result = run_and_apply_llm_review(
+                    input_prefix=llm_prefix,
+                    env_path=env_file,
+                    base_url=str(base_url or "").strip() or None,
+                    api_key=str(api_key or "").strip() or None,
+                    model=str(model or "").strip() or None,
+                    wire_api=str(wire_api or "").strip() or None,
+                )
+                llm_review_step = {
+                    "status": "completed",
+                    "reused": False,
+                    "stats": {
+                        "review_group_count": llm_review_result.get("review_group_count", 0),
+                        "reviewed_row_count": llm_review_result.get("reviewed_row_count", 0),
+                        "keep_row_count": llm_review_result.get("keep_row_count", 0),
+                    },
+                    "artifacts": {
+                        "review_jsonl": str(llm_review_result.get("llm_review_jsonl_path") or ""),
+                        "reviewed_xlsx": str(llm_review_result.get("llm_reviewed_xlsx_path") or ""),
+                        "keep_xlsx": str(llm_review_result.get("llm_reviewed_keep_xlsx_path") or ""),
+                    },
+                }
+            llm_review_mode, llm_review_reason = _resolve_execution_details(
+                reused=llm_review_reused,
+                existing_summary_accepted=existing_summary_accepted,
+                rerun_reason="llm_review_inputs_changed_or_resume_artifacts_missing",
+            )
+            llm_review_step = _annotate_step_payload(
+                llm_review_step,
+                execution_mode=llm_review_mode,
+                execution_reason=llm_review_reason,
+                input_refs={
+                    "llm_review_input_prefix": str(llm_prefix),
+                    "llm_candidates_jsonl": llm_candidates_step["artifacts"]["llm_candidates_jsonl"],
+                },
+                owned_artifact_keys=("review_jsonl", "reviewed_xlsx", "keep_xlsx"),
+                resume_point_key="keep_list",
+                reuse_supported=True,
+                stage_policy="reuse_only_if_llm_candidates_reused",
+            )
+            summary["steps"]["llm_review"] = llm_review_step
+            summary["artifacts"]["keep_workbook"] = llm_review_step["artifacts"]["keep_xlsx"]
+
+        summary["resume_points"]["keep_list"] = {
+            "keep_workbook": summary["artifacts"]["keep_workbook"],
+            "template_workbook": summary["artifacts"]["template_workbook"],
+        }
+        summary["canonical_artifacts"]["keep_list"] = _json_clone(summary["resume_points"]["keep_list"])
+        summary["downstream_handoff"] = {
+            "boundary_step": "keep-list",
+            "resume_point_key": "keep_list",
+            "matching_strategy": normalized_matching_strategy,
+            "runner_script": "scripts/run_keep_list_screening_pipeline.py",
+            "keep_workbook": summary["artifacts"]["keep_workbook"],
+            "template_workbook": summary["artifacts"]["template_workbook"],
+            "recommended_command": (
+                'backend/.venv/bin/python scripts/run_keep_list_screening_pipeline.py '
+                f'--keep-workbook "{summary["artifacts"]["keep_workbook"]}" '
+                f'--template-workbook "{summary["artifacts"]["template_workbook"]}" '
+                "--task-name "
+                f'"{normalized_task_name}" '
+                '--summary-json "temp/keep_list_pipeline_summary.json" '
+                "--platform instagram --max-identifiers-per-platform 1"
+            ),
+        }
+        _write_summary(run_summary_path, summary)
+        if normalized_stop_after == "keep-list":
+            return mark_stop("keep-list")
+    except Exception as exc:  # noqa: BLE001
+        failed_step = next(reversed(summary.get("steps") or {}), "")
+        failure = _classify_failure(exc, failed_step=failed_step)
+        if failure["stage"] == "preflight":
+            summary["preflight"]["ready"] = False
+            summary["preflight"]["errors"] = [failure]
+        return finalize(
+            "failed",
+            failed_step=failed_step,
+            error=failure["message"],
+            error_code=failure["error_code"],
+            failure=failure,
+        )
+
+    return finalize("completed")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Run the task-upload -> keep-list upstream pipeline through a single repo-local entrypoint."
+    )
+    parser.add_argument("--task-name", required=True, help="任务名，例如 MINISO。")
+    parser.add_argument("--env-file", default=".env", help="本地 env 文件路径，默认 ./.env。")
+    parser.add_argument("--task-upload-url", default="", help="飞书任务上传 wiki/base 链接。")
+    parser.add_argument("--employee-info-url", default="", help="飞书员工信息表 wiki/base 链接。")
+    parser.add_argument("--output-root", default="", help="输出目录；默认写到 temp/task_upload_to_keep_list_<timestamp>。")
+    parser.add_argument("--summary-json", default="", help="最终 summary.json 输出路径。")
+    parser.add_argument("--task-download-dir", default="", help="任务附件下载目录；默认写到 output-root/downloads。")
+    parser.add_argument("--mail-data-dir", default="", help="任务邮件数据目录；默认写到 output-root/mail_sync。")
+    parser.add_argument("--feishu-app-id", default="", help="飞书自建应用 app_id。")
+    parser.add_argument("--feishu-app-secret", default="", help="飞书自建应用 app_secret。")
+    parser.add_argument("--feishu-base-url", default="", help="飞书 OpenAPI Base URL。")
+    parser.add_argument("--timeout-seconds", type=float, default=0.0, help="飞书请求超时时间；默认读取 .env 或 30 秒。")
+    parser.add_argument("--folder-prefix", action="append", help="任务邮箱目录前缀，可重复传入；默认 其他文件夹。")
+    parser.add_argument(
+        "--owner-email-override",
+        action="append",
+        help="负责人邮箱覆盖，格式 MINISO:eden@amagency.biz，可重复传入。",
+    )
+    parser.add_argument("--mail-limit", type=int, default=0, help="mail sync 只抓最新 N 封；0 表示不截断。")
+    parser.add_argument("--mail-workers", type=int, default=1, help="mail sync worker 数。")
+    parser.add_argument("--sent-since", default="", help="mail sync 起始日期 YYYY-MM-DD；默认最近 3 个月。")
+    parser.add_argument("--reset-state", action="store_true", help="mail sync 忽略本地游标，重新全量扫描。")
+    parser.add_argument(
+        "--matching-strategy",
+        default=MATCHING_STRATEGIES[0],
+        choices=MATCHING_STRATEGIES,
+        help="上游匹配策略；默认 legacy-enrichment，也可选 brand-keyword-fast-path。",
+    )
+    parser.add_argument("--brand-keyword", default="", help="fast path 的品牌关键词；默认复用 task-name。")
+    parser.add_argument(
+        "--brand-match-include-from",
+        action="store_true",
+        help="fast path 品牌匹配时把 from/sender 地址也纳入精确匹配候选。",
+    )
+    parser.add_argument("--stop-after", default="", choices=("",) + STOP_AFTER_CHOICES, help="在指定边界后停止。")
+    parser.add_argument("--no-reuse-existing", action="store_true", help="不要复用当前 output-root 下已存在的上游 artifact。")
+    parser.add_argument("--base-url", default="", help="覆盖 duplicate review 的 LLM base URL。")
+    parser.add_argument("--api-key", default="", help="覆盖 duplicate review 的 LLM API key。")
+    parser.add_argument("--model", default="", help="覆盖 duplicate review 的 LLM model。")
+    parser.add_argument("--wire-api", default="", help="覆盖 duplicate review 的 wire API。")
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    summary = run_task_upload_to_keep_list_pipeline(
+        task_name=args.task_name,
+        env_file=args.env_file,
+        task_upload_url=args.task_upload_url,
+        employee_info_url=args.employee_info_url,
+        output_root=Path(args.output_root) if args.output_root else None,
+        summary_json=Path(args.summary_json) if args.summary_json else None,
+        task_download_dir=args.task_download_dir,
+        mail_data_dir=args.mail_data_dir,
+        feishu_app_id=args.feishu_app_id,
+        feishu_app_secret=args.feishu_app_secret,
+        feishu_base_url=args.feishu_base_url,
+        timeout_seconds=float(args.timeout_seconds),
+        folder_prefixes=args.folder_prefix,
+        owner_email_overrides=_parse_mapping_overrides(args.owner_email_override),
+        mail_limit=max(0, int(args.mail_limit)),
+        mail_workers=max(1, int(args.mail_workers)),
+        sent_since=args.sent_since,
+        reset_state=bool(args.reset_state),
+        matching_strategy=args.matching_strategy,
+        brand_keyword=args.brand_keyword,
+        brand_match_include_from=bool(args.brand_match_include_from),
+        stop_after=args.stop_after,
+        reuse_existing=not bool(args.no_reuse_existing),
+        base_url=args.base_url,
+        api_key=args.api_key,
+        model=args.model,
+        wire_api=args.wire_api,
+    )
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0 if summary.get("status") != "failed" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

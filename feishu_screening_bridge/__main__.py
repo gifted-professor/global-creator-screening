@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from typing import Any
 
 from email_sync.date_windows import resolve_sync_sent_since
 
@@ -13,7 +14,7 @@ from .bridge import (
     DEFAULT_UPLOAD_ENDPOINT_URL,
     import_screening_workbook_from_feishu,
 )
-from .email_project import DEFAULT_EMAIL_PROJECT_ROOT
+from .email_project import DEFAULT_EMAIL_PROJECT_ROOT, inspect_email_project_dependency
 from .feishu_api import DEFAULT_FEISHU_BASE_URL, FeishuOpenClient
 from .local_env import get_preferred_value, load_local_env
 from .task_upload_sync import inspect_task_upload_assignments, sync_task_upload_mailboxes, sync_task_upload_view_to_email_project
@@ -120,6 +121,11 @@ def _build_parser() -> argparse.ArgumentParser:
     inspect_parser.add_argument("--download-templates", action="store_true", help="下载任务上传里的需求模板")
     inspect_parser.add_argument("--parse-templates", action="store_true", help="下载后立即解析模板，自动隐含 --download-templates")
     inspect_parser.add_argument("--parse-output-dir", default="", help="解析产物输出目录，默认 <download-dir>/parsed_outputs")
+    inspect_parser.add_argument(
+        "--owner-email-overrides",
+        default="",
+        help="负责人邮箱覆盖，格式 MINISO:eden@amagency.biz，可逗号分隔多个任务",
+    )
     inspect_parser.add_argument("--timeout-seconds", type=float, default=0.0, help="飞书请求超时时间，默认 30 秒")
     inspect_parser.add_argument("--json", action="store_true", help="输出完整 JSON 结果")
 
@@ -134,6 +140,11 @@ def _build_parser() -> argparse.ArgumentParser:
     mail_sync_parser.add_argument("--download-dir", default="", help="任务模板下载目录，默认 ./downloads/task_upload_attachments")
     mail_sync_parser.add_argument("--mail-data-dir", default="", help="任务邮件数据目录，默认 ./data/task_upload_mail_sync")
     mail_sync_parser.add_argument("--folder-prefixes", default="", help="任务邮箱目录前缀，逗号分隔，默认 其他文件夹")
+    mail_sync_parser.add_argument(
+        "--owner-email-overrides",
+        default="",
+        help="负责人邮箱覆盖，格式 MINISO:eden@amagency.biz，可逗号分隔多个任务",
+    )
     mail_sync_parser.add_argument("--folder-overrides", default="", help="任务邮箱目录覆盖，格式 MINISO:其他文件夹/MINISO")
     mail_sync_parser.add_argument("--limit", type=int, default=0, help="只抓最新 N 封用于测试，不推进增量游标")
     mail_sync_parser.add_argument("--workers", type=int, default=1, help="并发抓取 worker 数，默认 1")
@@ -151,6 +162,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _cmd_import_from_feishu(args: argparse.Namespace) -> int:
     env_values = load_local_env(args.env_file)
+    legacy_dependency = _require_legacy_email_project_dependency(
+        command_name="import-from-feishu",
+        env_values=env_values,
+        email_project_root=args.email_project_root,
+        email_env_file=args.email_env_file,
+        json_output=bool(args.json),
+    )
+    if legacy_dependency is None:
+        return 2
     app_id = get_preferred_value(args.feishu_app_id, env_values, "FEISHU_APP_ID")
     app_secret = get_preferred_value(args.feishu_app_secret, env_values, "FEISHU_APP_SECRET")
     if not app_id:
@@ -178,8 +198,8 @@ def _cmd_import_from_feishu(args: argparse.Namespace) -> int:
     download_name = get_preferred_value(args.download_name, env_values, "DOWNLOAD_NAME") or None
 
     result = import_screening_workbook_from_feishu(
-        email_project_root=get_preferred_value(args.email_project_root, env_values, "EMAIL_PROJECT_ROOT", str(DEFAULT_EMAIL_PROJECT_ROOT)),
-        email_env_file=get_preferred_value(args.email_env_file, env_values, "EMAIL_ENV_FILE", ".env"),
+        email_project_root=legacy_dependency["email_project_root"],
+        email_env_file=legacy_dependency["email_env_file"],
         feishu_app_id=app_id,
         feishu_app_secret=app_secret,
         file_token_or_url=file_token or file_url,
@@ -205,6 +225,7 @@ def _cmd_import_from_feishu(args: argparse.Namespace) -> int:
         feishu_base_url=get_preferred_value(args.feishu_base_url, env_values, "FEISHU_OPEN_BASE_URL", DEFAULT_FEISHU_BASE_URL),
         timeout_seconds=timeout_seconds,
     )
+    result["legacyDependency"] = legacy_dependency["diagnostic"]
 
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -316,6 +337,15 @@ def _cmd_download_bitable_attachments(args: argparse.Namespace) -> int:
 
 def _cmd_sync_task_upload_view(args: argparse.Namespace) -> int:
     env_values = load_local_env(args.env_file)
+    legacy_dependency = _require_legacy_email_project_dependency(
+        command_name="sync-task-upload-view",
+        env_values=env_values,
+        email_project_root=args.email_project_root,
+        email_env_file=args.email_env_file,
+        json_output=bool(args.json),
+    )
+    if legacy_dependency is None:
+        return 2
     app_id = get_preferred_value(args.feishu_app_id, env_values, "FEISHU_APP_ID")
     app_secret = get_preferred_value(args.feishu_app_secret, env_values, "FEISHU_APP_SECRET")
     if not app_id:
@@ -338,8 +368,8 @@ def _cmd_sync_task_upload_view(args: argparse.Namespace) -> int:
     result = sync_task_upload_view_to_email_project(
         client=client,
         task_upload_url=task_upload_url,
-        email_project_root=get_preferred_value(args.email_project_root, env_values, "EMAIL_PROJECT_ROOT", str(DEFAULT_EMAIL_PROJECT_ROOT)),
-        email_env_file=get_preferred_value(args.email_env_file, env_values, "EMAIL_ENV_FILE", ".env"),
+        email_project_root=legacy_dependency["email_project_root"],
+        email_env_file=legacy_dependency["email_env_file"],
         download_dir=get_preferred_value(args.download_dir, env_values, "TASK_UPLOAD_DOWNLOAD_DIR", "./downloads/task_upload_attachments"),
         dashboard_output=get_preferred_value(args.dashboard_output, env_values, "DASHBOARD_OUTPUT") or None,
         project_code_prefix=get_preferred_value(args.project_code_prefix, env_values, "PROJECT_CODE_PREFIX", "P-FSH-"),
@@ -351,6 +381,7 @@ def _cmd_sync_task_upload_view(args: argparse.Namespace) -> int:
         ),
         category_overrides=_parse_category_overrides(get_preferred_value(args.category_overrides, env_values, "TASK_UPLOAD_CATEGORY_OVERRIDES")),
     )
+    result["legacyDependency"] = legacy_dependency["diagnostic"]
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
@@ -397,6 +428,9 @@ def _cmd_inspect_task_upload(args: argparse.Namespace) -> int:
         download_templates=bool(args.download_templates or args.parse_templates),
         parse_templates=bool(args.parse_templates),
         parse_output_dir=get_preferred_value(args.parse_output_dir, env_values, "TASK_UPLOAD_PARSE_OUTPUT_DIR") or None,
+        owner_email_overrides=_parse_mapping_overrides(
+            get_preferred_value(args.owner_email_overrides, env_values, "TASK_UPLOAD_OWNER_EMAIL_OVERRIDES")
+        ),
     )
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -464,6 +498,9 @@ def _cmd_sync_task_upload_mail(args: argparse.Namespace) -> int:
         download_dir=get_preferred_value(args.download_dir, env_values, "TASK_UPLOAD_DOWNLOAD_DIR", "./downloads/task_upload_attachments"),
         mail_data_dir=get_preferred_value(args.mail_data_dir, env_values, "TASK_UPLOAD_MAIL_DATA_DIR", "./data/task_upload_mail_sync"),
         task_names=list(args.task_name or []),
+        owner_email_overrides=_parse_mapping_overrides(
+            get_preferred_value(args.owner_email_overrides, env_values, "TASK_UPLOAD_OWNER_EMAIL_OVERRIDES")
+        ),
         folder_overrides=_parse_mapping_overrides(get_preferred_value(args.folder_overrides, env_values, "TASK_UPLOAD_MAIL_FOLDER_OVERRIDES")),
         folder_prefixes=_parse_csv_values(get_preferred_value(args.folder_prefixes, env_values, "TASK_UPLOAD_MAIL_FOLDER_PREFIXES", "其他文件夹")),
         limit=args.limit if args.limit > 0 else None,
@@ -512,6 +549,56 @@ def _parse_category_overrides(raw: str) -> dict[str, str]:
         if normalized_key and normalized_value:
             result[normalized_key] = normalized_value
     return result
+
+
+def _require_legacy_email_project_dependency(
+    *,
+    command_name: str,
+    env_values: dict[str, str],
+    email_project_root: str,
+    email_env_file: str,
+    json_output: bool,
+) -> dict[str, Any] | None:
+    resolved_root = get_preferred_value(
+        email_project_root,
+        env_values,
+        "EMAIL_PROJECT_ROOT",
+        str(DEFAULT_EMAIL_PROJECT_ROOT),
+    )
+    resolved_env_file = get_preferred_value(
+        email_env_file,
+        env_values,
+        "EMAIL_ENV_FILE",
+        ".env",
+    )
+    diagnostic = inspect_email_project_dependency(
+        resolved_root,
+        resolved_env_file,
+        validate_import=True,
+    )
+    if diagnostic["available"]:
+        return {
+            "email_project_root": resolved_root,
+            "email_env_file": resolved_env_file,
+            "diagnostic": diagnostic,
+        }
+    failure_payload = {
+        "ok": False,
+        "command": command_name,
+        "error_code": diagnostic.get("error_code") or "EMAIL_PROJECT_DEPENDENCY_UNAVAILABLE",
+        "error": diagnostic.get("message") or "legacy bridge 外部 email 项目依赖不可用",
+        "remediation": diagnostic.get("remediation") or "",
+        "legacyDependency": diagnostic,
+    }
+    if json_output:
+        print(json.dumps(failure_payload, ensure_ascii=False, indent=2))
+    else:
+        print(
+            f"[{failure_payload['error_code']}] {failure_payload['error']}\n"
+            f"remediation: {failure_payload['remediation']}",
+            file=sys.stderr,
+        )
+    return None
 
 
 def _parse_mapping_overrides(raw: str) -> dict[str, str]:

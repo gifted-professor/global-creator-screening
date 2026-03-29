@@ -2,7 +2,7 @@
 
 ## What This Is
 
-`chuhaihai` 是一个把创作者筛选相关本地工具收拢到同一仓库的整合工程。`v1.0.0` 已把飞书桥接、任务驱动邮件抓取、模板解析、达人匹配与报价抽取、duplicate review，以及 `筛号` 后端主链统一到当前仓库，并保留对现有本地工作流的兼容。
+`chuhaihai` 是一个把创作者筛选相关本地工具收拢到同一仓库的整合工程。到 `v1.2.0` 为止，仓库已经不仅完成了飞书桥接、任务驱动邮件抓取、模板解析、达人匹配 / duplicate review 和 `筛号` 后端整合，还把它们收成了一个从 task upload 到 final export 的 repo-local 单入口闭环，并补齐了可靠性与诊断 contract。
 
 ## Core Value
 
@@ -27,13 +27,14 @@
 - [x] `MINISO` 模板 rulespec 和高置信达人名单已实写到当前仓库 `config/active_rulespec.json` 与 `data/*/*_upload_metadata.json`
 - [x] 当前仓库已经包含 backend-owned 的视觉 provider snapshot / preflight / structured early failure 诊断能力，并写进 health 与 runner summary
 - [x] 当前仓库已经用显式 `openai` provider 成功跑通一轮真实 bounded `MINISO instagram` visual review，从 scrape 一直到 final export
+- [x] 用户已在另一条已验证流程中证明品牌关键词快路径可以把 `MINISO` 三个月邮件中的绝大多数候选自动绑定，只剩极小人工尾部
 
 ### Active
 
-- [ ] 让操作人可以从任务上传起点用单入口跑到最终导出，而不是手工串多个命令
-- [ ] 继续减少全流程对外部全量 `email` 项目和隐式本地状态的依赖
-- [ ] 决定报价结果是否需要在下一里程碑正式接入 `筛号` 运行态或导出
-- [ ] 让当前仓库成为统一的 `.env` 与运行诊断承载位置，减少跨项目手工同步
+- [ ] 移除 legacy workbook / dashboard / project-home 对外部全量 `email` 项目的剩余依赖
+- [ ] 把报价结果正式接入 `筛号` 运行态或最终导出链
+- [ ] 为多平台或更大批量补充稳定性证明，而不只停留在 bounded validation
+- [ ] 规划下一里程碑应该优先做 dependency removal、quote integration，还是更大样本的 live proof
 
 ### Out of Scope
 
@@ -53,28 +54,47 @@
 - `任务上传 -> 员工信息 -> 模板下载/解析 -> 按任务抓取邮箱文件夹邮件 -> 达人匹配 -> duplicate review -> keep-list`
 - `keep-list -> 筛号运行态 -> Apify 抓取 -> 预筛 -> 视觉复核 -> 导出`
 
-`v1.1.0` 已证明此前的 `auth_not_found` 不是“现在 apikey 没填好”，而是旧 provider 路径不稳定；当前显式 `openai` 路径已经 real run 成功。接下来真正缺的是把这两段链拼成一个 repo-local 的单入口 E2E，而不是继续单点修视觉。
+`v1.1.0` 已证明此前的 `auth_not_found` 不是“现在 apikey 没填好”，而是旧 provider 路径不稳定；当前显式 `openai` 路径已经 real run 成功。与此同时，用户还提供了一条在 `MINISO` 三个月真实邮件上验证过的更快上游路径：按品牌关键词筛信、邮箱精确匹配总表、按 IGlink 去重、拆唯一/共享邮箱、共享邮箱先看邮件内容再决定，只有极少数尾部交给 LLM / 人工。`16.1` 已经把这条 fast-path 泛化并串进单入口上游 runner；`18-01` 则进一步把它和 keep-list 下游串成一个 thin final wrapper，并在 `temp/phase18_real_bounded_e2e_final2` 留下了一轮真实 bounded `task upload -> final export` proof。
 
 ## Current State
 
 - `v1.0.0` 已交付 repo-local 的创作者筛选主线，核心模块不再散落在多个 sibling 工程里
 - `v1.1.0` 已交付视觉 provider 诊断、显式 provider 选择、live probe，以及一轮真实 non-error bounded visual validation
 - `MINISO` 已具备真实 duplicate review 产物链和 keep workbook，下游也已证明能从 scrape 跑到 final export
-- 当前 active milestone 是 `v1.2.0`，目标是补上“从任务上传起点到最终导出”的单入口 repo-local orchestration
+- Phase 16 已交付 repo-local 的 `task upload -> keep-list` 单入口 runner 和 machine-readable handoff summary
+- 当前 runner summary 已能显式区分每一步是 `produced`、`reused` 还是 `rerun`
+- 当前 runner 已明确收紧复用语义：`task_assets` 可复用，`mail_sync` 永远按当前 run 增量重跑，只有在上游输入未变化且没有新邮件时，下游 matching / review steps 才能复用
+- 当前 upstream/downstream runner summary 已能显式暴露 resolved input/source/preflight，operator 可以直接看到 env file、任务附件/workbook、task DB 和 output dirs 的实际归属
+- `16.1` 已交付 repo-local 的 `match-brand-keyword` / `split-shared-email` / `resolve-shared-email` / `llm-final-review`，并把 fast-path 正式接进单入口上游 runner
+- 单入口上游 runner 现在显式支持 `legacy-enrichment` 与 `brand-keyword-fast-path` 两条策略；fast-path 会输出 `manual_tail.xlsx` 与最终 `final_keep.xlsx`
+- legacy `feishu_screening_bridge` 命令现在会在入口显式诊断外部 full `email` 依赖，缺失时直接返回 remediation，而不是中途模糊失败
+- `scripts/run_task_upload_to_final_export_pipeline.py` 已交付为最终单入口 surface，并保留 `keep-list` 作为内部 canonical resume boundary
+- `v1.2.0` 已正式归档，当前仓库处于“等待下一里程碑定义”的 between-milestones 状态
+- Phase 19 已把 upstream shared-email final review 升级为 primary / secondary / tertiary candidate 可重试、可 failover 的 transport contract，summary 会显式保留 `selected_provider`、`selected_model`、`provider_attempts`、`absorbed_failures`
+- Phase 19 已把 downstream scrape 状态收紧成 live、stageful、partial-result-aware contract；`scrape_failed` 只代表零输出失败，partial salvage 会落成 `scrape_partial` 或 `scrape_poll_failed_with_partial`
+- Phase 19 已让 final wrapper 保留 `delivery_status` 与 `platform_statuses`，所以 `completed_with_partial_scrape` 这类可交付状态不会再被顶层误判为纯失败
+- Phase 19 已把 visual review trace 标准化为 `configured_model` / `requested_model` / `response_model` / `effective_model`，并让 preferred pool 在 retryable fault 后继续尝试健康候选
+- 真实 bounded `MINISO` proof 已完成：
+  - 顶层 artifact root: `temp/phase18_real_bounded_e2e_final2`
+  - top-level `status = completed`
+  - upstream `final_keep_row_count = 325`
+  - downstream `instagram` bounded run 成功产出 `instagram_final_review.xlsx`
+- 当前没有 active milestone；下一步应通过 `$gsd-new-milestone` 决定是先处理 `DEP-01` / `QTE-01`，还是补 `REL-01` 的更大样本 live proof
 
-## Current Milestone: v1.2.0 End-to-End Single-Entry Pipeline Verification
+## Next Milestone Candidates
 
-**Goal:** 把已经分别验证过的上游链和下游链收成一个单入口 repo-local E2E，并在真实 `MINISO` 上留下一轮 bounded proof run。
+`v1.2.0` 已归档完成。下一里程碑更合理的候选方向有三类：
 
-**Target features:**
-- 单入口 runner 从任务上传起点一路编排到 keep-list 与最终导出
-- 全流程 summary、handoff contract、early failure 和 resume 点
-- 真实 bounded MINISO E2E artifact 与可复跑 operator 路径
+- 先处理 `DEP-01`，把 legacy workbook / dashboard / project-home 的剩余 external dependency 拆掉
+- 先处理 `QTE-01`，把报价结果接进 screening runtime / final export，让链路从“筛选”走向“可执行交付”
+- 先处理 `REL-01`，补更大样本或多平台 live proof，把当前 bounded-first 证据扩成更强的稳定性证明
+
+建议在新 milestone 里只选其中一个作为 committed 主轴，避免把 dependency removal、data integration 和 broad live proof 混成一个模糊里程碑。
 
 ## Constraints
 
 - **Compatibility**: 迁移后仍需兼容现有 sibling 项目结构 — 旧的 `抓取邮件/email_sync` 目录短期内仍是依赖方
-- **Scope**: 只搬运已经验证过的飞书桥接能力 — 暂不顺手扩展新功能
+- **Scope**: 只搬运已经验证过的飞书桥接和邮件处理能力 — 暂不顺手扩展无关新功能
 - **Security**: `.env.example` 不应继续携带真实密钥 — 示例文件只保留结构和安全默认值
 - **Workflow**: 里程碑收尾与新里程碑启动要分开提交 — 归档 tag 应对应真实 shipped 状态，而不是混入后续规划
 
@@ -93,7 +113,16 @@
 | `筛号` 后端按整包迁移到当前仓库 | 用户要的是完整可用链路，不是分散读取若干零件 | ✓ Good |
 | 视觉复核默认并发设为 `6` | 2026-03-27 冷缓存 8 位达人 benchmark 下，`6` 在速度与稳定性间最优 | ✓ Good |
 | 上游产物先写入筛号当前输入状态 | 当前最缺的是把已拿到的模板规则和达人名单真正喂给后端，而不是继续只停留在文件输出 | ✓ Good |
-| 下一阶段把“全流程跑通”定义成 orchestration 与 runtime contract 问题 | `v1.1.0` 已证明下游视觉链可用，下一缺口是单入口 E2E，而不是继续怀疑 apikey | — Pending |
+| `auth_not_found` 不再被当成“当前 apikey 配错”问题 | Phase 15 已用显式 `openai` 路径完成真实 bounded run，说明当前 key/base_url 读入与 live run 已可用 | ✓ Good |
+| 用户验证过的 brand-keyword fast path 必须进入 repo-local 主线，而不是继续留在终端 sidecar | 它显著提升上游匹配速度与准确率，并改变当前 milestone 的 upstream contract | ✓ Good |
+| 单入口 runner 必须显式暴露 `--matching-strategy` | 用户要的是“融合进总链路”，但不能静默替换 legacy route；operator 必须知道现在到底走的是哪条路径 | ✓ Good |
+| shared-email 先 deterministic 判定，再把 unresolved tail 交给 LLM | 这样才能保持 fast-path 的速度与可解释性，不把可规则化的问题过早扔给模型 | ✓ Good |
+| 下游 matching / review artifact 只能在上游输入未变化时复用 | `mail_sync` 是增量阶段，抓到新邮件后继续复用旧匹配结果会破坏 contract | ✓ Good |
+| `keep-list` 继续作为 canonical upstream boundary | 这能让 Phase 17 的 dependency diagnostics 和 Phase 18 的真实 proof run 都建立在同一个稳定 handoff 上 | ✓ Good |
+| 最终 E2E surface 采用 thin wrapper，而不是改写 upstream/downstream 业务逻辑 | 这样可以直接复用已验证 runner，同时给 operator 一个真正的单入口命令 | ✓ Good |
+| Phase 19 的 Apify reliability contract 继续保留在 `backend/app.py` 和 runner summary surface，而不是急着拆成新模块 | 现有 guard、job 状态和 partial salvage 已经深度耦合在 backend runtime；先收口 reusable contract，再考虑物理拆分更稳妥 | ✓ Good |
+| `scrape_failed` 只保留给“没有任何可用 scrape 输出”的情况 | 这样 operator 才能严格区分 true failure 和 partial salvage，不会把可恢复 run 误当成全损 | ✓ Good |
+| final wrapper 必须把 `completed_with_partial_scrape` 当作可交付状态 | 顶层 operator surface 不能再把已有导出的 partial delivery run 扁平成 opaque `failed` | ✓ Good |
 
 ---
-*Last updated: 2026-03-28 after v1.2.0 milestone start*
+*Last updated: 2026-03-29 after v1.2.0 milestone archive*

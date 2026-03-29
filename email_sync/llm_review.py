@@ -71,6 +71,7 @@ class LlmReviewConfig:
     timeout_seconds: int
     provider_name: str
     reasoning_effort: str
+    candidate_stage: str = "primary"
 
 
 def _utc_now() -> str:
@@ -452,15 +453,106 @@ def _resolve_env_value(key: str, env_values: dict[str, str], default: str = "") 
     return str(env_values.get(key, default) or "").strip()
 
 
-def _resolve_llm_review_config(
+def _extract_retryable_status_code(error_text: str) -> int | None:
+    match = re.search(r"HTTP\s+(\d{3})", str(error_text or ""))
+    if not match:
+        return None
+    try:
+        return int(match.group(1))
+    except Exception:
+        return None
+
+
+def is_retryable_llm_transport_failure(exc: BaseException) -> bool:
+    if isinstance(exc, requests.exceptions.RequestException):
+        return True
+    message = str(exc or "")
+    status_code = _extract_retryable_status_code(message)
+    if status_code is not None and status_code in RETRYABLE_STATUS_CODES.union({522}):
+        return True
+    lowered = message.lower()
+    return any(
+        term in lowered
+        for term in (
+            "ssleoferror",
+            "timed out",
+            "timeout",
+            "connection aborted",
+            "bad gateway",
+            "internal server error",
+        )
+    )
+
+
+def _resolve_openai_candidate_config(
+    env_values: dict[str, str],
+    *,
+    candidate_stage: str,
+    base_url_key: str,
+    api_key_key: str,
+    model_key: str,
+    wire_api_key: str,
+    provider_name_key: str,
+    reasoning_effort_key: str,
+    timeout_seconds: int,
+) -> LlmReviewConfig | None:
+    resolved_api_key = _resolve_env_value(api_key_key, env_values)
+    resolved_base_url = _resolve_env_value(base_url_key, env_values)
+    if not resolved_api_key or not resolved_base_url:
+        return None
+    resolved_model = (
+        _resolve_env_value(model_key, env_values)
+        or _resolve_env_value("OPENAI_MODEL", env_values)
+        or _resolve_env_value("OPENAI_VISION_MODEL", env_values)
+        or "gpt-5.4"
+    )
+    resolved_wire_api = (
+        _resolve_env_value(wire_api_key, env_values)
+        or _resolve_env_value("OPENAI_WIRE_API", env_values)
+        or "chat_completions"
+    ).strip().lower()
+    if resolved_wire_api not in {"responses", "chat_completions"}:
+        raise RuntimeError(f"{wire_api_key} 只支持 responses 或 chat_completions。")
+    provider_name = (
+        _resolve_env_value(provider_name_key, env_values)
+        or _resolve_env_value("OPENAI_PROVIDER_NAME", env_values)
+        or f"openai-compatible-{candidate_stage}"
+    )
+    reasoning_effort = (
+        _resolve_env_value(reasoning_effort_key, env_values)
+        or _resolve_env_value("OPENAI_REASONING_EFFORT", env_values)
+    )
+    return LlmReviewConfig(
+        base_url=resolved_base_url.rstrip("/"),
+        api_key=resolved_api_key,
+        model=resolved_model,
+        wire_api=resolved_wire_api,
+        timeout_seconds=timeout_seconds,
+        provider_name=provider_name,
+        reasoning_effort=reasoning_effort,
+        candidate_stage=candidate_stage,
+    )
+
+
+def resolve_llm_review_config_chain(
     env_path: str,
     *,
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
     model: Optional[str] = None,
     wire_api: Optional[str] = None,
-) -> LlmReviewConfig:
+) -> list[LlmReviewConfig]:
     env_values = _load_env_file(env_path)
+
+    timeout_text = (
+        _resolve_env_value("LLM_TIMEOUT_SECONDS", env_values)
+        or _resolve_env_value("VISION_REQUEST_TIMEOUT", env_values)
+        or "60"
+    )
+    try:
+        timeout_seconds = max(5, int(timeout_text))
+    except Exception:
+        timeout_seconds = 60
 
     openai_api_key = _resolve_env_value("OPENAI_API_KEY", env_values)
     legacy_api_key = _resolve_env_value("LLM_API_KEY", env_values)
@@ -489,16 +581,6 @@ def _resolve_llm_review_config(
     if resolved_wire_api not in {"responses", "chat_completions"}:
         raise RuntimeError("OPENAI_WIRE_API 只支持 responses 或 chat_completions。")
 
-    timeout_text = (
-        _resolve_env_value("LLM_TIMEOUT_SECONDS", env_values)
-        or _resolve_env_value("VISION_REQUEST_TIMEOUT", env_values)
-        or "60"
-    )
-    try:
-        timeout_seconds = max(5, int(timeout_text))
-    except Exception:
-        timeout_seconds = 60
-
     provider_name = (
         _resolve_env_value("OPENAI_PROVIDER_NAME", env_values)
         or ("legacy-llm" if use_legacy_surface else "openai-compatible")
@@ -510,15 +592,51 @@ def _resolve_llm_review_config(
     if not resolved_api_key:
         raise RuntimeError("缺少 LLM API key，请设置 OPENAI_API_KEY 或 LLM_API_KEY。")
 
-    return LlmReviewConfig(
-        base_url=resolved_base_url.rstrip("/"),
-        api_key=resolved_api_key,
-        model=resolved_model,
-        wire_api=resolved_wire_api,
-        timeout_seconds=timeout_seconds,
-        provider_name=provider_name,
-        reasoning_effort=reasoning_effort,
-    )
+    configs = [
+        LlmReviewConfig(
+            base_url=resolved_base_url.rstrip("/"),
+            api_key=resolved_api_key,
+            model=resolved_model,
+            wire_api=resolved_wire_api,
+            timeout_seconds=timeout_seconds,
+            provider_name=provider_name,
+            reasoning_effort=reasoning_effort,
+            candidate_stage="primary",
+        )
+    ]
+
+    for candidate_stage, prefix in (("secondary", "OPENAI_SECONDARY"), ("tertiary", "OPENAI_TERTIARY")):
+        config = _resolve_openai_candidate_config(
+            env_values,
+            candidate_stage=candidate_stage,
+            base_url_key=f"{prefix}_BASE_URL",
+            api_key_key=f"{prefix}_API_KEY",
+            model_key=f"{prefix}_MODEL",
+            wire_api_key=f"{prefix}_WIRE_API",
+            provider_name_key=f"{prefix}_PROVIDER_NAME",
+            reasoning_effort_key=f"{prefix}_REASONING_EFFORT",
+            timeout_seconds=timeout_seconds,
+        )
+        if config is not None:
+            configs.append(config)
+    return configs
+
+
+def _resolve_llm_review_config(
+    env_path: str,
+    *,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    model: Optional[str] = None,
+    wire_api: Optional[str] = None,
+) -> LlmReviewConfig:
+    return resolve_llm_review_config_chain(
+        env_path,
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        wire_api=wire_api,
+    )[0]
 
 
 def _truncate_text(value: str, limit: int) -> str:

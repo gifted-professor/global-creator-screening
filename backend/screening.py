@@ -221,21 +221,49 @@ def resolve_upload_metadata(metadata_lookup, *candidates):
     return {}
 
 
+def _collect_instagram_region_field_text(value, parts):
+    if isinstance(value, str) and value.strip():
+        parts.append(value.strip())
+        return
+    if isinstance(value, dict):
+        for nested in value.values():
+            _collect_instagram_region_field_text(nested, parts)
+        return
+    if isinstance(value, list):
+        for nested in value:
+            _collect_instagram_region_field_text(nested, parts)
+
+
+def normalize_region_text(value):
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", str(value or "").lower())).strip()
+
+
 def build_instagram_region_text(profile):
-    fields = [
-        profile.get("biography"),
-        profile.get("addressStreet"),
-        profile.get("cityName"),
-        profile.get("location"),
-        profile.get("businessAddressJson"),
-    ]
     parts = []
-    for field in fields:
-        if isinstance(field, str) and field.strip():
-            parts.append(field.strip())
-        elif isinstance(field, dict):
-            parts.extend(str(value).strip() for value in field.values() if str(value or "").strip())
-    return " ".join(parts).lower()
+    for key in (
+        "biography",
+        "fullName",
+        "full_name",
+        "addressStreet",
+        "address_street",
+        "cityName",
+        "city_name",
+        "location",
+        "externalUrl",
+        "external_url",
+        "externalUrls",
+        "external_urls",
+        "businessAddressJson",
+        "business_address_json",
+        "businessAddressCity",
+        "business_address_city",
+        "businessAddressCountryCode",
+        "business_address_country_code",
+        "businessCategoryName",
+        "business_category_name",
+    ):
+        _collect_instagram_region_field_text(profile.get(key), parts)
+    return normalize_region_text(" ".join(parts))
 
 
 def has_instagram_allowed_region(profile, upload_metadata, allowed_regions):
@@ -252,12 +280,32 @@ def has_instagram_allowed_region(profile, upload_metadata, allowed_regions):
         return False
 
     region_aliases = {
-        "US": (" usa ", " united states ", " america ", " california ", " texas ", " florida ", " new york "),
+        "US": (
+            r"\busa\b",
+            r"\bunited states\b",
+            r"\bamerica\b",
+            r"\bamerican\b",
+            r"\bnew york\b",
+            r"\bnyc\b",
+            r"\bcalifornia\b",
+            r"\bflorida\b",
+            r"\bsouth florida\b",
+            r"\btexas\b",
+            r"\barizona\b",
+            r"\bchicago\b",
+            r"\bmiami\b",
+            r"\blos angeles\b",
+            r"\bbay area\b",
+            r"\bsedona\b",
+            r"\bla\s+ca\b",
+            r"\bmiami\s+fl\b",
+            r"\bchicago\s+il\b",
+            r"\bnew york\s+ny\b",
+        ),
     }
-    padded = f" {region_text} "
     for region in allowed_regions:
-        aliases = region_aliases.get(region, (f" {region.lower()} ",))
-        if any(alias in padded for alias in aliases):
+        aliases = region_aliases.get(region, (rf"\b{re.escape(region.lower())}\b",))
+        if any(re.search(alias, region_text) for alias in aliases):
             return True
     return False
 

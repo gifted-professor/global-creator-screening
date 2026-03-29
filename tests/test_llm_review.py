@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import tempfile
 import unittest
@@ -13,6 +14,7 @@ from email_sync.db import Database
 from email_sync.llm_review import (
     _resolve_llm_review_config,
     prepare_llm_review_candidates,
+    resolve_llm_review_config_chain,
     run_and_apply_llm_review,
 )
 from email_sync.relation_index import rebuild_relation_index
@@ -23,14 +25,49 @@ def _addresses(*items: tuple[str, str]) -> str:
 
 
 class LlmReviewPrepTests(unittest.TestCase):
+    ENV_KEYS = {
+        "OPENAI_API_KEY",
+        "OPENAI_BASE_URL",
+        "OPENAI_MODEL",
+        "OPENAI_VISION_MODEL",
+        "OPENAI_WIRE_API",
+        "OPENAI_PROVIDER_NAME",
+        "OPENAI_REASONING_EFFORT",
+        "OPENAI_SECONDARY_API_KEY",
+        "OPENAI_SECONDARY_BASE_URL",
+        "OPENAI_SECONDARY_MODEL",
+        "OPENAI_SECONDARY_WIRE_API",
+        "OPENAI_SECONDARY_PROVIDER_NAME",
+        "OPENAI_SECONDARY_REASONING_EFFORT",
+        "OPENAI_TERTIARY_API_KEY",
+        "OPENAI_TERTIARY_BASE_URL",
+        "OPENAI_TERTIARY_MODEL",
+        "OPENAI_TERTIARY_WIRE_API",
+        "OPENAI_TERTIARY_PROVIDER_NAME",
+        "OPENAI_TERTIARY_REASONING_EFFORT",
+        "LLM_API_KEY",
+        "LLM_API_BASE",
+        "LLM_MODEL",
+        "LLM_TIMEOUT_SECONDS",
+        "VISION_MODEL",
+    }
+
     def setUp(self) -> None:
         self.temp_dir = Path(tempfile.mkdtemp(prefix="llm_review_test_"))
         self.input_path = self.temp_dir / "high_confidence.xlsx"
         self.output_prefix = self.temp_dir / "exports" / "测试达人库_MINISO_匹配结果_高置信_按我们去重"
         self.db_path = self.temp_dir / "email_sync.db"
         self.env_path = self.temp_dir / ".env"
+        self.original_env = {key: os.environ.get(key) for key in self.ENV_KEYS}
+        for key in self.ENV_KEYS:
+            os.environ.pop(key, None)
 
     def tearDown(self) -> None:
+        for key, value in self.original_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
         shutil.rmtree(self.temp_dir, ignore_errors=True)
 
     def _make_workbook(self) -> None:
@@ -393,6 +430,34 @@ class LlmReviewPrepTests(unittest.TestCase):
         self.assertEqual(config.base_url, "https://legacy.example/v1")
         self.assertEqual(config.model, "legacy-chat")
         self.assertEqual(config.wire_api, "chat_completions")
+
+    def test_resolve_llm_review_config_chain_includes_secondary_and_tertiary_candidates(self) -> None:
+        self.env_path.write_text(
+            "\n".join(
+                [
+                    "OPENAI_API_KEY=sk-primary",
+                    "OPENAI_BASE_URL=https://primary.example/v1",
+                    "OPENAI_MODEL=gpt-5.4",
+                    "OPENAI_PROVIDER_NAME=Primary",
+                    "OPENAI_SECONDARY_API_KEY=sk-secondary",
+                    "OPENAI_SECONDARY_BASE_URL=https://secondary.example/v1",
+                    "OPENAI_SECONDARY_MODEL=qwen-max",
+                    "OPENAI_SECONDARY_PROVIDER_NAME=Secondary",
+                    "OPENAI_TERTIARY_API_KEY=sk-tertiary",
+                    "OPENAI_TERTIARY_BASE_URL=https://tertiary.example/v1",
+                    "OPENAI_TERTIARY_MODEL=gemini-2.5-pro",
+                    "OPENAI_TERTIARY_PROVIDER_NAME=Tertiary",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        configs = resolve_llm_review_config_chain(str(self.env_path))
+
+        self.assertEqual([config.candidate_stage for config in configs], ["primary", "secondary", "tertiary"])
+        self.assertEqual([config.provider_name for config in configs], ["Primary", "Secondary", "Tertiary"])
+        self.assertEqual([config.model for config in configs], ["gpt-5.4", "qwen-max", "gemini-2.5-pro"])
 
     def test_run_and_apply_llm_review_supports_responses_wire_api(self) -> None:
         self._make_workbook()

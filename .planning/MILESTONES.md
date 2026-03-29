@@ -1,5 +1,25 @@
 # Milestones
 
+## v1.2.0 End-to-End Single-Entry Pipeline Verification (Shipped: 2026-03-29)
+
+**Phases completed:** 5 roadmap phases through Phase 19
+
+**Key accomplishments:**
+
+- Shipped a repo-local single-entry path from task upload through keep-list to final export
+- Productized the brand-keyword fast path and shared-email resolution as a first-class upstream strategy
+- Hardened runtime contracts around resolved inputs, legacy dependency diagnostics, and keep-list resume boundaries
+- Proved a real bounded `MINISO` end-to-end run and documented the exact rerun command plus artifact locations
+- Added reliability semantics for upstream LLM failover, downstream partial scrape salvage, and visual model diagnostics
+
+**Known gaps accepted at archive time:**
+
+- `DEP-01`: legacy workbook / dashboard / project-home flows still depend on the external full `email` project
+- `QTE-01`: quote results are still not wired into screening runtime or final export
+- `REL-01`: live evidence is still bounded-first and mostly `instagram/openai`-centric rather than broad multi-platform stability proof
+
+---
+
 ## v1.1.0 Visual Provider Reliability and Downstream Hardening (Shipped: 2026-03-28)
 
 **Phases completed:** 2 roadmap phases through Phase 15

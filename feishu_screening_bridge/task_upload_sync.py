@@ -164,6 +164,7 @@ def inspect_task_upload_assignments(
     download_templates: bool = False,
     parse_templates: bool = False,
     parse_output_dir: str | Path | None = None,
+    owner_email_overrides: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     task_resolved = resolve_bitable_view_from_url(client, task_upload_url)
     if task_resolved.table_name and task_resolved.table_name != "任务上传":
@@ -187,6 +188,11 @@ def inspect_task_upload_assignments(
     }
 
     should_download_templates = bool(download_templates or parse_templates)
+    normalized_owner_email_overrides = {
+        _normalize_lookup_key(key): str(value or "").strip()
+        for key, value in (owner_email_overrides or {}).items()
+        if _normalize_lookup_key(key) and str(value or "").strip()
+    }
     download_root = Path(download_dir).expanduser()
     parse_root = (
         Path(parse_output_dir).expanduser()
@@ -208,12 +214,30 @@ def inspect_task_upload_assignments(
         employee: EmployeeDirectoryEntry | None = None
         employee_id_key = _normalize_lookup_key(entry.employee_id)
         owner_email_key = _normalize_lookup_key(entry.owner_email)
-        if employee_id_key:
+        task_key = _normalize_lookup_key(entry.task_name)
+        preferred_owner_email = normalized_owner_email_overrides.get(task_key, "")
+        preferred_owner_email_key = _normalize_lookup_key(preferred_owner_email)
+        owner_email_candidates = list(entry.owner_email_candidates or ((entry.owner_email,) if entry.owner_email else ()))
+        if preferred_owner_email_key:
+            owner_email_candidates = [
+                candidate
+                for candidate in owner_email_candidates
+                if _normalize_lookup_key(candidate) == preferred_owner_email_key
+            ] + [
+                candidate
+                for candidate in owner_email_candidates
+                if _normalize_lookup_key(candidate) != preferred_owner_email_key
+            ]
+            for candidate in owner_email_candidates:
+                employee = employees_by_email.get(_normalize_lookup_key(candidate))
+                if employee is not None:
+                    matched_by = "owner_email_override"
+                    break
+        if employee is None and employee_id_key:
             employee = employees_by_id.get(employee_id_key)
             if employee is not None:
                 matched_by = "employee_id"
         if employee is None:
-            owner_email_candidates = entry.owner_email_candidates or ((entry.owner_email,) if entry.owner_email else ())
             for candidate in owner_email_candidates:
                 employee = employees_by_email.get(_normalize_lookup_key(candidate))
                 if employee is not None:
@@ -261,6 +285,7 @@ def inspect_task_upload_assignments(
             "ownerName": entry.owner_name,
             "ownerEmail": entry.owner_email,
             "ownerEmailCandidates": list(entry.owner_email_candidates),
+            "preferredOwnerEmail": preferred_owner_email,
             "linkedBitableUrl": entry.linked_bitable_url,
             "templateFileToken": entry.workbook_file_token,
             "templateFileName": entry.workbook_file_name,
@@ -305,6 +330,7 @@ def sync_task_upload_mailboxes(
     download_dir: str | Path,
     mail_data_dir: str | Path,
     task_names: list[str] | tuple[str, ...] | None = None,
+    owner_email_overrides: dict[str, str] | None = None,
     folder_overrides: dict[str, str] | None = None,
     folder_prefixes: list[str] | tuple[str, ...] | None = None,
     limit: int | None = None,
@@ -343,6 +369,7 @@ def sync_task_upload_mailboxes(
         download_dir=download_dir,
         download_templates=False,
         parse_templates=False,
+        owner_email_overrides=owner_email_overrides,
     )
 
     mail_root = Path(mail_data_dir).expanduser()

@@ -391,6 +391,83 @@ class FeishuScreeningBridgeTests(unittest.TestCase):
         _, kwargs = sync_mock.call_args
         self.assertEqual(kwargs["sent_since"], "2025-12-27")
 
+    def test_inspect_task_upload_assignments_can_override_owner_email_match(self) -> None:
+        class _FakeOverrideClient(_FakeInspectionClient):
+            def post_api_json(self, url_path: str, *, body: dict[str, Any] | None = None, headers: dict[str, str] | None = None) -> dict[str, Any]:
+                if url_path == "/bitable/v1/apps/WVxtbuOkdaoqbxscPfJcG3oEnMd/tables/tblYvtOYLoGWCRna/records/search":
+                    return {
+                        "code": 0,
+                        "msg": "success",
+                        "data": {
+                            "has_more": False,
+                            "items": [
+                                {
+                                    "record_id": "rec-task-002",
+                                    "fields": {
+                                        "任务名": [{"text": "MINISO", "type": "text"}],
+                                        "员工ID": {"type": 1, "value": [{"text": "ou_primary", "type": "text"}]},
+                                        "负责人邮箱": {
+                                            "type": 1,
+                                            "value": [
+                                                {"link": "mailto:chenjunren@amagency.biz", "text": "chenjunren@amagency.biz", "type": "url"},
+                                                {"text": ",", "type": "text"},
+                                                {"link": "mailto:eden@amagency.biz", "text": "eden@amagency.biz", "type": "url"},
+                                            ],
+                                        },
+                                        "负责人": [{"name": "陈俊仁"}],
+                                        "发信名单": [{"file_token": "boxcn-miniso-sending-list", "name": "陈俊仁的总表.xlsx"}],
+                                        "达人管理表链接": {"link": "https://example.com/base/miniso", "type": "mention"},
+                                        "需求上传（excel 格式）": [{"file_token": "boxcn-miniso-file", "name": "miniso.xlsx"}],
+                                    },
+                                }
+                            ],
+                        },
+                    }
+                if url_path == "/bitable/v1/apps/WVxtbuOkdaoqbxscPfJcG3oEnMd/tables/tblQho4xE6SrOtmw/records/search":
+                    return {
+                        "code": 0,
+                        "msg": "success",
+                        "data": {
+                            "has_more": False,
+                            "items": [
+                                {
+                                    "record_id": "rec-employee-primary",
+                                    "fields": {
+                                        "imap 码": [{"text": "imap-chen-123", "type": "text"}],
+                                        "员工 ID": [{"text": "ou_primary", "type": "text"}],
+                                        "员工名": [{"name": "陈俊仁"}],
+                                        "邮箱": [{"link": "mailto:chenjunren@amagency.biz", "text": "chenjunren@amagency.biz", "type": "url"}],
+                                    },
+                                },
+                                {
+                                    "record_id": "rec-employee-eden",
+                                    "fields": {
+                                        "imap 码": [{"text": "imap-eden-456", "type": "text"}],
+                                        "员工 ID": [{"text": "ou_eden", "type": "text"}],
+                                        "员工名": [{"name": "Eden"}],
+                                        "邮箱": [{"link": "mailto:eden@amagency.biz", "text": "eden@amagency.biz", "type": "url"}],
+                                    },
+                                },
+                            ],
+                        },
+                    }
+                return super().post_api_json(url_path, body=body, headers=headers)
+
+        result = inspect_task_upload_assignments(
+            client=_FakeOverrideClient(self._build_new_template_workbook_bytes()),
+            task_upload_url="https://bcnorxdfy50v.feishu.cn/wiki/S0bbwTnlZiJlVMk1Q04ctPXBnje?table=tblYvtOYLoGWCRna&view=vewNwYvkQL",
+            employee_info_url="https://bcnorxdfy50v.feishu.cn/wiki/S0bbwTnlZiJlVMk1Q04ctPXBnje?table=tblQho4xE6SrOtmw&view=vewHoxVXaC",
+            download_dir=self.base_path / "downloads",
+            owner_email_overrides={"MINISO": "eden@amagency.biz"},
+        )
+
+        self.assertTrue(result["ok"])
+        item = result["items"][0]
+        self.assertEqual(item["preferredOwnerEmail"], "eden@amagency.biz")
+        self.assertEqual(item["matchedBy"], "owner_email_override")
+        self.assertEqual(item["employeeEmail"], "eden@amagency.biz")
+        self.assertEqual(item["imapCode"], "imap-eden-456")
+
     def test_local_env_loader_parses_key_values(self) -> None:
         env_path = self.base_path / ".env.local"
         env_path.write_text(

@@ -16,9 +16,11 @@ from .creator_enrichment import enrich_creator_workbook
 from .creator_review import prepare_duplicate_review, review_duplicate_groups
 from .date_windows import resolve_sync_sent_since
 from .db import Database, MessageQuery
+from .brand_keyword_match import match_brand_keyword, split_shared_email_candidates
 from .imap_sync import connect, discover_mailboxes, sync_mailboxes
 from .llm_review import prepare_llm_review_candidates, run_and_apply_llm_review
 from .relation_index import rebuild_relation_index
+from .shared_email_resolution import resolve_shared_email_candidates, run_shared_email_final_review
 
 
 LOCAL_TZ = datetime.now().astimezone().tzinfo
@@ -145,6 +147,64 @@ def _build_parser() -> argparse.ArgumentParser:
     llm_review.add_argument("--api-key", help="覆盖 LLM api key；默认优先从 .env 的 OPENAI_API_KEY 读取")
     llm_review.add_argument("--model", help="覆盖 LLM model；默认优先从 .env 的 OPENAI_MODEL 读取")
     llm_review.add_argument("--wire-api", help="覆盖 LLM wire API；支持 responses 或 chat_completions")
+
+    brand_match = subparsers.add_parser(
+        "match-brand-keyword",
+        help="按品牌关键词筛邮件并用工作簿邮箱做精确匹配，输出去重与 unique/shared-email 产物",
+    )
+    brand_match.add_argument("--env-file", default=".env", help="配置文件路径，默认 ./.env")
+    brand_match.add_argument("--input", required=True, help="输入 workbook 路径")
+    brand_match.add_argument("--db-path", help="覆盖邮件库 SQLite 路径；默认沿用 .env 里的 DB_PATH / DATA_DIR")
+    brand_match.add_argument("--keyword", required=True, help="品牌关键词，例如 MINISO")
+    brand_match.add_argument(
+        "--output-prefix",
+        default="exports/brand_keyword_match",
+        help="输出文件前缀，默认 exports/brand_keyword_match",
+    )
+    brand_match.add_argument("--message-limit", type=int, default=0, help="只读取最新 N 封命中邮件；0 表示不截断")
+    brand_match.add_argument("--include-from", action="store_true", help="把 from/sender 地址也纳入精确匹配候选")
+    brand_match.add_argument("--email-column", default="", help="显式指定邮箱列名")
+    brand_match.add_argument("--creator-column", default="", help="显式指定 creator 列名")
+    brand_match.add_argument("--profile-column", default="", help="显式指定 profile/link 列名")
+    brand_match.add_argument("--handle-column", default="", help="显式指定 handle / username 列名")
+    brand_match.add_argument("--platform-column", default="", help="显式指定平台列名")
+
+    split_shared = subparsers.add_parser(
+        "split-shared-email",
+        help="根据 matched_email 是否对应多个 profile_dedupe_key，把 workbook 拆成 unique/shared-email 产物",
+    )
+    split_shared.add_argument("--env-file", default=".env", help="配置文件路径，默认 ./.env")
+    split_shared.add_argument("--input", required=True, help="输入 workbook 路径，通常是 fast-path 的 deduped 输出")
+    split_shared.add_argument(
+        "--output-prefix",
+        default="exports/shared_email_split",
+        help="输出文件前缀，默认 exports/shared_email_split",
+    )
+
+    resolve_shared = subparsers.add_parser(
+        "resolve-shared-email",
+        help="按邮件内容规则解析 shared-email groups，并输出 unresolved tail 的 LLM candidates",
+    )
+    resolve_shared.add_argument("--env-file", default=".env", help="配置文件路径，默认 ./.env")
+    resolve_shared.add_argument("--input", required=True, help="输入 shared-email workbook 路径")
+    resolve_shared.add_argument("--db-path", help="覆盖邮件库 SQLite 路径；默认沿用 .env 里的 DB_PATH / DATA_DIR")
+    resolve_shared.add_argument(
+        "--output-prefix",
+        default="exports/shared_email_resolution",
+        help="输出文件前缀，默认 exports/shared_email_resolution",
+    )
+
+    final_review = subparsers.add_parser(
+        "llm-final-review",
+        help="对 shared-email unresolved tail 做最终 LLM review，并产出 final keep/manual tail workbooks",
+    )
+    final_review.add_argument("--env-file", default=".env", help="配置文件路径，默认 ./.env")
+    final_review.add_argument("--input-prefix", required=True, help="resolve-shared-email 的输出前缀")
+    final_review.add_argument("--auto-keep-workbook", action="append", help="已自动保留的 workbook 路径，可重复传入")
+    final_review.add_argument("--base-url", help="覆盖 LLM base url；默认优先从 .env 的 OPENAI_BASE_URL 读取")
+    final_review.add_argument("--api-key", help="覆盖 LLM api key；默认优先从 .env 的 OPENAI_API_KEY 读取")
+    final_review.add_argument("--model", help="覆盖 LLM model；默认优先从 .env 的 OPENAI_MODEL 读取")
+    final_review.add_argument("--wire-api", help="覆盖 LLM wire API；支持 responses 或 chat_completions")
 
     return parser
 
@@ -713,6 +773,94 @@ def _cmd_run_llm_review(
     return 0
 
 
+def _cmd_match_brand_keyword(
+    settings: Settings,
+    *,
+    input_path: str,
+    output_prefix: str,
+    db_path: Optional[str],
+    keyword: str,
+    message_limit: int,
+    include_from: bool,
+    email_column: str,
+    creator_column: str,
+    profile_column: str,
+    handle_column: str,
+    platform_column: str,
+) -> int:
+    db = Database(Path(db_path) if db_path else settings.db_path)
+    try:
+        result = match_brand_keyword(
+            db=db,
+            input_path=Path(input_path),
+            output_prefix=Path(output_prefix),
+            keyword=keyword,
+            message_limit=message_limit,
+            include_from=include_from,
+            email_column=email_column,
+            creator_column=creator_column,
+            profile_column=profile_column,
+            handle_column=handle_column,
+            platform_column=platform_column,
+        )
+    finally:
+        db.close()
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _cmd_split_shared_email(*, input_path: str, output_prefix: str) -> int:
+    result = split_shared_email_candidates(
+        input_path=Path(input_path),
+        output_prefix=Path(output_prefix),
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _cmd_resolve_shared_email(
+    settings: Settings,
+    *,
+    input_path: str,
+    output_prefix: str,
+    db_path: Optional[str],
+) -> int:
+    db = Database(Path(db_path) if db_path else settings.db_path)
+    try:
+        result = resolve_shared_email_candidates(
+            db=db,
+            input_path=Path(input_path),
+            output_prefix=Path(output_prefix),
+        )
+    finally:
+        db.close()
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
+def _cmd_llm_final_review(
+    *,
+    input_prefix: str,
+    env_file: str,
+    auto_keep_workbooks: Optional[list[str]],
+    base_url: Optional[str],
+    api_key: Optional[str],
+    model: Optional[str],
+    wire_api: Optional[str],
+) -> int:
+    result = run_shared_email_final_review(
+        input_prefix=Path(input_prefix),
+        env_path=env_file,
+        auto_keep_paths=[Path(path) for path in (auto_keep_workbooks or [])],
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        wire_api=wire_api,
+    )
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return 0
+
+
 def main() -> int:
     parser = _build_parser()
     args = parser.parse_args()
@@ -806,6 +954,43 @@ def main() -> int:
                 args.api_key,
                 args.model,
                 args.wire_api,
+            )
+        if args.command == "match-brand-keyword":
+            return _cmd_match_brand_keyword(
+                settings,
+                input_path=args.input,
+                output_prefix=args.output_prefix,
+                db_path=args.db_path,
+                keyword=args.keyword,
+                message_limit=args.message_limit,
+                include_from=args.include_from,
+                email_column=args.email_column,
+                creator_column=args.creator_column,
+                profile_column=args.profile_column,
+                handle_column=args.handle_column,
+                platform_column=args.platform_column,
+            )
+        if args.command == "split-shared-email":
+            return _cmd_split_shared_email(
+                input_path=args.input,
+                output_prefix=args.output_prefix,
+            )
+        if args.command == "resolve-shared-email":
+            return _cmd_resolve_shared_email(
+                settings,
+                input_path=args.input,
+                output_prefix=args.output_prefix,
+                db_path=args.db_path,
+            )
+        if args.command == "llm-final-review":
+            return _cmd_llm_final_review(
+                input_prefix=args.input_prefix,
+                env_file=args.env_file,
+                auto_keep_workbooks=args.auto_keep_workbook,
+                base_url=args.base_url,
+                api_key=args.api_key,
+                model=args.model,
+                wire_api=args.wire_api,
             )
         raise ValueError(f"未知命令: {args.command}")
     except Exception as exc:  # noqa: BLE001

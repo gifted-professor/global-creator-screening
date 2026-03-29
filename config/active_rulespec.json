@@ -1,180 +1,21 @@
 {
-  "version": "v1-flex-visual-reuse",
-  "compile_mode": "workbook_flexible_visual_reuse",
-  "source_layout": "flex_sectioned_workbook",
-  "goal": "判断达人基础数据和封面是否符合 电影资讯类/泛影迷/潮玩/开箱类/家庭/亲子类/情侣/剧情类/本地生活/资讯/Coser/变装/宠物/DIY类内容合作标准",
-  "basic_info": {
-    "project_name": "MINISO",
-    "brand_product": "电影资讯类/泛影迷/潮玩/开箱类/家庭/亲子类/情侣/剧情类/本地生活/资讯/Coser/变装/宠物/DIY类",
-    "platform_scope": [
-      "tiktok"
-    ],
-    "audit_goal": "判断达人基础数据和封面是否符合 电影资讯类/泛影迷/潮玩/开箱类/家庭/亲子类/情侣/剧情类/本地生活/资讯/Coser/变装/宠物/DIY类内容合作标准",
-    "reference_accounts": [],
-    "counterexample_accounts": [],
-    "notes": null,
-    "extra_rows": []
-  },
-  "platform_scope": [
-    "tiktok"
-  ],
-  "rules": [
-    {
-      "id": "data_mean_view_threshold",
-      "step": "step_2_data",
-      "rule_type": "metric_threshold",
-      "metric_key": "view_count_mean",
-      "platforms": [
-        "tiktok"
-      ],
-      "threshold": 30000,
-      "operator": ">",
-      "window": {
-        "size": 50,
-        "unit": "posts"
-      }
+  "version": "rulespec-lite-v1",
+  "compiled_at": "2026-03-28T13:28:16.889706Z",
+  "source_text": "Instagram 仅保留美国；最近30天有更新；TikTok 平均播放量 10000；中位数 8000；视觉看 9 张封面。",
+  "platform_overrides": {
+    "shared": {
+      "active_days_max": 30,
+      "visual_review_cover_limit": 9
     },
-    {
-      "id": "data_median_view_threshold",
-      "step": "step_2_data",
-      "rule_type": "metric_threshold",
-      "metric_key": "view_count_median",
-      "platforms": [
-        "tiktok"
-      ],
-      "threshold": 30000,
-      "operator": ">",
-      "window": {
-        "size": 50,
-        "unit": "posts"
-      }
-    },
-    {
-      "id": "data_follower_threshold",
-      "step": "step_2_data",
-      "rule_type": "metric_threshold",
-      "metric_key": "follower_count",
-      "platforms": [
-        "tiktok"
-      ],
-      "threshold": 100000,
-      "operator": ">"
-    },
-    {
-      "id": "data_recent_active_days",
-      "step": "step_2_data",
-      "rule_type": "metric_threshold",
-      "metric_key": "activity_recency_days",
-      "platforms": [
-        "tiktok"
-      ],
-      "threshold_days": 30,
-      "operator": "<="
-    },
-    {
-      "id": "visual_feature_group",
-      "step": "step_3_visual",
-      "rule_type": "visual_feature_group",
-      "platforms": [
-        "tiktok"
-      ],
-      "cover_count": 18,
-      "min_hit_features": 1,
-      "features": [
-        {
-          "key": "multi_person_interaction",
-          "label": "多人互动",
-          "source_label": "多人互动",
-          "source_cell": "B36",
-          "note": "示例：街访、朋友互动、陌生人交流"
-        },
-        {
-          "key": "speaking_led",
-          "label": "Speaking-led",
-          "source_label": "镜头口播",
-          "source_cell": "B37",
-          "note": "示例：镜头前开口说话，有表达能力"
-        },
-        {
-          "key": "kid_interaction",
-          "label": "孩子互动",
-          "source_label": "孩子互动",
-          "source_cell": "B38",
-          "note": "示例：室内环境与孩子互动"
-        },
-        {
-          "key": "product_display",
-          "label": "产品展示",
-          "source_label": "潮玩产品展示",
-          "source_cell": "B39",
-          "note": "示例：手持或展示产品"
-        },
-        {
-          "key": "pet_interaction",
-          "label": "宠物互动",
-          "source_label": "宠物互动",
-          "source_cell": "B41",
-          "note": "示例：与宠物互动"
-        }
+    "instagram": {
+      "allowed_regions": [
+        "US"
       ]
     },
-    {
-      "id": "exclusion_beauty_ratio",
-      "step": "step_4_exclusions",
-      "rule_type": "content_keyword_ratio",
-      "platforms": [
-        "tiktok"
-      ],
-      "operator": "ratio_gt",
-      "threshold_percent": 50,
-      "keyword_values": [
-        "beauty",
-        "makeup",
-        "skincare"
-      ]
+    "tiktok": {
+      "min_avg_views": 10000,
+      "min_median_views": 8000
     },
-    {
-      "id": "exclusion_multi_dance_ratio",
-      "step": "step_4_exclusions",
-      "rule_type": "multi_dance_ratio",
-      "platforms": [
-        "tiktok"
-      ],
-      "operator": "ratio_gt",
-      "threshold_percent": 30
-    },
-    {
-      "id": "exclusion_selfie_couple_ratio",
-      "step": "step_4_exclusions",
-      "rule_type": "selfie_or_couple_ratio",
-      "platforms": [
-        "tiktok"
-      ],
-      "operator": "ratio_gt",
-      "threshold_percent": 70
-    },
-    {
-      "id": "exclusion_green_screen",
-      "step": "step_4_exclusions",
-      "rule_type": "green_screen",
-      "platforms": [
-        "tiktok"
-      ],
-      "operator": "must_not_appear"
-    }
-  ],
-  "manual_review_items": [],
-  "compliance_notes": [],
-  "final_logic": {
-    "must_pass_steps": [
-      "step_1_qualification",
-      "step_2_data"
-    ],
-    "reject_if_any_steps": [
-      "step_4_exclusions"
-    ],
-    "manual_hit_action": "manual_review",
-    "success_output": "pass",
-    "failure_output": "reject"
+    "youtube": {}
   }
 }

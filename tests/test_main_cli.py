@@ -1,10 +1,21 @@
 from __future__ import annotations
 
+from contextlib import redirect_stdout
 from datetime import date
+from io import StringIO
+import json
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import patch
 
 from email_sync.__main__ import _build_parser
 from email_sync.date_windows import default_sync_sent_since, resolve_sync_sent_since, subtract_calendar_months
+from feishu_screening_bridge.__main__ import (
+    _build_parser as build_feishu_bridge_parser,
+    _cmd_import_from_feishu,
+    _cmd_sync_task_upload_view,
+)
 from scripts.run_keep_list_screening_pipeline import (
     build_parser as build_keep_list_parser,
     build_scrape_payload,
@@ -16,6 +27,7 @@ class MainCliTests(unittest.TestCase):
     def setUp(self) -> None:
         self.parser = _build_parser()
         self.keep_list_parser = build_keep_list_parser()
+        self.feishu_bridge_parser = build_feishu_bridge_parser()
 
     def test_list_folders_uses_default_env_file(self) -> None:
         args = self.parser.parse_args(["list-folders"])
@@ -192,6 +204,96 @@ class MainCliTests(unittest.TestCase):
         self.assertEqual(args.model, "qwen-test")
         self.assertEqual(args.wire_api, "responses")
 
+    def test_match_brand_keyword_parser_keeps_generic_inputs(self) -> None:
+        args = self.parser.parse_args(
+            [
+                "match-brand-keyword",
+                "--input",
+                "/tmp/input.xlsx",
+                "--db-path",
+                "/tmp/email_sync.db",
+                "--keyword",
+                "MINISO",
+                "--output-prefix",
+                "exports/miniso_fast_path",
+                "--message-limit",
+                "50",
+                "--include-from",
+                "--email-column",
+                "邮箱地址",
+                "--profile-column",
+                "IGlink",
+            ]
+        )
+        self.assertEqual(args.command, "match-brand-keyword")
+        self.assertEqual(args.input, "/tmp/input.xlsx")
+        self.assertEqual(args.db_path, "/tmp/email_sync.db")
+        self.assertEqual(args.keyword, "MINISO")
+        self.assertEqual(args.output_prefix, "exports/miniso_fast_path")
+        self.assertEqual(args.message_limit, 50)
+        self.assertTrue(args.include_from)
+        self.assertEqual(args.email_column, "邮箱地址")
+        self.assertEqual(args.profile_column, "IGlink")
+
+    def test_split_shared_email_parser_keeps_paths(self) -> None:
+        args = self.parser.parse_args(
+            [
+                "split-shared-email",
+                "--input",
+                "/tmp/deduped.xlsx",
+                "--output-prefix",
+                "exports/shared_email_split",
+            ]
+        )
+        self.assertEqual(args.command, "split-shared-email")
+        self.assertEqual(args.input, "/tmp/deduped.xlsx")
+        self.assertEqual(args.output_prefix, "exports/shared_email_split")
+
+    def test_resolve_shared_email_parser_keeps_paths(self) -> None:
+        args = self.parser.parse_args(
+            [
+                "resolve-shared-email",
+                "--input",
+                "/tmp/shared.xlsx",
+                "--db-path",
+                "/tmp/email_sync.db",
+                "--output-prefix",
+                "exports/shared_email_resolution",
+            ]
+        )
+        self.assertEqual(args.command, "resolve-shared-email")
+        self.assertEqual(args.input, "/tmp/shared.xlsx")
+        self.assertEqual(args.db_path, "/tmp/email_sync.db")
+        self.assertEqual(args.output_prefix, "exports/shared_email_resolution")
+
+    def test_llm_final_review_parser_keeps_auto_keep_and_provider_overrides(self) -> None:
+        args = self.parser.parse_args(
+            [
+                "llm-final-review",
+                "--input-prefix",
+                "exports/shared_email_resolution",
+                "--auto-keep-workbook",
+                "exports/unique.xlsx",
+                "--auto-keep-workbook",
+                "exports/resolved.xlsx",
+                "--base-url",
+                "https://example.com/v1",
+                "--api-key",
+                "sk-test",
+                "--model",
+                "gpt-test",
+                "--wire-api",
+                "responses",
+            ]
+        )
+        self.assertEqual(args.command, "llm-final-review")
+        self.assertEqual(args.input_prefix, "exports/shared_email_resolution")
+        self.assertEqual(args.auto_keep_workbook, ["exports/unique.xlsx", "exports/resolved.xlsx"])
+        self.assertEqual(args.base_url, "https://example.com/v1")
+        self.assertEqual(args.api_key, "sk-test")
+        self.assertEqual(args.model, "gpt-test")
+        self.assertEqual(args.wire_api, "responses")
+
     def test_keep_list_runner_parser_keeps_bounded_execution_flags(self) -> None:
         args = self.keep_list_parser.parse_args(
             [
@@ -228,6 +330,100 @@ class MainCliTests(unittest.TestCase):
         self.assertEqual(build_scrape_payload("instagram", ["alpha"]), {"usernames": ["alpha"]})
         self.assertEqual(build_scrape_payload("tiktok", ["beta"]), {"profiles": ["beta"]})
         self.assertEqual(build_scrape_payload("youtube", ["https://youtube.com/@gamma"]), {"urls": ["https://youtube.com/@gamma"]})
+
+    def test_feishu_bridge_import_command_returns_structured_legacy_dependency_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "FEISHU_APP_ID=test_app",
+                        "FEISHU_APP_SECRET=test_secret",
+                        "FEISHU_FILE_TOKEN=boxcn-test",
+                        "PROJECT_CODE=P-001",
+                        "PRIMARY_CATEGORY=lifestyle",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            args = self.feishu_bridge_parser.parse_args(
+                [
+                    "import-from-feishu",
+                    "--env-file",
+                    str(env_path),
+                    "--json",
+                ]
+            )
+            captured = StringIO()
+            with (
+                patch(
+                    "feishu_screening_bridge.__main__.inspect_email_project_dependency",
+                    return_value={
+                        "available": False,
+                        "error_code": "EMAIL_PROJECT_ROOT_MISSING",
+                        "message": "legacy bridge 依赖的外部 email 项目目录不存在: /tmp/email",
+                        "remediation": "set EMAIL_PROJECT_ROOT",
+                    },
+                ),
+                patch(
+                    "feishu_screening_bridge.__main__.import_screening_workbook_from_feishu",
+                    side_effect=AssertionError("should not reach legacy import"),
+                ),
+                redirect_stdout(captured),
+            ):
+                exit_code = _cmd_import_from_feishu(args)
+
+        payload = json.loads(captured.getvalue())
+        self.assertEqual(exit_code, 2)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error_code"], "EMAIL_PROJECT_ROOT_MISSING")
+        self.assertIn("legacyDependency", payload)
+
+    def test_feishu_bridge_sync_task_upload_view_returns_structured_legacy_dependency_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_path = Path(temp_dir) / ".env"
+            env_path.write_text(
+                "\n".join(
+                    [
+                        "FEISHU_APP_ID=test_app",
+                        "FEISHU_APP_SECRET=test_secret",
+                        "TASK_UPLOAD_URL=https://example.com/task",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            args = self.feishu_bridge_parser.parse_args(
+                [
+                    "sync-task-upload-view",
+                    "--env-file",
+                    str(env_path),
+                    "--json",
+                ]
+            )
+            captured = StringIO()
+            with (
+                patch(
+                    "feishu_screening_bridge.__main__.inspect_email_project_dependency",
+                    return_value={
+                        "available": False,
+                        "error_code": "EMAIL_PROJECT_PACKAGE_MISSING",
+                        "message": "legacy bridge 指向的目录缺少 email_sync 包: /tmp/email/email_sync",
+                        "remediation": "fix email project root",
+                    },
+                ),
+                patch(
+                    "feishu_screening_bridge.__main__.sync_task_upload_view_to_email_project",
+                    side_effect=AssertionError("should not reach legacy sync"),
+                ),
+                redirect_stdout(captured),
+            ):
+                exit_code = _cmd_sync_task_upload_view(args)
+
+        payload = json.loads(captured.getvalue())
+        self.assertEqual(exit_code, 2)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error_code"], "EMAIL_PROJECT_PACKAGE_MISSING")
+        self.assertEqual(payload["command"], "sync-task-upload-view")
 
     def test_keep_list_runner_builds_visual_payloads_from_identifiers(self) -> None:
         self.assertEqual(build_visual_payload("instagram", ["alpha"]), {"identifiers": ["alpha"]})

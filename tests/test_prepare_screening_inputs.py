@@ -103,6 +103,26 @@ def build_keep_workbook(path: Path) -> None:
     workbook.save(path)
 
 
+def build_keep_workbook_with_missing_platform(path: Path) -> None:
+    build_keep_workbook(path)
+    from openpyxl import load_workbook
+
+    loaded = load_workbook(path)
+    sheet = loaded[loaded.sheetnames[0]]
+    sheet.append([
+        "MINISO",
+        "samandcitra90day",
+        "samandcitra90day",
+        "",
+        None,
+        "Sam&Citra 90 day fiancè (@samandcitra90day) | TikTok",
+        "booking.samandcitra@outlook.com",
+        "tiktok:samandcitra90day",
+        "match_all",
+    ])
+    loaded.save(path)
+
+
 @unittest.skipIf(prepare_screening_inputs is None, f"screening deps unavailable: {IMPORT_ERROR}")
 class PrepareScreeningInputsTests(unittest.TestCase):
     def test_prepare_screening_inputs_persists_rulespec_and_upload_metadata(self) -> None:
@@ -214,6 +234,35 @@ class PrepareScreeningInputsTests(unittest.TestCase):
             self.assertEqual(summary["upload"]["metadata_count_by_platform"]["tiktok"], 1, summary)
             self.assertEqual(summary["upload"]["metadata_count_by_platform"]["youtube"], 1, summary)
             self.assertTrue(summary_json.exists(), summary_json)
+
+    def test_prepare_screening_inputs_infers_platform_and_canonical_url_for_keep_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            keep_workbook = tmp_path / "miniso_llm_reviewed_keep_with_gap.xlsx"
+            screening_data_dir = tmp_path / "screening_data"
+            config_dir = tmp_path / "config"
+            temp_dir = tmp_path / "temp"
+
+            build_keep_workbook_with_missing_platform(keep_workbook)
+
+            summary = prepare_screening_inputs(
+                creator_workbook=keep_workbook,
+                template_workbook=FIXTURE_TEMPLATE,
+                screening_data_dir=screening_data_dir,
+                config_dir=config_dir,
+                temp_dir=temp_dir,
+            )
+
+            self.assertEqual(summary["upload"]["parsed_source_kind"], "keep_list", summary)
+            self.assertEqual(summary["upload"]["metadata_count_by_platform"]["tiktok"], 2, summary)
+            tiktok_metadata_path = Path(summary["upload"]["upload_metadata_paths"]["tiktok"])
+            tiktok_metadata = json.loads(tiktok_metadata_path.read_text(encoding="utf-8"))
+            self.assertIn("samandcitra90day", tiktok_metadata, tiktok_metadata)
+            self.assertEqual(
+                tiktok_metadata["samandcitra90day"]["url"],
+                "https://www.tiktok.com/@samandcitra90day",
+                tiktok_metadata,
+            )
 
     def test_prepare_screening_inputs_can_source_task_upload_assets(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

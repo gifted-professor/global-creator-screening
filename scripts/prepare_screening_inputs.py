@@ -43,6 +43,38 @@ SENDING_LIST_PLATFORM_LINK_ALIASES = {
 }
 
 
+def _resolve_cli_env_value(
+    cli_value: object,
+    env_values: dict[str, str],
+    env_key: str,
+    default: str = "",
+) -> tuple[str, str]:
+    candidate = str(cli_value or "").strip()
+    if candidate:
+        return candidate, "cli"
+    env_candidate = str(env_values.get(env_key, "") or "").strip()
+    if env_candidate:
+        return env_candidate, "env_file"
+    return str(default or "").strip(), "default"
+
+
+def _path_summary(path: Path | None, *, source: str, kind: str) -> dict[str, Any]:
+    if path is None:
+        return {
+            "kind": kind,
+            "path": "",
+            "exists": False,
+            "source": source,
+        }
+    expanded = path.expanduser()
+    return {
+        "kind": kind,
+        "path": str(expanded.resolve()),
+        "exists": expanded.exists(),
+        "source": source,
+    }
+
+
 def configure_backend_runtime(
     *,
     screening_data_dir: Path | None = None,
@@ -81,45 +113,53 @@ def resolve_task_upload_source_files(
     download_sending_list: bool = True,
 ) -> dict[str, Any]:
     env_values = load_local_env(env_file)
-    app_id = get_preferred_value(feishu_app_id, env_values, "FEISHU_APP_ID")
-    app_secret = get_preferred_value(feishu_app_secret, env_values, "FEISHU_APP_SECRET")
+    app_id, app_id_source = _resolve_cli_env_value(feishu_app_id, env_values, "FEISHU_APP_ID")
+    app_secret, app_secret_source = _resolve_cli_env_value(feishu_app_secret, env_values, "FEISHU_APP_SECRET")
     if not app_id:
         raise ValueError("缺少 FEISHU_APP_ID，请在本地 .env 或参数里填写。")
     if not app_secret:
         raise ValueError("缺少 FEISHU_APP_SECRET，请在本地 .env 或参数里填写。")
 
-    resolved_task_upload_url = (
-        get_preferred_value(task_upload_url, env_values, "TASK_UPLOAD_URL")
-        or get_preferred_value(task_upload_url, env_values, "FEISHU_SOURCE_URL")
+    resolved_task_upload_url, task_upload_url_source = _resolve_cli_env_value(
+        task_upload_url,
+        env_values,
+        "TASK_UPLOAD_URL",
     )
+    if not resolved_task_upload_url:
+        resolved_task_upload_url, task_upload_url_source = _resolve_cli_env_value(
+            task_upload_url,
+            env_values,
+            "FEISHU_SOURCE_URL",
+        )
     if not resolved_task_upload_url:
         raise ValueError("缺少 TASK_UPLOAD_URL，请在本地 .env 或参数里填写。")
 
+    download_dir_value, download_dir_source = _resolve_cli_env_value(
+        str(task_download_dir or ""),
+        env_values,
+        "TASK_UPLOAD_DOWNLOAD_DIR",
+        str(DEFAULT_TASK_UPLOAD_DOWNLOAD_DIR),
+    )
     resolved_download_dir = Path(
-        get_preferred_value(
-            str(task_download_dir or ""),
-            env_values,
-            "TASK_UPLOAD_DOWNLOAD_DIR",
-            str(DEFAULT_TASK_UPLOAD_DOWNLOAD_DIR),
-        )
+        download_dir_value
     ).expanduser()
-    resolved_timeout_seconds = float(
-        get_preferred_value(
-            timeout_seconds if timeout_seconds > 0 else "",
-            env_values,
-            "TIMEOUT_SECONDS",
-            "30",
-        )
+    timeout_value, timeout_source = _resolve_cli_env_value(
+        timeout_seconds if timeout_seconds > 0 else "",
+        env_values,
+        "TIMEOUT_SECONDS",
+        "30",
+    )
+    resolved_timeout_seconds = float(timeout_value)
+    feishu_base_url_value, feishu_base_url_source = _resolve_cli_env_value(
+        feishu_base_url,
+        env_values,
+        "FEISHU_OPEN_BASE_URL",
+        DEFAULT_FEISHU_BASE_URL,
     )
     client = FeishuOpenClient(
         app_id=app_id,
         app_secret=app_secret,
-        base_url=get_preferred_value(
-            feishu_base_url,
-            env_values,
-            "FEISHU_OPEN_BASE_URL",
-            DEFAULT_FEISHU_BASE_URL,
-        ),
+        base_url=feishu_base_url_value,
         timeout_seconds=resolved_timeout_seconds,
     )
     result = download_task_upload_screening_assets(
@@ -132,6 +172,18 @@ def resolve_task_upload_source_files(
     )
     result["taskUploadUrl"] = resolved_task_upload_url
     result["downloadDir"] = str(resolved_download_dir)
+    result["resolvedConfig"] = {
+        "env_file": str(Path(env_file).expanduser().resolve()),
+        "env_file_exists": Path(env_file).expanduser().exists(),
+        "feishu_app_id_source": app_id_source,
+        "feishu_app_secret_source": app_secret_source,
+        "task_upload_url_source": task_upload_url_source,
+        "task_download_dir_source": download_dir_source,
+        "timeout_seconds": resolved_timeout_seconds,
+        "timeout_seconds_source": timeout_source,
+        "feishu_base_url": feishu_base_url_value,
+        "feishu_base_url_source": feishu_base_url_source,
+    }
     return result
 
 
@@ -483,6 +535,8 @@ def prepare_screening_inputs(
         "config_dir": backend_app.CONFIG_DIR,
         "temp_dir": backend_app.TEMP_DIR,
         "active_rulespec_path": backend_app.ACTIVE_RULESPEC_PATH,
+        "resolved_inputs": {},
+        "preflight": {},
         "rulespec": {},
         "upload": {},
         "taskSource": {},
@@ -491,6 +545,35 @@ def prepare_screening_inputs(
     resolved_creator_workbook = creator_workbook
     resolved_template_workbook = template_workbook
     normalized_task_name = str(task_name or "").strip()
+    env_path = Path(env_file).expanduser()
+    summary["resolved_inputs"] = {
+        "env_file": {
+            "path": str(env_path.resolve()),
+            "exists": env_path.exists(),
+            "source": "cli_or_default",
+        },
+        "runtime_dirs": {
+            "screening_data_dir": _path_summary(Path(backend_app.DATA_DIR), source="runtime_config", kind="dir"),
+            "config_dir": _path_summary(Path(backend_app.CONFIG_DIR), source="runtime_config", kind="dir"),
+            "temp_dir": _path_summary(Path(backend_app.TEMP_DIR), source="runtime_config", kind="dir"),
+        },
+        "creator_input": _path_summary(
+            resolved_creator_workbook.expanduser() if resolved_creator_workbook else None,
+            source="cli" if resolved_creator_workbook is not None else "pending",
+            kind="file",
+        ),
+        "template_input": _path_summary(
+            resolved_template_workbook.expanduser() if resolved_template_workbook else None,
+            source="cli" if resolved_template_workbook is not None else "pending",
+            kind="file",
+        ),
+        "rulespec_input": _path_summary(
+            rulespec_json.expanduser() if rulespec_json is not None else None,
+            source="cli" if rulespec_json is not None else "pending",
+            kind="file",
+        ),
+        "task_name": normalized_task_name,
+    }
     if normalized_task_name:
         task_source = resolve_task_upload_source_files(
             task_name=normalized_task_name,
@@ -509,6 +592,11 @@ def prepare_screening_inputs(
             resolved_creator_workbook = Path(task_source["sendingListDownloadedPath"]).expanduser()
         if resolved_template_workbook is None and rulespec_json is None:
             resolved_template_workbook = Path(task_source["templateDownloadedPath"]).expanduser()
+        summary["resolved_inputs"]["task_upload"] = {
+            "task_upload_url": task_source.get("taskUploadUrl", ""),
+            "download_dir": task_source.get("downloadDir", ""),
+            "resolved_config": dict(task_source.get("resolvedConfig") or {}),
+        }
 
     if resolved_template_workbook is not None:
         output_root = template_output_dir or DEFAULT_TEMPLATE_OUTPUT_DIR
@@ -537,6 +625,47 @@ def prepare_screening_inputs(
         summary["upload"] = prepare_upload_metadata(resolved_creator_workbook)
         summary["parsed_source_kind"] = summary["upload"].get("parsed_source_kind", "")
         summary["input_row_count"] = int(summary["upload"].get("input_row_count") or 0)
+
+    summary["resolved_inputs"]["creator_input"] = _path_summary(
+        resolved_creator_workbook.expanduser() if resolved_creator_workbook is not None else None,
+        source=(
+            "task_upload_sending_list"
+            if normalized_task_name and creator_workbook is None and resolved_creator_workbook is not None
+            else ("cli" if resolved_creator_workbook is not None else "none")
+        ),
+        kind="file",
+    )
+    summary["resolved_inputs"]["template_input"] = _path_summary(
+        resolved_template_workbook.expanduser() if resolved_template_workbook is not None else None,
+        source=(
+            "task_upload_template"
+            if normalized_task_name and template_workbook is None and rulespec_json is None and resolved_template_workbook is not None
+            else ("cli" if resolved_template_workbook is not None else "none")
+        ),
+        kind="file",
+    )
+    summary["resolved_inputs"]["rulespec_input"] = _path_summary(
+        rulespec_json.expanduser() if rulespec_json is not None else None,
+        source="cli" if rulespec_json is not None else "none",
+        kind="file",
+    )
+    summary["preflight"] = {
+        "runtime_dirs_ready": True,
+        "creator_input_mode": (
+            "task_upload_sending_list"
+            if normalized_task_name and creator_workbook is None and resolved_creator_workbook is not None
+            else ("creator_workbook" if resolved_creator_workbook is not None else "none")
+        ),
+        "template_input_mode": (
+            "task_upload_template"
+            if normalized_task_name and template_workbook is None and rulespec_json is None and resolved_template_workbook is not None
+            else ("template_workbook" if resolved_template_workbook is not None else ("rulespec_json" if rulespec_json is not None else "none"))
+        ),
+        "creator_input_exists": summary["resolved_inputs"]["creator_input"]["exists"],
+        "template_input_exists": summary["resolved_inputs"]["template_input"]["exists"],
+        "rulespec_input_exists": summary["resolved_inputs"]["rulespec_input"]["exists"],
+        "active_rulespec_path": backend_app.ACTIVE_RULESPEC_PATH,
+    }
 
     if summary_json is not None:
         backend_app.write_json_file(str(summary_json), summary)
