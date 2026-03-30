@@ -435,6 +435,165 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
         self.assertEqual(observed["owner_email_overrides"], {"MINISO": "eden@amagency.biz"})
         self.assertEqual(summary["resolved_inputs"]["mail_sync"]["owner_email_overrides"], {"MINISO": "eden@amagency.biz"})
 
+    def test_runner_passes_default_mail_credentials_to_mail_sync(self) -> None:
+        observed: dict[str, object] = {}
+
+        class FakeClient:
+            pass
+
+        class FakeDb:
+            def __init__(self, db_path):
+                self.db_path = Path(db_path)
+
+            def close(self):
+                return None
+
+        def fake_load_local_env(env_file):
+            return {
+                "FEISHU_APP_ID": "app-id",
+                "FEISHU_APP_SECRET": "app-secret",
+                "TASK_UPLOAD_URL": "https://env.example/task",
+                "EMPLOYEE_INFO_URL": "https://env.example/employee",
+                "TIMEOUT_SECONDS": "30",
+                "EMAIL_ACCOUNT": "partnerships@amagency.biz",
+                "EMAIL_AUTH_CODE": "xYeGKyNmK5jFN7Y2",
+            }
+
+        def fake_get_preferred_value(cli_value, env_values, env_key, default=""):
+            return str(cli_value or "").strip() or str(env_values.get(env_key, default) or "").strip()
+
+        def fake_download_task_upload_screening_assets(**kwargs):
+            download_dir = Path(kwargs["download_dir"])
+            template_path = download_dir / "miniso_template.xlsx"
+            sending_list_path = download_dir / "miniso_sending_list.xlsx"
+            template_path.parent.mkdir(parents=True, exist_ok=True)
+            template_path.touch()
+            sending_list_path.touch()
+            return {
+                "recordId": "rec123",
+                "taskName": "MINISO",
+                "linkedBitableUrl": "https://bitable.example/miniso",
+                "templateDownloadedPath": str(template_path),
+                "sendingListDownloadedPath": str(sending_list_path),
+            }
+
+        def fake_sync_task_upload_mailboxes(**kwargs):
+            observed["default_account_email"] = kwargs["default_account_email"]
+            observed["default_auth_code"] = kwargs["default_auth_code"]
+            mail_root = Path(kwargs["mail_data_dir"])
+            db_path = mail_root / "MINISO" / "email_sync.db"
+            raw_dir = mail_root / "MINISO" / "raw"
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            db_path.touch()
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            return {
+                "selectedCount": 1,
+                "syncedCount": 1,
+                "failedCount": 0,
+                "items": [
+                    {
+                        "taskName": "MINISO",
+                        "employeeName": "",
+                        "resolvedFolder": "其他文件夹/MINISO",
+                        "mailFetchedCount": 1,
+                        "mailSyncOk": True,
+                        "mailSyncError": "",
+                        "mailDbPath": str(db_path),
+                        "mailRawDir": str(raw_dir),
+                        "mailDataDir": str(db_path.parent),
+                        "mailCredentialSource": "default_account",
+                        "mailLoginEmail": "partnerships@amagency.biz",
+                    }
+                ],
+            }
+
+        def fake_enrich_creator_workbook(*, db, input_path, output_prefix):
+            all_xlsx = output_prefix.with_suffix(".xlsx")
+            high_xlsx = output_prefix.with_name(f"{output_prefix.name}_高置信").with_suffix(".xlsx")
+            all_csv = output_prefix.with_suffix(".csv")
+            high_csv = output_prefix.with_name(f"{output_prefix.name}_高置信").with_suffix(".csv")
+            for path in (all_xlsx, high_xlsx, all_csv, high_csv):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+            return {
+                "source_kind": "sending_list",
+                "rows": 1,
+                "matched_rows": 1,
+                "high_confidence_rows": 1,
+                "csv_path": str(all_csv),
+                "xlsx_path": str(all_xlsx),
+                "high_csv_path": str(high_csv),
+                "high_xlsx_path": str(high_xlsx),
+            }
+
+        def fake_prepare_llm_review_candidates(*, db, input_path, output_prefix):
+            prep_xlsx = output_prefix.with_suffix(".xlsx")
+            deduped_xlsx = output_prefix.with_name(f"{output_prefix.name}_去重").with_suffix(".xlsx")
+            jsonl_path = output_prefix.with_name(f"{output_prefix.name}_llm_candidates").with_suffix(".jsonl")
+            for path in (prep_xlsx, deduped_xlsx, jsonl_path):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+            return {
+                "source_row_count": 1,
+                "prep_row_count": 1,
+                "deduped_row_count": 1,
+                "llm_candidate_group_count": 0,
+                "prep_xlsx_path": str(prep_xlsx),
+                "deduped_xlsx_path": str(deduped_xlsx),
+                "llm_candidates_jsonl_path": str(jsonl_path),
+            }
+
+        def fake_run_and_apply_llm_review(*, input_prefix, env_path, base_url, api_key, model, wire_api):
+            review_jsonl = input_prefix.with_name(f"{input_prefix.name}_llm_review").with_suffix(".jsonl")
+            reviewed_xlsx = input_prefix.with_name(f"{input_prefix.name}_llm_reviewed").with_suffix(".xlsx")
+            keep_xlsx = input_prefix.with_name(f"{input_prefix.name}_llm_reviewed_keep").with_suffix(".xlsx")
+            for path in (review_jsonl, reviewed_xlsx, keep_xlsx):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+            return {
+                "review_group_count": 0,
+                "reviewed_row_count": 1,
+                "keep_row_count": 1,
+                "llm_review_jsonl_path": str(review_jsonl),
+                "llm_reviewed_xlsx_path": str(reviewed_xlsx),
+                "llm_reviewed_keep_xlsx_path": str(keep_xlsx),
+            }
+
+        task_runner._load_runtime_dependencies = lambda: {
+            "Settings": object,
+            "Database": FakeDb,
+            "FeishuOpenClient": lambda **kwargs: FakeClient(),
+            "DEFAULT_FEISHU_BASE_URL": "https://open.feishu.cn",
+            "download_task_upload_screening_assets": fake_download_task_upload_screening_assets,
+            "sync_task_upload_mailboxes": fake_sync_task_upload_mailboxes,
+            "match_brand_keyword": lambda **kwargs: (_ for _ in ()).throw(AssertionError("fast path should not run")),
+            "resolve_shared_email_candidates": lambda **kwargs: (_ for _ in ()).throw(AssertionError("fast path should not run")),
+            "run_shared_email_final_review": lambda **kwargs: (_ for _ in ()).throw(AssertionError("fast path should not run")),
+            "enrich_creator_workbook": fake_enrich_creator_workbook,
+            "prepare_llm_review_candidates": fake_prepare_llm_review_candidates,
+            "run_and_apply_llm_review": fake_run_and_apply_llm_review,
+            "resolve_sync_sent_since": lambda value: __import__("datetime").date(2025, 12, 27),
+            "load_local_env": fake_load_local_env,
+            "get_preferred_value": fake_get_preferred_value,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            summary = task_runner.run_task_upload_to_keep_list_pipeline(
+                task_name="MINISO",
+                env_file=".env",
+                output_root=temp_root / "run",
+                stop_after="keep-list",
+            )
+
+        self.assertEqual(observed["default_account_email"], "partnerships@amagency.biz")
+        self.assertEqual(observed["default_auth_code"], "xYeGKyNmK5jFN7Y2")
+        self.assertEqual(summary["resolved_inputs"]["mail_sync"]["default_account_email"], "partnerships@amagency.biz")
+        self.assertEqual(summary["resolved_inputs"]["mail_sync"]["default_account_email_source"], "env_file:EMAIL_ACCOUNT")
+        self.assertTrue(summary["resolved_inputs"]["mail_sync"]["default_auth_code_present"])
+        self.assertEqual(summary["resolved_inputs"]["mail_sync"]["default_auth_code_source"], "env_file:EMAIL_AUTH_CODE")
+        self.assertEqual(summary["resolved_inputs"]["mail_sync"]["credential_mode"], "default_account")
+
     def test_runner_can_reuse_existing_artifacts_from_prior_summary(self) -> None:
         class FakeClient:
             pass

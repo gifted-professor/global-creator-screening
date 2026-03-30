@@ -511,6 +511,16 @@ def _cmd_sync_task_upload_mail(args: argparse.Namespace) -> int:
     if not employee_info_url:
         raise ValueError("缺少 EMPLOYEE_INFO_URL，请在本地 .env 或 --employee-url 里填写。")
 
+    default_account_email = get_preferred_value("", env_values, "TASK_UPLOAD_MAIL_ACCOUNT") or get_preferred_value(
+        "",
+        env_values,
+        "EMAIL_ACCOUNT",
+    )
+    default_auth_code = get_preferred_value("", env_values, "TASK_UPLOAD_MAIL_AUTH_CODE") or get_preferred_value(
+        "",
+        env_values,
+        "EMAIL_AUTH_CODE",
+    )
     timeout_raw = get_preferred_value(args.timeout_seconds if args.timeout_seconds > 0 else "", env_values, "TIMEOUT_SECONDS", "30")
     timeout_seconds = float(timeout_raw)
     client = FeishuOpenClient(
@@ -539,6 +549,8 @@ def _cmd_sync_task_upload_mail(args: argparse.Namespace) -> int:
         ).isoformat(),
         imap_host=get_preferred_value(args.imap_host, env_values, "IMAP_HOST", "imap.qq.com"),
         imap_port=int(get_preferred_value(args.imap_port if args.imap_port > 0 else "", env_values, "IMAP_PORT", "993") or "993"),
+        default_account_email=default_account_email,
+        default_auth_code=default_auth_code,
     )
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))

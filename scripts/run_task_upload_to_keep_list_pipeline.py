@@ -151,6 +151,9 @@ def _classify_failure(exc: Exception, *, failed_step: str) -> dict[str, Any]:
     elif "mail sync failed" in message:
         error_code = "MAIL_SYNC_FAILED"
         remediation = "检查 `mail_sync` step 的 `mail_sync_error`、员工邮箱映射和 IMAP 配置。"
+    elif "默认抓取邮箱模式要求同时提供" in message:
+        error_code = "MAIL_SYNC_DEFAULT_CREDENTIALS_INCOMPLETE"
+        remediation = "同时配置 `TASK_UPLOAD_MAIL_ACCOUNT` / `TASK_UPLOAD_MAIL_AUTH_CODE`，或同时配置 `EMAIL_ACCOUNT` / `EMAIL_AUTH_CODE`。"
     return _build_failure_payload(
         stage=stage,
         error_code=error_code,
@@ -209,6 +212,18 @@ def _resolve_cli_env_value(
     env_candidate = str(env_values.get(env_key, "") or "").strip()
     if env_candidate:
         return env_candidate, "env_file"
+    return str(default or "").strip(), "default"
+
+
+def _resolve_env_fallback_value(
+    env_values: dict[str, str],
+    env_keys: Sequence[str],
+    default: str = "",
+) -> tuple[str, str]:
+    for env_key in env_keys:
+        env_candidate = str(env_values.get(env_key, "") or "").strip()
+        if env_candidate:
+            return env_candidate, f"env_file:{env_key}"
     return str(default or "").strip(), "default"
 
 
@@ -585,6 +600,20 @@ def run_task_upload_to_keep_list_pipeline(
             "993",
         )
         resolved_imap_port = int(resolved_imap_port_raw or "993")
+        resolved_default_account_email, default_account_email_source = _resolve_env_fallback_value(
+            env_values,
+            ("TASK_UPLOAD_MAIL_ACCOUNT", "EMAIL_ACCOUNT"),
+        )
+        resolved_default_auth_code, default_auth_code_source = _resolve_env_fallback_value(
+            env_values,
+            ("TASK_UPLOAD_MAIL_AUTH_CODE", "EMAIL_AUTH_CODE"),
+        )
+        if resolved_default_account_email and resolved_default_auth_code:
+            credential_mode = "default_account"
+        elif resolved_default_account_email or resolved_default_auth_code:
+            credential_mode = "incomplete_default_account"
+        else:
+            credential_mode = "employee_directory"
 
         downloads_dir.mkdir(parents=True, exist_ok=True)
         mail_root.mkdir(parents=True, exist_ok=True)
@@ -616,7 +645,16 @@ def run_task_upload_to_keep_list_pipeline(
             "imap_host_source": imap_host_source,
             "imap_port": resolved_imap_port,
             "imap_port_source": imap_port_source,
+            "default_account_email": resolved_default_account_email,
+            "default_account_email_source": default_account_email_source,
+            "default_auth_code_present": bool(resolved_default_auth_code),
+            "default_auth_code_source": default_auth_code_source,
+            "credential_mode": credential_mode,
         })
+        if credential_mode == "incomplete_default_account":
+            raise ValueError(
+                "默认抓取邮箱模式要求同时提供 default_account_email 和 default_auth_code。"
+            )
         summary["preflight"].update({
             "ready": True,
             "task_upload_url_present": True,
@@ -701,6 +739,8 @@ def run_task_upload_to_keep_list_pipeline(
             sent_since=resolved_sent_since,
             imap_host=resolved_imap_host,
             imap_port=resolved_imap_port,
+            default_account_email=resolved_default_account_email,
+            default_auth_code=resolved_default_auth_code,
         )
         mail_item = next(iter(mail_sync_result.get("items") or []), {})
         if not mail_item:
@@ -720,6 +760,8 @@ def run_task_upload_to_keep_list_pipeline(
             "task": {
                 "task_name": mail_item.get("taskName", ""),
                 "employee_name": mail_item.get("employeeName", ""),
+                "credential_source": mail_item.get("mailCredentialSource", ""),
+                "login_email": mail_item.get("mailLoginEmail", ""),
                 "resolved_folder": mail_item.get("resolvedFolder", ""),
                 "mail_fetched_count": mail_item.get("mailFetchedCount", 0),
                 "mail_sync_error": mail_item.get("mailSyncError", ""),

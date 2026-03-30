@@ -403,6 +403,73 @@ class FeishuScreeningBridgeTests(unittest.TestCase):
         self.assertEqual(kwargs["limit"], 3)
         self.assertEqual(kwargs["sent_since"], date(2026, 3, 1))
 
+    def test_sync_task_upload_mailboxes_can_use_default_credentials_without_employee_match(self) -> None:
+        mail_data_dir = self.base_path / "task-mail-data-default-account"
+
+        class _FakeNoEmployeeClient(_FakeInspectionClient):
+            def post_api_json(self, url_path: str, *, body: dict[str, Any] | None = None, headers: dict[str, str] | None = None) -> dict[str, Any]:
+                if url_path == "/bitable/v1/apps/WVxtbuOkdaoqbxscPfJcG3oEnMd/tables/tblQho4xE6SrOtmw/records/search":
+                    return {
+                        "code": 0,
+                        "msg": "success",
+                        "data": {
+                            "has_more": False,
+                            "items": [],
+                        },
+                    }
+                return super().post_api_json(url_path, body=body, headers=headers)
+
+        class _FakeImapClient:
+            def close(self) -> None:
+                return None
+
+            def logout(self) -> None:
+                return None
+
+        with (
+            patch("feishu_screening_bridge.task_upload_sync.connect", return_value=_FakeImapClient()),
+            patch(
+                "feishu_screening_bridge.task_upload_sync.discover_mailboxes",
+                return_value=[
+                    MailboxInfo(display_name="其他文件夹/duet", imap_name="其他文件夹/duet", delimiter="/", flags=["\\HasNoChildren"]),
+                ],
+            ),
+            patch(
+                "feishu_screening_bridge.task_upload_sync.sync_mailboxes",
+                return_value=[
+                    SyncResult(
+                        folder_name="其他文件夹/duet",
+                        fetched=2,
+                        skipped_state_advance=True,
+                        last_seen_uid=0,
+                        uidvalidity=9527,
+                        message_count_on_server=18,
+                    )
+                ],
+            ) as sync_mock,
+        ):
+            result = sync_task_upload_mailboxes(
+                client=_FakeNoEmployeeClient(self._build_new_template_workbook_bytes()),
+                task_upload_url="https://bcnorxdfy50v.feishu.cn/wiki/S0bbwTnlZiJlVMk1Q04ctPXBnje?table=tblYvtOYLoGWCRna&view=vewNwYvkQL",
+                employee_info_url="https://bcnorxdfy50v.feishu.cn/wiki/S0bbwTnlZiJlVMk1Q04ctPXBnje?table=tblQho4xE6SrOtmw&view=vewHoxVXaC",
+                download_dir=self.base_path / "downloads",
+                mail_data_dir=mail_data_dir,
+                default_account_email="partnerships@amagency.biz",
+                default_auth_code="xYeGKyNmK5jFN7Y2",
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["defaultCredentialMode"], "default_account")
+        self.assertEqual(result["defaultAccountEmail"], "partnerships@amagency.biz")
+        item = result["items"][0]
+        self.assertFalse(item["employeeMatched"])
+        self.assertTrue(item["mailSyncOk"])
+        self.assertEqual(item["mailCredentialSource"], "default_account")
+        self.assertEqual(item["mailLoginEmail"], "partnerships@amagency.biz")
+        settings = sync_mock.call_args.args[0]
+        self.assertEqual(settings.account_email, "partnerships@amagency.biz")
+        self.assertEqual(settings.auth_code, "xYeGKyNmK5jFN7Y2")
+
     def test_sync_task_upload_mail_cli_defaults_to_recent_three_months_when_omitted(self) -> None:
         mail_data_dir = self.base_path / "task-mail-data-default-window"
         env_path = self.base_path / "mail.env"

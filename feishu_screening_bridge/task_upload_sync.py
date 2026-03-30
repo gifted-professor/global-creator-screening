@@ -340,6 +340,8 @@ def sync_task_upload_mailboxes(
     sent_since: str | None = None,
     imap_host: str = "imap.qq.com",
     imap_port: int = 993,
+    default_account_email: str = "",
+    default_auth_code: str = "",
 ) -> dict[str, Any]:
     if limit is not None and limit <= 0:
         raise ValueError("--limit 必须是大于 0 的整数。")
@@ -362,6 +364,17 @@ def sync_task_upload_mailboxes(
         for prefix in (folder_prefixes or ["其他文件夹"])
         if str(prefix or "").strip()
     ]
+    normalized_default_account_email = str(default_account_email or "").strip()
+    normalized_default_auth_code = str(default_auth_code or "").strip()
+    default_credentials_requested = bool(
+        normalized_default_account_email or normalized_default_auth_code
+    )
+    if default_credentials_requested and not (
+        normalized_default_account_email and normalized_default_auth_code
+    ):
+        raise ValueError(
+            "默认抓取邮箱模式要求同时提供 default_account_email 和 default_auth_code。"
+        )
 
     inspection = inspect_task_upload_assignments(
         client=client,
@@ -403,23 +416,39 @@ def sync_task_upload_mailboxes(
                 "mailUidvalidity": None,
                 "mailServerCount": None,
                 "mailSkippedStateAdvance": False,
+                "mailCredentialSource": "",
+                "mailLoginEmail": "",
             }
         )
 
         try:
             employee_email = str(inspected.get("employeeEmail") or "").strip()
             imap_code = str(inspected.get("imapCode") or "").strip()
-            if not inspected.get("employeeMatched"):
+            resolved_account_email = employee_email
+            resolved_auth_code = imap_code
+            credential_source = "employee_directory"
+            if default_credentials_requested:
+                resolved_account_email = normalized_default_account_email
+                resolved_auth_code = normalized_default_auth_code
+                credential_source = "default_account"
+
+            result_item.update(
+                {
+                    "mailCredentialSource": credential_source,
+                    "mailLoginEmail": resolved_account_email,
+                }
+            )
+            if not inspected.get("employeeMatched") and not default_credentials_requested:
                 raise ValueError("任务未匹配到员工信息，无法抓取邮件。")
-            if not employee_email:
-                raise ValueError("员工邮箱为空，无法抓取邮件。")
-            if not imap_code:
-                raise ValueError("员工 IMAP 码为空，无法抓取邮件。")
+            if not resolved_account_email:
+                raise ValueError("登录邮箱为空，无法抓取邮件。")
+            if not resolved_auth_code:
+                raise ValueError("IMAP 授权码为空，无法抓取邮件。")
 
             task_data_dir = mail_root / _safe_path_component(inspected["taskName"] or inspected["recordId"] or "task-mail-sync")
             settings = Settings(
-                account_email=employee_email,
-                auth_code=imap_code,
+                account_email=resolved_account_email,
+                auth_code=resolved_auth_code,
                 imap_host=str(imap_host or "imap.qq.com").strip() or "imap.qq.com",
                 imap_port=int(imap_port),
                 data_dir=task_data_dir,
@@ -466,6 +495,8 @@ def sync_task_upload_mailboxes(
                     "mailUidvalidity": sync_result.uidvalidity if sync_result is not None else None,
                     "mailServerCount": sync_result.message_count_on_server if sync_result is not None else None,
                     "mailSkippedStateAdvance": bool(sync_result.skipped_state_advance) if sync_result is not None else False,
+                    "mailCredentialSource": credential_source,
+                    "mailLoginEmail": resolved_account_email,
                 }
             )
             synced_count += 1
@@ -488,6 +519,8 @@ def sync_task_upload_mailboxes(
         "mailDataDir": str(mail_root),
         "imapHost": str(imap_host or "imap.qq.com").strip() or "imap.qq.com",
         "imapPort": int(imap_port),
+        "defaultCredentialMode": "default_account" if default_credentials_requested else "employee_directory",
+        "defaultAccountEmail": normalized_default_account_email,
         "sentSince": sent_since_date.isoformat() if sent_since_date is not None else "",
         "items": items,
     }
