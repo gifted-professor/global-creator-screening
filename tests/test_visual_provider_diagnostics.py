@@ -659,6 +659,46 @@ class VisualProviderConfigDefaultsTests(unittest.TestCase):
         self.assertIn("品牌定制视觉规则", prompt)
         self.assertNotIn("重点排查", prompt)
 
+    def test_visual_review_prompt_selection_falls_back_to_rulespec_visual_contract(self) -> None:
+        active_rulespec = {
+            "goal": "优先保留家庭生活感强的账号",
+            "rules": [
+                {
+                    "type": "visual_feature_group",
+                    "platform": "instagram",
+                    "cover_count": 5,
+                    "min_hit_features": 2,
+                    "features": [
+                        {"label": "家庭场景"},
+                        {"label": "宠物陪伴"},
+                        {"label": "户外生活"},
+                    ],
+                },
+                {
+                    "type": "green_screen",
+                    "platforms": ["instagram"],
+                },
+            ],
+        }
+
+        selection = backend_app.resolve_visual_review_prompt_selection(
+            "openai",
+            "instagram",
+            model_name="gpt-5.4",
+            active_visual_prompts={},
+            active_rulespec=active_rulespec,
+        )
+
+        self.assertEqual(selection["source"], "rulespec_visual_contract")
+        self.assertEqual(selection["visual_contract_source"], "active_rulespec.rules")
+        self.assertEqual(selection["resolved_cover_limit"], 5)
+        self.assertEqual(selection["visual_runtime_contract"]["goal"], "优先保留家庭生活感强的账号")
+        self.assertEqual(selection["visual_runtime_contract"]["positive_feature_labels"], ["家庭场景", "宠物陪伴", "户外生活"])
+        self.assertIn("审核目标：优先保留家庭生活感强的账号", selection["prompt"])
+        self.assertIn("优先确认是否命中以下至少 2 类视觉特征", selection["prompt"])
+        self.assertIn("同时排除以下视觉风险", selection["prompt"])
+        self.assertIn("出现绿幕背景", selection["prompt"])
+
     def test_visual_review_prompt_selection_prefers_provider_then_model_then_platform(self) -> None:
         active_visual_prompts = {
             "instagram": {
