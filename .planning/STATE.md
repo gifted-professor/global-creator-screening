@@ -2,14 +2,14 @@
 gsd_state_version: 1.0
 milestone: v1.3.0
 milestone_name: External Email Dependency Decoupling
-status: unknown
-stopped_at: Phase 23 planned on 2026-03-30; next workflow step is `$gsd-execute-phase 23`
-last_updated: "2026-03-30T01:08:46.289Z"
+status: ready_for_milestone_audit
+stopped_at: Phase 24 executed on 2026-03-30; next workflow step is `$gsd-audit-milestone`
+last_updated: "2026-03-30T10:45:00+08:00"
 progress:
-  total_phases: 4
-  completed_phases: 3
-  total_plans: 9
-  completed_plans: 6
+  total_phases: 5
+  completed_phases: 5
+  total_plans: 11
+  completed_plans: 11
 ---
 
 # Project State
@@ -19,12 +19,12 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-30)
 
 **Core value:** 在不打断现有本地工作流的前提下，把飞书内容获取、筛选导入和相关配置集中到一个可持续维护的仓库里。
-**Current focus:** Phase 23 — Wire template-compiled visual prompts into runtime and define visual feature-group contract
+**Current focus:** Milestone closeout after Phases 23-24
 
 ## Current Position
 
-Phase: 23 (Wire template-compiled visual prompts into runtime and define visual feature-group contract) — EXECUTING
-Plan: 1 of 3
+Phase: 24 (Add post-visual-review positioning-card analysis step for approved creators) — COMPLETED
+Plan: 2 of 2 completed
 
 ## Performance Metrics
 
@@ -91,6 +91,8 @@ Recent decisions affecting current work:
 - [Phase 22]: summary-driven recovery 已实证成立；operator 可以从 `resume_points.keep_list.recommended_command` 接过 keep-list boundary，并在改用健康 provider 后继续完成 downstream
 - [Phase 22]: operator fallback/runbook 现在固定成三层说法：`repo-local single-entry mainline resume`、`repo-local bridge outputs`、`explicit legacy compatibility mode`
 - [Phase 23 Plan]: runtime visual contract 先拆成三段：持久化 `active_visual_prompts.json`、把 `visual_feature_group` / 视觉排除项接入 runtime cover/prompt contract、再用 smoke artifact + README 把 prompt precedence 和 fallback 顺序固定下来
+- [Phase 23]: runtime 现在已消费模板编译出的 active visual prompts、`visual_feature_group` 和支持的视觉排除项；brand/provider fallback 顺序与 runtime diagnostics 已通过回归覆盖固定下来
+- [Phase 24]: positioning-card analysis 现在作为 visual-pass 后的 repo-local stage 接入 downstream runner 和 final wrapper，可导出 machine-readable artifact，且默认 non-blocking
 - [Reference Intake]: 外部 `筛号/docs/2026-03-29-qwen-prompt-benchmark.md` 可作为后续视觉优化基线；优先保留 `gpt-5.4` 原 prompt，给 `qwen-vl-max` 单独挂 `v2`，并按 `gpt-5.4 -> qwen-vl-max` 路由，而不是继续强行用单 prompt 逼近 GPT
 - [Reference Intake]: 外部 `apify` 项目的 handoff 文档模式可直接复用到当前仓库；开发接手应先看 `README + .planning`，再从 `scripts/run_task_upload_to_final_export_pipeline.py`、`scripts/run_task_upload_to_keep_list_pipeline.py`、`scripts/run_keep_list_screening_pipeline.py`、`backend/app.py` 4 个入口下钻
 - [Phase 1]: 先补最小 `.planning` 再迁移代码
@@ -151,19 +153,18 @@ Recent decisions affecting current work:
 - Phase 21 added: Replace workbook/dashboard/project-home runtime paths with repo-local implementations
 - Phase 22 added: Validate decoupled runtime stability and operator fallback contract
 - Phase 23 added: Wire template-compiled visual prompts into runtime and define visual feature-group contract
+- Phase 24 added: Add post-visual-review positioning-card analysis step for approved creators
 
 ### Pending Todos
 
-- Phase 23: 执行 visual runtime contract 三个 plans，验证品牌 prompt / `visual_feature_group` 已真正接入 runtime
-- Milestone audit / closeout: 待 Phase 23 交付后再决定继续留在 `v1.3.0` 收尾，还是拆到新 milestone
+- Milestone audit / closeout: 执行 `v1.3.0` closeout，确认 Phases 20-24 与 deferred follow-ups 的边界
 - Deferred debt intake: `backend/app.py` 模块化 + app factory、shared settings loader、`pipeline_runtime.py` 抽取、SQLite WAL/FTS、upload/job hardening、LLM config consolidation、`pyproject.toml`/lint/typecheck、以及 workbook handle cleanup
 - Post-decoupling follow-up candidate: task-name single-entry orchestration API / thin operator UI，放到下一里程碑再开
 
 ### Blockers/Concerns
 
-- `visual_prompts.json` 和 `active_rulespec.rules` 现在是分离产物；如果 runtime 只接其中一边，仍会留下“编译有品牌规则、运行不消费”的断裂
-- 当前仓库仍要兼容 lite `active_rulespec.json`；Phase 23 不能假设所有入口都会先产出 full `rules`
-- 外部 qwen benchmark 仍在 sibling docs；Phase 23 应先接入 override capability，不把外部 benchmark 文件迁入变成阻塞项
+- 当前仓库仍要兼容 lite `active_rulespec.json`；后续优化不能假设所有入口都会先产出 full `rules`
+- 外部 qwen benchmark 仍在 sibling docs；后续 prompt 调优应继续走 override / benchmark route，而不是把 sibling benchmark 文件迁入变成阻塞项
 
 ### Quick Tasks Completed
 
@@ -217,9 +218,11 @@ Recent decisions affecting current work:
 - 2026-03-29: Add docs-first developer handoff guidance modeled on the external `apify` project: docs explain the full chain, while 4 code entrypoints are enough to start safe changes
 - 2026-03-29: Complete Phase 20 20-01 by inventorying every remaining workbook / dashboard / project-home external dependency surface and splitting current decoupling scope from deferred engineering debt
 - 2026-03-29: Complete Phase 20 20-02 by making legacy diagnostics repo-local-first, removing private absolute-path defaults from docs/sample/tests, and gating legacy integration coverage behind explicit `CHUHAI_LEGACY_EMAIL_PROJECT_ROOT`
+- 2026-03-30: Complete Phase 23 by wiring active visual prompts, `visual_feature_group`, cover-limit/runtime diagnostics, and rulespec fallback prompts into the visual-review runtime with regression coverage
+- 2026-03-30: Complete Phase 24 by adding post-visual-review `positioning_card_analysis`, backend positioning artifacts, downstream/top-level summary visibility, operator docs, and non-blocking stage semantics
 
 ## Session Continuity
 
-Last session: 2026-03-30 09:00
-Stopped at: Phase 23 planned on 2026-03-30; next workflow step is `$gsd-execute-phase 23`
+Last session: 2026-03-30 10:45
+Stopped at: Phase 24 executed on 2026-03-30; next workflow step is `$gsd-audit-milestone`
 Resume file: None

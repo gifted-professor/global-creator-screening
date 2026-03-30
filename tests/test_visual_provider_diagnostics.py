@@ -219,6 +219,37 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
         self.assertEqual(payload["missing_profiles_preview"][0]["identifier"], "ghost")
         self.assertFalse(payload["saved_final_review_artifacts_available"])
 
+    def test_artifact_status_reports_positioning_card_paths_and_counts(self) -> None:
+        with mock.patch.object(
+            backend_app,
+            "load_profile_reviews",
+            return_value=[
+                {
+                    "username": "alpha",
+                    "profile_url": "https://instagram.com/alpha",
+                    "status": "Pass",
+                    "reason": "ok",
+                    "upload_metadata": {},
+                    "stats": {},
+                }
+            ],
+        ), mock.patch.object(
+            backend_app,
+            "load_visual_results",
+            return_value={"alpha": {"decision": "Pass"}},
+        ), mock.patch.object(
+            backend_app,
+            "load_positioning_card_results",
+            return_value={"alpha": {"fit_recommendation": "High Fit"}},
+        ):
+            response = self.client.get("/api/artifacts/instagram/status")
+
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("positioning_card_results_path", payload)
+        self.assertEqual(payload["positioning_card_result_count"], 1)
+        self.assertTrue(payload["saved_positioning_card_artifacts_available"])
+
     def test_final_review_export_is_blocked_when_profile_reviews_contain_missing(self) -> None:
         with mock.patch.object(
             backend_app,
@@ -488,6 +519,10 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
 
 
 class VisualProviderConfigDefaultsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        os.environ.pop("VISION_PROVIDER_PREFERENCE", None)
+        self.client = backend_app.app.test_client()
+
     def test_reelx_defaults_to_generate_content_with_qwen_model(self) -> None:
         provider = next(item for item in backend_app.VISION_PROVIDER_CONFIGS if item["name"] == "reelx")
 
@@ -698,6 +733,113 @@ class VisualProviderConfigDefaultsTests(unittest.TestCase):
         self.assertIn("优先确认是否命中以下至少 2 类视觉特征", selection["prompt"])
         self.assertIn("同时排除以下视觉风险", selection["prompt"])
         self.assertIn("出现绿幕背景", selection["prompt"])
+
+    def test_positioning_card_prompt_selection_uses_rulespec_goal_and_features(self) -> None:
+        active_rulespec = {
+            "goal": "优先保留家庭生活感强的账号",
+            "rules": [
+                {
+                    "type": "visual_feature_group",
+                    "platform": "instagram",
+                    "cover_count": 5,
+                    "min_hit_features": 2,
+                    "features": [
+                        {"label": "家庭场景"},
+                        {"label": "宠物陪伴"},
+                    ],
+                },
+                {
+                    "type": "green_screen",
+                    "platforms": ["instagram"],
+                },
+            ],
+        }
+
+        selection = backend_app.resolve_positioning_card_prompt_selection(
+            "openai",
+            "instagram",
+            model_name="gpt-5.4",
+            active_rulespec=active_rulespec,
+        )
+
+        self.assertEqual(selection["source"], "generic_brand_fit")
+        self.assertEqual(selection["visual_contract_source"], "active_rulespec.rules")
+        self.assertEqual(selection["resolved_cover_limit"], 5)
+        self.assertIn("品牌审核目标：优先保留家庭生活感强的账号", selection["prompt"])
+        self.assertIn("家庭场景", selection["prompt"])
+        self.assertIn("出现绿幕背景", selection["prompt"])
+
+    def test_resolve_positioning_card_analysis_targets_only_returns_visual_pass_records(self) -> None:
+        with mock.patch.object(
+            backend_app,
+            "load_profile_reviews",
+            return_value=[
+                {"username": "alpha", "status": "Pass", "profile_url": "https://instagram.com/alpha"},
+                {"username": "beta", "status": "Pass", "profile_url": "https://instagram.com/beta"},
+                {"username": "gamma", "status": "Reject", "profile_url": "https://instagram.com/gamma"},
+            ],
+        ), mock.patch.object(
+            backend_app,
+            "merge_upload_metadata_into_reviews",
+            side_effect=lambda platform, reviews: reviews,
+        ), mock.patch.object(
+            backend_app,
+            "load_visual_results",
+            return_value={
+                "alpha": {"decision": "Pass", "reason": "ok"},
+                "beta": {"decision": "Reject", "reason": "off-brand"},
+            },
+        ):
+            targets = backend_app.resolve_positioning_card_analysis_targets("instagram", {"identifiers": ["alpha", "beta", "gamma"]})
+
+        self.assertEqual([item["username"] for item in targets], ["alpha"])
+        self.assertEqual(targets[0]["_visual_result"]["decision"], "Pass")
+
+    def test_positioning_card_job_start_returns_preflight_error_payload(self) -> None:
+        os.environ["OPENAI_API_KEY"] = "sk-live-12345678"
+        os.environ["OPENAI_BASE_URL"] = "not-a-url"
+        os.environ.pop("VISION_PROVIDER_PREFERENCE", None)
+
+        response = self.client.post(
+            "/api/jobs/positioning-card-analysis",
+            json={"platform": "instagram", "payload": {"identifiers": ["alpha"], "provider": "openai"}},
+        )
+        payload = response.get_json()
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(payload["success"])
+        self.assertEqual(payload["error_code"], "VISION_PROVIDER_NOT_RUNNABLE")
+
+    def test_download_positioning_card_json_exports_machine_readable_rows(self) -> None:
+        with mock.patch.object(
+            backend_app,
+            "load_positioning_card_results",
+            return_value={
+                "alpha": {
+                    "username": "alpha",
+                    "fit_recommendation": "High Fit",
+                    "positioning_labels": ["家庭", "宠物"],
+                    "fit_summary": "家庭生活感强",
+                    "evidence_signals": ["多人互动"],
+                }
+            },
+        ):
+            response = self.client.get("/api/download/instagram/positioning-card-json")
+
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["row_count"], 1)
+        self.assertEqual(payload["positioning_card_results"][0]["identifier"], "alpha")
+        self.assertEqual(payload["positioning_card_results"][0]["fit_recommendation"], "High Fit")
+
+    def test_parse_positioning_card_result_normalizes_fit_recommendation(self) -> None:
+        raw_text = '{"positioning_labels":["家庭","宠物"],"fit_recommendation":"strong fit","fit_summary":"家庭氛围明显","evidence_signals":["多人互动"]}'
+
+        parsed = backend_app.parse_positioning_card_result(raw_text)
+
+        self.assertEqual(parsed["fit_recommendation"], "High Fit")
+        self.assertEqual(parsed["positioning_labels"], ["家庭", "宠物"])
+        self.assertEqual(parsed["evidence_signals"], ["多人互动"])
 
     def test_visual_review_prompt_selection_prefers_provider_then_model_then_platform(self) -> None:
         active_visual_prompts = {
@@ -1011,7 +1153,7 @@ data: [DONE]
                     ["data:image/jpeg;base64,ZmFrZQ=="],
                 )
 
-        self.assertIn("合法的视觉 JSON contract", str(ctx.exception))
+        self.assertIn("合法的视觉复核 JSON contract", str(ctx.exception))
 
     def test_probe_vision_provider_retries_reelx_across_base_urls(self) -> None:
         provider = {

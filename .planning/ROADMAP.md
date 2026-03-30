@@ -5,20 +5,21 @@
 - ✅ **v1.0.0 Consolidated Local Creator Screening Pipeline** — Phases 1-13 shipped 2026-03-28. Archive: `.planning/milestones/v1.0.0-ROADMAP.md`
 - ✅ **v1.1.0 Visual Provider Reliability and Downstream Hardening** — Phases 14-15 shipped 2026-03-28. Archive: `.planning/milestones/v1.1.0-ROADMAP.md`
 - ✅ **v1.2.0 End-to-End Single-Entry Pipeline Verification** — Phases 16-19 shipped 2026-03-29. Archive: `.planning/milestones/v1.2.0-ROADMAP.md`
-- 🚧 **v1.3.0 External Email Dependency Decoupling** — Phases 20-22 completed; follow-up Phase 23 added for visual runtime contract work
+- 🚧 **v1.3.0 External Email Dependency Decoupling** — Phases 20-24 completed; milestone closeout pending
 
 ## Overview
 
 `v1.3.0` 先聚焦 `DEP-01`：把 workbook / dashboard / project-home 对 external full `email` 项目的剩余耦合从运行主线里拆掉，确保 operator 在当前仓库里就能完成关键入口流程。`QTE-01` 与 `REL-01` 保留为后续里程碑，避免本轮把 dependency removal、数据接入和大样本稳定性验证混成同一交付面。
 
-`Phase 23` 是在 decoupling proof 之后补录的视觉 runtime contract follow-up：重点不是继续做 dependency removal，而是把模板编译出的品牌视觉 prompt / feature contract 真正接入 runtime。当前先按 repo-local follow-up phase 收口，避免“编译有品牌规则、runtime 还在跑通用 prompt”的断裂继续带进下游。
+`Phase 23` 和 `Phase 24` 是在 decoupling proof 之后补录的 repo-local follow-up：前者把模板编译出的品牌视觉 prompt / feature contract 真正接回 runtime，后者把 visual-pass 之后的定位卡分析接入 downstream / final-wrapper 可观察 contract。当前 milestone 的实现面已经完成，剩下的是 audit / closeout。
 
 ## Phases
 
 - [x] **Phase 20: Baseline legacy dependency surfaces and lock repo-local replacement contract** - 盘点 workbook / dashboard / project-home 的外部依赖触点并定义统一替换规则
 - [x] **Phase 21: Replace workbook/dashboard/project-home runtime paths with repo-local implementations** - 把核心入口从 external full `email` 依赖切到当前仓库
 - [x] **Phase 22: Validate decoupled runtime stability and operator fallback contract** - 回归主链并收口兼容回退说明，确保迁移可安全落地
-- [ ] **Phase 23: Wire template-compiled visual prompts into runtime and define visual feature-group contract** - 把模板编译出的品牌视觉 prompt 接回 runtime，并定义 `visual_feature_group` 的消费契约
+- [x] **Phase 23: Wire template-compiled visual prompts into runtime and define visual feature-group contract** - 把模板编译出的品牌视觉 prompt 接回 runtime，并定义 `visual_feature_group` 的消费契约
+- [x] **Phase 24: Add post-visual-review positioning-card analysis step for approved creators** - 在 visual review 之后增加 repo-local 定位卡分析，并把结构化输出接入 downstream / final wrapper summary
 
 ## Progress
 
@@ -27,7 +28,8 @@
 | 20. Baseline legacy dependency surfaces and lock repo-local replacement contract | 2/2 | Completed | 2026-03-29 |
 | 21. Replace workbook/dashboard/project-home runtime paths with repo-local implementations | 2/2 | Completed | 2026-03-29 |
 | 22. Validate decoupled runtime stability and operator fallback contract | 2/2 | Completed | 2026-03-29 |
-| 23. Wire template-compiled visual prompts into runtime and define visual feature-group contract | 0/3 | Planned | — |
+| 23. Wire template-compiled visual prompts into runtime and define visual feature-group contract | 3/3 | Completed | 2026-03-30 |
+| 24. Add post-visual-review positioning-card analysis step for approved creators | 2/2 | Completed | 2026-03-30 |
 
 ### Phase 20: Baseline legacy dependency surfaces and lock repo-local replacement contract
 
@@ -89,6 +91,24 @@ Phase 22 已完成。回归 suite `python3 -m unittest tests.test_main_cli tests
 **Plans:** 3 plans
 
 Plans:
-- [ ] 23-01: Persist compiled visual prompt bundles into active runtime and resolve brand/provider prompt selection
-- [ ] 23-02: Consume `visual_feature_group` / supported visual exclusions in runtime cover selection and prompt fallback
-- [ ] 23-03: Verify the visual runtime contract with regression coverage, smoke artifacts, and operator docs
+- [x] 23-01: Persist compiled visual prompt bundles into active runtime and resolve brand/provider prompt selection
+- [x] 23-02: Consume `visual_feature_group` / supported visual exclusions in runtime cover selection and prompt fallback
+- [x] 23-03: Verify the visual runtime contract with regression coverage, smoke artifacts, and operator docs
+
+### Phase 24: Add post-visual-review positioning-card analysis step for approved creators
+
+**Goal:** 在不改变现有 visual review gate 的前提下，为 visual-review-pass 的达人新增 repo-local positioning-card analysis 步骤，并让其结构化输出和阶段状态进入 downstream runner / final wrapper 的可观察 contract。
+**Requirements**: [POS-01, POS-02, POS-03]
+**Depends on:** Phase 23
+**Success Criteria** (what must be TRUE):
+  1. downstream runtime 只会在 visual review 已通过的达人上执行 positioning-card analysis，不会替换或前移现有 visual review Pass/Reject gate
+  2. positioning-card analysis 会留下 machine-readable 结果，至少包含定位标签、品牌适配结论/建议和简明证据，并能被 operator 查看或导出
+  3. keep-list downstream runner 与 final wrapper summary 会显式暴露 positioning-card analysis 的 stage 状态、artifact 或摘要，且第一版默认不会因为该步骤失败就阻断 final export
+**Plans:** 2 plans
+
+Plans:
+- [x] 24-01: Add backend-owned positioning-card analysis contract and wire it into the downstream runner stage graph
+- [x] 24-02: Surface positioning artifacts through wrapper/docs and leave repo-local verification guidance
+
+**Details:**
+Phase 24 已完成。定位卡分析现在作为 `positioning_card_analysis` stage 运行在 visual-review-pass 达人之后，并通过 backend artifact、downstream summary、top-level final-wrapper summary 暴露结构化产物与阶段状态。第一版默认保持 non-blocking：stage 可 skipped / failed，但不会单独把 final export 提升为硬失败。contract note 留在 `.planning/phases/24-add-post-visual-review-positioning-card-analysis-step-for-approved-creators/24-POSITIONING-CARD-CONTRACT.md`，回归验证为 `PYTHONPYCACHEPREFIX=/tmp/pycache backend/.venv/bin/python -m unittest tests.test_visual_provider_diagnostics tests.test_keep_list_screening_pipeline tests.test_task_upload_to_final_export_pipeline -v`，结果 `85 tests, OK`。

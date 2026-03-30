@@ -207,6 +207,20 @@ def export_platform_artifacts(client, platform: str, export_dir: Path) -> dict[s
     final_review_path = export_dir / f"{platform}_final_review.xlsx"
     save_binary_response(client.post(f"/api/download/{platform}/final-review", json={}), final_review_path)
     outputs["final_review"] = str(final_review_path)
+
+    artifact_status = require_success(client.get(f"/api/artifacts/{platform}/status"), f"{platform} artifact status")
+    if artifact_status.get("saved_positioning_card_artifacts_available"):
+        positioning_review_path = export_dir / f"{platform}_positioning_card_review.xlsx"
+        save_binary_response(client.get(f"/api/download/{platform}/positioning-card-review"), positioning_review_path)
+        outputs["positioning_card_review"] = str(positioning_review_path)
+
+        positioning_json_path = export_dir / f"{platform}_positioning_card_results.json"
+        json_response = client.get(f"/api/download/{platform}/positioning-card-json")
+        if json_response.status_code >= 400:
+            payload = json_response.get_json(silent=True)
+            raise RuntimeError(f"download failed for {positioning_json_path.name}: HTTP {json_response.status_code} {payload}")
+        positioning_json_path.write_bytes(json_response.data)
+        outputs["positioning_card_json"] = str(positioning_json_path)
     return outputs
 
 

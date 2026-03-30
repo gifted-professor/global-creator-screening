@@ -296,6 +296,15 @@ def _persist_platform_summary(
     _write_summary(run_summary_path, summary)
 
 
+def _build_positioning_stage_payload(status: str, reason: str = "", **extra: Any) -> dict[str, Any]:
+    payload = {
+        "status": str(status or "").strip(),
+        "reason": str(reason or "").strip(),
+    }
+    payload.update({key: value for key, value in extra.items() if value not in (None, "")})
+    return payload
+
+
 def run_keep_list_screening_pipeline(
     *,
     keep_workbook: Path,
@@ -312,6 +321,7 @@ def run_keep_list_screening_pipeline(
     probe_vision_provider_only: bool = False,
     skip_scrape: bool = False,
     skip_visual: bool = False,
+    skip_positioning_card_analysis: bool = False,
 ) -> dict[str, Any]:
     resolved_output_root = (output_root or default_output_root()).expanduser().resolve()
     resolved_output_root.mkdir(parents=True, exist_ok=True)
@@ -364,6 +374,7 @@ def run_keep_list_screening_pipeline(
             "requested_platforms": requested_platforms,
             "skip_scrape": bool(skip_scrape),
             "skip_visual": bool(skip_visual),
+            "skip_positioning_card_analysis": bool(skip_positioning_card_analysis),
             "probe_vision_provider_only": bool(probe_vision_provider_only),
             "ready": False,
             "errors": [],
@@ -373,6 +384,7 @@ def run_keep_list_screening_pipeline(
         "max_identifiers_per_platform": int(max_identifiers_per_platform),
         "skip_scrape": bool(skip_scrape),
         "skip_visual": bool(skip_visual),
+        "skip_positioning_card_analysis": bool(skip_positioning_card_analysis),
         "probe_vision_provider_only": bool(probe_vision_provider_only),
         "vision_providers": [],
         "vision_preflight": {},
@@ -569,6 +581,10 @@ def run_keep_list_screening_pipeline(
                     "runnable_provider_names": platform_summary["vision_preflight"]["runnable_provider_names"],
                     "selected_provider": platform_summary["vision_preflight"].get("preferred_provider") or "",
                 }
+                platform_summary["positioning_card_analysis"] = _build_positioning_stage_payload(
+                    "skipped",
+                    "scrape skipped before positioning analysis",
+                )
                 _persist_platform_summary(
                     summary=summary,
                     run_summary_path=run_summary_path,
@@ -670,6 +686,10 @@ def run_keep_list_screening_pipeline(
                     "status": "skipped",
                     "reason": "名单账号未在本次抓取结果中返回，已阻断视觉复核和最终导出",
                 }
+                platform_summary["positioning_card_analysis"] = _build_positioning_stage_payload(
+                    "skipped",
+                    "missing profiles blocked downstream stages",
+                )
                 platform_summary["artifact_status"] = require_success(
                     client.get(f"/api/artifacts/{platform}/status"),
                     f"{platform} artifact status",
@@ -728,6 +748,69 @@ def run_keep_list_screening_pipeline(
                     "error_code": platform_summary["vision_preflight"]["error_code"],
                     "vision_preflight": platform_summary["vision_preflight"],
                 }
+
+            if skip_positioning_card_analysis:
+                platform_summary["positioning_card_analysis"] = _build_positioning_stage_payload(
+                    "skipped",
+                    "skip_positioning_card_analysis flag set",
+                )
+            elif skip_visual:
+                platform_summary["positioning_card_analysis"] = _build_positioning_stage_payload(
+                    "skipped",
+                    "visual review skipped",
+                )
+            else:
+                resolve_targets = getattr(backend_app, "resolve_positioning_card_analysis_targets", None)
+                eligible_targets = []
+                if callable(resolve_targets):
+                    eligible_targets = list(resolve_targets(platform, build_visual_payload(platform, requested_identifiers)))
+                if not eligible_targets:
+                    platform_summary["positioning_card_analysis"] = _build_positioning_stage_payload(
+                        "skipped",
+                        "no Visual=Pass targets",
+                    )
+                else:
+                    positioning_payload_body = build_visual_payload(platform, requested_identifiers)
+                    if vision_provider:
+                        positioning_payload_body["provider"] = str(vision_provider).strip().lower()
+                    try:
+                        _persist_platform_summary(
+                            summary=summary,
+                            run_summary_path=run_summary_path,
+                            backend_app=backend_app,
+                            platform=platform,
+                            platform_summary=platform_summary,
+                            current_stage="positioning_card_analysis_starting",
+                        )
+                        positioning_payload = require_success(
+                            client.post(
+                                "/api/jobs/positioning-card-analysis",
+                                json={"platform": platform, "payload": positioning_payload_body},
+                            ),
+                            f"{platform} positioning card start",
+                        )
+                        platform_summary["positioning_card_analysis"] = dict(positioning_payload.get("job") or {})
+                        _persist_platform_summary(
+                            summary=summary,
+                            run_summary_path=run_summary_path,
+                            backend_app=backend_app,
+                            platform=platform,
+                            platform_summary=platform_summary,
+                            current_stage="positioning_card_analysis_running",
+                        )
+                        platform_summary["positioning_card_analysis"] = poll_job(
+                            client,
+                            positioning_payload["job"]["id"],
+                            f"{platform} positioning card poll",
+                            max(1.0, float(poll_interval)),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        platform_summary["positioning_card_analysis"] = _build_positioning_stage_payload(
+                            "failed",
+                            str(exc) or exc.__class__.__name__,
+                            error_code="POSITIONING_CARD_ANALYSIS_FAILED",
+                            non_blocking=True,
+                        )
 
             _persist_platform_summary(
                 summary=summary,
@@ -791,6 +874,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--probe-vision-provider-only", action="store_true", help="只做视觉 provider live probe，不继续 scrape/visual/export。")
     parser.add_argument("--skip-scrape", action="store_true", help="只做 staging，不触发 scrape/visual/export。")
     parser.add_argument("--skip-visual", action="store_true", help="跑 scrape 和导出，但跳过视觉复核。")
+    parser.add_argument("--skip-positioning-card-analysis", action="store_true", help="跳过 visual-pass 后的定位卡分析。")
     return parser
 
 
@@ -812,6 +896,7 @@ def main(argv: list[str] | None = None) -> int:
         probe_vision_provider_only=bool(args.probe_vision_provider_only),
         skip_scrape=bool(args.skip_scrape),
         skip_visual=bool(args.skip_visual),
+        skip_positioning_card_analysis=bool(args.skip_positioning_card_analysis),
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0 if summary.get("status") != "failed" else 1

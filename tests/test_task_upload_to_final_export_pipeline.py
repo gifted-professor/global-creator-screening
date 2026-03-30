@@ -244,6 +244,79 @@ class TaskUploadToFinalExportRunnerTests(unittest.TestCase):
             {"instagram": "completed_with_partial_scrape", "tiktok": "scrape_failed"},
         )
 
+    def test_runner_surfaces_positioning_artifacts_and_stage_summaries_without_blocking_delivery(self) -> None:
+        def fake_upstream(**kwargs):
+            keep_path = Path(kwargs["output_root"]) / "exports" / "MINISO_final_keep.xlsx"
+            template_path = Path(kwargs["output_root"]) / "downloads" / "template.xlsx"
+            keep_path.parent.mkdir(parents=True, exist_ok=True)
+            keep_path.touch()
+            template_path.parent.mkdir(parents=True, exist_ok=True)
+            template_path.touch()
+            return {
+                "status": "stopped_after_keep-list",
+                "contract": {"canonical_boundary": "keep-list"},
+                "resume_points": {
+                    "keep_list": {
+                        "keep_workbook": str(keep_path),
+                        "template_workbook": str(template_path),
+                    }
+                },
+                "artifacts": {
+                    "keep_workbook": str(keep_path),
+                    "template_workbook": str(template_path),
+                },
+            }
+
+        def fake_downstream(**kwargs):
+            final_export = Path(kwargs["output_root"]) / "exports" / "instagram" / "instagram_final_review.xlsx"
+            positioning_export = Path(kwargs["output_root"]) / "exports" / "instagram" / "instagram_positioning_card_review.xlsx"
+            positioning_json = Path(kwargs["output_root"]) / "exports" / "instagram" / "instagram_positioning_card_results.json"
+            for path in (final_export, positioning_export, positioning_json):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+            return {
+                "status": "completed",
+                "platforms": {
+                    "instagram": {
+                        "status": "completed",
+                        "exports": {
+                            "final_review": str(final_export),
+                            "positioning_card_review": str(positioning_export),
+                            "positioning_card_json": str(positioning_json),
+                        },
+                        "positioning_card_analysis": {
+                            "status": "failed",
+                            "reason": "provider timeout",
+                            "non_blocking": True,
+                        },
+                    }
+                },
+            }
+
+        final_runner._load_runtime_dependencies = lambda: {
+            "run_task_upload_to_keep_list_pipeline": fake_upstream,
+            "run_keep_list_screening_pipeline": fake_downstream,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            summary = final_runner.run_task_upload_to_final_export_pipeline(
+                task_name="MINISO",
+                output_root=temp_root / "run",
+                platform_filters=["instagram"],
+            )
+
+        self.assertEqual(summary["status"], "completed")
+        self.assertIn("instagram", summary["steps"]["downstream"]["positioning_artifacts"])
+        self.assertEqual(
+            summary["steps"]["downstream"]["positioning_card_analysis"]["instagram"]["status"],
+            "failed",
+        )
+        self.assertTrue(
+            summary["steps"]["downstream"]["positioning_card_analysis"]["instagram"]["non_blocking"]
+        )
+        self.assertIn("positioning_card_review", summary["artifacts"]["positioning_artifacts"]["instagram"])
+
 
 if __name__ == "__main__":
     unittest.main()

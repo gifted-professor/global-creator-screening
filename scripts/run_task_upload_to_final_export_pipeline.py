@@ -89,6 +89,7 @@ def _build_keep_list_resume_command(
     probe_vision_provider_only: bool,
     skip_scrape: bool,
     skip_visual: bool,
+    skip_positioning_card_analysis: bool,
 ) -> str:
     parts = [
         "backend/.venv/bin/python",
@@ -118,6 +119,8 @@ def _build_keep_list_resume_command(
         parts.append("--skip-scrape")
     if skip_visual:
         parts.append("--skip-visual")
+    if skip_positioning_card_analysis:
+        parts.append("--skip-positioning-card-analysis")
     return " ".join(parts)
 
 
@@ -147,6 +150,31 @@ def _collect_platform_statuses(downstream_summary: dict[str, Any]) -> dict[str, 
         if status:
             statuses[platform_name] = status
     return statuses
+
+
+def _collect_positioning_artifacts(downstream_summary: dict[str, Any]) -> dict[str, dict[str, str]]:
+    artifacts: dict[str, dict[str, str]] = {}
+    for platform, platform_summary in (downstream_summary.get("platforms") or {}).items():
+        exports_payload = (platform_summary or {}).get("exports")
+        if not isinstance(exports_payload, dict):
+            continue
+        cleaned = {
+            key: str(value).strip()
+            for key, value in exports_payload.items()
+            if key.startswith("positioning_card_") and str(value or "").strip()
+        }
+        if cleaned:
+            artifacts[str(platform)] = cleaned
+    return artifacts
+
+
+def _collect_positioning_stage_summaries(downstream_summary: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    stages: dict[str, dict[str, Any]] = {}
+    for platform, platform_summary in (downstream_summary.get("platforms") or {}).items():
+        stage_payload = (platform_summary or {}).get("positioning_card_analysis")
+        if isinstance(stage_payload, dict) and stage_payload:
+            stages[str(platform)] = dict(stage_payload)
+    return stages
 
 
 def run_task_upload_to_final_export_pipeline(
@@ -186,6 +214,7 @@ def run_task_upload_to_final_export_pipeline(
     probe_vision_provider_only: bool = False,
     skip_scrape: bool = False,
     skip_visual: bool = False,
+    skip_positioning_card_analysis: bool = False,
 ) -> dict[str, Any]:
     runtime = _load_runtime_dependencies()
     run_upstream = runtime["run_task_upload_to_keep_list_pipeline"]
@@ -251,6 +280,7 @@ def run_task_upload_to_final_export_pipeline(
                 "probe_vision_provider_only": bool(probe_vision_provider_only),
                 "skip_scrape": bool(skip_scrape),
                 "skip_visual": bool(skip_visual),
+                "skip_positioning_card_analysis": bool(skip_positioning_card_analysis),
             },
         },
         "resolved_paths": {
@@ -274,6 +304,7 @@ def run_task_upload_to_final_export_pipeline(
             "keep_workbook": "",
             "template_workbook": "",
             "final_exports": {},
+            "positioning_artifacts": {},
         },
         "resume_points": {},
     }
@@ -368,6 +399,7 @@ def run_task_upload_to_final_export_pipeline(
             probe_vision_provider_only=bool(probe_vision_provider_only),
             skip_scrape=bool(skip_scrape),
             skip_visual=bool(skip_visual),
+            skip_positioning_card_analysis=bool(skip_positioning_card_analysis),
         ),
     }
     _write_summary(run_summary_path, summary)
@@ -411,6 +443,7 @@ def run_task_upload_to_final_export_pipeline(
             probe_vision_provider_only=bool(probe_vision_provider_only),
             skip_scrape=bool(skip_scrape),
             skip_visual=bool(skip_visual),
+            skip_positioning_card_analysis=bool(skip_positioning_card_analysis),
         )
     except Exception as exc:  # noqa: BLE001
         failure = _build_failure_payload(
@@ -426,16 +459,21 @@ def run_task_upload_to_final_export_pipeline(
         return finalize("failed", error=failure["message"], error_code=failure["error_code"], failure=failure)
 
     final_exports = _collect_final_exports(downstream_summary)
+    positioning_artifacts = _collect_positioning_artifacts(downstream_summary)
+    positioning_stage_summaries = _collect_positioning_stage_summaries(downstream_summary)
     summary["steps"]["downstream"] = {
         "status": downstream_summary.get("status"),
         "summary_json": str(downstream_summary_path),
         "output_root": str(downstream_output_root),
         "requested_platforms": requested_platforms,
         "final_exports": final_exports,
+        "positioning_artifacts": positioning_artifacts,
+        "positioning_card_analysis": positioning_stage_summaries,
         "platform_statuses": _collect_platform_statuses(downstream_summary),
         "vision_probe": downstream_summary.get("vision_probe") or {},
     }
     summary["artifacts"]["final_exports"] = final_exports
+    summary["artifacts"]["positioning_artifacts"] = positioning_artifacts
 
     downstream_status = str(downstream_summary.get("status") or "")
     if downstream_status not in SUCCESSFUL_DOWNSTREAM_STATUSES:
@@ -505,6 +543,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--probe-vision-provider-only", action="store_true", help="只做视觉 provider live probe，不继续 scrape/visual/export。")
     parser.add_argument("--skip-scrape", action="store_true", help="只做 staging，不触发 scrape/visual/export。")
     parser.add_argument("--skip-visual", action="store_true", help="跑 scrape 和导出，但跳过视觉复核。")
+    parser.add_argument("--skip-positioning-card-analysis", action="store_true", help="跳过 visual-pass 后的定位卡分析。")
     return parser
 
 
@@ -556,6 +595,7 @@ def main(argv: list[str] | None = None) -> int:
         probe_vision_provider_only=bool(args.probe_vision_provider_only),
         skip_scrape=bool(args.skip_scrape),
         skip_visual=bool(args.skip_visual),
+        skip_positioning_card_analysis=bool(args.skip_positioning_card_analysis),
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0 if summary.get("status") != "failed" else 1

@@ -27,9 +27,15 @@
 
 ### Visual Runtime Contract
 
-- [ ] **VIS-01**: 如果模板编译产出了 `visual_prompts.json`，runtime visual review 必须按 platform/provider 消费它，而不是继续对所有品牌复用同一套通用 prompt
-- [ ] **VIS-02**: `active_rulespec.rules` 中的 `visual_feature_group` 与支持的视觉排除项必须在 runtime 有实际消费面，至少影响 cover count、prompt contract 或等价 runtime diagnostics
-- [ ] **VIS-03**: 保留 `mimo` / `qwen-vl-max` 的 provider-specific prompt capability，且无模板场景继续 fallback 到现有通用 prompt 变体
+- [x] **VIS-01**: 如果模板编译产出了 `visual_prompts.json`，runtime visual review 必须按 platform/provider 消费它，而不是继续对所有品牌复用同一套通用 prompt
+- [x] **VIS-02**: `active_rulespec.rules` 中的 `visual_feature_group` 与支持的视觉排除项必须在 runtime 有实际消费面，至少影响 cover count、prompt contract 或等价 runtime diagnostics
+- [x] **VIS-03**: 保留 `mimo` / `qwen-vl-max` 的 provider-specific prompt capability，且无模板场景继续 fallback 到现有通用 prompt 变体
+
+### Positioning Card Analysis
+
+- [x] **POS-01**: visual review 通过的达人可以在 visual review 之后进入独立的 positioning-card analysis；现有 visual review 的 Pass/Reject gate 保持不变
+- [x] **POS-02**: positioning-card analysis 产出 machine-readable 的结构化结果，至少包含定位标签、品牌适配结论/建议、以及支撑这些判断的简明证据
+- [x] **POS-03**: keep-list downstream runner 与 final wrapper 必须显式暴露 positioning-card analysis 的 stage 状态、artifact 路径或摘要；第一版默认不把该步骤失败变成 final export 的硬阻塞
 
 ## Out of Scope
 
@@ -49,16 +55,19 @@
 | DEP-03 | Phase 21 | Completed |
 | SAF-01 | Phase 22 | Completed |
 | SAF-02 | Phase 22 | Completed |
-| VIS-01 | Phase 23 | Planned |
-| VIS-02 | Phase 23 | Planned |
-| VIS-03 | Phase 23 | Planned |
+| VIS-01 | Phase 23 | Completed |
+| VIS-02 | Phase 23 | Completed |
+| VIS-03 | Phase 23 | Completed |
+| POS-01 | Phase 24 | Completed |
+| POS-02 | Phase 24 | Completed |
+| POS-03 | Phase 24 | Completed |
 
 **Coverage:**
 - v1 requirements: 6 total
-- Follow-up requirements: 5 total
-- Mapped to phases: 9
+- Follow-up requirements: 8 total
+- Mapped to phases: 12
 - Unmapped follow-ups: 2 (`QTE-01`, `REL-01`)
 
 ---
 *Requirements defined: 2026-03-29*
-*Last updated: 2026-03-30 after Phase 23 planning*
+*Last updated: 2026-03-30 after Phase 24 execution*

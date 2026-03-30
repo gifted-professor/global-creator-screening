@@ -374,6 +374,108 @@ def build_profile_review_record(
     }
 
 
+def _normalize_string_list(values, *, limit=None):
+    normalized = []
+    seen = set()
+    for value in values or []:
+        cleaned = str(value or "").strip()
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        normalized.append(cleaned)
+        if limit is not None and len(normalized) >= int(limit):
+            break
+    return normalized
+
+
+def normalize_fit_recommendation(value):
+    cleaned = str(value or "").strip().lower()
+    mapping = {
+        "high": "High Fit",
+        "high fit": "High Fit",
+        "strong": "High Fit",
+        "strong fit": "High Fit",
+        "pass": "High Fit",
+        "medium": "Medium Fit",
+        "medium fit": "Medium Fit",
+        "mid": "Medium Fit",
+        "moderate": "Medium Fit",
+        "moderate fit": "Medium Fit",
+        "partial": "Medium Fit",
+        "low": "Low Fit",
+        "low fit": "Low Fit",
+        "weak": "Low Fit",
+        "weak fit": "Low Fit",
+        "reject": "Low Fit",
+        "unclear": "Unclear",
+        "unknown": "Unclear",
+        "not sure": "Unclear",
+    }
+    if cleaned in mapping:
+        return mapping[cleaned]
+    if "high" in cleaned:
+        return "High Fit"
+    if "medium" in cleaned or "moderate" in cleaned:
+        return "Medium Fit"
+    if "low" in cleaned or "weak" in cleaned:
+        return "Low Fit"
+    return "Unclear"
+
+
+def build_positioning_card_record(
+    platform,
+    username="",
+    profile_url="",
+    positioning_labels=None,
+    fit_recommendation="",
+    fit_summary="",
+    evidence_signals=None,
+    provider="",
+    model="",
+    configured_model="",
+    requested_model="",
+    response_model="",
+    effective_model="",
+    prompt_source="",
+    prompt_selection=None,
+    reviewed_at=None,
+    visual_status="",
+    visual_reason="",
+    visual_reviewed_at=None,
+    visual_contract_source="",
+    usage=None,
+    cover_count=None,
+    candidate_cover_count=None,
+    skipped_cover_count=None,
+):
+    return {
+        "platform": str(platform or "").strip(),
+        "username": str(username or "").strip(),
+        "profile_url": str(profile_url or "").strip(),
+        "positioning_labels": _normalize_string_list(positioning_labels, limit=6),
+        "fit_recommendation": normalize_fit_recommendation(fit_recommendation),
+        "fit_summary": str(fit_summary or "").strip(),
+        "evidence_signals": _normalize_string_list(evidence_signals, limit=5),
+        "provider": str(provider or "").strip(),
+        "model": str(model or "").strip(),
+        "configured_model": str(configured_model or "").strip(),
+        "requested_model": str(requested_model or "").strip(),
+        "response_model": str(response_model or "").strip(),
+        "effective_model": str(effective_model or "").strip(),
+        "prompt_source": str(prompt_source or "").strip(),
+        "prompt_selection": dict(prompt_selection or {}),
+        "reviewed_at": reviewed_at or None,
+        "visual_status": str(visual_status or "").strip(),
+        "visual_reason": str(visual_reason or "").strip(),
+        "visual_reviewed_at": visual_reviewed_at or None,
+        "visual_contract_source": str(visual_contract_source or "").strip(),
+        "usage": dict(usage or {}),
+        "cover_count": coerce_positive_int(cover_count),
+        "candidate_cover_count": coerce_positive_int(candidate_cover_count),
+        "skipped_cover_count": max(0, int(skipped_cover_count or 0)),
+    }
+
+
 def resolve_upload_metadata(metadata_lookup, *candidates):
     if not isinstance(metadata_lookup, dict):
         return {}

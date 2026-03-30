@@ -22,6 +22,7 @@ class FakeClient:
         self.probe_calls = []
         self.scrape_start_calls = []
         self.visual_start_calls = []
+        self.positioning_start_calls = []
         self.preflight = json.loads(json.dumps(preflight or {}))
 
     def post(self, url, json=None):
@@ -46,11 +47,18 @@ class FakeClient:
         if url == "/api/jobs/visual-review":
             self.visual_start_calls.append(json or {})
             return FakeResponse({"success": True, "job": {"id": "visual-job-1"}})
+        if url == "/api/jobs/positioning-card-analysis":
+            self.positioning_start_calls.append(json or {})
+            return FakeResponse({"success": True, "job": {"id": "positioning-job-1"}})
         raise AssertionError(f"unexpected POST {url}")
 
     def get(self, url):
         if url.endswith("/status"):
-            return FakeResponse({"success": True, "available": {"final_review": False}})
+            return FakeResponse({
+                "success": True,
+                "available": {"final_review": False},
+                "saved_positioning_card_artifacts_available": False,
+            })
         raise AssertionError(f"unexpected GET {url}")
 
 
@@ -104,6 +112,10 @@ class FakeBackendApp:
         output_path = Path(path)
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    def resolve_positioning_card_analysis_targets(self, platform, payload):
+        identifiers = payload.get("identifiers") or payload.get("usernames") or payload.get("profiles") or payload.get("urls") or []
+        return [{"username": identifier} for identifier in identifiers]
 
 
 class KeepListRunnerSummaryTests(unittest.TestCase):
@@ -690,6 +702,178 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             backend_app.app.test_client().visual_start_calls[0]["payload"]["provider"],
             "openai",
         )
+
+    def test_runner_executes_positioning_card_analysis_after_visual_pass(self) -> None:
+        preflight = {
+            "status": "configured",
+            "error_code": "",
+            "message": "视觉模型已就绪：openai",
+            "configured_provider_names": ["openai"],
+            "runnable_provider_names": ["openai"],
+            "preferred_provider": "openai",
+            "providers": [{"name": "openai", "runnable": True}],
+        }
+        backend_app = FakeBackendApp(preflight)
+
+        def fake_prepare_screening_inputs(**kwargs):
+            return {"prepared_at": "2026-03-28T01:02:03Z", "upload": {"stats": {"Instagram": 1}}}
+
+        def fake_poll_job(client, job_id, label, interval):
+            if job_id == "scrape-job-1":
+                return {
+                    "id": job_id,
+                    "status": "completed",
+                    "result": {"profile_reviews": [{"status": "Pass", "username": "alpha"}]},
+                }
+            if job_id == "visual-job-1":
+                return {"id": job_id, "status": "completed", "result": {"success": True}}
+            if job_id == "positioning-job-1":
+                return {"id": job_id, "status": "completed", "result": {"success": True}}
+            raise AssertionError(f"unexpected job id: {job_id}")
+
+        keep_list_runner._load_runtime_dependencies = lambda: {
+            "backend_app": backend_app,
+            "prepare_screening_inputs": fake_prepare_screening_inputs,
+            "count_passed_profiles": lambda scrape_job: 1,
+            "export_platform_artifacts": lambda client, platform, export_dir: {},
+            "poll_job": fake_poll_job,
+            "require_success": lambda response, label: response.get_json(),
+            "reset_backend_runtime_state": lambda: None,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            keep_path = temp_root / "keep.xlsx"
+            template_path = temp_root / "template.xlsx"
+            keep_path.touch()
+            template_path.touch()
+
+            summary = keep_list_runner.run_keep_list_screening_pipeline(
+                keep_workbook=keep_path,
+                template_workbook=template_path,
+                output_root=temp_root / "run",
+                platform_filters=["instagram"],
+                vision_provider="openai",
+            )
+
+        platform_summary = summary["platforms"]["instagram"]
+        self.assertEqual(platform_summary["positioning_card_analysis"]["status"], "completed")
+        self.assertEqual(
+            backend_app.app.test_client().positioning_start_calls[0]["payload"]["provider"],
+            "openai",
+        )
+
+    def test_runner_can_skip_positioning_card_analysis_explicitly(self) -> None:
+        preflight = {
+            "status": "configured",
+            "error_code": "",
+            "message": "视觉模型已就绪：openai",
+            "configured_provider_names": ["openai"],
+            "runnable_provider_names": ["openai"],
+            "preferred_provider": "openai",
+            "providers": [{"name": "openai", "runnable": True}],
+        }
+        backend_app = FakeBackendApp(preflight)
+
+        def fake_prepare_screening_inputs(**kwargs):
+            return {"prepared_at": "2026-03-28T01:02:03Z", "upload": {"stats": {"Instagram": 1}}}
+
+        def fake_poll_job(client, job_id, label, interval):
+            if job_id == "scrape-job-1":
+                return {
+                    "id": job_id,
+                    "status": "completed",
+                    "result": {"profile_reviews": [{"status": "Pass", "username": "alpha"}]},
+                }
+            return {"id": job_id, "status": "completed", "result": {"success": True}}
+
+        keep_list_runner._load_runtime_dependencies = lambda: {
+            "backend_app": backend_app,
+            "prepare_screening_inputs": fake_prepare_screening_inputs,
+            "count_passed_profiles": lambda scrape_job: 1,
+            "export_platform_artifacts": lambda client, platform, export_dir: {},
+            "poll_job": fake_poll_job,
+            "require_success": lambda response, label: response.get_json(),
+            "reset_backend_runtime_state": lambda: None,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            keep_path = temp_root / "keep.xlsx"
+            template_path = temp_root / "template.xlsx"
+            keep_path.touch()
+            template_path.touch()
+
+            summary = keep_list_runner.run_keep_list_screening_pipeline(
+                keep_workbook=keep_path,
+                template_workbook=template_path,
+                output_root=temp_root / "run",
+                platform_filters=["instagram"],
+                skip_positioning_card_analysis=True,
+            )
+
+        platform_summary = summary["platforms"]["instagram"]
+        self.assertEqual(platform_summary["positioning_card_analysis"]["status"], "skipped")
+        self.assertEqual(platform_summary["positioning_card_analysis"]["reason"], "skip_positioning_card_analysis flag set")
+        self.assertEqual(backend_app.app.test_client().positioning_start_calls, [])
+
+    def test_runner_keeps_platform_completed_when_positioning_card_analysis_fails_non_blockingly(self) -> None:
+        preflight = {
+            "status": "configured",
+            "error_code": "",
+            "message": "视觉模型已就绪：openai",
+            "configured_provider_names": ["openai"],
+            "runnable_provider_names": ["openai"],
+            "preferred_provider": "openai",
+            "providers": [{"name": "openai", "runnable": True}],
+        }
+        backend_app = FakeBackendApp(preflight)
+
+        def fake_prepare_screening_inputs(**kwargs):
+            return {"prepared_at": "2026-03-28T01:02:03Z", "upload": {"stats": {"Instagram": 1}}}
+
+        def fake_poll_job(client, job_id, label, interval):
+            if job_id == "scrape-job-1":
+                return {
+                    "id": job_id,
+                    "status": "completed",
+                    "result": {"profile_reviews": [{"status": "Pass", "username": "alpha"}]},
+                }
+            if job_id == "visual-job-1":
+                return {"id": job_id, "status": "completed", "result": {"success": True}}
+            if job_id == "positioning-job-1":
+                raise RuntimeError("positioning crash")
+            raise AssertionError(f"unexpected job id: {job_id}")
+
+        keep_list_runner._load_runtime_dependencies = lambda: {
+            "backend_app": backend_app,
+            "prepare_screening_inputs": fake_prepare_screening_inputs,
+            "count_passed_profiles": lambda scrape_job: 1,
+            "export_platform_artifacts": lambda client, platform, export_dir: {"final_review": str(export_dir / "instagram_final_review.xlsx")},
+            "poll_job": fake_poll_job,
+            "require_success": lambda response, label: response.get_json(),
+            "reset_backend_runtime_state": lambda: None,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            keep_path = temp_root / "keep.xlsx"
+            template_path = temp_root / "template.xlsx"
+            keep_path.touch()
+            template_path.touch()
+
+            summary = keep_list_runner.run_keep_list_screening_pipeline(
+                keep_workbook=keep_path,
+                template_workbook=template_path,
+                output_root=temp_root / "run",
+                platform_filters=["instagram"],
+            )
+
+        platform_summary = summary["platforms"]["instagram"]
+        self.assertEqual(summary["status"], "completed")
+        self.assertEqual(platform_summary["status"], "completed")
+        self.assertEqual(platform_summary["positioning_card_analysis"]["status"], "failed")
+        self.assertTrue(platform_summary["positioning_card_analysis"]["non_blocking"])
 
     def test_runner_marks_top_level_scrape_failure_when_platform_scrape_fails(self) -> None:
         preflight = {

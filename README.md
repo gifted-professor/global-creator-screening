@@ -16,6 +16,31 @@
 5. 把模板 rulespec + 达人匹配名单写入筛号当前输入状态
 6. Apify 抓取 -> 预筛 -> 视觉复核 -> 导出
 
+## 视觉复核后定位卡分析
+
+下游 screening runner 现在在 `visual review` 后面多了一段非阻塞的 `positioning_card_analysis`：
+
+- 只会处理已经 `Prescreen=Pass` 且 `Visual=Pass` 的达人
+- 不会改变原来的视觉 gate，也不会改变 final export 的成功判定
+- 第一版默认是附加分析，失败或跳过只会写进 summary，不会默认阻断最终导出
+
+repo-local 可观察面如下：
+
+- downstream runner summary：
+  `platforms.<platform>.positioning_card_analysis`
+- top-level wrapper summary：
+  `steps.downstream.positioning_card_analysis`
+  `steps.downstream.positioning_artifacts`
+- 导出产物：
+  `exports/<platform>/<platform>_positioning_card_review.xlsx`
+  `exports/<platform>/<platform>_positioning_card_results.json`
+
+如果只想跑到 final export，但显式跳过这一步，可以给这两个 runner 传：
+
+```bash
+--skip-positioning-card-analysis
+```
+
 ## 关键目录
 
 - `backend/app.py`：筛号 Flask API 入口
