@@ -4,8 +4,10 @@ import base64
 import io
 import os
 import struct
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
 import backend.app as backend_app
@@ -141,6 +143,13 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
         self.assertEqual(payload["error_code"], "VISION_PROVIDER_PREFLIGHT_FAILED")
         self.assertEqual(payload["vision_preflight"]["status"], "degraded")
         self.assertEqual(payload["vision_preflight"]["configured_provider_names"], ["openai"])
+
+    def test_preflight_unconfigured_message_mentions_reelx_key(self) -> None:
+        preflight = backend_app.build_vision_preflight()
+
+        self.assertEqual(preflight["status"], "unconfigured")
+        self.assertEqual(preflight["error_code"], "MISSING_VISION_CONFIG")
+        self.assertIn("VISION_REELX_API_KEY", preflight["message"])
 
     def test_test_info_export_keeps_only_profile_review_sheet(self) -> None:
         with mock.patch.object(
@@ -1864,6 +1873,257 @@ data: [DONE]
                 "cached_tokens": 8,
             },
         )
+
+
+class OperatorConsoleRoutesTests(unittest.TestCase):
+    def setUp(self) -> None:
+        with backend_app.OPERATOR_RUNS_LOCK:
+            backend_app.OPERATOR_RUNS.clear()
+        backend_app.OPERATOR_RUN_PROCESSES.clear()
+        for handle in list(backend_app.OPERATOR_RUN_LOG_HANDLES.values()):
+            try:
+                handle.close()
+            except Exception:
+                pass
+        backend_app.OPERATOR_RUN_LOG_HANDLES.clear()
+        self.client = backend_app.app.test_client()
+
+    def test_operator_console_page_renders(self) -> None:
+        response = self.client.get("/operator")
+
+        self.assertEqual(response.status_code, 200)
+        text = response.get_data(as_text=True)
+        self.assertIn("本地操作台", text)
+        self.assertIn("所有平台汇总表", text)
+        self.assertIn("/api/operator/tasks", text)
+        self.assertIn("/api/operator/runs", text)
+
+    def test_operator_tasks_route_returns_helper_payload(self) -> None:
+        expected_payload = {
+            "success": True,
+            "env_file": "/tmp/.env",
+            "task_upload_url": "https://example.com/task-upload",
+            "employee_info_url": "https://example.com/employee",
+            "task_table_name": "任务上传",
+            "employee_table_name": "员工信息",
+            "record_count": 1,
+            "matched_count": 1,
+            "tasks": [{"task_name": "MINISO", "employee_matched": True}],
+        }
+        with mock.patch.object(backend_app, "load_operator_task_candidates", return_value=expected_payload) as loader:
+            response = self.client.get("/api/operator/tasks?env_file=.env")
+
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["tasks"][0]["task_name"], "MINISO")
+        loader.assert_called_once_with(env_file=".env", task_upload_url="", employee_info_url="")
+
+    def test_operator_runs_post_returns_started_run_payload(self) -> None:
+        expected_run = {
+            "id": "run-1",
+            "task_name": "MINISO",
+            "status": "running",
+            "stage": "starting",
+            "summary": None,
+            "artifacts": {"final_exports": {}},
+        }
+        with mock.patch.object(backend_app, "launch_operator_run", return_value=expected_run) as launcher:
+            response = self.client.post(
+                "/api/operator/runs",
+                json={
+                    "task_name": "MINISO",
+                    "env_file": ".env",
+                    "platforms": ["instagram"],
+                    "vision_provider": "reelx",
+                    "max_identifiers_per_platform": 1,
+                },
+            )
+
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 202)
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["run"]["id"], "run-1")
+        launcher.assert_called_once()
+        self.assertEqual(launcher.call_args.kwargs["task_name"], "MINISO")
+        self.assertEqual(launcher.call_args.kwargs["env_file"], ".env")
+        self.assertEqual(launcher.call_args.kwargs["platforms"], ["instagram"])
+        self.assertEqual(launcher.call_args.kwargs["vision_provider"], "reelx")
+
+    def test_operator_run_detail_serializes_summary_artifacts(self) -> None:
+        refreshed_run = {
+            "id": "run-2",
+            "task_name": "MINISO",
+            "status": "completed",
+            "stage": "completed",
+            "env_file": "/tmp/.env",
+            "output_root": "/tmp/operator",
+            "summary_path": "/tmp/operator/summary.json",
+            "log_path": "/tmp/operator/operator_run.log",
+            "pid": 123,
+            "created_at": "2026-03-30T00:00:00Z",
+            "updated_at": "2026-03-30T00:10:00Z",
+            "finished_at": "2026-03-30T00:10:00Z",
+            "return_code": 0,
+            "error": "",
+            "requested_options": {},
+            "summary": {
+                "status": "completed",
+                "summary_json": str(backend_app.BASE_DIR / "temp" / "operator_runs" / "summary.json"),
+                "resolved_paths": {},
+                "artifacts": {
+                    "keep_workbook": "",
+                    "template_workbook": "",
+                    "final_exports": {},
+                },
+            },
+        }
+        with mock.patch.object(backend_app, "refresh_operator_run", return_value=refreshed_run):
+            response = self.client.get("/api/operator/runs/run-2")
+
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["success"])
+        self.assertEqual(payload["run"]["status"], "completed")
+        self.assertIn("artifacts", payload["run"])
+        self.assertIn("summary_json", payload["run"]["artifacts"])
+        self.assertIn("all_platforms_final_review", payload["run"]["artifacts"])
+
+    def test_operator_summary_view_builds_all_platforms_final_review_artifact(self) -> None:
+        output_root = backend_app.BASE_DIR / "temp" / "operator_test_artifacts" / "combined"
+        output_root.mkdir(parents=True, exist_ok=True)
+        instagram_export = output_root / "instagram_final_review.xlsx"
+        tiktok_export = output_root / "tiktok_final_review.xlsx"
+        pd.DataFrame(
+            [
+                {
+                    "identifier": "alpha",
+                    "username": "alpha",
+                    "profile_url": "https://www.instagram.com/alpha",
+                    "upload_handle": "alpha",
+                    "final_status": "Pass",
+                    "final_reason": "家庭场景明确",
+                }
+            ]
+        ).to_excel(instagram_export, index=False)
+        pd.DataFrame(
+            [
+                {
+                    "identifier": "beta",
+                    "username": "beta",
+                    "profile_url": "https://www.tiktok.com/@beta",
+                    "upload_handle": "beta",
+                    "runtime_avg_views": 240000,
+                    "final_status": "Reject",
+                    "final_reason": "未命中核心特征",
+                }
+            ]
+        ).to_excel(tiktok_export, index=False)
+
+        artifacts = backend_app._build_operator_summary_view({
+            "output_root": str(output_root),
+            "summary_json": str(output_root / "summary.json"),
+            "resolved_paths": {},
+            "artifacts": {
+                "final_exports": {
+                    "instagram": {"final_review": str(instagram_export)},
+                    "tiktok": {"final_review": str(tiktok_export)},
+                },
+            },
+        })
+
+        combined_ref = artifacts["all_platforms_final_review"]
+        self.assertTrue(combined_ref["exists"])
+        self.assertIn("/api/operator/file?path=", combined_ref["download_url"])
+        combined_rows = pd.read_excel(combined_ref["path"])
+        self.assertEqual(
+            list(combined_rows.columns),
+            [
+                "达人ID",
+                "平台",
+                "主页链接",
+                "# Followers(K)#",
+                "Average Views (K)",
+                "互动率",
+                "当前网红报价",
+                "达人最后一次回复邮件时间",
+                "达人回复的最后一封邮件内容",
+                "达人对接人",
+                "ai是否通过",
+                "ai筛号反馈理由",
+                "标签(ai)",
+                "ai评价",
+            ],
+        )
+        self.assertEqual(list(combined_rows["平台"]), ["instagram", "tiktok"])
+        self.assertEqual(list(combined_rows["ai是否通过"]), ["是", "否"])
+
+    def test_operator_file_download_serves_workspace_file(self) -> None:
+        temp_dir = backend_app.BASE_DIR / "temp" / "operator_test_artifacts"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        file_path = temp_dir / "demo.txt"
+        file_path.write_text("hello operator\n", encoding="utf-8")
+
+        response = self.client.get(f"/api/operator/file?path={file_path}")
+        body = response.get_data(as_text=True)
+        response.close()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(body, "hello operator\n")
+
+    def test_operator_file_download_blocks_outside_workspace(self) -> None:
+        with tempfile.NamedTemporaryFile("w+", delete=False) as handle:
+            handle.write("outside\n")
+            outside_path = Path(handle.name)
+        try:
+            response = self.client.get(f"/api/operator/file?path={outside_path}")
+        finally:
+            outside_path.unlink(missing_ok=True)
+
+        self.assertEqual(response.status_code, 403)
+        payload = response.get_json()
+        self.assertFalse(payload["success"])
+
+    def test_operator_run_detail_can_reload_persisted_run_after_restart(self) -> None:
+        run_id = "persisted_run_demo"
+        output_root = backend_app.OPERATOR_RUNS_ROOT / run_id
+        output_root.mkdir(parents=True, exist_ok=True)
+        try:
+            summary_path = output_root / "summary.json"
+            backend_app.write_json_file(
+                summary_path,
+                {
+                    "started_at": "2026-03-30T15:00:00+08:00",
+                    "finished_at": "2026-03-30T15:05:00+08:00",
+                    "status": "completed",
+                    "task_name": "MINISO",
+                    "env_file": str(backend_app.BASE_DIR / ".env"),
+                    "output_root": str(output_root),
+                    "summary_json": str(summary_path),
+                    "resolved_paths": {},
+                    "artifacts": {
+                        "keep_workbook": "",
+                        "template_workbook": "",
+                        "final_exports": {},
+                    },
+                },
+            )
+
+            with backend_app.OPERATOR_RUNS_LOCK:
+                backend_app.OPERATOR_RUNS.pop(run_id, None)
+
+            response = self.client.get(f"/api/operator/runs/{run_id}")
+
+            payload = response.get_json()
+            self.assertEqual(response.status_code, 200)
+            self.assertTrue(payload["success"])
+            self.assertEqual(payload["run"]["id"], run_id)
+            self.assertEqual(payload["run"]["status"], "completed")
+        finally:
+            with backend_app.OPERATOR_RUNS_LOCK:
+                backend_app.OPERATOR_RUNS.pop(run_id, None)
+            summary_path = output_root / "summary.json"
+            summary_path.unlink(missing_ok=True)
+            output_root.rmdir()
 
 
 if __name__ == "__main__":

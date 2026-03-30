@@ -84,8 +84,27 @@ repo-local 可观察面如下：
 ```bash
 python3 -m venv backend/.venv
 backend/.venv/bin/python -m pip install -r backend/requirements.txt
-backend/.venv/bin/python backend/app.py
+backend/.venv/bin/python -m backend.app
 ```
+
+如果想先用本地可视化控制台，而不是直接手敲 `task upload -> final export` 命令，启动 backend 后可以打开：
+
+```text
+http://127.0.0.1:5001/operator
+```
+
+当前 `operator` 页面是 local-only 的薄控制台，第一版支持：
+
+- 从飞书 task-upload 拉任务列表
+- 选择任务并发起 canonical `scripts/run_task_upload_to_final_export_pipeline.py`
+- 轮询当前 stage / summary / final export
+- 直接下载工作区内的 summary 和导出 Excel
+
+当前边界：
+
+- 默认更适合做 bounded run 验证，不是生产调度台
+- 不做飞书写回
+- 不解决统一邮箱 `邮件备份(30316)` 的 IMAP 暴露问题；邮箱策略仍以当前 runner / env 配置为准
 
 当前仓库已经同时支持：
 

@@ -1,0 +1,323 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import unittest
+from pathlib import Path
+
+import pandas as pd
+
+from backend.final_export_merge import build_all_platforms_final_review_artifacts
+
+
+class FinalExportMergeTests(unittest.TestCase):
+    def test_payload_skips_processing_failures_and_preserves_uploadable_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            exports_dir = root / "exports"
+            instagram_export = exports_dir / "instagram" / "instagram_final_review.xlsx"
+            tiktok_export = exports_dir / "tiktok" / "tiktok_final_review.xlsx"
+            instagram_export.parent.mkdir(parents=True, exist_ok=True)
+            tiktok_export.parent.mkdir(parents=True, exist_ok=True)
+
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "good_creator",
+                        "username": "good_creator",
+                        "profile_url": "https://www.instagram.com/good_creator",
+                        "upload_handle": "good_creator",
+                        "final_status": "Pass",
+                        "final_reason": "内容契合",
+                    },
+                    {
+                        "identifier": "bad_creator",
+                        "username": "bad_creator",
+                        "profile_url": "https://www.instagram.com/bad_creator",
+                        "upload_handle": "bad_creator",
+                        "final_status": "Error",
+                        "final_reason": "视觉复核超时：bad_creator 超过 120 秒未完成",
+                    },
+                ]
+            ).to_excel(instagram_export, index=False)
+            pd.DataFrame([]).to_excel(tiktok_export, index=False)
+
+            instagram_positioning = exports_dir / "instagram" / "instagram_positioning_card_review.xlsx"
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "good_creator",
+                        "username": "good_creator",
+                        "profile_url": "https://www.instagram.com/good_creator",
+                        "upload_handle": "good_creator",
+                        "positioning_stage_status": "Completed",
+                        "positioning_labels": "家庭博主",
+                        "fit_summary": "适合家庭类合作",
+                        "positioning_error": "",
+                    }
+                ]
+            ).to_excel(instagram_positioning, index=False)
+
+            instagram_data_path = root / "data" / "instagram" / "instagram_data.json"
+            instagram_data_path.parent.mkdir(parents=True, exist_ok=True)
+            instagram_data_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "username": "good_creator",
+                            "url": "https://www.instagram.com/good_creator",
+                            "followersCount": 52300,
+                            "latestPosts": [{"videoViewCount": 22100, "likesCount": 1600}],
+                        },
+                        {
+                            "username": "bad_creator",
+                            "url": "https://www.instagram.com/bad_creator",
+                            "followersCount": 48300,
+                            "latestPosts": [{"videoViewCount": 11000, "likesCount": 400}],
+                        },
+                    ],
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            output_path = exports_dir / "all_platforms_final_review.xlsx"
+            payload_path = exports_dir / "all_platforms_final_review_payload.json"
+            artifacts = build_all_platforms_final_review_artifacts(
+                output_path=output_path,
+                payload_json_path=payload_path,
+                final_exports={
+                    "instagram": {
+                        "final_review": str(instagram_export),
+                        "positioning_card_review": str(instagram_positioning),
+                    },
+                    "tiktok": {"final_review": str(tiktok_export)},
+                },
+                task_owner={"responsible_name": "陈俊仁"},
+            )
+
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+            archive_json_path = exports_dir / "feishu_upload_local_archive" / "skipped_from_feishu_upload.json"
+            archive_xlsx_path = exports_dir / "feishu_upload_local_archive" / "skipped_from_feishu_upload.xlsx"
+            archive_payload = json.loads(archive_json_path.read_text(encoding="utf-8"))
+            self.assertEqual(artifacts["source_row_count"], 2)
+            self.assertEqual(artifacts["row_count"], 1)
+            self.assertEqual(artifacts["skipped_row_count"], 1)
+            self.assertEqual(artifacts["all_platforms_upload_local_archive_dir"], str((exports_dir / "feishu_upload_local_archive").resolve()))
+            self.assertTrue(archive_json_path.exists())
+            self.assertTrue(archive_xlsx_path.exists())
+            self.assertEqual(payload["source_row_count"], 2)
+            self.assertEqual(payload["row_count"], 1)
+            self.assertEqual(payload["skipped_row_count"], 1)
+            self.assertEqual(payload["rows"][0]["达人ID"], "good_creator")
+            self.assertEqual(payload["skipped_rows"][0]["row"]["达人ID"], "bad_creator")
+            self.assertIn("系统处理失败", payload["skipped_rows"][0]["skip_reasons"])
+            self.assertEqual(archive_payload["skipped_row_count"], 1)
+            self.assertEqual(archive_payload["skipped_rows"][0]["row"]["达人ID"], "bad_creator")
+
+    def test_metric_notes_distinguish_missing_video_views_and_missing_scrape_data(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            exports_dir = root / "exports"
+            instagram_export = exports_dir / "instagram" / "instagram_final_review.xlsx"
+            tiktok_export = exports_dir / "tiktok" / "tiktok_final_review.xlsx"
+            instagram_export.parent.mkdir(parents=True, exist_ok=True)
+            tiktok_export.parent.mkdir(parents=True, exist_ok=True)
+
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "ejay.cruzz",
+                        "username": "ejay.cruzz",
+                        "profile_url": "https://www.instagram.com/ejay.cruzz",
+                        "upload_handle": "ejay.cruzz",
+                        "final_status": "Pass",
+                        "final_reason": "家庭内容契合",
+                    }
+                ]
+            ).to_excel(instagram_export, index=False)
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "farrobear",
+                        "username": "farrobear",
+                        "profile_url": "https://tiktok.com/@farrobear",
+                        "upload_handle": "farrobear",
+                        "final_status": "Reject",
+                        "final_reason": "抓取返回账号不存在或不可访问",
+                    }
+                ]
+            ).to_excel(tiktok_export, index=False)
+
+            instagram_data_path = root / "data" / "instagram" / "instagram_data.json"
+            instagram_data_path.parent.mkdir(parents=True, exist_ok=True)
+            instagram_data_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "username": "ejay.cruzz",
+                            "url": "https://www.instagram.com/ejay.cruzz",
+                            "followersCount": 290243,
+                            "latestPosts": [
+                                {
+                                    "type": "Sidecar",
+                                    "likesCount": 1200,
+                                }
+                            ],
+                        }
+                    ],
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            tiktok_data_path = root / "data" / "tiktok" / "tiktok_data.json"
+            tiktok_data_path.parent.mkdir(parents=True, exist_ok=True)
+            tiktok_data_path.write_text("[]", encoding="utf-8")
+
+            output_path = exports_dir / "all_platforms_final_review.xlsx"
+            artifacts = build_all_platforms_final_review_artifacts(
+                output_path=output_path,
+                final_exports={
+                    "instagram": {"final_review": str(instagram_export)},
+                    "tiktok": {"final_review": str(tiktok_export)},
+                },
+                task_owner={"responsible_name": "陈俊仁"},
+            )
+
+            self.assertEqual(artifacts["source_row_count"], 2)
+            self.assertEqual(artifacts["row_count"], 1)
+            self.assertEqual(artifacts["skipped_row_count"], 1)
+            rows = pd.read_excel(output_path).fillna("")
+
+            instagram_row = rows.loc[rows["达人ID"] == "ejay.cruzz"].iloc[0].to_dict()
+            self.assertEqual(instagram_row["# Followers(K)#"], 290.2)
+            self.assertEqual(instagram_row["Average Views (K)"], "")
+            self.assertIn("无视频播放数据", instagram_row["ai筛号反馈理由"])
+            self.assertIn("无视频播放数据", instagram_row["ai评价"])
+
+            tiktok_row = rows.loc[rows["达人ID"] == "farrobear"].iloc[0].to_dict()
+            self.assertEqual(tiktok_row["# Followers(K)#"], "")
+            self.assertEqual(tiktok_row["Average Views (K)"], "")
+            self.assertIn("无抓取数据，需人工确认", tiktok_row["ai筛号反馈理由"])
+            self.assertIn("无抓取数据，需人工确认", tiktok_row["ai评价"])
+
+    def test_processing_failures_and_positioning_errors_are_explicit_in_combined_sheet(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            exports_dir = root / "exports"
+            instagram_export = exports_dir / "instagram" / "instagram_final_review.xlsx"
+            tiktok_export = exports_dir / "tiktok" / "tiktok_final_review.xlsx"
+            instagram_positioning = exports_dir / "instagram" / "instagram_positioning_card_review.xlsx"
+            tiktok_positioning = exports_dir / "tiktok" / "tiktok_positioning_card_review.xlsx"
+            instagram_export.parent.mkdir(parents=True, exist_ok=True)
+            tiktok_export.parent.mkdir(parents=True, exist_ok=True)
+
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "cmpmelody",
+                        "username": "cmpmelody",
+                        "profile_url": "https://www.instagram.com/cmpmelody",
+                        "upload_handle": "cmpmelody",
+                        "final_status": "Error",
+                        "final_reason": "视觉复核超时：cmpmelody 超过 120 秒未完成",
+                    }
+                ]
+            ).to_excel(instagram_export, index=False)
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "aaroncarters",
+                        "username": "aaroncarters",
+                        "profile_url": "https://www.tiktok.com/@aaroncarters",
+                        "upload_handle": "aaroncarters",
+                        "runtime_avg_views": 3891028.9,
+                        "final_status": "Pass",
+                        "final_reason": "达人展示了户外场景、产品开箱及穿搭展示，符合内容合作标准。",
+                    }
+                ]
+            ).to_excel(tiktok_export, index=False)
+            pd.DataFrame([]).to_excel(instagram_positioning, index=False)
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "aaroncarters",
+                        "username": "aaroncarters",
+                        "profile_url": "https://www.tiktok.com/@aaroncarters",
+                        "upload_handle": "aaroncarters",
+                        "positioning_stage_status": "Error",
+                        "positioning_labels": "",
+                        "fit_summary": "",
+                        "positioning_error": "reelx: HTTP 401 认证失败；额度已用尽",
+                    }
+                ]
+            ).to_excel(tiktok_positioning, index=False)
+
+            instagram_data_path = root / "data" / "instagram" / "instagram_data.json"
+            instagram_data_path.parent.mkdir(parents=True, exist_ok=True)
+            instagram_data_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "username": "cmpmelody",
+                            "url": "https://www.instagram.com/cmpmelody",
+                            "followersCount": 129300,
+                            "latestPosts": [{"videoViewCount": 25300, "likesCount": 21900}],
+                        }
+                    ],
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            tiktok_data_path = root / "data" / "tiktok" / "tiktok_data.json"
+            tiktok_data_path.parent.mkdir(parents=True, exist_ok=True)
+            tiktok_data_path.write_text(
+                json.dumps(
+                    [
+                        {
+                            "authorMeta": {
+                                "name": "aaroncarters",
+                                "profileUrl": "https://www.tiktok.com/@aaroncarters",
+                                "fans": 253400,
+                            },
+                            "playCount": 3891029,
+                            "diggCount": 24100,
+                        }
+                    ],
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            output_path = exports_dir / "all_platforms_final_review.xlsx"
+            build_all_platforms_final_review_artifacts(
+                output_path=output_path,
+                final_exports={
+                    "instagram": {
+                        "final_review": str(instagram_export),
+                        "positioning_card_review": str(instagram_positioning),
+                    },
+                    "tiktok": {
+                        "final_review": str(tiktok_export),
+                        "positioning_card_review": str(tiktok_positioning),
+                    },
+                },
+                task_owner={"responsible_name": "陈俊仁"},
+            )
+
+            rows = pd.read_excel(output_path).fillna("")
+
+            instagram_row = rows.loc[rows["达人ID"] == "cmpmelody"].iloc[0].to_dict()
+            self.assertEqual(instagram_row["ai是否通过"], "处理失败")
+            self.assertIn("视觉复核超时", instagram_row["ai筛号反馈理由"])
+
+            tiktok_row = rows.loc[rows["达人ID"] == "aaroncarters"].iloc[0].to_dict()
+            self.assertEqual(tiktok_row["ai是否通过"], "处理失败")
+            self.assertEqual(tiktok_row["标签(ai)"], "定位卡处理失败")
+            self.assertIn("定位卡处理失败，需人工确认", tiktok_row["ai筛号反馈理由"])
+            self.assertIn("定位卡处理失败，需人工确认", tiktok_row["ai评价"])
+
+
+if __name__ == "__main__":
+    unittest.main()

@@ -5,13 +5,13 @@
 - ✅ **v1.0.0 Consolidated Local Creator Screening Pipeline** — Phases 1-13 shipped 2026-03-28. Archive: `.planning/milestones/v1.0.0-ROADMAP.md`
 - ✅ **v1.1.0 Visual Provider Reliability and Downstream Hardening** — Phases 14-15 shipped 2026-03-28. Archive: `.planning/milestones/v1.1.0-ROADMAP.md`
 - ✅ **v1.2.0 End-to-End Single-Entry Pipeline Verification** — Phases 16-19 shipped 2026-03-29. Archive: `.planning/milestones/v1.2.0-ROADMAP.md`
-- 🚧 **v1.3.0 External Email Dependency Decoupling** — Phases 20-24 completed; milestone closeout pending
+- 🚧 **v1.3.0 External Email Dependency Decoupling** — Phases 20-25 completed; milestone closeout pending
 
 ## Overview
 
 `v1.3.0` 先聚焦 `DEP-01`：把 workbook / dashboard / project-home 对 external full `email` 项目的剩余耦合从运行主线里拆掉，确保 operator 在当前仓库里就能完成关键入口流程。`QTE-01` 与 `REL-01` 保留为后续里程碑，避免本轮把 dependency removal、数据接入和大样本稳定性验证混成同一交付面。
 
-`Phase 23` 和 `Phase 24` 是在 decoupling proof 之后补录的 repo-local follow-up：前者把模板编译出的品牌视觉 prompt / feature contract 真正接回 runtime，后者把 visual-pass 之后的定位卡分析接入 downstream / final-wrapper 可观察 contract。当前 milestone 的实现面已经完成，剩下的是 audit / closeout。
+`Phase 23` 和 `Phase 24` 是在 decoupling proof 之后补录的 repo-local follow-up：前者把模板编译出的品牌视觉 prompt / feature contract 真正接回 runtime，后者把 visual-pass 之后的定位卡分析接入 downstream / final-wrapper 可观察 contract。2026-03-30 用户又把原本 deferred 的“本地薄 operator UI”提前拉进当前 roadmap，作为 local-only follow-up，不改写主 runner，只在现有 Flask/backend 和 single-entry pipeline 之上补一个控制页。
 
 ## Phases
 
@@ -20,6 +20,7 @@
 - [x] **Phase 22: Validate decoupled runtime stability and operator fallback contract** - 回归主链并收口兼容回退说明，确保迁移可安全落地
 - [x] **Phase 23: Wire template-compiled visual prompts into runtime and define visual feature-group contract** - 把模板编译出的品牌视觉 prompt 接回 runtime，并定义 `visual_feature_group` 的消费契约
 - [x] **Phase 24: Add post-visual-review positioning-card analysis step for approved creators** - 在 visual review 之后增加 repo-local 定位卡分析，并把结构化输出接入 downstream / final wrapper summary
+- [ ] **Phase 25: Build local thin operator UI for task-driven screening runs** - 提供本地可视化控制页，读取飞书任务、触发现有 task-driven runner，并展示 summary / 导出产物
 
 ## Progress
 
@@ -30,6 +31,7 @@
 | 22. Validate decoupled runtime stability and operator fallback contract | 2/2 | Completed | 2026-03-29 |
 | 23. Wire template-compiled visual prompts into runtime and define visual feature-group contract | 3/3 | Completed | 2026-03-30 |
 | 24. Add post-visual-review positioning-card analysis step for approved creators | 2/2 | Completed | 2026-03-30 |
+| 25. Build local thin operator UI for task-driven screening runs | 2/2 | Completed | 2026-03-30 |
 
 ### Phase 20: Baseline legacy dependency surfaces and lock repo-local replacement contract
 
@@ -112,3 +114,21 @@ Plans:
 
 **Details:**
 Phase 24 已完成。定位卡分析现在作为 `positioning_card_analysis` stage 运行在 visual-review-pass 达人之后，并通过 backend artifact、downstream summary、top-level final-wrapper summary 暴露结构化产物与阶段状态。第一版默认保持 non-blocking：stage 可 skipped / failed，但不会单独把 final export 提升为硬失败。contract note 留在 `.planning/phases/24-add-post-visual-review-positioning-card-analysis-step-for-approved-creators/24-POSITIONING-CARD-CONTRACT.md`，回归验证为 `PYTHONPYCACHEPREFIX=/tmp/pycache backend/.venv/bin/python -m unittest tests.test_visual_provider_diagnostics tests.test_keep_list_screening_pipeline tests.test_task_upload_to_final_export_pipeline -v`，结果 `85 tests, OK`。
+
+### Phase 25: Build local thin operator UI for task-driven screening runs
+
+**Goal**: 在当前 repo-local 单入口主线之上提供一个本地薄 operator UI，让操作者可以读取飞书任务、触发既有 runner、查看阶段状态与 summary/artifact 路径，而不需要手敲长命令。
+**Requirements**: [OPS-UI-01, OPS-UI-02, OPS-UI-03]
+**Depends on:** Phase 24
+**Success Criteria** (what must be TRUE):
+  1. 本地页面可以读取 task-upload 任务列表，并展示足够的任务信息让 operator 选择要跑的任务
+  2. 页面可以触发现有 `task upload -> final export` canonical runner，并持续显示当前 stage、错误与关键产物路径
+  3. 页面可以直接暴露最终 Excel 导出和 summary 路径；v1 明确保持 local-only，不承诺飞书写回
+**Plans:** 2 plans
+
+Plans:
+- [x] 25-01: Add a backend-served local operator control plane for task discovery, run launch, and summary polling
+- [x] 25-02: Add the first local HTML operator page and prove one bounded MINISO run through the page-driven contract
+
+**Details:**
+Phase 25 已完成。`25-01` 落下第一版 backend-served control plane：`/operator` 页面、`/api/operator/tasks`、`/api/operator/runs`、`/api/operator/runs/<id>`、`/api/operator/file` 已落地，并通过 `backend/.venv/bin/python -m unittest tests.test_visual_provider_diagnostics tests.test_task_upload_to_final_export_pipeline -v` 的 77 个 targeted tests。`25-02` 又用 operator API 真实发起了一轮 bounded `MINISO`，运行根目录留在 `temp/operator_runs/20260330_150053_MINISO_5a2afccf`，最终 top-level `summary.json` 与 `downstream/summary.json` 都为 `completed`，并产出 `instagram_final_review.xlsx` 与定位卡导出。

@@ -592,7 +592,10 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
         self.assertEqual(summary["resolved_inputs"]["mail_sync"]["default_account_email_source"], "env_file:EMAIL_ACCOUNT")
         self.assertTrue(summary["resolved_inputs"]["mail_sync"]["default_auth_code_present"])
         self.assertEqual(summary["resolved_inputs"]["mail_sync"]["default_auth_code_source"], "env_file:EMAIL_AUTH_CODE")
-        self.assertEqual(summary["resolved_inputs"]["mail_sync"]["credential_mode"], "default_account")
+        self.assertEqual(
+            summary["resolved_inputs"]["mail_sync"]["credential_mode"],
+            "employee_directory_preferred_with_default_fallback",
+        )
 
     def test_runner_can_reuse_existing_artifacts_from_prior_summary(self) -> None:
         class FakeClient:

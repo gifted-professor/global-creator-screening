@@ -117,6 +117,11 @@
   - 它证明的是 mainline runner，不等价于 legacy workbook / dashboard / project-home 入口已经完全摆脱 external full `email` 依赖
   - 它主要证明了当前 `openai` 路径和既有 orchestration contract 可用，不等价于其他 provider 或更大样本也已完成 live proof
 - 当前 active milestone 是 `v1.3.0`，范围聚焦 external dependency decoupling；`QTE-01` 与 `REL-01` 暂不纳入本轮 committed scope
+- Phase 25 已把原本 deferred 的本地薄 operator UI 提前拉进当前 roadmap，目标是在既有 repo-local pipeline 上补一个 local-only control plane
+- Phase 25 第一版确认由现有 Flask backend 直接服务页面，避免再起一套独立前端 runtime
+- Phase 25 第一版默认沿用已验证的老邮箱路径与健康视觉 provider，不把统一邮箱备份目录修复或飞书写回当成前置阻塞
+- Phase 25 已完成第一版 local operator UI：`/operator` 页面可以读取任务、启动 canonical runner、轮询 summary/artifact，并下载工作区内导出文件
+- Phase 25 已用 bounded `MINISO` 做过 page-driven live proof，真实产物留在 `temp/operator_runs/20260330_150053_MINISO_5a2afccf`
 
 ## Milestone Scope Decision
 
@@ -161,6 +166,8 @@
 | final wrapper 必须把 `completed_with_partial_scrape` 当作可交付状态 | 顶层 operator surface 不能再把已有导出的 partial delivery run 扁平成 opaque `failed` | ✓ Good |
 | `v1.3.0` 只锁定 `DEP-01` 作为 committed 主轴 | 先收口 external dependency 风险，再处理 `QTE-01` / `REL-01`，避免三类改动相互污染验证结果 | ✓ Good |
 | Phase 22 的 operator recovery 先固定成 `summary -> keep-list resume -> provider fallback`，而不是立刻新增 task-name orchestration API | 当前要证明的是 decoupled runtime 可恢复；把恢复 contract 固定在已有 single-entry/mainline summary 上，风险最小 | ✓ Good |
+| 用户在 2026-03-30 明确把薄 operator UI 从 deferred candidate 提前为当前 roadmap Phase 25 | 主链已经有 live proof，继续只靠命令行会增加操作成本；现在适合补一层 local-only 操作面板 | ✓ Good |
+| 薄 operator UI 第一版采用 backend-served local page，而不是额外起一个独立前端工程 | 现有 Flask backend、job contract 和 summary/artifact surface 已可复用，风险最低 | ✓ Good |
 
 ---
-*Last updated: 2026-03-30 after Phase 23 planning*
+*Last updated: 2026-03-30 after Phase 25 execution*

@@ -1,6 +1,10 @@
+from __future__ import annotations
+
 import json
 import os
 import re
+import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -11,7 +15,12 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
+from typing import Any
 from urllib.parse import quote, urlparse
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import pandas as pd
 import requests
@@ -26,6 +35,10 @@ except Exception:  # pragma: no cover - optional dependency for local runtime on
 
 from backend import rules as rules_module
 from backend import screening
+from backend.final_export_merge import build_all_platforms_final_review_artifacts, extract_task_owner_context
+from feishu_screening_bridge.feishu_api import DEFAULT_FEISHU_BASE_URL, FeishuOpenClient
+from feishu_screening_bridge.local_env import get_preferred_value, load_local_env
+from feishu_screening_bridge.task_upload_sync import inspect_task_upload_assignments
 
 
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -421,6 +434,12 @@ APIFY_BALANCE_POLLER_LOCK = threading.Lock()
 APIFY_RUN_GUARDS_LOCK = threading.Lock()
 APIFY_BALANCE_POLLER_THREAD = None
 APIFY_BALANCE_POLLER_STOP_EVENT = threading.Event()
+OPERATOR_RUNS_LOCK = threading.Lock()
+OPERATOR_RUNS: dict[str, dict[str, Any]] = {}
+OPERATOR_RUN_PROCESSES: dict[str, subprocess.Popen[Any]] = {}
+OPERATOR_RUN_LOG_HANDLES: dict[str, Any] = {}
+OPERATOR_RUNS_ROOT = BASE_DIR / "temp" / "operator_runs"
+OPERATOR_RUN_TERMINAL_STATUSES = {"completed", "completed_with_partial_scrape", "failed", "cancelled"}
 
 app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
@@ -434,6 +453,7 @@ def ensure_runtime_dirs():
     Path(CONFIG_DIR).mkdir(parents=True, exist_ok=True)
     Path(TEMP_DIR).mkdir(parents=True, exist_ok=True)
     Path(UPLOAD_FOLDER).mkdir(parents=True, exist_ok=True)
+    OPERATOR_RUNS_ROOT.mkdir(parents=True, exist_ok=True)
     for platform in PLATFORM_ACTORS:
         Path(get_platform_dir(platform)).mkdir(parents=True, exist_ok=True)
 
@@ -485,6 +505,540 @@ def sanitize_json_compatible(value):
     if isinstance(value, (int, float, str, bool)) or value is None:
         return value
     return str(value)
+
+
+def _path_is_within_root(path: Path, root: Path) -> bool:
+    try:
+        path.resolve().relative_to(root.resolve())
+        return True
+    except Exception:
+        return False
+
+
+def _resolve_operator_env_file(env_file: str = "") -> Path:
+    candidate = Path(str(env_file or ".env").strip() or ".env").expanduser()
+    if not candidate.is_absolute():
+        candidate = (BASE_DIR / candidate).resolve()
+    return candidate
+
+
+def _operator_file_ref(path_value: str) -> dict[str, Any]:
+    raw_path = str(path_value or "").strip()
+    if not raw_path:
+        return {
+            "path": "",
+            "exists": False,
+            "download_url": "",
+        }
+    resolved = Path(raw_path).expanduser().resolve()
+    exists = resolved.exists()
+    download_url = ""
+    if exists and _path_is_within_root(resolved, BASE_DIR):
+        download_url = f"/api/operator/file?path={quote(str(resolved))}"
+    return {
+        "path": str(resolved),
+        "exists": exists,
+        "download_url": download_url,
+    }
+
+
+def _normalize_operator_platforms(values: Any) -> list[str]:
+    if isinstance(values, str):
+        candidates = [item.strip() for item in values.split(",")]
+    else:
+        candidates = [str(item or "").strip() for item in (values or [])]
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        value = UPLOAD_PLATFORM_ALIASES.get(candidate.casefold(), "")
+        if value and value not in seen:
+            seen.add(value)
+            normalized.append(value)
+    return normalized
+
+
+def _boolish(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    normalized = str(value).strip().lower()
+    if not normalized:
+        return bool(default)
+    return normalized not in {"0", "false", "no", "off"}
+
+
+def _build_operator_error_payload(
+    *,
+    error_code: str,
+    message: str,
+    remediation: str,
+    details: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "success": False,
+        "error_code": error_code,
+        "error": message,
+        "remediation": remediation,
+        "details": details or {},
+    }
+
+
+def _classify_operator_config_error(exc: Exception) -> tuple[dict[str, Any], int]:
+    message = str(exc) or exc.__class__.__name__
+    error_code = "OPERATOR_CONFIG_ERROR"
+    remediation = "检查 operator 页面里的 env / Feishu 配置后重试。"
+    if "缺少 FEISHU_APP_ID" in message:
+        error_code = "FEISHU_APP_ID_MISSING"
+        remediation = "在 `.env` 或请求参数里填写 FEISHU_APP_ID。"
+    elif "缺少 FEISHU_APP_SECRET" in message:
+        error_code = "FEISHU_APP_SECRET_MISSING"
+        remediation = "在 `.env` 或请求参数里填写 FEISHU_APP_SECRET。"
+    elif "缺少 TASK_UPLOAD_URL" in message:
+        error_code = "TASK_UPLOAD_URL_MISSING"
+        remediation = "在 `.env` 或请求参数里填写 TASK_UPLOAD_URL。"
+    elif "缺少 EMPLOYEE_INFO_URL" in message:
+        error_code = "EMPLOYEE_INFO_URL_MISSING"
+        remediation = "在 `.env` 或请求参数里填写 EMPLOYEE_INFO_URL。"
+    elif "task_name" in message:
+        error_code = "TASK_NAME_MISSING"
+        remediation = "先从任务列表里选择任务，再启动 run。"
+    status_code = 400
+    return (
+        _build_operator_error_payload(
+            error_code=error_code,
+            message=message,
+            remediation=remediation,
+            details={"exception_type": exc.__class__.__name__},
+        ),
+        status_code,
+    )
+
+
+def load_operator_task_candidates(
+    *,
+    env_file: str = "",
+    task_upload_url: str = "",
+    employee_info_url: str = "",
+) -> dict[str, Any]:
+    resolved_env_file = _resolve_operator_env_file(env_file)
+    env_values = load_local_env(resolved_env_file)
+    app_id = get_preferred_value("", env_values, "FEISHU_APP_ID")
+    if not app_id:
+        raise ValueError("缺少 FEISHU_APP_ID，请在本地 .env 或参数里填写。")
+    app_secret = get_preferred_value("", env_values, "FEISHU_APP_SECRET")
+    if not app_secret:
+        raise ValueError("缺少 FEISHU_APP_SECRET，请在本地 .env 或参数里填写。")
+    resolved_task_upload_url = (
+        get_preferred_value(task_upload_url, env_values, "TASK_UPLOAD_URL")
+        or get_preferred_value(task_upload_url, env_values, "FEISHU_SOURCE_URL")
+    )
+    if not resolved_task_upload_url:
+        raise ValueError("缺少 TASK_UPLOAD_URL，请在本地 .env 或参数里填写。")
+    resolved_employee_info_url = (
+        get_preferred_value(employee_info_url, env_values, "EMPLOYEE_INFO_URL")
+        or get_preferred_value(employee_info_url, env_values, "FEISHU_SOURCE_URL")
+    )
+    if not resolved_employee_info_url:
+        raise ValueError("缺少 EMPLOYEE_INFO_URL，请在本地 .env 或参数里填写。")
+    timeout_seconds = float(get_preferred_value("", env_values, "TIMEOUT_SECONDS", "30") or "30")
+    client = FeishuOpenClient(
+        app_id=app_id,
+        app_secret=app_secret,
+        base_url=get_preferred_value("", env_values, "FEISHU_OPEN_BASE_URL", DEFAULT_FEISHU_BASE_URL),
+        timeout_seconds=timeout_seconds,
+    )
+    inspection = inspect_task_upload_assignments(
+        client=client,
+        task_upload_url=resolved_task_upload_url,
+        employee_info_url=resolved_employee_info_url,
+        download_dir=BASE_DIR / "downloads" / "task_upload_attachments",
+        download_templates=False,
+        parse_templates=False,
+    )
+    tasks = []
+    for item in inspection.get("items") or []:
+        tasks.append({
+            "task_name": str(item.get("taskName") or "").strip(),
+            "record_id": str(item.get("recordId") or "").strip(),
+            "responsible_name": str(item.get("responsibleName") or "").strip(),
+            "owner_name": str(item.get("ownerName") or "").strip(),
+            "owner_email": str(item.get("ownerEmail") or "").strip(),
+            "employee_email": str(item.get("employeeEmail") or "").strip(),
+            "employee_matched": bool(item.get("employeeMatched")),
+            "matched_by": str(item.get("matchedBy") or "").strip(),
+            "linked_bitable_url": str(item.get("linkedBitableUrl") or "").strip(),
+            "template_file_name": str(item.get("templateFileName") or "").strip(),
+            "sending_list_file_name": str(item.get("sendingListFileName") or "").strip(),
+        })
+    tasks.sort(key=lambda entry: (str(entry.get("task_name") or "").casefold(), str(entry.get("record_id") or "")))
+    return {
+        "success": True,
+        "env_file": str(resolved_env_file),
+        "task_upload_url": resolved_task_upload_url,
+        "employee_info_url": resolved_employee_info_url,
+        "task_table_name": inspection.get("taskTableName") or "",
+        "employee_table_name": inspection.get("employeeTableName") or "",
+        "record_count": int(inspection.get("recordCount") or 0),
+        "matched_count": int(inspection.get("matchedCount") or 0),
+        "tasks": tasks,
+    }
+
+
+def _close_operator_log_handle(run_id: str) -> None:
+    handle = OPERATOR_RUN_LOG_HANDLES.pop(run_id, None)
+    if handle is None:
+        return
+    try:
+        handle.close()
+    except Exception:
+        pass
+
+
+def _collect_operator_summary_stage(summary: dict[str, Any]) -> str:
+    summary_status = str(summary.get("status") or "").strip()
+    if summary_status and summary_status != "running":
+        return summary_status
+    steps = summary.get("steps") or {}
+    downstream_status = str((steps.get("downstream") or {}).get("status") or "").strip()
+    if downstream_status:
+        return f"downstream:{downstream_status}"
+    upstream_status = str((steps.get("upstream") or {}).get("status") or "").strip()
+    if upstream_status:
+        return f"upstream:{upstream_status}"
+    resolved_paths = summary.get("resolved_paths") or {}
+    for key, label in (
+        ("downstream_summary_json", "downstream"),
+        ("upstream_summary_json", "upstream"),
+    ):
+        nested_path = str(resolved_paths.get(key) or "").strip()
+        if not nested_path:
+            continue
+        nested_summary = load_json_payload(nested_path, default={}) or {}
+        nested_status = str(nested_summary.get("status") or "").strip()
+        if nested_status:
+            return f"{label}:{nested_status}"
+    return "running"
+
+
+def _load_persisted_operator_run(run_id: str) -> dict[str, Any] | None:
+    normalized_run_id = str(run_id or "").strip()
+    if not normalized_run_id:
+        return None
+    output_root = (OPERATOR_RUNS_ROOT / normalized_run_id).resolve()
+    if not output_root.exists() or not _path_is_within_root(output_root, OPERATOR_RUNS_ROOT):
+        return None
+    summary_path = output_root / "summary.json"
+    if not summary_path.exists():
+        return None
+    summary = load_json_payload(summary_path, default={})
+    if not isinstance(summary, dict) or not summary:
+        return None
+    log_path = output_root / "operator_run.log"
+    status = str(summary.get("status") or "completed").strip() or "completed"
+    return {
+        "id": normalized_run_id,
+        "task_name": str(summary.get("task_name") or "").strip() or normalized_run_id,
+        "status": status,
+        "stage": _collect_operator_summary_stage(summary),
+        "env_file": str(summary.get("env_file") or "").strip(),
+        "output_root": str(output_root),
+        "summary_path": str(summary_path),
+        "log_path": str(log_path),
+        "pid": None,
+        "created_at": str(summary.get("started_at") or "").strip(),
+        "updated_at": str(summary.get("finished_at") or summary.get("started_at") or "").strip(),
+        "finished_at": str(summary.get("finished_at") or "").strip(),
+        "return_code": 0 if status in OPERATOR_RUN_TERMINAL_STATUSES else None,
+        "error": str(summary.get("error") or "").strip(),
+        "requested_options": {},
+        "summary": summary,
+    }
+
+
+def _build_operator_all_platforms_final_review(summary: dict[str, Any]) -> dict[str, Any]:
+    artifacts = summary.get("artifacts") or {}
+    existing_output = str(artifacts.get("all_platforms_final_review") or "").strip()
+    if existing_output:
+        existing_ref = _operator_file_ref(existing_output)
+        if existing_ref.get("exists"):
+            return existing_ref
+    output_root_value = str(summary.get("output_root") or "").strip()
+    if not output_root_value:
+        return _operator_file_ref("")
+    output_root = Path(output_root_value).expanduser().resolve()
+    final_exports = artifacts.get("final_exports") or {}
+    if not final_exports:
+        return _operator_file_ref("")
+    upstream_summary_json = str(artifacts.get("upstream_summary_json") or "").strip()
+    task_owner_context: dict[str, Any] = {}
+    if upstream_summary_json:
+        upstream_path = Path(upstream_summary_json).expanduser().resolve()
+        if upstream_path.exists():
+            try:
+                task_owner_context = extract_task_owner_context(
+                    json.loads(upstream_path.read_text(encoding="utf-8"))
+                )
+            except Exception:
+                task_owner_context = {}
+    output_dir = output_root / "operator_exports"
+    output_path = output_dir / "all_platforms_final_review.xlsx"
+    payload_path = output_dir / "all_platforms_final_review_payload.json"
+    try:
+        build_all_platforms_final_review_artifacts(
+            output_path=output_path,
+            payload_json_path=payload_path,
+            final_exports=final_exports,
+            keep_workbook=str(artifacts.get("keep_workbook") or ""),
+            task_owner=task_owner_context,
+        )
+    except Exception:
+        return _operator_file_ref("")
+    return _operator_file_ref(str(output_path))
+
+
+def _build_operator_summary_view(summary: dict[str, Any]) -> dict[str, Any]:
+    artifacts = summary.get("artifacts") or {}
+    final_exports: dict[str, dict[str, Any]] = {}
+    for platform, export_map in (artifacts.get("final_exports") or {}).items():
+        if not isinstance(export_map, dict):
+            continue
+        final_exports[str(platform)] = {
+            str(name): _operator_file_ref(str(path_value or ""))
+            for name, path_value in export_map.items()
+            if str(path_value or "").strip()
+        }
+    all_platforms_final_review = _build_operator_all_platforms_final_review(summary)
+    return {
+        "summary_json": _operator_file_ref(str(summary.get("summary_json") or "")),
+        "upstream_summary_json": _operator_file_ref(
+            str((summary.get("resolved_paths") or {}).get("upstream_summary_json") or "")
+        ),
+        "downstream_summary_json": _operator_file_ref(
+            str((summary.get("resolved_paths") or {}).get("downstream_summary_json") or "")
+        ),
+        "keep_workbook": _operator_file_ref(str(artifacts.get("keep_workbook") or "")),
+        "template_workbook": _operator_file_ref(str(artifacts.get("template_workbook") or "")),
+        "all_platforms_final_review": all_platforms_final_review,
+        "final_exports": final_exports,
+    }
+
+
+def _serialize_operator_run(run: dict[str, Any]) -> dict[str, Any]:
+    payload = {key: value for key, value in run.items() if key != "summary"}
+    summary = run.get("summary")
+    if isinstance(summary, dict):
+        payload["summary"] = sanitize_json_compatible(summary)
+        payload["artifacts"] = _build_operator_summary_view(summary)
+    else:
+        payload["summary"] = None
+        payload["artifacts"] = {
+            "summary_json": _operator_file_ref(str(run.get("summary_path") or "")),
+            "upstream_summary_json": _operator_file_ref(""),
+            "downstream_summary_json": _operator_file_ref(""),
+            "keep_workbook": _operator_file_ref(""),
+            "template_workbook": _operator_file_ref(""),
+            "all_platforms_final_review": _operator_file_ref(""),
+            "final_exports": {},
+        }
+    return sanitize_json_compatible(payload)
+
+
+def refresh_operator_run(run_id: str) -> dict[str, Any] | None:
+    with OPERATOR_RUNS_LOCK:
+        run = OPERATOR_RUNS.get(run_id)
+    if not run:
+        run = _load_persisted_operator_run(run_id)
+        if run is None:
+            return None
+        with OPERATOR_RUNS_LOCK:
+            OPERATOR_RUNS[run_id] = run
+    run = dict(run)
+    process = OPERATOR_RUN_PROCESSES.get(run_id)
+    summary_path = Path(str(run.get("summary_path") or "")).expanduser()
+    summary = load_json_payload(summary_path, default={}) if str(summary_path) else {}
+    summary = summary if isinstance(summary, dict) else {}
+    return_code = process.poll() if process is not None else run.get("return_code")
+    status = str(run.get("status") or "queued").strip() or "queued"
+    stage = str(run.get("stage") or "queued").strip() or "queued"
+    error = str(run.get("error") or "").strip()
+    finished_at = str(run.get("finished_at") or "").strip()
+    if summary:
+        summary_status = str(summary.get("status") or "").strip()
+        if summary_status:
+            status = summary_status
+        stage = _collect_operator_summary_stage(summary)
+        error = str(summary.get("error") or error).strip()
+        finished_at = str(summary.get("finished_at") or finished_at).strip()
+    elif process is not None and return_code is None:
+        status = "running"
+        stage = "running"
+    if process is not None and return_code is not None and status == "running":
+        status = "failed" if return_code else "completed"
+        stage = status
+        if not error and return_code:
+            error = f"operator subprocess exited with code {return_code}"
+        if not finished_at:
+            finished_at = iso_now()
+    if status in OPERATOR_RUN_TERMINAL_STATUSES or return_code is not None:
+        _close_operator_log_handle(run_id)
+    updated_run = dict(run)
+    updated_run.update({
+        "status": status,
+        "stage": stage,
+        "summary": summary or None,
+        "return_code": return_code,
+        "error": error,
+        "finished_at": finished_at,
+        "updated_at": iso_now(),
+    })
+    with OPERATOR_RUNS_LOCK:
+        OPERATOR_RUNS[run_id] = updated_run
+    return updated_run
+
+
+def list_operator_runs() -> list[dict[str, Any]]:
+    with OPERATOR_RUNS_LOCK:
+        run_ids = list(OPERATOR_RUNS.keys())
+    if OPERATOR_RUNS_ROOT.exists():
+        for candidate in OPERATOR_RUNS_ROOT.iterdir():
+            if not candidate.is_dir():
+                continue
+            if not (candidate / "summary.json").exists():
+                continue
+            run_ids.append(candidate.name)
+    run_ids = list(dict.fromkeys(run_ids))
+    runs = [refresh_operator_run(run_id) for run_id in run_ids]
+    cleaned = [run for run in runs if run]
+    cleaned.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
+    return [_serialize_operator_run(run) for run in cleaned]
+
+
+def launch_operator_run(
+    *,
+    task_name: str,
+    env_file: str = "",
+    task_upload_url: str = "",
+    employee_info_url: str = "",
+    matching_strategy: str = "brand-keyword-fast-path",
+    brand_keyword: str = "",
+    brand_match_include_from: bool = False,
+    platforms: list[str] | None = None,
+    vision_provider: str = "",
+    max_identifiers_per_platform: int = 0,
+    mail_limit: int = 0,
+    sent_since: str = "",
+    reuse_existing: bool = True,
+    probe_vision_provider_only: bool = False,
+    skip_scrape: bool = False,
+    skip_visual: bool = False,
+    skip_positioning_card_analysis: bool = False,
+) -> dict[str, Any]:
+    normalized_task_name = str(task_name or "").strip()
+    if not normalized_task_name:
+        raise ValueError("task_name 不能为空。")
+    ensure_runtime_dirs()
+    OPERATOR_RUNS_ROOT.mkdir(parents=True, exist_ok=True)
+    resolved_env_file = _resolve_operator_env_file(env_file)
+    safe_task_name = re.sub(r"[^0-9A-Za-z._-]+", "_", normalized_task_name).strip("_") or "task"
+    run_id = uuid.uuid4().hex
+    output_root = (OPERATOR_RUNS_ROOT / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe_task_name}_{run_id[:8]}").resolve()
+    output_root.mkdir(parents=True, exist_ok=True)
+    summary_path = output_root / "summary.json"
+    log_path = output_root / "operator_run.log"
+    command = [
+        sys.executable,
+        str((BASE_DIR / "scripts" / "run_task_upload_to_final_export_pipeline.py").resolve()),
+        "--task-name",
+        normalized_task_name,
+        "--env-file",
+        str(resolved_env_file),
+        "--output-root",
+        str(output_root),
+        "--summary-json",
+        str(summary_path),
+        "--matching-strategy",
+        str(matching_strategy or "brand-keyword-fast-path").strip() or "brand-keyword-fast-path",
+    ]
+    normalized_brand_keyword = str(brand_keyword or "").strip()
+    if normalized_brand_keyword:
+        command.extend(["--brand-keyword", normalized_brand_keyword])
+    if brand_match_include_from:
+        command.append("--brand-match-include-from")
+    if task_upload_url:
+        command.extend(["--task-upload-url", str(task_upload_url).strip()])
+    if employee_info_url:
+        command.extend(["--employee-info-url", str(employee_info_url).strip()])
+    for platform in _normalize_operator_platforms(platforms):
+        command.extend(["--platform", platform])
+    if str(vision_provider or "").strip():
+        command.extend(["--vision-provider", str(vision_provider).strip()])
+    if int(max_identifiers_per_platform or 0) > 0:
+        command.extend(["--max-identifiers-per-platform", str(int(max_identifiers_per_platform))])
+    if int(mail_limit or 0) > 0:
+        command.extend(["--mail-limit", str(int(mail_limit))])
+    if str(sent_since or "").strip():
+        command.extend(["--sent-since", str(sent_since).strip()])
+    if not reuse_existing:
+        command.append("--no-reuse-existing")
+    if probe_vision_provider_only:
+        command.append("--probe-vision-provider-only")
+    if skip_scrape:
+        command.append("--skip-scrape")
+    if skip_visual:
+        command.append("--skip-visual")
+    if skip_positioning_card_analysis:
+        command.append("--skip-positioning-card-analysis")
+    log_handle = open(log_path, "a", encoding="utf-8")
+    process = subprocess.Popen(
+        command,
+        cwd=str(BASE_DIR),
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
+        env={**os.environ, "PYTHONUNBUFFERED": "1"},
+        text=True,
+    )
+    run = {
+        "id": run_id,
+        "task_name": normalized_task_name,
+        "status": "running",
+        "stage": "starting",
+        "env_file": str(resolved_env_file),
+        "output_root": str(output_root),
+        "summary_path": str(summary_path),
+        "log_path": str(log_path),
+        "command": command,
+        "pid": process.pid,
+        "created_at": iso_now(),
+        "updated_at": iso_now(),
+        "finished_at": "",
+        "return_code": None,
+        "error": "",
+        "summary": None,
+        "requested_options": {
+            "task_upload_url": str(task_upload_url or "").strip(),
+            "employee_info_url": str(employee_info_url or "").strip(),
+            "matching_strategy": str(matching_strategy or "").strip() or "brand-keyword-fast-path",
+            "brand_keyword": normalized_brand_keyword,
+            "brand_match_include_from": bool(brand_match_include_from),
+            "platforms": _normalize_operator_platforms(platforms),
+            "vision_provider": str(vision_provider or "").strip(),
+            "max_identifiers_per_platform": int(max_identifiers_per_platform or 0),
+            "mail_limit": int(mail_limit or 0),
+            "sent_since": str(sent_since or "").strip(),
+            "reuse_existing": bool(reuse_existing),
+            "probe_vision_provider_only": bool(probe_vision_provider_only),
+            "skip_scrape": bool(skip_scrape),
+            "skip_visual": bool(skip_visual),
+            "skip_positioning_card_analysis": bool(skip_positioning_card_analysis),
+        },
+    }
+    with OPERATOR_RUNS_LOCK:
+        OPERATOR_RUNS[run_id] = run
+        OPERATOR_RUN_PROCESSES[run_id] = process
+        OPERATOR_RUN_LOG_HANDLES[run_id] = log_handle
+    refreshed = refresh_operator_run(run_id)
+    return _serialize_operator_run(refreshed or run)
 
 
 def get_platform_dir(platform):
@@ -1683,7 +2237,7 @@ def build_vision_preflight(provider_name=None):
     else:
         status = "unconfigured"
         error_code = "MISSING_VISION_CONFIG"
-        message = "缺少视觉模型配置：请设置 OPENAI_API_KEY、VISION_MIMO_API_KEY、VISION_QIANDAO_API_KEY、VISION_QUAN2GO_API_KEY 或 VISION_LEMONAPI_API_KEY。"
+        message = "缺少视觉模型配置：请设置 OPENAI_API_KEY、VISION_REELX_API_KEY、VISION_MIMO_API_KEY、VISION_QIANDAO_API_KEY、VISION_QUAN2GO_API_KEY 或 VISION_LEMONAPI_API_KEY。"
     return {
         "status": status,
         "error_code": error_code,
@@ -6054,6 +6608,89 @@ def apify_balance_dashboard():
         initial_payload=payload,
         initial_status_code=status_code,
     )
+
+
+@app.route("/operator", methods=["GET"])
+def operator_console():
+    return render_template(
+        "operator_console.html",
+        api_tasks_path="/api/operator/tasks",
+        api_runs_path="/api/operator/runs",
+        api_file_path="/api/operator/file",
+        initial_runs=list_operator_runs(),
+        default_env_file=".env",
+        default_matching_strategy="brand-keyword-fast-path",
+        default_vision_provider="reelx",
+        default_platforms=["instagram", "tiktok"],
+        default_max_identifiers_per_platform=1,
+    )
+
+
+@app.route("/api/operator/tasks", methods=["GET"])
+def operator_tasks():
+    try:
+        payload = load_operator_task_candidates(
+            env_file=request.args.get("env_file", ""),
+            task_upload_url=request.args.get("task_upload_url", ""),
+            employee_info_url=request.args.get("employee_info_url", ""),
+        )
+    except Exception as exc:  # noqa: BLE001
+        error_payload, status_code = _classify_operator_config_error(exc)
+        return jsonify(error_payload), status_code
+    return jsonify(payload)
+
+
+@app.route("/api/operator/runs", methods=["GET", "POST"])
+def operator_runs_collection():
+    if request.method == "GET":
+        return jsonify({"success": True, "runs": list_operator_runs()})
+    payload = request.get_json(silent=True) or {}
+    try:
+        run_payload = launch_operator_run(
+            task_name=str(payload.get("task_name") or "").strip(),
+            env_file=str(payload.get("env_file") or "").strip(),
+            task_upload_url=str(payload.get("task_upload_url") or "").strip(),
+            employee_info_url=str(payload.get("employee_info_url") or "").strip(),
+            matching_strategy=str(payload.get("matching_strategy") or "brand-keyword-fast-path").strip()
+            or "brand-keyword-fast-path",
+            brand_keyword=str(payload.get("brand_keyword") or "").strip(),
+            brand_match_include_from=_boolish(payload.get("brand_match_include_from"), default=False),
+            platforms=_normalize_operator_platforms(payload.get("platforms")),
+            vision_provider=str(payload.get("vision_provider") or "").strip(),
+            max_identifiers_per_platform=max(0, int(payload.get("max_identifiers_per_platform") or 0)),
+            mail_limit=max(0, int(payload.get("mail_limit") or 0)),
+            sent_since=str(payload.get("sent_since") or "").strip(),
+            reuse_existing=_boolish(payload.get("reuse_existing"), default=True),
+            probe_vision_provider_only=_boolish(payload.get("probe_vision_provider_only"), default=False),
+            skip_scrape=_boolish(payload.get("skip_scrape"), default=False),
+            skip_visual=_boolish(payload.get("skip_visual"), default=False),
+            skip_positioning_card_analysis=_boolish(payload.get("skip_positioning_card_analysis"), default=False),
+        )
+    except Exception as exc:  # noqa: BLE001
+        error_payload, status_code = _classify_operator_config_error(exc)
+        return jsonify(error_payload), status_code
+    return jsonify({"success": True, "run": run_payload}), 202
+
+
+@app.route("/api/operator/runs/<run_id>", methods=["GET"])
+def operator_run_detail(run_id):
+    run = refresh_operator_run(run_id)
+    if run is None:
+        return jsonify({"success": False, "error": "未找到 operator run"}), 404
+    return jsonify({"success": True, "run": _serialize_operator_run(run)})
+
+
+@app.route("/api/operator/file", methods=["GET"])
+def operator_file_download():
+    raw_path = str(request.args.get("path") or "").strip()
+    if not raw_path:
+        return jsonify({"success": False, "error": "缺少 path"}), 400
+    resolved = Path(raw_path).expanduser().resolve()
+    if not resolved.exists():
+        return jsonify({"success": False, "error": "文件不存在"}), 404
+    if not _path_is_within_root(resolved, BASE_DIR):
+        return jsonify({"success": False, "error": "不允许下载工作区外文件"}), 403
+    return send_file(resolved, as_attachment=True, download_name=resolved.name)
 
 
 @app.route("/api/upload", methods=["POST"])

@@ -45,10 +45,18 @@ class TaskUploadToFinalExportRunnerTests(unittest.TestCase):
         def fake_downstream(**kwargs):
             observed["downstream_kwargs"] = kwargs
             export_path = Path(kwargs["output_root"]) / "exports" / "instagram" / "instagram_final_review.xlsx"
+            combined_path = Path(kwargs["output_root"]) / "exports" / "all_platforms_final_review.xlsx"
+            payload_path = Path(kwargs["output_root"]) / "exports" / "all_platforms_final_review_payload.json"
             export_path.parent.mkdir(parents=True, exist_ok=True)
             export_path.touch()
+            combined_path.touch()
+            payload_path.touch()
             return {
                 "status": "completed",
+                "artifacts": {
+                    "all_platforms_final_review": str(combined_path),
+                    "all_platforms_upload_payload_json": str(payload_path),
+                },
                 "platforms": {
                     "instagram": {
                         "status": "completed",
@@ -87,6 +95,7 @@ class TaskUploadToFinalExportRunnerTests(unittest.TestCase):
         self.assertEqual(summary["contract"]["canonical_internal_boundary"], "keep-list")
         self.assertTrue(summary["artifacts"]["keep_workbook"].endswith("MINISO_final_keep.xlsx"))
         self.assertIn("instagram", summary["artifacts"]["final_exports"])
+        self.assertTrue(summary["artifacts"]["all_platforms_final_review"].endswith("all_platforms_final_review.xlsx"))
         self.assertIn("--keep-workbook", summary["resume_points"]["keep_list"]["recommended_command"])
         self.assertIn("--platform instagram", summary["resume_points"]["keep_list"]["recommended_command"])
         self.assertIn("--vision-provider openai", summary["resume_points"]["keep_list"]["recommended_command"])
@@ -96,9 +105,14 @@ class TaskUploadToFinalExportRunnerTests(unittest.TestCase):
         self.assertEqual(observed["downstream_kwargs"]["vision_provider"], "openai")
         self.assertEqual(observed["downstream_kwargs"]["platform_filters"], ["instagram"])
         self.assertEqual(observed["downstream_kwargs"]["max_identifiers_per_platform"], 1)
+        self.assertEqual(observed["downstream_kwargs"]["task_owner_name"], "")
         self.assertEqual(
             persisted_summary["steps"]["downstream"]["final_exports"]["instagram"]["final_review"],
             summary["artifacts"]["final_exports"]["instagram"]["final_review"],
+        )
+        self.assertEqual(
+            persisted_summary["artifacts"]["all_platforms_final_review"],
+            summary["artifacts"]["all_platforms_final_review"],
         )
 
     def test_runner_fails_when_upstream_keep_workbook_is_missing(self) -> None:
@@ -271,11 +285,17 @@ class TaskUploadToFinalExportRunnerTests(unittest.TestCase):
             final_export = Path(kwargs["output_root"]) / "exports" / "instagram" / "instagram_final_review.xlsx"
             positioning_export = Path(kwargs["output_root"]) / "exports" / "instagram" / "instagram_positioning_card_review.xlsx"
             positioning_json = Path(kwargs["output_root"]) / "exports" / "instagram" / "instagram_positioning_card_results.json"
-            for path in (final_export, positioning_export, positioning_json):
+            combined_path = Path(kwargs["output_root"]) / "exports" / "all_platforms_final_review.xlsx"
+            payload_path = Path(kwargs["output_root"]) / "exports" / "all_platforms_final_review_payload.json"
+            for path in (final_export, positioning_export, positioning_json, combined_path, payload_path):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.touch()
             return {
                 "status": "completed",
+                "artifacts": {
+                    "all_platforms_final_review": str(combined_path),
+                    "all_platforms_upload_payload_json": str(payload_path),
+                },
                 "platforms": {
                     "instagram": {
                         "status": "completed",
@@ -316,6 +336,7 @@ class TaskUploadToFinalExportRunnerTests(unittest.TestCase):
             summary["steps"]["downstream"]["positioning_card_analysis"]["instagram"]["non_blocking"]
         )
         self.assertIn("positioning_card_review", summary["artifacts"]["positioning_artifacts"]["instagram"])
+        self.assertTrue(summary["artifacts"]["all_platforms_upload_payload_json"].endswith(".json"))
 
 
 if __name__ == "__main__":

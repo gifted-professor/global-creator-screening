@@ -3,13 +3,13 @@ gsd_state_version: 1.0
 milestone: v1.3.0
 milestone_name: External Email Dependency Decoupling
 status: ready_for_milestone_audit
-stopped_at: Phase 24 completed on 2026-03-30; quick task 260330-gqs completed; next workflow step remains `$gsd-audit-milestone`
-last_updated: "2026-03-30T12:15:14+08:00"
+stopped_at: Phase 25 completed on 2026-03-30; next workflow step is `$gsd-audit-milestone`
+last_updated: "2026-03-30T15:07:01+08:00"
 progress:
-  total_phases: 5
-  completed_phases: 5
-  total_plans: 11
-  completed_plans: 11
+  total_phases: 6
+  completed_phases: 6
+  total_plans: 13
+  completed_plans: 13
 ---
 
 # Project State
@@ -19,11 +19,11 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-30)
 
 **Core value:** 在不打断现有本地工作流的前提下，把飞书内容获取、筛选导入和相关配置集中到一个可持续维护的仓库里。
-**Current focus:** Milestone closeout after Phases 23-24
+**Current focus:** Milestone closeout after Phase 25 local operator UI delivery
 
 ## Current Position
 
-Phase: 24 (Add post-visual-review positioning-card analysis step for approved creators) — COMPLETED
+Phase: 25 (Build local thin operator UI for task-driven screening runs) — COMPLETED
 Plan: 2 of 2 completed
 
 ## Performance Metrics
@@ -57,6 +57,9 @@ Plan: 2 of 2 completed
 | 20 | 2 | n/a | n/a |
 | 21 | 2 | n/a | n/a |
 | 22 | 2 | n/a | n/a |
+| 23 | 3 | n/a | n/a |
+| 24 | 2 | n/a | n/a |
+| 25 | 2 | n/a | n/a |
 
 **Recent Trend:**
 
@@ -90,6 +93,10 @@ Recent decisions affecting current work:
 - [Phase 22]: fresh bounded wrapper 顶层失败点是外部 `openai` vision probe 503；上游仍然成功达到 keep-list，说明问题在 provider/channel availability，不在 decoupling contract
 - [Phase 22]: summary-driven recovery 已实证成立；operator 可以从 `resume_points.keep_list.recommended_command` 接过 keep-list boundary，并在改用健康 provider 后继续完成 downstream
 - [Phase 22]: operator fallback/runbook 现在固定成三层说法：`repo-local single-entry mainline resume`、`repo-local bridge outputs`、`explicit legacy compatibility mode`
+- [Phase 25 Intake]: 用户在 2026-03-30 明确把本地薄 operator UI 从 deferred follow-up 提前拉进当前 roadmap，作为已验证主链之上的 local-only control plane
+- [Phase 25 Intake]: 第一版 UI 由现有 Flask backend 直接服务，并调用 canonical `scripts/run_task_upload_to_final_export_pipeline.py`；不重写 orchestration 逻辑
+- [Phase 25 Intake]: 统一邮箱 `partnerships@amagency.biz` 的 `邮件备份(30316)` 目录当前仍未通过 IMAP 暴露，所以 UI v1 默认继续走已验证的老邮箱 route / 健康视觉 provider
+- [Phase 25 25-01]: `/operator`、`/api/operator/tasks`、`/api/operator/runs`、`/api/operator/runs/<id>`、`/api/operator/file` 已落地；第一版 control plane 与 targeted route tests 已通过
 - [Phase 23 Plan]: runtime visual contract 先拆成三段：持久化 `active_visual_prompts.json`、把 `visual_feature_group` / 视觉排除项接入 runtime cover/prompt contract、再用 smoke artifact + README 把 prompt precedence 和 fallback 顺序固定下来
 - [Phase 23]: runtime 现在已消费模板编译出的 active visual prompts、`visual_feature_group` 和支持的视觉排除项；brand/provider fallback 顺序与 runtime diagnostics 已通过回归覆盖固定下来
 - [Phase 24]: positioning-card analysis 现在作为 visual-pass 后的 repo-local stage 接入 downstream runner 和 final wrapper，可导出 machine-readable artifact，且默认 non-blocking
@@ -154,17 +161,19 @@ Recent decisions affecting current work:
 - Phase 22 added: Validate decoupled runtime stability and operator fallback contract
 - Phase 23 added: Wire template-compiled visual prompts into runtime and define visual feature-group contract
 - Phase 24 added: Add post-visual-review positioning-card analysis step for approved creators
+- Phase 25 added: Build local thin operator UI for task-driven screening runs
 
 ### Pending Todos
 
-- Milestone audit / closeout: 执行 `v1.3.0` closeout，确认 Phases 20-24 与 deferred follow-ups 的边界
+- Milestone audit / closeout: 执行 `v1.3.0` closeout，确认 Phases 20-25 与 deferred follow-ups 的边界
+- Milestone closeout: `v1.3.0` 的 audit / closeout 顺延到 Phase 25 完成之后，再一起确认 Phases 20-25 与 deferred follow-ups 的边界
 - Deferred debt intake: `backend/app.py` 模块化 + app factory、shared settings loader、`pipeline_runtime.py` 抽取、SQLite WAL/FTS、upload/job hardening、LLM config consolidation、`pyproject.toml`/lint/typecheck、以及 workbook handle cleanup
-- Post-decoupling follow-up candidate: task-name single-entry orchestration API / thin operator UI，放到下一里程碑再开
 
 ### Blockers/Concerns
 
 - 当前仓库仍要兼容 lite `active_rulespec.json`；后续优化不能假设所有入口都会先产出 full `rules`
 - 外部 qwen benchmark 仍在 sibling docs；后续 prompt 调优应继续走 override / benchmark route，而不是把 sibling benchmark 文件迁入变成阻塞项
+- UI v1 不能假设统一邮箱 `partnerships@amagency.biz` 已经通过 IMAP 暴露 `邮件备份(30316)` 或项目专属目录；默认执行路径要继续沿用已验证的老邮箱 route
 
 ### Quick Tasks Completed
 
@@ -224,6 +233,6 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-Last session: 2026-03-30 12:15
-Stopped at: Phase 24 completed on 2026-03-30; quick task 260330-gqs completed; next workflow step remains `$gsd-audit-milestone`
+Last session: 2026-03-30 15:07
+Stopped at: Phase 25 completed on 2026-03-30; next workflow step is `$gsd-audit-milestone`
 Resume file: None

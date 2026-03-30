@@ -6,6 +6,7 @@ from datetime import date
 import os
 from pathlib import Path
 import re
+from time import perf_counter
 from typing import Any
 
 from email_sync.config import Settings
@@ -80,6 +81,15 @@ class EmployeeDirectoryEntry:
     employee_name: str
     email: str
     imap_code: str
+
+
+@dataclass(frozen=True)
+class TaskMailboxSelection:
+    strategy: str
+    requested_folders: list[str] | None
+    resolved_folder: str
+    resolved_folders: list[str]
+    fallback_reason: str
 
 
 def resolve_task_upload_entry(
@@ -408,6 +418,12 @@ def sync_task_upload_mailboxes(
                 "mailSyncError": "",
                 "requestedFolder": requested_folder,
                 "resolvedFolder": "",
+                "resolvedFolders": [],
+                "mailSyncStrategy": "",
+                "mailFallbackReason": "",
+                "mailScannedFolderCount": 0,
+                "mailServerTotalCount": None,
+                "mailSyncDurationSeconds": 0.0,
                 "mailDataDir": "",
                 "mailDbPath": "",
                 "mailRawDir": "",
@@ -424,13 +440,19 @@ def sync_task_upload_mailboxes(
         try:
             employee_email = str(inspected.get("employeeEmail") or "").strip()
             imap_code = str(inspected.get("imapCode") or "").strip()
-            resolved_account_email = employee_email
-            resolved_auth_code = imap_code
-            credential_source = "employee_directory"
-            if default_credentials_requested:
+            has_employee_credentials = bool(employee_email and imap_code)
+            if has_employee_credentials:
+                resolved_account_email = employee_email
+                resolved_auth_code = imap_code
+                credential_source = "employee_directory"
+            elif default_credentials_requested:
                 resolved_account_email = normalized_default_account_email
                 resolved_auth_code = normalized_default_auth_code
                 credential_source = "default_account"
+            else:
+                resolved_account_email = employee_email
+                resolved_auth_code = imap_code
+                credential_source = "employee_directory"
 
             result_item.update(
                 {
@@ -460,7 +482,7 @@ def sync_task_upload_mailboxes(
             settings.ensure_directories()
 
             discovered_mailboxes = _discover_mailboxes_for_settings(settings)
-            resolved_folder = _resolve_task_mailbox_name(
+            mailbox_selection = _resolve_task_mailbox_selection(
                 discovered_mailboxes,
                 task_name=inspected["taskName"],
                 explicit_folder=requested_folder,
@@ -470,31 +492,52 @@ def sync_task_upload_mailboxes(
             db = Database(settings.db_path)
             try:
                 db.init_schema()
+                sync_started_at = perf_counter()
                 sync_results = sync_mailboxes(
                     settings,
                     db,
-                    requested_folders=[resolved_folder],
+                    requested_folders=mailbox_selection.requested_folders,
                     limit=limit,
                     reset_state=reset_state,
                     workers=workers,
                     sent_since=sent_since_date,
                 )
+                sync_duration_seconds = round(perf_counter() - sync_started_at, 3)
             finally:
                 db.close()
 
-            sync_result = sync_results[0] if sync_results else None
+            sync_result = sync_results[0] if len(sync_results) == 1 else None
+            total_fetched_count = sum(item.fetched for item in sync_results)
+            total_server_count = sum(
+                item.message_count_on_server or 0
+                for item in sync_results
+                if item.message_count_on_server is not None
+            )
+            server_count_available = any(item.message_count_on_server is not None for item in sync_results)
+            last_seen_uid = max((item.last_seen_uid for item in sync_results), default=0)
+            uidvalidity_values = {
+                item.uidvalidity
+                for item in sync_results
+                if item.uidvalidity is not None
+            }
             result_item.update(
                 {
                     "mailSyncOk": True,
-                    "resolvedFolder": resolved_folder,
+                    "resolvedFolder": mailbox_selection.resolved_folder,
+                    "resolvedFolders": mailbox_selection.resolved_folders,
+                    "mailSyncStrategy": mailbox_selection.strategy,
+                    "mailFallbackReason": mailbox_selection.fallback_reason,
+                    "mailScannedFolderCount": len(sync_results),
+                    "mailServerTotalCount": total_server_count if server_count_available else None,
+                    "mailSyncDurationSeconds": sync_duration_seconds,
                     "mailDataDir": str(settings.data_dir),
                     "mailDbPath": str(settings.db_path),
                     "mailRawDir": str(settings.raw_dir),
-                    "mailFetchedCount": sync_result.fetched if sync_result is not None else 0,
-                    "mailLastSeenUid": sync_result.last_seen_uid if sync_result is not None else 0,
-                    "mailUidvalidity": sync_result.uidvalidity if sync_result is not None else None,
-                    "mailServerCount": sync_result.message_count_on_server if sync_result is not None else None,
-                    "mailSkippedStateAdvance": bool(sync_result.skipped_state_advance) if sync_result is not None else False,
+                    "mailFetchedCount": total_fetched_count,
+                    "mailLastSeenUid": sync_result.last_seen_uid if sync_result is not None else last_seen_uid,
+                    "mailUidvalidity": sync_result.uidvalidity if sync_result is not None else (next(iter(uidvalidity_values)) if len(uidvalidity_values) == 1 else None),
+                    "mailServerCount": sync_result.message_count_on_server if sync_result is not None else (total_server_count if server_count_available else None),
+                    "mailSkippedStateAdvance": any(item.skipped_state_advance for item in sync_results),
                     "mailCredentialSource": credential_source,
                     "mailLoginEmail": resolved_account_email,
                 }
@@ -519,7 +562,11 @@ def sync_task_upload_mailboxes(
         "mailDataDir": str(mail_root),
         "imapHost": str(imap_host or "imap.qq.com").strip() or "imap.qq.com",
         "imapPort": int(imap_port),
-        "defaultCredentialMode": "default_account" if default_credentials_requested else "employee_directory",
+        "defaultCredentialMode": (
+            "employee_directory_preferred_with_default_fallback"
+            if default_credentials_requested
+            else "employee_directory"
+        ),
         "defaultAccountEmail": normalized_default_account_email,
         "sentSince": sent_since_date.isoformat() if sent_since_date is not None else "",
         "items": items,
@@ -909,6 +956,40 @@ def _resolve_task_mailbox_name(
     if len(selectable) > 20:
         available = f"{available}, ..."
     raise ValueError(f"找不到任务 {task_name!r} 对应的邮箱文件夹。可用文件夹：{available}")
+
+
+def _resolve_task_mailbox_selection(
+    discovered_mailboxes: list[MailboxInfo],
+    *,
+    task_name: str,
+    explicit_folder: str = "",
+    folder_prefixes: list[str] | tuple[str, ...] | None = None,
+) -> TaskMailboxSelection:
+    selectable = resolve_mailboxes(discovered_mailboxes, None)
+    try:
+        resolved_folder = _resolve_task_mailbox_name(
+            discovered_mailboxes,
+            task_name=task_name,
+            explicit_folder=explicit_folder,
+            folder_prefixes=folder_prefixes,
+        )
+        return TaskMailboxSelection(
+            strategy="task_folder",
+            requested_folders=[resolved_folder],
+            resolved_folder=resolved_folder,
+            resolved_folders=[resolved_folder],
+            fallback_reason="",
+        )
+    except ValueError as exc:
+        if not selectable:
+            raise
+        return TaskMailboxSelection(
+            strategy="all_selectable_fallback",
+            requested_folders=None,
+            resolved_folder="[all selectable folders]",
+            resolved_folders=[mailbox.display_name for mailbox in selectable],
+            fallback_reason=str(exc),
+        )
 
 
 def _parse_task_upload_workbook(*, workbook_path: Path, output_root: Path) -> dict[str, Any]:

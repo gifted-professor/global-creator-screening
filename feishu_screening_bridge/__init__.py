@@ -1,6 +1,7 @@
 from .attachment_download import download_bitable_attachments
 from .bridge import import_screening_workbook_from_feishu
 from .bitable_export import export_bitable_view, resolve_bitable_view_from_url
+from .bitable_upload import upload_final_review_payload_to_bitable
 from .feishu_api import FeishuApiError, FeishuOpenClient, extract_file_token
 from .task_upload_sync import (
     download_task_upload_screening_assets,
@@ -23,4 +24,5 @@ __all__ = [
     "resolve_bitable_view_from_url",
     "sync_task_upload_mailboxes",
     "sync_task_upload_view_to_email_project",
+    "upload_final_review_payload_to_bitable",
 ]

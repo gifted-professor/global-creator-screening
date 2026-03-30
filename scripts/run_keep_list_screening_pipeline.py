@@ -29,6 +29,7 @@ DEFAULT_PLATFORM_ORDER = ("tiktok", "instagram", "youtube")
 
 def _load_runtime_dependencies():
     import backend.app as backend_app
+    from backend.final_export_merge import build_all_platforms_final_review_artifacts, collect_final_exports
     from scripts.prepare_screening_inputs import prepare_screening_inputs
     from scripts.run_screening_smoke import (
         count_passed_profiles,
@@ -40,6 +41,8 @@ def _load_runtime_dependencies():
 
     return {
         "backend_app": backend_app,
+        "build_all_platforms_final_review_artifacts": build_all_platforms_final_review_artifacts,
+        "collect_final_exports": collect_final_exports,
         "prepare_screening_inputs": prepare_screening_inputs,
         "count_passed_profiles": count_passed_profiles,
         "export_platform_artifacts": export_platform_artifacts,
@@ -322,6 +325,12 @@ def run_keep_list_screening_pipeline(
     skip_scrape: bool = False,
     skip_visual: bool = False,
     skip_positioning_card_analysis: bool = False,
+    task_owner_name: str = "",
+    task_owner_employee_id: str = "",
+    task_owner_employee_record_id: str = "",
+    task_owner_employee_email: str = "",
+    task_owner_owner_name: str = "",
+    linked_bitable_url: str = "",
 ) -> dict[str, Any]:
     resolved_output_root = (output_root or default_output_root()).expanduser().resolve()
     resolved_output_root.mkdir(parents=True, exist_ok=True)
@@ -390,6 +399,13 @@ def run_keep_list_screening_pipeline(
         "vision_preflight": {},
         "staging": {},
         "platforms": {},
+        "artifacts": {
+            "keep_workbook": str(resolved_keep_workbook.resolve()),
+            "template_workbook": str(resolved_template_workbook.resolve()) if resolved_template_workbook else "",
+            "all_platforms_final_review": "",
+            "all_platforms_upload_payload_json": "",
+            "final_exports": {},
+        },
     }
 
     preflight_errors: list[dict[str, Any]] = []
@@ -443,6 +459,12 @@ def run_keep_list_screening_pipeline(
         return summary
 
     backend_app = runtime["backend_app"]
+    if "build_all_platforms_final_review_artifacts" in runtime and "collect_final_exports" in runtime:
+        build_all_platforms_final_review_artifacts = runtime["build_all_platforms_final_review_artifacts"]
+        collect_final_exports = runtime["collect_final_exports"]
+    else:
+        from backend.final_export_merge import build_all_platforms_final_review_artifacts, collect_final_exports
+
     prepare_screening_inputs = runtime["prepare_screening_inputs"]
     count_passed_profiles = runtime["count_passed_profiles"]
     export_platform_artifacts = runtime["export_platform_artifacts"]
@@ -850,6 +872,32 @@ def run_keep_list_screening_pipeline(
         _write_summary(run_summary_path, summary)
         return summary
 
+    combined_exports = collect_final_exports(summary.get("platforms"))
+    combined_artifacts = build_all_platforms_final_review_artifacts(
+        output_path=exports_dir / "all_platforms_final_review.xlsx",
+        payload_json_path=exports_dir / "all_platforms_final_review_payload.json",
+        final_exports=combined_exports,
+        keep_workbook=resolved_keep_workbook,
+        task_owner={
+            "responsible_name": str(task_owner_name or "").strip(),
+            "employee_name": str(task_owner_name or "").strip(),
+            "employee_id": str(task_owner_employee_id or "").strip(),
+            "employee_record_id": str(task_owner_employee_record_id or "").strip(),
+            "employee_email": str(task_owner_employee_email or "").strip(),
+            "owner_name": str(task_owner_owner_name or "").strip(),
+            "linked_bitable_url": str(linked_bitable_url or "").strip(),
+            "task_name": str(task_name or "").strip(),
+        },
+    )
+    summary["artifacts"]["final_exports"] = combined_exports
+    summary["artifacts"]["all_platforms_final_review"] = combined_artifacts["all_platforms_final_review"]
+    summary["artifacts"]["all_platforms_upload_payload_json"] = combined_artifacts["all_platforms_upload_payload_json"]
+    summary["artifacts"]["all_platforms_upload_local_archive_dir"] = combined_artifacts["all_platforms_upload_local_archive_dir"]
+    summary["artifacts"]["all_platforms_upload_skipped_archive_json"] = combined_artifacts["all_platforms_upload_skipped_archive_json"]
+    summary["artifacts"]["all_platforms_upload_skipped_archive_xlsx"] = combined_artifacts["all_platforms_upload_skipped_archive_xlsx"]
+    summary["artifacts"]["all_platforms_upload_row_count"] = combined_artifacts["row_count"]
+    summary["artifacts"]["all_platforms_upload_source_row_count"] = combined_artifacts["source_row_count"]
+    summary["artifacts"]["all_platforms_upload_skipped_row_count"] = combined_artifacts["skipped_row_count"]
     summary["status"] = summarize_platform_statuses(summary["platforms"])
     summary["finished_at"] = backend_app.iso_now()
     _write_summary(run_summary_path, summary)
@@ -875,6 +923,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skip-scrape", action="store_true", help="只做 staging，不触发 scrape/visual/export。")
     parser.add_argument("--skip-visual", action="store_true", help="跑 scrape 和导出，但跳过视觉复核。")
     parser.add_argument("--skip-positioning-card-analysis", action="store_true", help="跳过 visual-pass 后的定位卡分析。")
+    parser.add_argument("--task-owner-name", default="", help="任务负责人展示名，用于总表 `达人对接人`。")
+    parser.add_argument("--task-owner-employee-id", default="", help="任务负责人飞书 employeeId，用于总表 payload。")
+    parser.add_argument("--task-owner-employee-record-id", default="", help="任务负责人员工表 record_id。")
+    parser.add_argument("--task-owner-employee-email", default="", help="任务负责人邮箱。")
+    parser.add_argument("--task-owner-owner-name", default="", help="任务上传 ownerName 原始值。")
+    parser.add_argument("--linked-bitable-url", default="", help="任务关联达人管理表链接。")
     return parser
 
 
@@ -897,6 +951,12 @@ def main(argv: list[str] | None = None) -> int:
         skip_scrape=bool(args.skip_scrape),
         skip_visual=bool(args.skip_visual),
         skip_positioning_card_analysis=bool(args.skip_positioning_card_analysis),
+        task_owner_name=args.task_owner_name or "",
+        task_owner_employee_id=args.task_owner_employee_id or "",
+        task_owner_employee_record_id=args.task_owner_employee_record_id or "",
+        task_owner_employee_email=args.task_owner_employee_email or "",
+        task_owner_owner_name=args.task_owner_owner_name or "",
+        linked_bitable_url=args.linked_bitable_url or "",
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0 if summary.get("status") != "failed" else 1

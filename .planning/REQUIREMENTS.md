@@ -37,6 +37,12 @@
 - [x] **POS-02**: positioning-card analysis 产出 machine-readable 的结构化结果，至少包含定位标签、品牌适配结论/建议、以及支撑这些判断的简明证据
 - [x] **POS-03**: keep-list downstream runner 与 final wrapper 必须显式暴露 positioning-card analysis 的 stage 状态、artifact 路径或摘要；第一版默认不把该步骤失败变成 final export 的硬阻塞
 
+### Local Operator UI
+
+- [x] **OPS-UI-01**: operator 可以在本地页面查看 task-upload 任务列表，并基于任务名选择要执行的 screening run
+- [x] **OPS-UI-02**: operator 可以从本地页面启动现有 canonical `task upload -> final export` runner，并在页面上轮询查看 stage、错误、summary 路径和关键 artifact
+- [x] **OPS-UI-03**: operator 可以在 run 完成后从页面直接拿到最终导出 Excel 与 summary 路径；v1 保持 local-only，不要求飞书写回
+
 ## Out of Scope
 
 | Feature | Reason |
@@ -61,13 +67,16 @@
 | POS-01 | Phase 24 | Completed |
 | POS-02 | Phase 24 | Completed |
 | POS-03 | Phase 24 | Completed |
+| OPS-UI-01 | Phase 25 | Completed |
+| OPS-UI-02 | Phase 25 | Completed |
+| OPS-UI-03 | Phase 25 | Completed |
 
 **Coverage:**
 - v1 requirements: 6 total
-- Follow-up requirements: 8 total
-- Mapped to phases: 12
+- Follow-up requirements: 11 total
+- Mapped to phases: 15
 - Unmapped follow-ups: 2 (`QTE-01`, `REL-01`)
 
 ---
 *Requirements defined: 2026-03-29*
-*Last updated: 2026-03-30 after Phase 24 execution*
+*Last updated: 2026-03-30 after Phase 25 execution*

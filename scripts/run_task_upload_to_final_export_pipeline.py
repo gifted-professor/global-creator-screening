@@ -12,6 +12,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from backend.final_export_merge import extract_task_owner_context
+
 
 MATCHING_STRATEGIES = ("legacy-enrichment", "brand-keyword-fast-path")
 SUCCESSFUL_DOWNSTREAM_STATUSES = {"completed", "completed_with_partial_scrape"}
@@ -177,6 +179,10 @@ def _collect_positioning_stage_summaries(downstream_summary: dict[str, Any]) -> 
     return stages
 
 
+def _collect_downstream_artifact_path(downstream_summary: dict[str, Any], key: str) -> str:
+    return str(((downstream_summary.get("artifacts") or {}).get(key) or "")).strip()
+
+
 def run_task_upload_to_final_export_pipeline(
     *,
     task_name: str,
@@ -303,6 +309,8 @@ def run_task_upload_to_final_export_pipeline(
             "downstream_summary_json": str(downstream_summary_path),
             "keep_workbook": "",
             "template_workbook": "",
+            "all_platforms_final_review": "",
+            "all_platforms_upload_payload_json": "",
             "final_exports": {},
             "positioning_artifacts": {},
         },
@@ -382,6 +390,7 @@ def run_task_upload_to_final_export_pipeline(
     }
     summary["artifacts"]["keep_workbook"] = keep_workbook
     summary["artifacts"]["template_workbook"] = template_workbook
+    task_owner_context = extract_task_owner_context(upstream_summary)
     summary["resume_points"]["keep_list"] = {
         "keep_workbook": keep_workbook,
         "template_workbook": template_workbook,
@@ -444,6 +453,12 @@ def run_task_upload_to_final_export_pipeline(
             skip_scrape=bool(skip_scrape),
             skip_visual=bool(skip_visual),
             skip_positioning_card_analysis=bool(skip_positioning_card_analysis),
+            task_owner_name=str(task_owner_context.get("responsible_name") or "").strip(),
+            task_owner_employee_id=str(task_owner_context.get("employee_id") or "").strip(),
+            task_owner_employee_record_id=str(task_owner_context.get("employee_record_id") or "").strip(),
+            task_owner_employee_email=str(task_owner_context.get("employee_email") or "").strip(),
+            task_owner_owner_name=str(task_owner_context.get("owner_name") or "").strip(),
+            linked_bitable_url=str(task_owner_context.get("linked_bitable_url") or "").strip(),
         )
     except Exception as exc:  # noqa: BLE001
         failure = _build_failure_payload(
@@ -461,19 +476,46 @@ def run_task_upload_to_final_export_pipeline(
     final_exports = _collect_final_exports(downstream_summary)
     positioning_artifacts = _collect_positioning_artifacts(downstream_summary)
     positioning_stage_summaries = _collect_positioning_stage_summaries(downstream_summary)
+    all_platforms_final_review = _collect_downstream_artifact_path(downstream_summary, "all_platforms_final_review")
+    all_platforms_upload_payload_json = _collect_downstream_artifact_path(
+        downstream_summary,
+        "all_platforms_upload_payload_json",
+    )
     summary["steps"]["downstream"] = {
         "status": downstream_summary.get("status"),
         "summary_json": str(downstream_summary_path),
         "output_root": str(downstream_output_root),
         "requested_platforms": requested_platforms,
         "final_exports": final_exports,
+        "all_platforms_final_review": all_platforms_final_review,
+        "all_platforms_upload_payload_json": all_platforms_upload_payload_json,
         "positioning_artifacts": positioning_artifacts,
         "positioning_card_analysis": positioning_stage_summaries,
         "platform_statuses": _collect_platform_statuses(downstream_summary),
         "vision_probe": downstream_summary.get("vision_probe") or {},
     }
     summary["artifacts"]["final_exports"] = final_exports
+    summary["artifacts"]["all_platforms_final_review"] = all_platforms_final_review
+    summary["artifacts"]["all_platforms_upload_payload_json"] = all_platforms_upload_payload_json
     summary["artifacts"]["positioning_artifacts"] = positioning_artifacts
+    summary["artifacts"]["all_platforms_upload_local_archive_dir"] = str(
+        (downstream_summary.get("artifacts") or {}).get("all_platforms_upload_local_archive_dir") or ""
+    )
+    summary["artifacts"]["all_platforms_upload_skipped_archive_json"] = str(
+        (downstream_summary.get("artifacts") or {}).get("all_platforms_upload_skipped_archive_json") or ""
+    )
+    summary["artifacts"]["all_platforms_upload_skipped_archive_xlsx"] = str(
+        (downstream_summary.get("artifacts") or {}).get("all_platforms_upload_skipped_archive_xlsx") or ""
+    )
+    summary["artifacts"]["all_platforms_upload_row_count"] = int(
+        (downstream_summary.get("artifacts") or {}).get("all_platforms_upload_row_count") or 0
+    )
+    summary["artifacts"]["all_platforms_upload_source_row_count"] = int(
+        (downstream_summary.get("artifacts") or {}).get("all_platforms_upload_source_row_count") or 0
+    )
+    summary["artifacts"]["all_platforms_upload_skipped_row_count"] = int(
+        (downstream_summary.get("artifacts") or {}).get("all_platforms_upload_skipped_row_count") or 0
+    )
 
     downstream_status = str(downstream_summary.get("status") or "")
     if downstream_status not in SUCCESSFUL_DOWNSTREAM_STATUSES:

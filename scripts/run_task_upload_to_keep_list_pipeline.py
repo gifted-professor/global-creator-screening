@@ -609,7 +609,7 @@ def run_task_upload_to_keep_list_pipeline(
             ("TASK_UPLOAD_MAIL_AUTH_CODE", "EMAIL_AUTH_CODE"),
         )
         if resolved_default_account_email and resolved_default_auth_code:
-            credential_mode = "default_account"
+            credential_mode = "employee_directory_preferred_with_default_fallback"
         elif resolved_default_account_email or resolved_default_auth_code:
             credential_mode = "incomplete_default_account"
         else:
@@ -762,8 +762,14 @@ def run_task_upload_to_keep_list_pipeline(
                 "employee_name": mail_item.get("employeeName", ""),
                 "credential_source": mail_item.get("mailCredentialSource", ""),
                 "login_email": mail_item.get("mailLoginEmail", ""),
+                "sync_strategy": mail_item.get("mailSyncStrategy", ""),
+                "fallback_reason": mail_item.get("mailFallbackReason", ""),
                 "resolved_folder": mail_item.get("resolvedFolder", ""),
+                "resolved_folders": list(mail_item.get("resolvedFolders") or []),
+                "scanned_folder_count": mail_item.get("mailScannedFolderCount", 0),
                 "mail_fetched_count": mail_item.get("mailFetchedCount", 0),
+                "mail_server_total_count": mail_item.get("mailServerTotalCount"),
+                "mail_sync_duration_seconds": mail_item.get("mailSyncDurationSeconds", 0.0),
                 "mail_sync_error": mail_item.get("mailSyncError", ""),
             },
             "artifacts": {

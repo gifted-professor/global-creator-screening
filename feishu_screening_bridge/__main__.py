@@ -9,6 +9,7 @@ from email_sync.date_windows import resolve_sync_sent_since
 
 from .attachment_download import download_bitable_attachments
 from .bitable_export import export_bitable_view
+from .bitable_upload import upload_final_review_payload_to_bitable
 from .bridge import (
     DEFAULT_MANUAL_UPDATE_ENDPOINT_URL,
     DEFAULT_UPLOAD_ENDPOINT_URL,
@@ -157,6 +158,25 @@ def _build_parser() -> argparse.ArgumentParser:
     mail_sync_parser.add_argument("--feishu-base-url", default="", help="飞书 OpenAPI Base URL")
     mail_sync_parser.add_argument("--timeout-seconds", type=float, default=0.0, help="飞书请求超时时间，默认 30 秒")
     mail_sync_parser.add_argument("--json", action="store_true", help="输出完整 JSON 结果")
+
+    upload_parser = subparsers.add_parser(
+        "upload-final-review-payload",
+        help="把已过滤的总表 payload 写入飞书达人管理表，并把失败/跳过结果保留在本地归档",
+    )
+    upload_parser.add_argument("--env-file", default=".env", help="本地 env 文件路径，默认当前目录 ./.env")
+    upload_parser.add_argument("--payload-json", required=True, help="总表 upload payload JSON 路径")
+    upload_parser.add_argument("--linked-bitable-url", default="", help="显式指定目标飞书多维表 URL；不传时优先从 task upload 解析")
+    upload_parser.add_argument("--task-name", default="", help="任务名；配合 --task-upload-url 可覆盖 payload 里的旧链接")
+    upload_parser.add_argument("--task-upload-url", default="", help="飞书任务上传 wiki/base 链接，用于实时解析正确的达人管理表")
+    upload_parser.add_argument("--feishu-app-id", default="", help="飞书自建应用 app_id")
+    upload_parser.add_argument("--feishu-app-secret", default="", help="飞书自建应用 app_secret")
+    upload_parser.add_argument("--feishu-base-url", default="", help="飞书 OpenAPI Base URL")
+    upload_parser.add_argument("--timeout-seconds", type=float, default=0.0, help="飞书请求超时时间，默认 30 秒")
+    upload_parser.add_argument("--result-json", default="", help="上传结果 JSON 输出路径")
+    upload_parser.add_argument("--result-xlsx", default="", help="上传结果 XLSX 输出路径")
+    upload_parser.add_argument("--limit", type=int, default=0, help="只上传前 N 条，用于真实试写验证；0 表示不截断")
+    upload_parser.add_argument("--dry-run", action="store_true", help="只做映射/查重，不真正写入飞书")
+    upload_parser.add_argument("--json", action="store_true", help="输出完整 JSON 结果")
     return parser
 
 
@@ -569,11 +589,59 @@ def _cmd_sync_task_upload_mail(args: argparse.Namespace) -> int:
             f"task={item['taskName']}  "
             f"employee={item['employeeName'] or '-'}  "
             f"folder={item['resolvedFolder'] or item['requestedFolder'] or '-'}  "
+            f"strategy={item.get('mailSyncStrategy') or '-'}  "
+            f"folders={item.get('mailScannedFolderCount') or 0}  "
             f"fetched={item['mailFetchedCount']}  "
             f"db={item['mailDbPath'] or '-'}"
         )
         if item["mailSyncError"]:
             print(f"   mail_error={item['mailSyncError']}")
+        if item.get("mailFallbackReason"):
+            print(f"   fallback_reason={item['mailFallbackReason']}")
+    return 0
+
+
+def _cmd_upload_final_review_payload(args: argparse.Namespace) -> int:
+    env_values = load_local_env(args.env_file)
+    app_id = get_preferred_value(args.feishu_app_id, env_values, "FEISHU_APP_ID")
+    app_secret = get_preferred_value(args.feishu_app_secret, env_values, "FEISHU_APP_SECRET")
+    if not app_id:
+        raise ValueError("缺少 FEISHU_APP_ID，请在本地 .env 或 --feishu-app-id 里填写。")
+    if not app_secret:
+        raise ValueError("缺少 FEISHU_APP_SECRET，请在本地 .env 或 --feishu-app-secret 里填写。")
+
+    timeout_raw = get_preferred_value(args.timeout_seconds if args.timeout_seconds > 0 else "", env_values, "TIMEOUT_SECONDS", "30")
+    timeout_seconds = float(timeout_raw)
+    client = FeishuOpenClient(
+        app_id=app_id,
+        app_secret=app_secret,
+        base_url=get_preferred_value(args.feishu_base_url, env_values, "FEISHU_OPEN_BASE_URL", DEFAULT_FEISHU_BASE_URL),
+        timeout_seconds=timeout_seconds,
+    )
+    result = upload_final_review_payload_to_bitable(
+        client,
+        payload_json_path=args.payload_json,
+        linked_bitable_url=get_preferred_value(args.linked_bitable_url, env_values, "LINKED_BITABLE_URL"),
+        task_name=get_preferred_value(args.task_name, env_values, "TASK_NAME"),
+        task_upload_url=get_preferred_value(args.task_upload_url, env_values, "TASK_UPLOAD_URL"),
+        result_json_path=get_preferred_value(args.result_json, env_values, "FEISHU_UPLOAD_RESULT_JSON"),
+        result_xlsx_path=get_preferred_value(args.result_xlsx, env_values, "FEISHU_UPLOAD_RESULT_XLSX"),
+        dry_run=bool(args.dry_run),
+        limit=int(max(0, int(args.limit or 0))),
+    )
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+
+    print(
+        "final review payload uploaded: "
+        f"table={result['target_table_name'] or result['target_table_id']}  "
+        f"selected={result['selected_row_count']}  "
+        f"created={result['created_count']}  "
+        f"skipped_existing={result['skipped_existing_count']}  "
+        f"failed={result['failed_count']}  "
+        f"result_json={result['result_json_path']}"
+    )
     return 0
 
 
@@ -692,6 +760,8 @@ def main(argv: list[str] | None = None) -> int:
         return _cmd_inspect_task_upload(args)
     if args.command == "sync-task-upload-mail":
         return _cmd_sync_task_upload_mail(args)
+    if args.command == "upload-final-review-payload":
+        return _cmd_upload_final_review_payload(args)
     parser.error(f"unknown command: {args.command}")
     return 2
 

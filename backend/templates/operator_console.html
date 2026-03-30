@@ -1,0 +1,854 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>本地操作台</title>
+  <style>
+    :root {
+      --bg: #f4efe6;
+      --paper: rgba(255, 251, 245, 0.88);
+      --paper-strong: rgba(255, 251, 245, 0.96);
+      --ink: #1f2330;
+      --muted: #5e6473;
+      --line: rgba(31, 35, 48, 0.12);
+      --accent: #0f766e;
+      --accent-soft: rgba(15, 118, 110, 0.12);
+      --warn: #b45309;
+      --danger: #b42318;
+      --shadow: 0 24px 60px rgba(64, 42, 16, 0.12);
+      --radius-xl: 28px;
+      --radius-lg: 20px;
+      --radius-md: 14px;
+      --font-body: "Avenir Next", "PingFang SC", "Hiragino Sans GB", "Segoe UI", sans-serif;
+      --font-mono: "SF Mono", "SFMono-Regular", "JetBrains Mono", monospace;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      font-family: var(--font-body);
+      color: var(--ink);
+      background:
+        radial-gradient(circle at top left, rgba(15, 118, 110, 0.18), transparent 32%),
+        radial-gradient(circle at right 12%, rgba(180, 83, 9, 0.14), transparent 28%),
+        linear-gradient(180deg, #f7f2ea 0%, #efe8dc 100%);
+    }
+
+    .shell {
+      width: min(1440px, calc(100vw - 32px));
+      margin: 20px auto;
+      display: grid;
+      grid-template-columns: 360px minmax(0, 1fr);
+      gap: 18px;
+    }
+
+    .panel {
+      background: var(--paper);
+      border: 1px solid rgba(255, 255, 255, 0.5);
+      border-radius: var(--radius-xl);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(20px);
+      overflow: hidden;
+    }
+
+    .sidebar {
+      padding: 22px;
+      display: flex;
+      flex-direction: column;
+      gap: 18px;
+    }
+
+    .main {
+      padding: 22px;
+      display: grid;
+      gap: 18px;
+    }
+
+    .hero {
+      display: flex;
+      justify-content: space-between;
+      gap: 20px;
+      align-items: flex-start;
+      padding: 22px 24px;
+      border-radius: var(--radius-xl);
+      background:
+        linear-gradient(135deg, rgba(15, 118, 110, 0.16), rgba(255, 255, 255, 0.72)),
+        linear-gradient(180deg, rgba(255, 255, 255, 0.78), rgba(255, 255, 255, 0.32));
+      border: 1px solid rgba(255, 255, 255, 0.5);
+    }
+
+    .hero h1,
+    .sidebar h2,
+    .card h2,
+    .card h3 {
+      margin: 0;
+      letter-spacing: -0.03em;
+    }
+
+    .hero h1 {
+      font-size: clamp(32px, 5vw, 52px);
+      line-height: 0.95;
+      max-width: 10ch;
+    }
+
+    .hero p,
+    .muted,
+    .hint,
+    .task-meta,
+    .run-meta,
+    .empty {
+      color: var(--muted);
+    }
+
+    .hero p {
+      margin: 12px 0 0;
+      line-height: 1.6;
+      max-width: 58ch;
+    }
+
+    .pulse {
+      min-width: 132px;
+      padding: 14px 16px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.66);
+      text-align: center;
+      border: 1px solid rgba(15, 118, 110, 0.18);
+    }
+
+    .pulse strong {
+      display: block;
+      font-size: 22px;
+      color: var(--accent);
+    }
+
+    .card {
+      padding: 20px;
+      border-radius: var(--radius-lg);
+      background: var(--paper-strong);
+      border: 1px solid var(--line);
+    }
+
+    .card-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 18px;
+    }
+
+    label {
+      display: grid;
+      gap: 8px;
+      font-size: 14px;
+      color: var(--muted);
+      margin-bottom: 12px;
+    }
+
+    input,
+    select,
+    button,
+    textarea {
+      font: inherit;
+    }
+
+    input,
+    select {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 12px 14px;
+      background: rgba(255, 255, 255, 0.9);
+      color: var(--ink);
+    }
+
+    input:focus,
+    select:focus {
+      outline: 2px solid rgba(15, 118, 110, 0.16);
+      border-color: rgba(15, 118, 110, 0.3);
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+
+    .checks {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 14px;
+    }
+
+    .checks label {
+      margin: 0;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 12px;
+      border-radius: 999px;
+      background: rgba(15, 118, 110, 0.08);
+      color: var(--ink);
+      cursor: pointer;
+    }
+
+    .checks input {
+      width: auto;
+      margin: 0;
+    }
+
+    .actions {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+
+    button {
+      border: 0;
+      border-radius: 999px;
+      padding: 12px 18px;
+      cursor: pointer;
+      transition: transform 160ms ease, box-shadow 160ms ease, opacity 160ms ease;
+    }
+
+    button:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 10px 24px rgba(31, 35, 48, 0.12);
+    }
+
+    button.primary {
+      background: linear-gradient(135deg, #0f766e, #14532d);
+      color: #fff;
+    }
+
+    button.secondary {
+      background: rgba(15, 118, 110, 0.08);
+      color: var(--ink);
+    }
+
+    button.ghost {
+      background: rgba(31, 35, 48, 0.06);
+      color: var(--ink);
+    }
+
+    .task-list,
+    .run-list,
+    .artifact-list {
+      display: grid;
+      gap: 10px;
+    }
+
+    .task-item,
+    .run-item,
+    .artifact-item {
+      padding: 14px 16px;
+      border-radius: 18px;
+      border: 1px solid var(--line);
+      background: rgba(255, 255, 255, 0.72);
+    }
+
+    .task-item {
+      cursor: pointer;
+      transition: border-color 180ms ease, transform 180ms ease, background 180ms ease;
+    }
+
+    .task-item:hover,
+    .task-item.active {
+      border-color: rgba(15, 118, 110, 0.35);
+      background: rgba(15, 118, 110, 0.1);
+      transform: translateY(-1px);
+    }
+
+    .task-name,
+    .run-name {
+      font-size: 17px;
+      font-weight: 700;
+      margin-bottom: 6px;
+    }
+
+    .badge-row,
+    .artifact-row {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 10px;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(31, 35, 48, 0.08);
+      color: var(--ink);
+      font-size: 12px;
+    }
+
+    .badge.ok {
+      background: rgba(15, 118, 110, 0.12);
+      color: var(--accent);
+    }
+
+    .badge.warn {
+      background: rgba(180, 83, 9, 0.12);
+      color: var(--warn);
+    }
+
+    .badge.danger {
+      background: rgba(180, 35, 24, 0.12);
+      color: var(--danger);
+    }
+
+    .status-banner {
+      margin-top: 14px;
+      padding: 14px 16px;
+      border-radius: 18px;
+      background: rgba(15, 118, 110, 0.08);
+      border: 1px solid rgba(15, 118, 110, 0.15);
+    }
+
+    .status-banner.error {
+      background: rgba(180, 35, 24, 0.08);
+      border-color: rgba(180, 35, 24, 0.18);
+    }
+
+    .detail-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+
+    .detail {
+      padding: 14px;
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.7);
+      border: 1px solid var(--line);
+    }
+
+    .detail strong,
+    .artifact-item strong {
+      display: block;
+      margin-bottom: 6px;
+    }
+
+    .mono,
+    pre {
+      font-family: var(--font-mono);
+    }
+
+    .path {
+      word-break: break-all;
+      font-size: 12px;
+      line-height: 1.55;
+    }
+
+    pre {
+      margin: 0;
+      max-height: 320px;
+      overflow: auto;
+      padding: 14px;
+      border-radius: 18px;
+      background: #171a22;
+      color: #f5f7fa;
+      font-size: 12px;
+      line-height: 1.6;
+    }
+
+    a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+
+    a:hover {
+      text-decoration: underline;
+    }
+
+    .empty {
+      padding: 20px;
+      text-align: center;
+      border: 1px dashed var(--line);
+      border-radius: 18px;
+    }
+
+    @media (max-width: 1120px) {
+      .shell {
+        grid-template-columns: 1fr;
+      }
+
+      .card-grid,
+      .detail-grid,
+      .row {
+        grid-template-columns: 1fr;
+      }
+
+      .hero {
+        flex-direction: column;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <aside class="panel sidebar">
+      <div>
+        <h2>任务池</h2>
+        <p class="muted">从飞书 task-upload 拉最新任务，点一下就把任务名灌进右侧运行面板。</p>
+      </div>
+
+      <div class="card">
+        <label>
+          环境文件
+          <input id="env-file" value="{{ default_env_file }}" placeholder=".env">
+        </label>
+        <div class="actions">
+          <button class="primary" id="refresh-tasks">刷新任务</button>
+          <button class="ghost" id="refresh-runs">刷新运行</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="badge-row" id="task-stats"></div>
+        <div class="task-list" id="task-list">
+          <div class="empty">还没有加载任务。</div>
+        </div>
+      </div>
+    </aside>
+
+    <main class="panel main">
+      <section class="hero">
+        <div>
+          <h1>本地操作台</h1>
+          <p>这版只做本地薄控制台。它不会重写主链，而是直接调用现有 canonical runner，然后把汇总文件、阶段状态和最终 Excel 暴露给你看。</p>
+        </div>
+        <div class="pulse">
+          <strong id="run-count">0</strong>
+          <span class="muted">已跟踪运行</span>
+        </div>
+      </section>
+
+      <section class="card-grid">
+        <section class="card">
+          <h2>运行面板</h2>
+          <p class="hint">建议先选左侧任务。默认参数偏保守，适合先做 bounded 验证。</p>
+
+          <label>
+            任务名称
+            <input id="task-name" placeholder="例如 MINISO">
+          </label>
+
+          <div class="row">
+            <label>
+              匹配策略
+              <select id="matching-strategy">
+                <option value="brand-keyword-fast-path" {% if default_matching_strategy == "brand-keyword-fast-path" %}selected{% endif %}>brand-keyword-fast-path</option>
+                <option value="legacy-enrichment" {% if default_matching_strategy == "legacy-enrichment" %}selected{% endif %}>legacy-enrichment</option>
+              </select>
+            </label>
+            <label>
+              视觉 Provider
+              <input id="vision-provider" value="{{ default_vision_provider }}" placeholder="reelx / openai / qwen-vl-max route">
+            </label>
+          </div>
+
+          <div class="row">
+            <label>
+              品牌关键词
+              <input id="brand-keyword" placeholder="默认复用任务名">
+            </label>
+            <label>
+              每个平台最多账号数
+              <input id="max-identifiers" type="number" min="0" value="{{ default_max_identifiers_per_platform }}">
+            </label>
+          </div>
+
+          <label>
+            平台
+            <div class="checks">
+              <label><input class="platform-check" type="checkbox" value="instagram" checked>Instagram</label>
+              <label><input class="platform-check" type="checkbox" value="tiktok" checked>TikTok</label>
+              <label><input class="platform-check" type="checkbox" value="youtube">YouTube</label>
+            </div>
+          </label>
+
+          <div class="checks">
+            <label><input id="brand-match-include-from" type="checkbox">品牌匹配包含发件人</label>
+            <label><input id="reuse-existing" type="checkbox" checked>复用已有产物</label>
+            <label><input id="probe-only" type="checkbox">只做视觉探测</label>
+            <label><input id="skip-scrape" type="checkbox">跳过抓取</label>
+            <label><input id="skip-visual" type="checkbox">跳过视觉复核</label>
+            <label><input id="skip-positioning" type="checkbox">跳过定位卡分析</label>
+          </div>
+
+          <div class="actions">
+            <button class="primary" id="start-run">启动任务</button>
+          </div>
+          <div class="status-banner" id="form-status">等待操作。</div>
+        </section>
+
+        <section class="card">
+          <h2>当前运行</h2>
+          <div id="active-run-panel">
+            <div class="empty">还没有选中运行。</div>
+          </div>
+        </section>
+      </section>
+
+      <section class="card">
+        <h2>最近运行</h2>
+        <div class="run-list" id="run-list">
+          <div class="empty">当前还没有已跟踪运行。</div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <script>
+    const state = {
+      tasks: [],
+      runs: {{ initial_runs | tojson }},
+      selectedTaskName: "",
+      activeRunId: null,
+      pollTimer: null,
+    };
+
+    const taskListEl = document.getElementById("task-list");
+    const taskStatsEl = document.getElementById("task-stats");
+    const runListEl = document.getElementById("run-list");
+    const activeRunPanelEl = document.getElementById("active-run-panel");
+    const formStatusEl = document.getElementById("form-status");
+    const runCountEl = document.getElementById("run-count");
+
+    function selectedPlatforms() {
+      return Array.from(document.querySelectorAll(".platform-check:checked")).map((node) => node.value);
+    }
+
+    function badgeClass(text) {
+      const value = String(text || "").toLowerCase();
+      if (!value) return "";
+      if (value.includes("completed")) return "ok";
+      if (value.includes("failed") || value.includes("error") || value.includes("cancel")) return "danger";
+      if (value.includes("missing") || value.includes("blocked") || value.includes("partial")) return "warn";
+      return "";
+    }
+
+    function setFormStatus(message, isError = false) {
+      formStatusEl.textContent = message;
+      formStatusEl.classList.toggle("error", isError);
+    }
+
+    function renderTasks() {
+      runCountEl.textContent = String(state.runs.length);
+      if (!state.tasks.length) {
+        taskStatsEl.innerHTML = "";
+        taskListEl.innerHTML = '<div class="empty">没有可显示任务。</div>';
+        return;
+      }
+      const matchedCount = state.tasks.filter((task) => task.employee_matched).length;
+      taskStatsEl.innerHTML = `
+        <span class="badge ok">任务 ${state.tasks.length}</span>
+        <span class="badge ${matchedCount === state.tasks.length ? 'ok' : 'warn'}">已匹配 ${matchedCount}/${state.tasks.length}</span>
+      `;
+      taskListEl.innerHTML = state.tasks.map((task) => {
+        const active = task.task_name === state.selectedTaskName ? "active" : "";
+        return `
+          <div class="task-item ${active}" data-task-name="${task.task_name}">
+            <div class="task-name">${task.task_name || "(未命名任务)"}</div>
+            <div class="task-meta">负责人: ${task.owner_name || "-"} · 员工邮箱: ${task.employee_email || "-"}</div>
+            <div class="badge-row">
+              <span class="badge ${task.employee_matched ? 'ok' : 'warn'}">${task.employee_matched ? '员工已匹配' : '缺少员工映射'}</span>
+              ${task.template_file_name ? `<span class="badge">${task.template_file_name}</span>` : ""}
+            </div>
+          </div>
+        `;
+      }).join("");
+      taskListEl.querySelectorAll(".task-item").forEach((node) => {
+        node.addEventListener("click", () => {
+          state.selectedTaskName = node.dataset.taskName || "";
+          document.getElementById("task-name").value = state.selectedTaskName;
+          document.getElementById("brand-keyword").value = state.selectedTaskName;
+          renderTasks();
+        });
+      });
+    }
+
+    function renderRuns() {
+      runCountEl.textContent = String(state.runs.length);
+      if (!state.runs.length) {
+        runListEl.innerHTML = '<div class="empty">当前还没有已跟踪运行。</div>';
+        return;
+      }
+      runListEl.innerHTML = state.runs.map((run) => `
+        <div class="run-item" data-run-id="${run.id}">
+          <div class="run-name">${run.task_name}</div>
+          <div class="run-meta">阶段: ${run.stage || run.status || "-"} · 进程: ${run.pid || "-"} · 创建于: ${run.created_at || "-"}</div>
+          <div class="badge-row">
+            <span class="badge ${badgeClass(run.status)}">${run.status || "未知"}</span>
+            ${run.return_code === null || run.return_code === undefined ? "" : `<span class="badge">退出码 ${run.return_code}</span>`}
+          </div>
+        </div>
+      `).join("");
+      runListEl.querySelectorAll(".run-item").forEach((node) => {
+        node.addEventListener("click", () => {
+          state.activeRunId = node.dataset.runId || null;
+          renderActiveRun();
+          startPolling();
+        });
+      });
+      renderActiveRun();
+    }
+
+    function renderArtifactRef(label, ref) {
+      if (!ref || !ref.path) {
+        return "";
+      }
+      const link = ref.download_url ? `<a href="${ref.download_url}">下载</a>` : "";
+      return `
+        <div class="artifact-item">
+          <strong>${label}</strong>
+          <div class="artifact-row">
+            <span class="badge ${ref.exists ? 'ok' : 'warn'}">${ref.exists ? '已生成' : '缺失'}</span>
+            ${link}
+          </div>
+          <div class="path mono">${ref.path}</div>
+        </div>
+      `;
+    }
+
+    function renderConsolidatedExports(artifacts) {
+      const finalReview = artifacts && artifacts.all_platforms_final_review;
+      if (!finalReview || !finalReview.path) return "";
+      return `
+        <div class="detail">
+          <strong>所有平台汇总表</strong>
+          <div class="artifact-list">
+            ${renderArtifactRef("最终检查总表", finalReview)}
+          </div>
+        </div>
+      `;
+    }
+
+    function renderFinalExports(artifacts) {
+      const platforms = Object.entries((artifacts && artifacts.final_exports) || {});
+      if (!platforms.length) {
+        return `
+          <div class="detail">
+            <strong>分平台导出</strong>
+            <div class="muted">等待导出产物。</div>
+          </div>
+        `;
+      }
+      return platforms.map(([platform, files]) => {
+        const entries = Object.entries(files || {});
+        return `
+          <div class="detail">
+            <strong>${platform}</strong>
+            <div class="artifact-list">
+              ${entries.map(([name, ref]) => renderArtifactRef(name, ref)).join("")}
+            </div>
+          </div>
+        `;
+      }).join("");
+    }
+
+    function renderActiveRun() {
+      const run = state.runs.find((item) => item.id === state.activeRunId) || state.runs[0] || null;
+      if (!run) {
+        activeRunPanelEl.innerHTML = '<div class="empty">还没有选中运行。</div>';
+        return;
+      }
+      state.activeRunId = run.id;
+      const artifacts = run.artifacts || {};
+      const summary = run.summary || {};
+      const platformStatuses = ((summary.steps || {}).downstream || {}).platform_statuses || {};
+      activeRunPanelEl.innerHTML = `
+        <div class="status-banner ${badgeClass(run.status) === 'danger' ? 'error' : ''}">
+          <strong>${run.task_name}</strong>
+          <div class="badge-row">
+            <span class="badge ${badgeClass(run.status)}">${run.status || "未知"}</span>
+            <span class="badge">${run.stage || "-"}</span>
+            ${run.pid ? `<span class="badge">进程 ${run.pid}</span>` : ""}
+          </div>
+          <div class="path mono" style="margin-top:10px;">${run.output_root || "-"}</div>
+        </div>
+
+          <div class="detail-grid" style="margin-top:14px;">
+          <div class="detail">
+            <strong>汇总文件</strong>
+            ${renderArtifactRef("summary.json", artifacts.summary_json)}
+            ${renderArtifactRef("上游 summary", artifacts.upstream_summary_json)}
+            ${renderArtifactRef("下游 summary", artifacts.downstream_summary_json)}
+          </div>
+          <div class="detail">
+            <strong>输入信息</strong>
+            <div class="path mono">${run.env_file || "-"}</div>
+            <div class="path mono" style="margin-top:10px;">日志: ${run.log_path || "-"}</div>
+            ${run.error ? `<div class="path" style="margin-top:10px;color:#b42318;">${run.error}</div>` : ""}
+          </div>
+          <div class="detail">
+            <strong>工作簿产物</strong>
+            <div class="artifact-list">
+              ${renderArtifactRef("keep 工作簿", artifacts.keep_workbook)}
+              ${renderArtifactRef("模板工作簿", artifacts.template_workbook)}
+            </div>
+          </div>
+          <div class="detail">
+            <strong>平台状态</strong>
+            <div class="badge-row">
+              ${Object.keys(platformStatuses).length ? Object.entries(platformStatuses).map(([platform, status]) => `<span class="badge ${badgeClass(status)}">${platform}: ${status}</span>`).join("") : '<span class="muted">等待下游状态。</span>'}
+            </div>
+          </div>
+        </div>
+
+        <div class="detail-grid" style="margin-top:14px;">
+          ${renderConsolidatedExports(artifacts)}
+        </div>
+
+        <div style="margin-top:14px;">
+          <strong style="display:block;margin-bottom:10px;">分平台导出</strong>
+        </div>
+
+        <div class="detail-grid" style="margin-top:14px;">
+          ${renderFinalExports(artifacts)}
+        </div>
+
+        <div style="margin-top:14px;">
+          <strong style="display:block;margin-bottom:10px;">原始汇总</strong>
+          <pre>${escapeHtml(JSON.stringify(summary, null, 2))}</pre>
+        </div>
+      `;
+    }
+
+    function escapeHtml(value) {
+      return String(value || "")
+        .replaceAll("&", "&amp;")
+        .replaceAll("<", "&lt;")
+        .replaceAll(">", "&gt;");
+    }
+
+    async function fetchTasks() {
+      const envFile = document.getElementById("env-file").value.trim() || ".env";
+      setFormStatus("正在从飞书拉任务列表…");
+      const response = await fetch(`{{ api_tasks_path }}?env_file=${encodeURIComponent(envFile)}`);
+      const payload = await response.json();
+      if (!response.ok || !payload.success) {
+        setFormStatus(payload.error || "任务列表加载失败", true);
+        return;
+      }
+      state.tasks = payload.tasks || [];
+      if (!state.selectedTaskName && state.tasks.length) {
+        state.selectedTaskName = state.tasks[0].task_name || "";
+        document.getElementById("task-name").value = state.selectedTaskName;
+        document.getElementById("brand-keyword").value = state.selectedTaskName;
+      }
+      renderTasks();
+      setFormStatus(`任务列表已刷新，共 ${state.tasks.length} 个任务。`);
+    }
+
+    async function fetchRuns() {
+      const response = await fetch(`{{ api_runs_path }}`);
+      const payload = await response.json();
+      if (!response.ok || !payload.success) {
+        setFormStatus(payload.error || "运行列表刷新失败", true);
+        return;
+      }
+      state.runs = payload.runs || [];
+      if (!state.activeRunId && state.runs.length) {
+        state.activeRunId = state.runs[0].id;
+      }
+      renderRuns();
+    }
+
+    async function startRun() {
+      const taskName = document.getElementById("task-name").value.trim();
+      const envFile = document.getElementById("env-file").value.trim() || ".env";
+      if (!taskName) {
+        setFormStatus("请先选择任务。", true);
+        return;
+      }
+      setFormStatus(`正在启动 ${taskName}…`);
+      const response = await fetch(`{{ api_runs_path }}`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({
+          task_name: taskName,
+          env_file: envFile,
+          matching_strategy: document.getElementById("matching-strategy").value,
+          brand_keyword: document.getElementById("brand-keyword").value.trim(),
+          brand_match_include_from: document.getElementById("brand-match-include-from").checked,
+          platforms: selectedPlatforms(),
+          vision_provider: document.getElementById("vision-provider").value.trim(),
+          max_identifiers_per_platform: Number(document.getElementById("max-identifiers").value || 0),
+          reuse_existing: document.getElementById("reuse-existing").checked,
+          probe_vision_provider_only: document.getElementById("probe-only").checked,
+          skip_scrape: document.getElementById("skip-scrape").checked,
+          skip_visual: document.getElementById("skip-visual").checked,
+          skip_positioning_card_analysis: document.getElementById("skip-positioning").checked,
+        }),
+      });
+      const payload = await response.json();
+      if (!response.ok || !payload.success) {
+        setFormStatus(payload.error || "启动失败", true);
+        return;
+      }
+      state.activeRunId = payload.run.id;
+      await fetchRuns();
+      setFormStatus(`已启动 ${taskName}，正在轮询状态。`);
+      startPolling();
+    }
+
+    async function pollActiveRun() {
+      if (!state.activeRunId) return;
+      const response = await fetch(`{{ api_runs_path }}/${encodeURIComponent(state.activeRunId)}`);
+      const payload = await response.json();
+      if (!response.ok || !payload.success) {
+        setFormStatus(payload.error || "轮询当前运行失败", true);
+        return;
+      }
+      const run = payload.run;
+      const index = state.runs.findIndex((item) => item.id === run.id);
+      if (index >= 0) {
+        state.runs[index] = run;
+      } else {
+        state.runs.unshift(run);
+      }
+      renderRuns();
+      if (["completed", "completed_with_partial_scrape", "failed", "cancelled"].includes(run.status)) {
+        stopPolling();
+        setFormStatus(`任务 ${run.task_name} 已结束：${run.status}`);
+      }
+    }
+
+    function startPolling() {
+      stopPolling();
+      state.pollTimer = window.setInterval(() => {
+        pollActiveRun().catch((error) => setFormStatus(error.message || "轮询失败", true));
+      }, 4000);
+    }
+
+    function stopPolling() {
+      if (state.pollTimer) {
+        window.clearInterval(state.pollTimer);
+        state.pollTimer = null;
+      }
+    }
+
+    document.getElementById("refresh-tasks").addEventListener("click", () => {
+      fetchTasks().catch((error) => setFormStatus(error.message || "任务刷新失败", true));
+    });
+    document.getElementById("refresh-runs").addEventListener("click", () => {
+      fetchRuns().catch((error) => setFormStatus(error.message || "运行刷新失败", true));
+    });
+    document.getElementById("start-run").addEventListener("click", () => {
+      startRun().catch((error) => setFormStatus(error.message || "启动失败", true));
+    });
+
+    renderTasks();
+    renderRuns();
+    fetchTasks().catch((error) => setFormStatus(error.message || "任务刷新失败", true));
+  </script>
+</body>
+</html>
