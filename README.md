@@ -416,6 +416,26 @@ backend/.venv/bin/python scripts/run_keep_list_screening_pipeline.py \
 
 Phase 15 已经单独证明过 `openai` 视觉链本身可以真实进入 visual review；Phase 18 证明的是单入口 `task upload -> final export` 在 repo-local 主线里已经真实跑通，但不应把这轮 bounded proof 误读成“所有入口、所有 provider、所有规模都已 fully proven”。
 
+Phase 22 在 decoupling 完成后又重跑了一轮 fresh bounded validation，结果把 operator fallback contract 证明得更具体了：
+
+- `temp/phase22_decoupled_bounded_validation/summary.json` 的 top-level `status = failed`，但失败点是外部视觉 provider probe：`error_code = DOWNSTREAM_VISION_PROBE_FAILED`
+- 上游仍然 fresh 跑到了 `keep-list`，并留下了新的 repo-local keep workbook：
+  `temp/phase22_decoupled_bounded_validation/upstream/exports/MINISO_shared_email_resolution_final_keep.xlsx`
+- top-level summary 同时给出了 `resume_points.keep_list.recommended_command`
+- 这次 `openai` probe 的真实错误是 `HTTP 503 No available channel for model gpt-5.4 under group default (distributor)`，属于外部 provider/channel 可用性问题，不是 decoupling 把 repo-local runtime 打坏了
+- 随后按 summary handoff 从 keep-list 单独 resume，下游改用 `qiandao`，并在 `temp/phase22_keep_list_resume_qiandao/exports/instagram/instagram_final_review.xlsx` 成功完成最终导出
+
+所以当前 operator runbook 应该统一成三条路径：
+
+- `repo-local single-entry mainline resume`
+  默认优先看 top-level `summary.json`，直接使用 `resume_points.keep_list.recommended_command` 从 canonical keep-list 边界继续，而不是自己手拼路径
+- `repo-local bridge outputs`
+  如果你走的是 `import-from-feishu` / `sync-task-upload-view` 这类 bridge 入口，当前仓库默认产物面已经是 repo-local `summary.json`、`project_state.json`、`dashboard.html`
+- `explicit legacy compatibility mode`
+  只有在你明确需要旧 external full `email` read-model 行为时，才显式传 `--email-project-root` 或设置 `EMAIL_PROJECT_ROOT`
+
+这三条路径里，第一条是 canonical operator 主线；第二条是 repo-local bridge artifact surface；第三条只是兼容保底，不再是默认依赖。
+
 如果后面要继续做视觉 prompt / fallback 优化，可以直接参考外部 benchmark：
 
 - 参考文档：外部 sibling `筛号/docs/2026-03-29-qwen-prompt-benchmark.md`
@@ -510,6 +530,11 @@ summary 会明确记录：
 - `VISION_MIMO_BASE_URL`
 - `VISION_MIMO_MODEL`
 - `VISION_MIMO_MAX_COMPLETION_TOKENS`
+- `VISION_REELX_API_KEY`
+- `VISION_REELX_BASE_URL`
+- `VISION_REELX_BASE_URL_FALLBACKS`
+- `VISION_REELX_MODEL`
+- `VISION_REELX_FALLBACK_MODEL`
 - `VISION_QIANDAO_API_KEY`
 - `VISION_QIANDAO_BASE_URL`
 - `VISION_QIANDAO_MODEL`
@@ -523,7 +548,7 @@ summary 会明确记录：
 - `VISION_LEMONAPI_BASE_URL`
 - `VISION_LEMONAPI_MODEL`
 
-当前建议把默认视觉 provider 显式锁到 `openai`，例如在 `.env.local` 里设置：
+当前建议把默认视觉主路显式锁到 `openai / gpt-5.4`，例如在 `.env.local` 里设置：
 
 - `VISION_PROVIDER_PREFERENCE=openai`
 
@@ -534,7 +559,27 @@ summary 会明确记录：
 - 鉴权头使用 `api-key: ...`
 - 默认 `max_completion_tokens=2048`
 
-`qiandao` 也走 `chat/completions` 分支，适合接 OpenAI-compatible 的 Gemini 聚合通道，默认配置是：
+`reelx` 是当前推荐的统一 fallback 通道，`qwen-vl-max` 和 `gemini` 都走这条 `generateContent` 路径，默认建议是：
+
+- `VISION_REELX_BASE_URL=https://llmxapi.com/v1beta`
+- `VISION_REELX_BASE_URL_FALLBACKS=https://reelxai.com/v1beta,https://hk.llmxapi.com/v1beta,https://hk.reelxai.com/v1beta`
+- `VISION_REELX_MODEL=qwen-vl-max`
+- `VISION_REELX_FALLBACK_MODEL=gemini-3-flash-preview`
+- 鉴权头使用 `Authorization: Bearer ...`
+- `qwen-vl-max` 和 `gemini-*` 都可以挂在同一个 `reelx` provider 下，只通过不同 stage 的 `model` 做切换
+- backend 会给 `qwen-vl-max` 自动挂一版更保守的 visual-review prompt，不会直接复用 GPT 的提示词
+- 当前在 `2026-03-29` 实测能直接 `200` 的 Reelx Gemini 型号包括：
+  - `gemini-3-flash-preview`
+  - `gemini-3.1-pro-preview`
+
+`quan2go` 仍然保留为手动兼容 provider，但不再是默认 fallback 通道：
+
+- `VISION_QUAN2GO_BASE_URL=https://capi.quan2go.com/openai`
+- `VISION_QUAN2GO_MODEL=qwen-vl-max`
+- 鉴权头使用 `Authorization: Bearer ...`
+- 只建议在你要手动切一条 OpenAI-compatible qwen 通道时再启用
+
+`qiandao` 也仍然保留为手动兼容 provider，但默认 `gemini` fallback 已不再走它：
 
 - `VISION_QIANDAO_BASE_URL=https://api2.qiandao.mom/v1`
 - `VISION_QIANDAO_MODEL=gemini-2.5-pro-preview-p`
@@ -549,11 +594,11 @@ summary 会明确记录：
 如果你要启用分层视觉路由，而不是固定单 provider，可以额外配置：
 
 - `VISION_VISUAL_REVIEW_ROUTING_STRATEGY=tiered`
-- `VISION_VISUAL_REVIEW_PRIMARY_PROVIDER=qiandao`
-- `VISION_VISUAL_REVIEW_PRIMARY_MODEL=gemini-3-flash-preview-S`
+- `VISION_VISUAL_REVIEW_PRIMARY_PROVIDER=reelx`
+- `VISION_VISUAL_REVIEW_PRIMARY_MODEL=gemini-3-flash-preview`
 - `VISION_VISUAL_REVIEW_PRIMARY_TIMEOUT_SECONDS=20`
-- `VISION_VISUAL_REVIEW_BACKUP_PROVIDER=qiandao`
-- `VISION_VISUAL_REVIEW_BACKUP_MODEL=gemini-2.5-pro-preview-p`
+- `VISION_VISUAL_REVIEW_BACKUP_PROVIDER=reelx`
+- `VISION_VISUAL_REVIEW_BACKUP_MODEL=gemini-3.1-pro-preview`
 - `VISION_VISUAL_REVIEW_BACKUP_TIMEOUT_SECONDS=25`
 - `VISION_VISUAL_REVIEW_JUDGE_PROVIDER=openai`
 - `VISION_VISUAL_REVIEW_JUDGE_MODEL=gpt-5.4`
@@ -571,31 +616,33 @@ summary 会明确记录：
 - `VISION_VISUAL_REVIEW_PROBE_RANKED_PREFERRED_PROVIDER=openai`
 - `VISION_VISUAL_REVIEW_PROBE_RANKED_PREFERRED_MODEL=gpt-5.4`
 - `VISION_VISUAL_REVIEW_PROBE_RANKED_PREFERRED_TIMEOUT_SECONDS=30`
-- `VISION_VISUAL_REVIEW_PROBE_RANKED_PREFERRED_PARALLEL_PROVIDER=quan2go`
-- `VISION_VISUAL_REVIEW_PROBE_RANKED_PREFERRED_PARALLEL_MODEL=gpt-5.4`
+- `VISION_VISUAL_REVIEW_PROBE_RANKED_PREFERRED_PARALLEL_PROVIDER=reelx`
+- `VISION_VISUAL_REVIEW_PROBE_RANKED_PREFERRED_PARALLEL_MODEL=qwen-vl-max`
 - `VISION_VISUAL_REVIEW_PROBE_RANKED_PREFERRED_PARALLEL_TIMEOUT_SECONDS=30`
-- `VISION_VISUAL_REVIEW_PROBE_RANKED_SECONDARY_PROVIDER=qiandao`
-- `VISION_VISUAL_REVIEW_PROBE_RANKED_SECONDARY_MODEL=gemini-2.5-pro-preview-p`
+- `VISION_VISUAL_REVIEW_PROBE_RANKED_SECONDARY_PROVIDER=reelx`
+- `VISION_VISUAL_REVIEW_PROBE_RANKED_SECONDARY_MODEL=gemini-3-pro-preview`
 - `VISION_VISUAL_REVIEW_PROBE_RANKED_SECONDARY_TIMEOUT_SECONDS=25`
-- `VISION_VISUAL_REVIEW_PROBE_RANKED_TERTIARY_PROVIDER=qiandao`
-- `VISION_VISUAL_REVIEW_PROBE_RANKED_TERTIARY_MODEL=gemini-3-flash-preview-S`
+- `VISION_VISUAL_REVIEW_PROBE_RANKED_TERTIARY_PROVIDER=reelx`
+- `VISION_VISUAL_REVIEW_PROBE_RANKED_TERTIARY_MODEL=gemini-3-flash-preview`
 - `VISION_VISUAL_REVIEW_PROBE_RANKED_TERTIARY_TIMEOUT_SECONDS=20`
 - `VISION_VISUAL_REVIEW_PROBE_RANKED_DISABLE_AFTER_FAILURES=2`
 
 这条 `probe_ranked` 路由会在每个 visual batch 开始前并发做最小图片 probe，然后按固定优先级构建当前批次执行池：
 
 - `gpt-5.4 / openai`
-- `gpt-5.4 / quan2go`
-- `gemini-2.5-pro-preview-p`
-- `gemini-3-flash-preview-S`
+- `qwen-vl-max / reelx`
+- `gemini-3-pro-preview / reelx`
+- `gemini-3-flash-preview / reelx`
 
-如果两条 `gpt-5.4` 通道都 probe 成功，backend 会把账号分摊到这两个通道并发执行，而不是整批只吃一条。单个账号失败时，会按：
+当前默认不是 “GPT 和 qwen 同时分流跑量”，而是严格 fallback：单个账号失败时，会按：
 
-- 另一条 `gpt-5.4`
-- `gemini-2.5-pro-preview-p`
-- `gemini-3-flash-preview-S`
+- `qwen-vl-max / reelx`
+- `gemini-3-pro-preview / reelx`
+- `gemini-3-flash-preview / reelx`
 
 顺序降级，不会每个账号都重新赛马。某条通道连续失败达到阈值后，会在当前批次里临时摘掉。
+
+这也和外部 benchmark 的结论保持一致：当前更推荐的默认顺序是 `gpt-5.4 -> qwen-vl-max -> gemini`，而不是继续把第二条优先通道也配成另一条 `gpt-5.4`。
 
 开始真实视觉 run 前，推荐先做一次 bounded 诊断：
 

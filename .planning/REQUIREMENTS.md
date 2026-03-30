@@ -15,8 +15,8 @@
 
 ### Runtime Safety
 
-- [ ] **SAF-01**: 拆依赖后，`task upload -> final export` 的 bounded runner 回归不出现功能倒退
-- [ ] **SAF-02**: 迁移结果提供明确的兼容与回退策略（配置开关或文档化手工回退步骤），避免一次性切换导致主流程不可恢复
+- [x] **SAF-01**: 拆依赖后，`task upload -> final export` 的 bounded runner 回归不出现功能倒退
+- [x] **SAF-02**: 迁移结果提供明确的兼容与回退策略（配置开关或文档化手工回退步骤），避免一次性切换导致主流程不可恢复
 
 ## v2 Requirements
 
@@ -24,6 +24,12 @@
 
 - **QTE-01**: 把报价结果正式接入 `筛号` 运行态或最终导出链
 - **REL-01**: 为多平台或更大批量补充稳定性证明，而不只停留在 bounded validation
+
+### Visual Runtime Contract
+
+- [ ] **VIS-01**: 如果模板编译产出了 `visual_prompts.json`，runtime visual review 必须按 platform/provider 消费它，而不是继续对所有品牌复用同一套通用 prompt
+- [ ] **VIS-02**: `active_rulespec.rules` 中的 `visual_feature_group` 与支持的视觉排除项必须在 runtime 有实际消费面，至少影响 cover count、prompt contract 或等价 runtime diagnostics
+- [ ] **VIS-03**: 保留 `mimo` / `qwen-vl-max` 的 provider-specific prompt capability，且无模板场景继续 fallback 到现有通用 prompt 变体
 
 ## Out of Scope
 
@@ -41,14 +47,18 @@
 | DEP-01 | Phase 21 | Completed |
 | DEP-02 | Phase 21 | Completed |
 | DEP-03 | Phase 21 | Completed |
-| SAF-01 | Phase 22 | Pending |
-| SAF-02 | Phase 22 | Pending |
+| SAF-01 | Phase 22 | Completed |
+| SAF-02 | Phase 22 | Completed |
+| VIS-01 | Phase 23 | Planned |
+| VIS-02 | Phase 23 | Planned |
+| VIS-03 | Phase 23 | Planned |
 
 **Coverage:**
 - v1 requirements: 6 total
-- Mapped to phases: 6
-- Unmapped: 0
+- Follow-up requirements: 5 total
+- Mapped to phases: 9
+- Unmapped follow-ups: 2 (`QTE-01`, `REL-01`)
 
 ---
 *Requirements defined: 2026-03-29*
-*Last updated: 2026-03-29 after Phase 21 completion*
+*Last updated: 2026-03-30 after Phase 23 planning*

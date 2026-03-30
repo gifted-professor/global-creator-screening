@@ -90,6 +90,7 @@ def configure_backend_runtime(
 
     backend_app.UPLOAD_FOLDER = str(Path(backend_app.DATA_DIR) / "uploads")
     backend_app.ACTIVE_RULESPEC_PATH = str(Path(backend_app.CONFIG_DIR) / "active_rulespec.json")
+    backend_app.ACTIVE_VISUAL_PROMPTS_PATH = str(Path(backend_app.CONFIG_DIR) / "active_visual_prompts.json")
     backend_app.FIELD_MATCH_REPORT_PATH = str(Path(backend_app.CONFIG_DIR) / "field_match_report.json")
     backend_app.MISSING_CAPABILITIES_PATH = str(Path(backend_app.CONFIG_DIR) / "missing_capabilities.json")
     backend_app.REVIEW_NOTES_PATH = str(Path(backend_app.CONFIG_DIR) / "review_notes.md")
@@ -444,6 +445,20 @@ def persist_active_rulespec(rulespec_json_path: Path) -> dict[str, Any]:
     return payload
 
 
+def persist_active_visual_prompts(visual_prompts_json_path: Path) -> dict[str, Any]:
+    payload = backend_app.load_json_payload(str(visual_prompts_json_path), default={}) or {}
+    if not isinstance(payload, dict) or not payload:
+        raise ValueError(f"visual_prompts 文件无效: {visual_prompts_json_path}")
+    backend_app.write_json_file(backend_app.ACTIVE_VISUAL_PROMPTS_PATH, payload)
+    return payload
+
+
+def clear_active_visual_prompts() -> None:
+    active_path = Path(backend_app.ACTIVE_VISUAL_PROMPTS_PATH)
+    if active_path.exists():
+        active_path.unlink()
+
+
 def prepare_upload_metadata(source_path: Path) -> dict[str, Any]:
     frames = load_upload_frames(source_path)
     if not frames:
@@ -535,6 +550,7 @@ def prepare_screening_inputs(
         "config_dir": backend_app.CONFIG_DIR,
         "temp_dir": backend_app.TEMP_DIR,
         "active_rulespec_path": backend_app.ACTIVE_RULESPEC_PATH,
+        "active_visual_prompts_path": backend_app.ACTIVE_VISUAL_PROMPTS_PATH,
         "resolved_inputs": {},
         "preflight": {},
         "rulespec": {},
@@ -574,7 +590,14 @@ def prepare_screening_inputs(
         ),
         "task_name": normalized_task_name,
     }
-    if normalized_task_name:
+    should_resolve_task_upload = bool(
+        normalized_task_name
+        and (
+            resolved_creator_workbook is None
+            or (resolved_template_workbook is None and rulespec_json is None)
+        )
+    )
+    if should_resolve_task_upload:
         task_source = resolve_task_upload_source_files(
             task_name=normalized_task_name,
             task_upload_url=task_upload_url,
@@ -602,21 +625,29 @@ def prepare_screening_inputs(
         output_root = template_output_dir or DEFAULT_TEMPLATE_OUTPUT_DIR
         report = compile_workbook(resolved_template_workbook, output_root)
         rulespec_path = Path(report["artifacts"]["rulespec_json"])
+        visual_prompts_path = Path(report["artifacts"]["visual_prompts_json"]) if report.get("artifacts", {}).get("visual_prompts_json") else None
         payload = persist_active_rulespec(rulespec_path)
+        if visual_prompts_path is not None:
+            persist_active_visual_prompts(visual_prompts_path)
+        else:
+            clear_active_visual_prompts()
         summary["rulespec"] = {
-            "source": "task_upload_template" if normalized_task_name and template_workbook is None else "template_workbook",
+            "source": "task_upload_template" if should_resolve_task_upload and template_workbook is None else "template_workbook",
             "template_workbook": str(resolved_template_workbook),
             "compile_output_dir": report["output_dir"],
             "compile_report_path": str(Path(report["output_dir"]) / "compile_report.json"),
             "rulespec_json_path": str(rulespec_path),
+            "visual_prompts_json_path": str(visual_prompts_path) if visual_prompts_path is not None else "",
             "warning_count": len(report.get("warnings") or []),
             "rule_count": len(payload.get("rules") or []),
         }
     elif rulespec_json is not None:
         payload = persist_active_rulespec(rulespec_json)
+        clear_active_visual_prompts()
         summary["rulespec"] = {
             "source": "rulespec_json",
             "rulespec_json_path": str(rulespec_json),
+            "visual_prompts_json_path": "",
             "rule_count": len(payload.get("rules") or []),
         }
 
@@ -630,7 +661,7 @@ def prepare_screening_inputs(
         resolved_creator_workbook.expanduser() if resolved_creator_workbook is not None else None,
         source=(
             "task_upload_sending_list"
-            if normalized_task_name and creator_workbook is None and resolved_creator_workbook is not None
+            if should_resolve_task_upload and creator_workbook is None and resolved_creator_workbook is not None
             else ("cli" if resolved_creator_workbook is not None else "none")
         ),
         kind="file",
@@ -639,7 +670,7 @@ def prepare_screening_inputs(
         resolved_template_workbook.expanduser() if resolved_template_workbook is not None else None,
         source=(
             "task_upload_template"
-            if normalized_task_name and template_workbook is None and rulespec_json is None and resolved_template_workbook is not None
+            if should_resolve_task_upload and template_workbook is None and rulespec_json is None and resolved_template_workbook is not None
             else ("cli" if resolved_template_workbook is not None else "none")
         ),
         kind="file",
@@ -653,18 +684,19 @@ def prepare_screening_inputs(
         "runtime_dirs_ready": True,
         "creator_input_mode": (
             "task_upload_sending_list"
-            if normalized_task_name and creator_workbook is None and resolved_creator_workbook is not None
+            if should_resolve_task_upload and creator_workbook is None and resolved_creator_workbook is not None
             else ("creator_workbook" if resolved_creator_workbook is not None else "none")
         ),
         "template_input_mode": (
             "task_upload_template"
-            if normalized_task_name and template_workbook is None and rulespec_json is None and resolved_template_workbook is not None
+            if should_resolve_task_upload and template_workbook is None and rulespec_json is None and resolved_template_workbook is not None
             else ("template_workbook" if resolved_template_workbook is not None else ("rulespec_json" if rulespec_json is not None else "none"))
         ),
         "creator_input_exists": summary["resolved_inputs"]["creator_input"]["exists"],
         "template_input_exists": summary["resolved_inputs"]["template_input"]["exists"],
         "rulespec_input_exists": summary["resolved_inputs"]["rulespec_input"]["exists"],
         "active_rulespec_path": backend_app.ACTIVE_RULESPEC_PATH,
+        "active_visual_prompts_path": backend_app.ACTIVE_VISUAL_PROMPTS_PATH,
     }
 
     if summary_json is not None:

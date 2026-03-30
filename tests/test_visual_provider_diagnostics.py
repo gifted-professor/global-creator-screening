@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import base64
+import io
 import os
+import struct
+import time
 import unittest
 from unittest import mock
 
 import backend.app as backend_app
+import pandas as pd
 
 
 class DummyProviderResponse:
@@ -28,6 +33,7 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
         "OPENAI_VISION_MODEL",
         "VISION_MODEL",
         "VISION_PROVIDER_PREFERENCE",
+        "VISUAL_REVIEW_ITEM_TIMEOUT_SECONDS",
     }
 
     def setUp(self) -> None:
@@ -136,6 +142,175 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
         self.assertEqual(payload["vision_preflight"]["status"], "degraded")
         self.assertEqual(payload["vision_preflight"]["configured_provider_names"], ["openai"])
 
+    def test_test_info_export_keeps_only_profile_review_sheet(self) -> None:
+        with mock.patch.object(
+            backend_app,
+            "load_profile_reviews",
+            return_value=[
+                {
+                    "username": "alpha",
+                    "profile_url": "https://instagram.com/alpha",
+                    "status": "Pass",
+                    "reason": "ok",
+                    "upload_metadata": {},
+                    "stats": {},
+                }
+            ],
+        ):
+            response = self.client.get("/api/download/instagram/test-info")
+
+        self.assertEqual(response.status_code, 200)
+        workbook = pd.ExcelFile(io.BytesIO(response.data))
+        self.assertEqual(workbook.sheet_names, ["Profile Reviews"])
+        frame = workbook.parse("Profile Reviews")
+        self.assertNotIn("platform", frame.columns)
+
+    def test_test_info_json_hides_internal_runtime_fields(self) -> None:
+        with mock.patch.object(
+            backend_app,
+            "load_profile_reviews",
+            return_value=[
+                {
+                    "username": "alpha",
+                    "profile_url": "https://instagram.com/alpha",
+                    "status": "Pass",
+                    "reason": "ok",
+                    "upload_metadata": {},
+                    "stats": {},
+                }
+            ],
+        ):
+            response = self.client.get("/api/download/instagram/test-info-json")
+
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(payload["row_count"], 1)
+        self.assertIn("profile_reviews", payload)
+        self.assertNotIn("platform", payload)
+        self.assertNotIn("raw_items", payload)
+        self.assertNotIn("upload_metadata", payload)
+        self.assertNotIn("raw_source_path", payload)
+
+    def test_artifact_status_reports_final_review_block_when_missing_profiles_exist(self) -> None:
+        with mock.patch.object(
+            backend_app,
+            "load_profile_reviews",
+            return_value=[
+                {
+                    "username": "ghost",
+                    "profile_url": "https://instagram.com/ghost",
+                    "status": "Missing",
+                    "reason": "名单账号未在本次抓取结果中返回",
+                    "upload_metadata": {},
+                    "stats": {},
+                }
+            ],
+        ), mock.patch.object(
+            backend_app,
+            "load_visual_results",
+            return_value={"ghost": {"decision": "Pass"}},
+        ):
+            response = self.client.get("/api/artifacts/instagram/status")
+
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["final_review_export_blocked"])
+        self.assertEqual(payload["missing_profile_count"], 1)
+        self.assertEqual(payload["missing_profiles_preview"][0]["identifier"], "ghost")
+        self.assertFalse(payload["saved_final_review_artifacts_available"])
+
+    def test_final_review_export_is_blocked_when_profile_reviews_contain_missing(self) -> None:
+        with mock.patch.object(
+            backend_app,
+            "load_profile_reviews",
+            return_value=[
+                {
+                    "username": "ghost",
+                    "profile_url": "https://instagram.com/ghost",
+                    "status": "Missing",
+                    "reason": "名单账号未在本次抓取结果中返回",
+                    "upload_metadata": {},
+                    "stats": {},
+                }
+            ],
+        ):
+            response = self.client.post("/api/download/instagram/final-review", json={})
+
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 409)
+        self.assertEqual(payload["error_code"], "FINAL_REVIEW_BLOCKED_BY_MISSING_PROFILES")
+        self.assertEqual(payload["missing_profile_count"], 1)
+        self.assertEqual(payload["missing_profiles"][0]["identifier"], "ghost")
+
+    def test_perform_scrape_retries_missing_profiles_before_returning(self) -> None:
+        batch_calls = []
+
+        def fake_run_apify_batch(platform, batch, payload, progress_callback=None, cancel_check=None):
+            batch_calls.append(list(batch))
+            if len(batch_calls) == 1:
+                return {
+                    "success": True,
+                    "raw_items": [
+                        {
+                            "url": "https://instagram.com/alpha",
+                            "username": "alpha",
+                            "biography": "NYC creator",
+                            "latestPosts": [{"timestamp": "2026-03-29T00:00:00+00:00", "displayUrl": "https://example.com/a.jpg"}],
+                        }
+                    ],
+                    "apify": {"usage_total_usd": 0.1},
+                }
+            return {
+                "success": True,
+                "raw_items": [
+                    {
+                        "url": "https://instagram.com/beta",
+                        "username": "beta",
+                        "biography": "LA CA lifestyle",
+                        "latestPosts": [{"timestamp": "2026-03-29T00:00:00+00:00", "displayUrl": "https://example.com/b.jpg"}],
+                    }
+                ],
+                "apify": {"usage_total_usd": 0.05},
+            }
+
+        with mock.patch.object(
+            backend_app,
+            "run_apify_batch",
+            side_effect=fake_run_apify_batch,
+        ), mock.patch.object(
+            backend_app,
+            "load_upload_metadata",
+            return_value={
+                "alpha": {"handle": "alpha", "region": "US"},
+                "beta": {"handle": "beta", "region": "US"},
+            },
+        ), mock.patch.object(
+            backend_app,
+            "load_active_rulespec",
+            return_value={},
+        ), mock.patch.object(
+            backend_app,
+            "write_json_file",
+        ), mock.patch.object(
+            backend_app,
+            "save_profile_reviews",
+        ):
+            result = backend_app.perform_scrape(
+                "instagram",
+                {"usernames": ["alpha", "beta"]},
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(batch_calls, [["alpha", "beta"], ["beta"]])
+        self.assertEqual(result["retry_summary"]["attempt_count"], 1)
+        self.assertEqual(result["retry_summary"]["retried_identifier_count"], 1)
+        self.assertEqual(result["retry_summary"]["remaining_missing_count"], 0)
+        self.assertEqual(sorted(result["successful_identifiers"]), ["alpha", "beta"])
+        self.assertEqual(
+            [item["status"] for item in result["profile_reviews"]],
+            ["Pass", "Pass"],
+        )
+
     def test_probe_endpoint_returns_success_payload_for_selected_provider(self) -> None:
         os.environ["OPENAI_API_KEY"] = "sk-live-12345678"
 
@@ -178,8 +353,153 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
         self.assertIn("auth_not_found", payload["error"])
         self.assertEqual(payload["provider"], "openai")
 
+    def test_probe_endpoint_sanitizes_html_upstream_error(self) -> None:
+        os.environ["OPENAI_API_KEY"] = "sk-live-12345678"
+
+        with mock.patch.object(
+            backend_app.requests,
+            "post",
+            return_value=DummyProviderResponse(
+                ValueError("not json"),
+                status_code=413,
+                text="<html><head><title>413 Request Entity Too Large</title></head><body><center><h1>413 Request Entity Too Large</h1></center></body></html>",
+                headers={"Content-Type": "text/html"},
+            ),
+        ):
+            response = self.client.post("/api/vision/providers/probe", json={"provider": "openai"})
+
+        payload = response.get_json()
+        self.assertEqual(response.status_code, 502)
+        self.assertFalse(payload["success"])
+        self.assertIn("HTTP 413", payload["error"])
+        self.assertIn("请求体过大", payload["error"])
+        self.assertIn("HTML 错误页", payload["error"])
+        self.assertNotIn("<html>", payload["error"])
+        self.assertNotIn("https://", payload["error"])
+
+    def test_export_rows_hide_internal_provider_model_and_platform_columns(self) -> None:
+        rows = backend_app.build_final_review_rows(
+            "instagram",
+            [
+                {
+                    "username": "alpha",
+                    "profile_url": "https://instagram.com/alpha",
+                    "status": "Pass",
+                    "reason": "prescreen ok",
+                    "stats": {},
+                    "upload_metadata": {},
+                }
+            ],
+            {
+                "alpha": {
+                    "decision": "Pass",
+                    "reason": "visual ok",
+                    "signals": ["主体清晰"],
+                    "provider": "reelx",
+                    "model": "qwen-vl-max",
+                    "route": "preferred_parallel",
+                    "judge_used": True,
+                    "usage": {"prompt_tokens": 12, "total_tokens": 34},
+                }
+            },
+        )
+
+        self.assertEqual(len(rows), 1)
+        row = rows[0]
+        self.assertNotIn("platform", row)
+        self.assertNotIn("visual_provider", row)
+        self.assertNotIn("visual_model", row)
+        self.assertNotIn("visual_route", row)
+        self.assertNotIn("visual_judge_used", row)
+        self.assertNotIn("visual_prompt_tokens", row)
+        self.assertNotIn("visual_total_tokens", row)
+        self.assertEqual(row["visual_status"], "Pass")
+        self.assertEqual(row["visual_reason"], "visual ok")
+        self.assertEqual(row["final_status"], "Pass")
+
+    def test_perform_visual_review_marks_stalled_future_as_timeout_error(self) -> None:
+        class HangingFuture:
+            def __init__(self) -> None:
+                self.cancelled = False
+
+            def done(self) -> bool:
+                return False
+
+            def cancel(self) -> bool:
+                self.cancelled = True
+                return True
+
+        class FakeExecutor:
+            def __init__(self, *args, **kwargs) -> None:
+                self.future = HangingFuture()
+
+            def submit(self, *args, **kwargs):
+                return self.future
+
+            def shutdown(self, wait=False, cancel_futures=False) -> None:
+                return None
+
+        def fake_wait(*args, **kwargs):
+            time.sleep(0.06)
+            return set(), set()
+
+        with mock.patch.object(
+            backend_app,
+            "build_vision_preflight",
+            return_value={"preferred_provider": "openai"},
+        ), mock.patch.object(
+            backend_app,
+            "get_available_vision_providers",
+            return_value=[{"name": "openai"}],
+        ), mock.patch.object(
+            backend_app,
+            "get_available_vision_provider_names",
+            return_value=["openai"],
+        ), mock.patch.object(
+            backend_app,
+            "resolve_visual_review_targets",
+            return_value=[{"username": "alpha", "status": "Pass"}],
+        ), mock.patch.object(
+            backend_app,
+            "load_visual_results",
+            return_value={},
+        ), mock.patch.object(
+            backend_app,
+            "save_visual_results",
+        ), mock.patch.object(
+            backend_app,
+            "ThreadPoolExecutor",
+            FakeExecutor,
+        ), mock.patch.object(
+            backend_app,
+            "wait",
+            side_effect=fake_wait,
+        ):
+            result = backend_app.perform_visual_review(
+                "instagram",
+                {"provider": "openai", "max_workers": 1, "item_timeout_seconds": 0.05},
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["summary"]["error"], 1)
+        self.assertIn("alpha", result["visual_results"])
+        self.assertFalse(result["visual_results"]["alpha"]["success"])
+        self.assertIn("视觉复核超时", result["visual_results"]["alpha"]["error"])
+
 
 class VisualProviderConfigDefaultsTests(unittest.TestCase):
+    def test_reelx_defaults_to_generate_content_with_qwen_model(self) -> None:
+        provider = next(item for item in backend_app.VISION_PROVIDER_CONFIGS if item["name"] == "reelx")
+
+        self.assertEqual(provider["api_style"], backend_app.VISION_API_STYLE_GENERATE_CONTENT)
+        self.assertEqual(provider["default_base_url"], backend_app.DEFAULT_REELX_BASE_URL)
+        self.assertEqual(
+            provider["default_base_url_fallbacks"],
+            backend_app.DEFAULT_REELX_BASE_URL_FALLBACKS,
+        )
+        self.assertEqual(provider["default_model"], "qwen-vl-max")
+        self.assertEqual(provider["default_fallback_model"], "gemini-3-flash-preview")
+
     def test_quan2go_defaults_to_chat_completions(self) -> None:
         provider = next(item for item in backend_app.VISION_PROVIDER_CONFIGS if item["name"] == "quan2go")
         self.assertEqual(provider["api_style"], backend_app.VISION_API_STYLE_CHAT_COMPLETIONS)
@@ -223,10 +543,10 @@ class VisualProviderConfigDefaultsTests(unittest.TestCase):
 
         self.assertEqual(workers, backend_app.DEFAULT_VISUAL_REVIEW_MAX_WORKERS)
 
-    def test_tiered_routing_with_25p_backup_uses_tighter_worker_profile(self) -> None:
+    def test_tiered_routing_without_25p_models_keeps_global_worker_profile(self) -> None:
         workers = backend_app.resolve_visual_review_max_workers({}, 10, routing_strategy="tiered")
 
-        self.assertEqual(workers, 2)
+        self.assertEqual(workers, backend_app.DEFAULT_VISUAL_REVIEW_MAX_WORKERS)
 
     def test_probe_ranked_with_25p_selected_uses_tighter_worker_profile(self) -> None:
         workers = backend_app.resolve_visual_review_max_workers(
@@ -249,6 +569,43 @@ class VisualProviderConfigDefaultsTests(unittest.TestCase):
             resolved = backend_app.resolve_vision_provider_base_url(provider)
 
         self.assertEqual(resolved, "https://capi.quan2go.com/v1")
+
+    def test_resolve_reelx_base_urls_prefers_llmxapi_and_keeps_failover_pool(self) -> None:
+        provider = next(item for item in backend_app.VISION_PROVIDER_CONFIGS if item["name"] == "reelx")
+
+        resolved = backend_app.resolve_vision_provider_base_urls(provider)
+
+        self.assertEqual(
+            resolved,
+            [
+                "https://llmxapi.com/v1beta",
+                "https://reelxai.com/v1beta",
+                "https://hk.llmxapi.com/v1beta",
+                "https://hk.reelxai.com/v1beta",
+            ],
+        )
+
+    def test_resolve_reelx_base_urls_accepts_env_override_and_extra_fallbacks(self) -> None:
+        provider = next(item for item in backend_app.VISION_PROVIDER_CONFIGS if item["name"] == "reelx")
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "VISION_REELX_BASE_URL": "https://hk.llmxapi.com/v1beta",
+                "VISION_REELX_BASE_URL_FALLBACKS": "https://llmxapi.com/v1beta, https://reelxai.com/v1beta",
+            },
+            clear=False,
+        ):
+            resolved = backend_app.resolve_vision_provider_base_urls(provider)
+
+        self.assertEqual(
+            resolved,
+            [
+                "https://hk.llmxapi.com/v1beta",
+                "https://llmxapi.com/v1beta",
+                "https://reelxai.com/v1beta",
+            ],
+        )
 
     def test_mimo_defaults_to_chat_completions_with_api_key_header(self) -> None:
         provider = next(item for item in backend_app.VISION_PROVIDER_CONFIGS if item["name"] == "mimo")
@@ -282,14 +639,92 @@ class VisualProviderConfigDefaultsTests(unittest.TestCase):
         )
         self.assertEqual(request_payload["body"]["messages"][0]["content"][0]["type"], "text")
 
-    def test_build_visual_review_prompt_uses_shorter_mimo_variant(self) -> None:
-        mimo_prompt = backend_app.build_visual_review_prompt("mimo", "instagram", "alpha")
-        openai_prompt = backend_app.build_visual_review_prompt("openai", "instagram", "alpha")
+    def test_build_visual_review_prompt_prefers_active_bundle_platform_prompt(self) -> None:
+        active_visual_prompts = {
+            "instagram": {
+                "prompt": "品牌定制视觉规则：命中 Tapo 家庭 / 宠物 / 户外生活内容特征才可通过。",
+            }
+        }
 
+        with mock.patch.object(
+            backend_app,
+            "load_active_visual_prompts",
+            return_value=active_visual_prompts,
+        ):
+            selection = backend_app.resolve_visual_review_prompt_selection("openai", "instagram", "gpt-5.4")
+            prompt = backend_app.build_visual_review_prompt("openai", "instagram", "alpha", model_name="gpt-5.4")
+
+        self.assertEqual(selection["source"], "platform_prompt")
+        self.assertIn("品牌定制视觉规则", selection["prompt"])
+        self.assertIn("品牌定制视觉规则", prompt)
+        self.assertNotIn("重点排查", prompt)
+
+    def test_visual_review_prompt_selection_prefers_provider_then_model_then_platform(self) -> None:
+        active_visual_prompts = {
+            "instagram": {
+                "provider_prompts": {
+                    "openai": "provider level prompt",
+                },
+                "model_prompts": {
+                    "qwen-vl-max": "model level prompt",
+                },
+                "prompt": "platform level prompt",
+            }
+        }
+
+        provider_selection = backend_app.resolve_visual_review_prompt_selection(
+            "openai",
+            "instagram",
+            model_name="gpt-5.4",
+            active_visual_prompts=active_visual_prompts,
+        )
+        model_selection = backend_app.resolve_visual_review_prompt_selection(
+            "reelx",
+            "instagram",
+            model_name="qwen-vl-max",
+            active_visual_prompts=active_visual_prompts,
+        )
+        platform_selection = backend_app.resolve_visual_review_prompt_selection(
+            "mimo",
+            "instagram",
+            model_name="mimo-v2-omni",
+            active_visual_prompts=active_visual_prompts,
+        )
+
+        self.assertEqual(provider_selection["source"], "provider_prompts")
+        self.assertEqual(provider_selection["prompt"], "provider level prompt")
+        self.assertEqual(model_selection["source"], "model_prompts")
+        self.assertEqual(model_selection["prompt"], "model level prompt")
+        self.assertEqual(platform_selection["source"], "platform_prompt")
+        self.assertEqual(platform_selection["prompt"], "platform level prompt")
+
+    def test_build_visual_review_prompt_keeps_generic_provider_fallbacks_without_active_bundle(self) -> None:
+        with mock.patch.object(backend_app, "load_active_visual_prompts", return_value={}):
+            mimo_selection = backend_app.resolve_visual_review_prompt_selection("mimo", "instagram", "mimo-v2-omni")
+            qwen_selection = backend_app.resolve_visual_review_prompt_selection("reelx", "instagram", "qwen-vl-max")
+            mimo_prompt = backend_app.build_visual_review_prompt("mimo", "instagram", "alpha")
+            openai_prompt = backend_app.build_visual_review_prompt("openai", "instagram", "alpha")
+            qwen_prompt = backend_app.build_visual_review_prompt("reelx", "instagram", "alpha", model_name="qwen-vl-max")
+
+        self.assertEqual(mimo_selection["source"], "generic_fallback")
+        self.assertEqual(qwen_selection["source"], "generic_fallback")
         self.assertIn("不要逐图解释", mimo_prompt)
         self.assertNotIn("不要逐图解释", openai_prompt)
+        self.assertIn("不要为了写得完整而乱猜", qwen_prompt)
+        self.assertIn("只有当多张图都出现强且直接的视觉证据时，才输出 Reject", qwen_prompt)
         self.assertIn("平台：Instagram", mimo_prompt)
         self.assertIn("达人：alpha", mimo_prompt)
+
+    def test_minimal_visual_probe_image_meets_reelx_min_size_requirement(self) -> None:
+        prefix = "data:image/png;base64,"
+        self.assertTrue(backend_app.MINIMAL_VISUAL_REVIEW_PROBE_IMAGE_DATA_URL.startswith(prefix))
+
+        payload = backend_app.MINIMAL_VISUAL_REVIEW_PROBE_IMAGE_DATA_URL[len(prefix):]
+        png_bytes = base64.b64decode(payload)
+        width, height = struct.unpack("!II", png_bytes[16:24])
+
+        self.assertGreaterEqual(width, 16)
+        self.assertGreaterEqual(height, 16)
 
     def test_evaluate_profile_visual_review_honors_requested_provider(self) -> None:
         with mock.patch.object(
@@ -399,6 +834,215 @@ data: [DONE]
         self.assertTrue(parsed["retryable"])
         self.assertEqual(parsed["message"], "codex: status=500 Internal Server Error")
 
+    def test_extract_vision_provider_text_error_detects_not_supported_400(self) -> None:
+        parsed = backend_app.extract_vision_provider_text_error("codex: status=400 qwen-vl-max is not supported")
+
+        self.assertEqual(parsed["status_code"], 400)
+        self.assertFalse(parsed["retryable"])
+        self.assertEqual(parsed["message"], "codex: status=400 qwen-vl-max is not supported")
+
+    def test_call_vision_provider_supports_reelx_generate_content(self) -> None:
+        provider = {
+            "name": "reelx",
+            "base_url": "https://llmxapi.com/v1beta",
+            "api_key": "reelx-test-key",
+            "api_style": backend_app.VISION_API_STYLE_GENERATE_CONTENT,
+            "default_model": "qwen-vl-max",
+            "default_fallback_model": "gemini-3-flash-preview",
+        }
+        response = DummyProviderResponse(
+            {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": '{"decision":"Pass","reason":"画面正常","signals":["无高风险信号"]}'
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+            status_code=200,
+        )
+
+        with mock.patch.object(backend_app.requests, "post", return_value=response) as mocked_post:
+            parsed = backend_app.call_vision_provider(
+                provider,
+                "instagram",
+                "alpha",
+                ["data:image/jpeg;base64,ZmFrZQ=="],
+            )
+
+        self.assertEqual(parsed["decision"], "Pass")
+        self.assertEqual(parsed["provider"], "reelx")
+        self.assertEqual(parsed["model"], "qwen-vl-max")
+        self.assertEqual(parsed["configured_model"], "qwen-vl-max")
+        self.assertEqual(parsed["requested_model"], "qwen-vl-max")
+        self.assertEqual(parsed["effective_model"], "qwen-vl-max")
+        self.assertEqual(
+            mocked_post.call_args.kwargs["json"]["generationConfig"]["responseMimeType"],
+            "application/json",
+        )
+        self.assertEqual(
+            mocked_post.call_args.args[0],
+            "https://llmxapi.com/v1beta/models/qwen-vl-max:generateContent",
+        )
+
+    def test_call_vision_provider_retries_reelx_across_base_urls_before_fallback_model(self) -> None:
+        provider = {
+            "name": "reelx",
+            "base_url": "https://llmxapi.com/v1beta",
+            "base_url_candidates": [
+                "https://llmxapi.com/v1beta",
+                "https://reelxai.com/v1beta",
+            ],
+            "api_key": "reelx-test-key",
+            "api_style": backend_app.VISION_API_STYLE_GENERATE_CONTENT,
+            "default_model": "qwen-vl-max",
+            "default_fallback_model": "gemini-3-flash-preview",
+        }
+        response = DummyProviderResponse(
+            {
+                "modelVersion": "qwen-vl-max",
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": '{"decision":"Pass","reason":"画面正常","signals":["无高风险信号"]}'
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+            status_code=200,
+        )
+
+        with mock.patch.object(
+            backend_app.requests,
+            "post",
+            side_effect=[backend_app.requests.exceptions.ReadTimeout("read timed out"), response],
+        ) as mocked_post:
+            parsed = backend_app.call_vision_provider(
+                provider,
+                "instagram",
+                "alpha",
+                ["data:image/jpeg;base64,ZmFrZQ=="],
+            )
+
+        self.assertEqual(parsed["decision"], "Pass")
+        self.assertEqual(parsed["model"], "qwen-vl-max")
+        self.assertEqual(parsed["base_url"], "https://reelxai.com/v1beta")
+        self.assertEqual(mocked_post.call_args_list[0].args[0], "https://llmxapi.com/v1beta/models/qwen-vl-max:generateContent")
+        self.assertEqual(mocked_post.call_args_list[1].args[0], "https://reelxai.com/v1beta/models/qwen-vl-max:generateContent")
+
+    def test_call_vision_provider_rejects_non_json_visual_contract(self) -> None:
+        provider = {
+            "name": "reelx",
+            "base_url": "https://llmxapi.com/v1beta",
+            "api_key": "reelx-test-key",
+            "api_style": backend_app.VISION_API_STYLE_GENERATE_CONTENT,
+            "default_model": "qwen-vl-max",
+            "default_fallback_model": "gemini-3-flash-preview",
+        }
+        response = DummyProviderResponse(
+            {
+                "modelVersion": "qwen-vl-max",
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [{"text": "{\n  \"decision"}]
+                        }
+                    }
+                ]
+            },
+            status_code=200,
+        )
+
+        with mock.patch.object(backend_app.requests, "post", return_value=response):
+            with self.assertRaises(backend_app.VisionProviderError) as ctx:
+                backend_app.call_vision_provider(
+                    provider,
+                    "instagram",
+                    "alpha",
+                    ["data:image/jpeg;base64,ZmFrZQ=="],
+                )
+
+        self.assertIn("合法的视觉 JSON contract", str(ctx.exception))
+
+    def test_probe_vision_provider_retries_reelx_across_base_urls(self) -> None:
+        provider = {
+            "name": "reelx",
+            "base_url": "https://llmxapi.com/v1beta",
+            "base_url_candidates": [
+                "https://llmxapi.com/v1beta",
+                "https://hk.llmxapi.com/v1beta",
+            ],
+            "api_key": "reelx-test-key",
+            "api_style": backend_app.VISION_API_STYLE_GENERATE_CONTENT,
+            "model": "qwen-vl-max",
+            "default_model": "qwen-vl-max",
+        }
+        response = DummyProviderResponse(
+            {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [{"text": "ok"}]
+                        }
+                    }
+                ]
+            },
+            status_code=200,
+        )
+
+        with mock.patch.object(
+            backend_app.requests,
+            "post",
+            side_effect=[backend_app.requests.exceptions.ReadTimeout("read timed out"), response],
+        ) as mocked_post:
+            result = backend_app.probe_vision_provider(provider)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["base_url"], "https://hk.llmxapi.com/v1beta")
+        self.assertEqual(mocked_post.call_args_list[0].args[0], "https://llmxapi.com/v1beta/models/qwen-vl-max:generateContent")
+        self.assertEqual(mocked_post.call_args_list[1].args[0], "https://hk.llmxapi.com/v1beta/models/qwen-vl-max:generateContent")
+
+    def test_call_vision_provider_sanitizes_html_413_without_base_url_leak(self) -> None:
+        provider = {
+            "name": "reelx",
+            "base_url": "https://hk.reelxai.com/v1beta",
+            "api_key": "reelx-test-key",
+            "api_style": backend_app.VISION_API_STYLE_GENERATE_CONTENT,
+            "default_model": "qwen-vl-max",
+            "default_fallback_model": "gemini-3-flash-preview",
+        }
+        response = DummyProviderResponse(
+            ValueError("not json"),
+            status_code=413,
+            text="<html><head><title>413 Request Entity Too Large</title></head><body><center><h1>413 Request Entity Too Large</h1></center></body></html>",
+            headers={"Content-Type": "text/html"},
+        )
+
+        with mock.patch.object(backend_app.requests, "post", return_value=response):
+            with self.assertRaises(backend_app.VisionProviderError) as ctx:
+                backend_app.call_vision_provider(
+                    provider,
+                    "instagram",
+                    "alpha",
+                    ["data:image/jpeg;base64,ZmFrZQ=="],
+                )
+
+        message = str(ctx.exception)
+        self.assertIn("reelx: HTTP 413", message)
+        self.assertIn("请求体过大", message)
+        self.assertIn("HTML 错误页", message)
+        self.assertNotIn("https://hk.reelxai.com/v1beta", message)
+        self.assertNotIn("<html>", message)
+
     def test_call_vision_provider_falls_back_to_secondary_qiandao_model(self) -> None:
         provider = {
             "name": "qiandao",
@@ -447,8 +1091,8 @@ data: [DONE]
     def test_tiered_routing_escalates_borderline_primary_to_backup(self) -> None:
         def fake_get_available(provider_name=None):
             provider_name = (provider_name or "").strip().lower()
-            if provider_name == "qiandao":
-                return [{"name": "qiandao", "base_url": "https://api2.qiandao.mom/v1", "api_key": "key", "api_style": backend_app.VISION_API_STYLE_CHAT_COMPLETIONS}]
+            if provider_name == "reelx":
+                return [{"name": "reelx", "base_url": "https://reelxai.com/v1beta", "api_key": "key", "api_style": backend_app.VISION_API_STYLE_GENERATE_CONTENT}]
             if provider_name == "openai":
                 return [{"name": "openai", "base_url": "https://example.com/v1", "api_key": "key", "api_style": backend_app.VISION_API_STYLE_RESPONSES}]
             return []
@@ -470,14 +1114,14 @@ data: [DONE]
                     "reason": "可能存在边界情况",
                     "signals": ["可能擦边"],
                     "model": "gemini-3-flash-preview-S",
-                    "provider": "qiandao",
+                    "provider": "reelx",
                 },
                 {
                     "decision": "Reject",
                     "reason": "存在明确高风险视觉信号",
                     "signals": ["明显暴露"],
                     "model": "gemini-2.5-pro-preview-p",
-                    "provider": "qiandao",
+                    "provider": "reelx",
                 },
             ],
         ):
@@ -498,8 +1142,8 @@ data: [DONE]
     def test_tiered_routing_escalates_to_judge_after_primary_error_and_invalid_backup(self) -> None:
         def fake_get_available(provider_name=None):
             provider_name = (provider_name or "").strip().lower()
-            if provider_name == "qiandao":
-                return [{"name": "qiandao", "base_url": "https://api2.qiandao.mom/v1", "api_key": "key", "api_style": backend_app.VISION_API_STYLE_CHAT_COMPLETIONS}]
+            if provider_name == "reelx":
+                return [{"name": "reelx", "base_url": "https://reelxai.com/v1beta", "api_key": "key", "api_style": backend_app.VISION_API_STYLE_GENERATE_CONTENT}]
             if provider_name == "openai":
                 return [{"name": "openai", "base_url": "https://example.com/v1", "api_key": "key", "api_style": backend_app.VISION_API_STYLE_RESPONSES}]
             return []
@@ -522,7 +1166,7 @@ data: [DONE]
                     "reason": "",
                     "signals": [],
                     "model": "gemini-2.5-pro-preview-p",
-                    "provider": "qiandao",
+                    "provider": "reelx",
                 },
                 {
                     "decision": "Reject",
@@ -575,13 +1219,13 @@ data: [DONE]
             race = backend_app.run_probe_ranked_visual_provider_race()
 
         self.assertTrue(race["success"])
-        self.assertEqual(race["selected_stage"], backend_app.VISUAL_REVIEW_PROBE_RANKED_SELECTED_STAGE_PREFERRED_POOL)
+        self.assertEqual(race["selected_stage"], "preferred")
         self.assertEqual(race["selected_provider"], "openai")
         self.assertEqual(race["selected_model"], "gpt-5.4")
-        self.assertTrue(race["dual_active_enabled"])
+        self.assertFalse(race["dual_active_enabled"])
         self.assertEqual(
             [item["stage"] for item in race["active_preferred_candidates"]],
-            ["preferred", "preferred_parallel"],
+            ["preferred"],
         )
         self.assertEqual(
             [item["stage"] for item in race["candidates"]],
@@ -593,8 +1237,11 @@ data: [DONE]
         self.assertEqual(race["active_preferred_candidates"][0]["configured_model"], "gpt-5.4")
         self.assertEqual(race["active_preferred_candidates"][0]["requested_model"], "gpt-5.4")
         self.assertEqual(race["active_preferred_candidates"][0]["effective_model"], "gpt-5.4")
+        self.assertEqual(race["candidates"][1]["configured_model"], "qwen-vl-max")
+        self.assertEqual(race["candidates"][1]["requested_model"], "qwen-vl-max")
+        self.assertEqual(race["candidates"][1]["effective_model"], "qwen-vl-max")
 
-    def test_probe_ranked_race_falls_back_to_secondary_when_preferred_probe_fails(self) -> None:
+    def test_probe_ranked_race_falls_back_to_qwen_when_preferred_probe_fails(self) -> None:
         def fake_get_runnable(provider_name, *, model="", timeout_seconds=None):
             return {
                 "name": provider_name,
@@ -604,7 +1251,7 @@ data: [DONE]
             }
 
         def fake_probe(provider, platform="instagram", cover_urls=None):
-            if provider["name"] in {"openai", "quan2go"}:
+            if provider["name"] == "openai":
                 raise RuntimeError("503 no channel")
             return {
                 "success": True,
@@ -625,20 +1272,56 @@ data: [DONE]
             race = backend_app.run_probe_ranked_visual_provider_race()
 
         self.assertTrue(race["success"])
-        self.assertEqual(race["selected_stage"], "secondary")
-        self.assertEqual(race["selected_provider"], "qiandao")
-        self.assertEqual(race["selected_model"], "gemini-2.5-pro-preview-p")
+        self.assertEqual(race["selected_stage"], "preferred_parallel")
+        self.assertEqual(race["selected_provider"], "reelx")
+        self.assertEqual(race["selected_model"], "qwen-vl-max")
         self.assertFalse(race["candidates"][0]["ok"])
-        self.assertFalse(race["candidates"][1]["ok"])
-        self.assertTrue(race["candidates"][2]["ok"])
-        self.assertEqual(race["candidates"][2]["configured_model"], "gemini-2.5-pro-preview-p")
-        self.assertEqual(race["candidates"][2]["requested_model"], "gemini-2.5-pro-preview-p")
-        self.assertEqual(race["candidates"][2]["effective_model"], "gemini-2.5-pro-preview-p")
+        self.assertTrue(race["candidates"][1]["ok"])
+        self.assertEqual(race["candidates"][1]["configured_model"], "qwen-vl-max")
+        self.assertEqual(race["candidates"][1]["requested_model"], "qwen-vl-max")
+        self.assertEqual(race["candidates"][1]["effective_model"], "qwen-vl-max")
+
+    def test_probe_ranked_race_keeps_gemini_after_qwen_in_fallback_order(self) -> None:
+        def fake_get_runnable(provider_name, *, model="", timeout_seconds=None):
+            return {
+                "name": provider_name,
+                "model": model,
+                "default_model": model,
+                "request_timeout_seconds": timeout_seconds,
+            }
+
+        def fake_probe(provider, platform="instagram", cover_urls=None):
+            return {
+                "success": True,
+                "provider": provider["name"],
+                "model": provider["model"],
+                "checked_at": "2026-03-28T00:00:00Z",
+                "decision": "Pass",
+                "reason": "ok",
+                "signals": ["ok"],
+                "response_excerpt": "ok",
+            }
+
+        with mock.patch.object(backend_app, "get_runnable_vision_provider", side_effect=fake_get_runnable), mock.patch.object(
+            backend_app,
+            "probe_vision_provider_with_image",
+            side_effect=fake_probe,
+        ):
+            race = backend_app.run_probe_ranked_visual_provider_race()
+
+        self.assertEqual(
+            [(item["provider"], item["model"]) for item in race["fallback_candidates"]],
+            [
+                ("reelx", "qwen-vl-max"),
+                ("reelx", "gemini-3-pro-preview"),
+                ("reelx", "gemini-3-flash-preview"),
+            ],
+        )
 
     def test_probe_ranked_candidate_order_shards_across_dual_preferred_pool(self) -> None:
         race = {
             "success": True,
-            "selected_stage": backend_app.VISUAL_REVIEW_PROBE_RANKED_SELECTED_STAGE_PREFERRED_POOL,
+            "selected_stage": "preferred",
             "selected_provider": "openai",
             "selected_model": "gpt-5.4",
             "candidates": [
@@ -653,7 +1336,7 @@ data: [DONE]
                 {
                     "stage": "preferred_parallel",
                     "group": backend_app.VISUAL_REVIEW_PROBE_RANKED_GROUP_PREFERRED,
-                    "provider": "quan2go",
+                    "provider": "reelx",
                     "model": "gpt-5.4",
                     "timeout_seconds": 30,
                     "ok": True,
@@ -661,7 +1344,7 @@ data: [DONE]
                 {
                     "stage": "secondary",
                     "group": backend_app.VISUAL_REVIEW_PROBE_RANKED_GROUP_FALLBACK,
-                    "provider": "qiandao",
+                    "provider": "reelx",
                     "model": "gemini-2.5-pro-preview-p",
                     "timeout_seconds": 25,
                     "ok": True,
@@ -694,9 +1377,9 @@ data: [DONE]
                 },
                 {
                     "stage": "preferred_parallel",
-                    "group": backend_app.VISUAL_REVIEW_PROBE_RANKED_GROUP_PREFERRED,
-                    "provider": "quan2go",
-                    "model": "gpt-5.4",
+                    "group": backend_app.VISUAL_REVIEW_PROBE_RANKED_GROUP_FALLBACK,
+                    "provider": "reelx",
+                    "model": "qwen-vl-max",
                     "timeout_seconds": 30,
                     "ok": True,
                     "selected": False,
@@ -704,7 +1387,7 @@ data: [DONE]
                 {
                     "stage": "secondary",
                     "group": backend_app.VISUAL_REVIEW_PROBE_RANKED_GROUP_FALLBACK,
-                    "provider": "qiandao",
+                    "provider": "reelx",
                     "model": "gemini-2.5-pro-preview-p",
                     "timeout_seconds": 25,
                     "ok": True,
@@ -757,8 +1440,8 @@ data: [DONE]
             )
 
         self.assertEqual(result["route"], "preferred_parallel")
-        self.assertEqual(result["provider"], "quan2go")
-        self.assertEqual(result["model"], "gpt-5.4")
+        self.assertEqual(result["provider"], "reelx")
+        self.assertEqual(result["model"], "qwen-vl-max")
         self.assertEqual(result["trace"][0]["configured_model"], "gpt-5.4")
         self.assertEqual(result["trace"][0]["requested_model"], "gpt-5.4")
         self.assertEqual([item["stage"] for item in result["trace"]], ["preferred", "preferred_parallel"])
@@ -768,7 +1451,7 @@ data: [DONE]
     def test_probe_ranked_visual_review_retries_preferred_pool_after_full_retryable_first_pass(self) -> None:
         race = {
             "success": True,
-            "selected_stage": backend_app.VISUAL_REVIEW_PROBE_RANKED_SELECTED_STAGE_PREFERRED_POOL,
+            "selected_stage": "preferred",
             "selected_provider": "openai",
             "selected_model": "gpt-5.4",
             "candidates": [
@@ -782,16 +1465,16 @@ data: [DONE]
                 },
                 {
                     "stage": "preferred_parallel",
-                    "group": backend_app.VISUAL_REVIEW_PROBE_RANKED_GROUP_PREFERRED,
-                    "provider": "quan2go",
-                    "model": "gpt-5.4",
+                    "group": backend_app.VISUAL_REVIEW_PROBE_RANKED_GROUP_FALLBACK,
+                    "provider": "reelx",
+                    "model": "qwen-vl-max",
                     "timeout_seconds": 30,
                     "ok": True,
                 },
                 {
                     "stage": "secondary",
                     "group": backend_app.VISUAL_REVIEW_PROBE_RANKED_GROUP_FALLBACK,
-                    "provider": "qiandao",
+                    "provider": "reelx",
                     "model": "gemini-2.5-pro-preview-p",
                     "timeout_seconds": 25,
                     "ok": True,
@@ -814,9 +1497,9 @@ data: [DONE]
             call_log.append(provider_name)
             if call_log == ["openai"]:
                 raise backend_app.VisionProviderError(provider_name, "HTTP 503 upstream connect error", status_code=503, retryable=True)
-            if call_log == ["openai", "quan2go"]:
+            if call_log == ["openai", "reelx"]:
                 raise backend_app.VisionProviderError(provider_name, "HTTP 522", status_code=522, retryable=True)
-            if call_log == ["openai", "quan2go", "qiandao"]:
+            if call_log == ["openai", "reelx", "reelx"]:
                 raise backend_app.VisionProviderError(provider_name, "write operation timed out", retryable=True)
             return {
                 "decision": "Pass",
@@ -854,7 +1537,7 @@ data: [DONE]
                 routing_context=race,
             )
 
-        self.assertEqual(call_log, ["openai", "quan2go", "qiandao", "openai"])
+        self.assertEqual(call_log, ["openai", "reelx", "reelx", "openai"])
         self.assertEqual(result["route"], "preferred")
         self.assertEqual(result["provider"], "openai")
         self.assertEqual(result["decision"], "Pass")
@@ -871,7 +1554,7 @@ data: [DONE]
         runtime_context = backend_app.build_probe_ranked_runtime_context(
             {
                 "success": True,
-                "selected_stage": backend_app.VISUAL_REVIEW_PROBE_RANKED_SELECTED_STAGE_PREFERRED_POOL,
+                "selected_stage": "preferred",
                 "selected_provider": "openai",
                 "selected_model": "gpt-5.4",
                 "candidates": [
@@ -885,9 +1568,9 @@ data: [DONE]
                     },
                     {
                         "stage": "preferred_parallel",
-                        "group": backend_app.VISUAL_REVIEW_PROBE_RANKED_GROUP_PREFERRED,
-                        "provider": "quan2go",
-                        "model": "gpt-5.4",
+                        "group": backend_app.VISUAL_REVIEW_PROBE_RANKED_GROUP_FALLBACK,
+                        "provider": "reelx",
+                        "model": "qwen-vl-max",
                         "timeout_seconds": 30,
                         "ok": True,
                     },

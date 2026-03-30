@@ -425,24 +425,32 @@ def prepare_llm_review_candidates(
     }
 
 
-def _load_env_file(env_path: str) -> dict[str, str]:
-    path = Path(env_path).expanduser()
-    candidates = [path]
-    if path.name == ".env":
-        local_path = path.with_name(".env.local")
-        if local_path.exists():
-            candidates.append(local_path)
-
+def _read_env_values(path: Path) -> dict[str, str]:
     values: dict[str, str] = {}
-    for candidate in candidates:
-        if not candidate.exists():
+    if not path.exists():
+        return values
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
             continue
-        for raw_line in candidate.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, value = line.split("=", 1)
-            values[key.strip()] = value.strip().strip('"').strip("'")
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
+
+
+def _load_env_layers(env_path: str) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+    path = Path(env_path).expanduser()
+    base_values = _read_env_values(path)
+    local_values: dict[str, str] = {}
+    if path.name == ".env":
+        local_values = _read_env_values(path.with_name(".env.local"))
+    merged_values = dict(base_values)
+    merged_values.update(local_values)
+    return base_values, local_values, merged_values
+
+
+def _load_env_file(env_path: str) -> dict[str, str]:
+    _, _, values = _load_env_layers(env_path)
     return values
 
 
@@ -542,7 +550,7 @@ def resolve_llm_review_config_chain(
     model: Optional[str] = None,
     wire_api: Optional[str] = None,
 ) -> list[LlmReviewConfig]:
-    env_values = _load_env_file(env_path)
+    base_env_values, _local_env_values, env_values = _load_env_layers(env_path)
 
     timeout_text = (
         _resolve_env_value("LLM_TIMEOUT_SECONDS", env_values)
@@ -556,26 +564,43 @@ def resolve_llm_review_config_chain(
 
     openai_api_key = _resolve_env_value("OPENAI_API_KEY", env_values)
     legacy_api_key = _resolve_env_value("LLM_API_KEY", env_values)
-    use_legacy_surface = not openai_api_key and bool(legacy_api_key)
+    legacy_base_url = _resolve_env_value("LLM_API_BASE", env_values)
+    legacy_model = (
+        _resolve_env_value("LLM_MODEL", env_values)
+        or _resolve_env_value("VISION_MODEL", env_values)
+        or "gpt-5.4"
+    )
+    base_openai_api_key = str(base_env_values.get("OPENAI_API_KEY") or "").strip()
+    explicit_primary_override = any(str(value or "").strip() for value in (base_url, api_key, model, wire_api))
+    # Keep upstream text review on the repo-local legacy LLM surface when it is
+    # explicitly configured in `.env`, even if `.env.local` defines visual
+    # OPENAI_* keys for downstream screening.
+    use_legacy_surface = bool(legacy_api_key and legacy_base_url) and not explicit_primary_override and not base_openai_api_key
 
-    resolved_api_key = str(api_key or "").strip() or openai_api_key or legacy_api_key
+    resolved_api_key = (
+        str(api_key or "").strip()
+        or (legacy_api_key if use_legacy_surface else "")
+        or openai_api_key
+        or legacy_api_key
+    )
     resolved_base_url = (
         str(base_url or "").strip()
-        or ("" if use_legacy_surface else _resolve_env_value("OPENAI_BASE_URL", env_values))
-        or _resolve_env_value("LLM_API_BASE", env_values)
+        or (legacy_base_url if use_legacy_surface else _resolve_env_value("OPENAI_BASE_URL", env_values))
+        or legacy_base_url
         or "https://api.openai.com/v1"
     )
     resolved_model = (
         str(model or "").strip()
-        or ("" if use_legacy_surface else _resolve_env_value("OPENAI_MODEL", env_values))
+        or (legacy_model if use_legacy_surface else _resolve_env_value("OPENAI_MODEL", env_values))
         or _resolve_env_value("OPENAI_VISION_MODEL", env_values)
-        or _resolve_env_value("LLM_MODEL", env_values)
+        or legacy_model
         or _resolve_env_value("VISION_MODEL", env_values)
         or "gpt-5.4"
     )
     resolved_wire_api = (
         str(wire_api or "").strip()
-        or _resolve_env_value("OPENAI_WIRE_API", env_values)
+        or ("" if use_legacy_surface else _resolve_env_value("OPENAI_WIRE_API", env_values))
+        or ("chat_completions" if use_legacy_surface else "")
         or "chat_completions"
     ).strip().lower()
     if resolved_wire_api not in {"responses", "chat_completions"}:

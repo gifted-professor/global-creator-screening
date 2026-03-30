@@ -11,7 +11,7 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import pandas as pd
 import requests
@@ -80,6 +80,7 @@ CONFIG_DIR = str(BASE_DIR / "config")
 TEMP_DIR = str(BASE_DIR / "temp")
 UPLOAD_FOLDER = str(Path(DATA_DIR) / "uploads")
 ACTIVE_RULESPEC_PATH = str(Path(CONFIG_DIR) / "active_rulespec.json")
+ACTIVE_VISUAL_PROMPTS_PATH = str(Path(CONFIG_DIR) / "active_visual_prompts.json")
 FIELD_MATCH_REPORT_PATH = str(Path(CONFIG_DIR) / "field_match_report.json")
 MISSING_CAPABILITIES_PATH = str(Path(CONFIG_DIR) / "missing_capabilities.json")
 REVIEW_NOTES_PATH = str(Path(CONFIG_DIR) / "review_notes.md")
@@ -108,6 +109,21 @@ APIFY_BUDGET_BUFFER_USD = max(
     0.0,
     float(os.getenv("APIFY_BUDGET_BUFFER_USD", "0.1")),
 )
+UPSTREAM_HTTP_STATUS_PUBLIC_LABELS = {
+    400: "请求格式无效",
+    401: "认证失败",
+    403: "拒绝访问",
+    404: "接口不存在",
+    408: "请求超时",
+    413: "请求体过大",
+    415: "请求格式不受支持",
+    422: "请求内容无效",
+    429: "请求过于频繁",
+    500: "上游内部错误",
+    502: "上游网关错误",
+    503: "上游服务暂不可用",
+    504: "上游超时",
+}
 BACKEND_BIND_HOST = os.getenv("BACKEND_BIND_HOST", "127.0.0.1")
 BACKEND_PORT = int(os.getenv("BACKEND_PORT", "5001"))
 BACKEND_DEBUG = parse_env_flag("BACKEND_DEBUG", default=False)
@@ -128,6 +144,7 @@ PLATFORM_BATCH_SIZES = {
     "instagram": int(os.getenv("INSTAGRAM_BATCH_SIZE", "50")),
     "youtube": int(os.getenv("YOUTUBE_BATCH_SIZE", "5")),
 }
+DEFAULT_SCRAPE_MISSING_RETRY_ATTEMPTS = max(0, int(os.getenv("SCRAPE_MISSING_RETRY_ATTEMPTS", "1")))
 PLATFORM_ESTIMATED_COST_PER_IDENTIFIER_USD = {
     "tiktok": float(os.getenv("APIFY_TIKTOK_COST_PER_PROFILE_USD", "0.0")),
     "instagram": float(os.getenv("APIFY_INSTAGRAM_COST_PER_PROFILE_USD", "0.0026")),
@@ -192,8 +209,16 @@ DEFAULT_QIANDAO_MAX_TOKENS = 900
 DEFAULT_QIANDAO_TEMPERATURE = 0.2
 DEFAULT_MIMO_VISION_MODEL = "mimo-v2-omni"
 DEFAULT_MIMO_MAX_COMPLETION_TOKENS = 2048
+DEFAULT_QWEN_VISION_MODEL = "qwen-vl-max"
+DEFAULT_REELX_BASE_URL = "https://llmxapi.com/v1beta"
+DEFAULT_REELX_BASE_URL_FALLBACKS = (
+    "https://reelxai.com/v1beta",
+    "https://hk.llmxapi.com/v1beta",
+    "https://hk.reelxai.com/v1beta",
+)
 VISION_API_STYLE_RESPONSES = "responses"
 VISION_API_STYLE_CHAT_COMPLETIONS = "chat_completions"
+VISION_API_STYLE_GENERATE_CONTENT = "generate_content"
 VISUAL_REVIEW_REQUEST_COVER_LIMIT = max(1, int(os.getenv("VISUAL_REVIEW_REQUEST_COVER_LIMIT", "9")))
 VISUAL_REVIEW_CANDIDATE_COVER_LIMIT_FLOOR = max(
     VISUAL_REVIEW_REQUEST_COVER_LIMIT,
@@ -201,6 +226,10 @@ VISUAL_REVIEW_CANDIDATE_COVER_LIMIT_FLOOR = max(
 )
 DEFAULT_VISUAL_REVIEW_MAX_WORKERS = max(1, int(os.getenv("VISUAL_REVIEW_MAX_WORKERS", "6")))
 VISUAL_REVIEW_MAX_RETRIES = max(1, int(os.getenv("VISUAL_REVIEW_MAX_RETRIES", "3")))
+DEFAULT_VISUAL_REVIEW_ITEM_TIMEOUT_SECONDS = max(
+    90.0,
+    float(os.getenv("VISUAL_REVIEW_ITEM_TIMEOUT_SECONDS", str(VISION_REQUEST_TIMEOUT * 2))),
+)
 VISUAL_REVIEW_RETRY_BASE_DELAY_SECONDS = max(
     0.5,
     float(os.getenv("VISUAL_REVIEW_RETRY_BASE_DELAY_SECONDS", "2")),
@@ -221,6 +250,19 @@ VISION_PROVIDER_CONFIGS = (
         "env_key": "OPENAI_API_KEY",
         "api_style": VISION_API_STYLE_RESPONSES,
         "model_env_key": "OPENAI_VISION_MODEL",
+    },
+    {
+        "name": "reelx",
+        "base_url_env_key": "VISION_REELX_BASE_URL",
+        "default_base_url": DEFAULT_REELX_BASE_URL,
+        "base_url_fallbacks_env_key": "VISION_REELX_BASE_URL_FALLBACKS",
+        "default_base_url_fallbacks": DEFAULT_REELX_BASE_URL_FALLBACKS,
+        "env_key": "VISION_REELX_API_KEY",
+        "api_style": VISION_API_STYLE_GENERATE_CONTENT,
+        "model_env_key": "VISION_REELX_MODEL",
+        "default_model": DEFAULT_QWEN_VISION_MODEL,
+        "fallback_model_env_key": "VISION_REELX_FALLBACK_MODEL",
+        "default_fallback_model": "gemini-3-flash-preview",
     },
     {
         "name": "quan2go",
@@ -269,11 +311,11 @@ VISION_PROVIDER_CONFIGS = (
 )
 VISUAL_REVIEW_ROUTING_TIERED = "tiered"
 VISUAL_REVIEW_ROUTING_PROBE_RANKED = "probe_ranked"
-DEFAULT_VISUAL_REVIEW_ROUTING_PRIMARY_PROVIDER = "qiandao"
-DEFAULT_VISUAL_REVIEW_ROUTING_PRIMARY_MODEL = "gemini-3-flash-preview-S"
+DEFAULT_VISUAL_REVIEW_ROUTING_PRIMARY_PROVIDER = "reelx"
+DEFAULT_VISUAL_REVIEW_ROUTING_PRIMARY_MODEL = "gemini-3-flash-preview"
 DEFAULT_VISUAL_REVIEW_ROUTING_PRIMARY_TIMEOUT_SECONDS = 20
-DEFAULT_VISUAL_REVIEW_ROUTING_BACKUP_PROVIDER = "qiandao"
-DEFAULT_VISUAL_REVIEW_ROUTING_BACKUP_MODEL = "gemini-2.5-pro-preview-p"
+DEFAULT_VISUAL_REVIEW_ROUTING_BACKUP_PROVIDER = "reelx"
+DEFAULT_VISUAL_REVIEW_ROUTING_BACKUP_MODEL = "gemini-3.1-pro-preview"
 DEFAULT_VISUAL_REVIEW_ROUTING_BACKUP_TIMEOUT_SECONDS = 25
 DEFAULT_VISUAL_REVIEW_ROUTING_JUDGE_PROVIDER = "openai"
 DEFAULT_VISUAL_REVIEW_ROUTING_JUDGE_MODEL = "gpt-5.4"
@@ -281,14 +323,14 @@ DEFAULT_VISUAL_REVIEW_ROUTING_JUDGE_TIMEOUT_SECONDS = 30
 DEFAULT_VISUAL_REVIEW_PROBE_RANKED_PREFERRED_PROVIDER = "openai"
 DEFAULT_VISUAL_REVIEW_PROBE_RANKED_PREFERRED_MODEL = "gpt-5.4"
 DEFAULT_VISUAL_REVIEW_PROBE_RANKED_PREFERRED_TIMEOUT_SECONDS = 30
-DEFAULT_VISUAL_REVIEW_PROBE_RANKED_PREFERRED_PARALLEL_PROVIDER = "quan2go"
-DEFAULT_VISUAL_REVIEW_PROBE_RANKED_PREFERRED_PARALLEL_MODEL = "gpt-5.4"
+DEFAULT_VISUAL_REVIEW_PROBE_RANKED_PREFERRED_PARALLEL_PROVIDER = "reelx"
+DEFAULT_VISUAL_REVIEW_PROBE_RANKED_PREFERRED_PARALLEL_MODEL = DEFAULT_QWEN_VISION_MODEL
 DEFAULT_VISUAL_REVIEW_PROBE_RANKED_PREFERRED_PARALLEL_TIMEOUT_SECONDS = 30
-DEFAULT_VISUAL_REVIEW_PROBE_RANKED_SECONDARY_PROVIDER = "qiandao"
-DEFAULT_VISUAL_REVIEW_PROBE_RANKED_SECONDARY_MODEL = "gemini-2.5-pro-preview-p"
+DEFAULT_VISUAL_REVIEW_PROBE_RANKED_SECONDARY_PROVIDER = "reelx"
+DEFAULT_VISUAL_REVIEW_PROBE_RANKED_SECONDARY_MODEL = "gemini-3-pro-preview"
 DEFAULT_VISUAL_REVIEW_PROBE_RANKED_SECONDARY_TIMEOUT_SECONDS = 25
-DEFAULT_VISUAL_REVIEW_PROBE_RANKED_TERTIARY_PROVIDER = "qiandao"
-DEFAULT_VISUAL_REVIEW_PROBE_RANKED_TERTIARY_MODEL = "gemini-3-flash-preview-S"
+DEFAULT_VISUAL_REVIEW_PROBE_RANKED_TERTIARY_PROVIDER = "reelx"
+DEFAULT_VISUAL_REVIEW_PROBE_RANKED_TERTIARY_MODEL = "gemini-3-flash-preview"
 DEFAULT_VISUAL_REVIEW_PROBE_RANKED_TERTIARY_TIMEOUT_SECONDS = 20
 DEFAULT_VISUAL_REVIEW_PROBE_RANKED_DISABLE_AFTER_FAILURES = 2
 VISUAL_REVIEW_PROBE_RANKED_GROUP_PREFERRED = "preferred"
@@ -297,7 +339,7 @@ VISUAL_REVIEW_PROBE_RANKED_SELECTED_STAGE_PREFERRED_POOL = "preferred_pool"
 DEFAULT_VISUAL_REVIEW_ROUTING_HIGH_VALUE_FOLLOWER_THRESHOLD = 0
 MINIMAL_VISUAL_REVIEW_PROBE_IMAGE_DATA_URL = (
     "data:image/png;base64,"
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO5W9pQAAAAASUVORK5CYII="
+    "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAJUlEQVR4nGP47+AARw4N/+EIlzjDINRAjCJk8cGoYRAG60iMBwCgRZ8QleOc0QAAAABJRU5ErkJggg=="
 )
 VISUAL_REVIEW_BORDERLINE_MARKERS = (
     "可能",
@@ -335,6 +377,27 @@ MIMO_VISION_PROMPT = """你是达人筛号视觉复核员。输入是同一位�
 6. 大面积明显纹身。
 
 请只返回一行 JSON，不要 markdown，不要额外说明，格式固定为：
+{"decision":"Pass 或 Reject","reason":"一句中文原因","signals":["最多 3 个简短中文信号"]}"""
+QWEN_VISION_PROMPT_V2 = """你是保守但专业的达人筛号视觉复核员。输入是同一位博主最近若干条内容的封面图，请综合全部图片一起判断。
+
+只能根据图片里直接可见的视觉证据判断。不要为了写得完整而乱猜；不要把偶发元素放大成长期标签；不要根据账号名、文案外信息或常识补全。
+
+重点排查：
+1. 是否明显过度性感、暴露或带强擦边倾向。
+2. 是否存在明显低价平台/竞品合作痕迹，如 Temu、Shein、AliExpress、Wish、TikTok Shop。
+3. 是否长期画面杂乱、昏暗、模糊、质感差。
+4. 是否高度母婴/晒娃导向，主体大多是婴儿、儿童或孕期内容。
+5. 是否整体过度商业化、广告摆拍感很重。
+6. 是否存在大面积明显纹身等高风险视觉信号。
+
+规则：
+1. 只有当多张图都出现强且直接的视觉证据时，才输出 Reject。
+2. 如果只是少量、模糊、边缘信号，不要硬判高风险。
+3. `reason` 只写一句克制中文，先写最稳定的主因，不要写空泛套话。
+4. `signals` 最多写 3 个简短中文点，只保留最直接的视觉证据。
+5. 只返回 JSON，不要 markdown，不要解释。
+
+格式固定为：
 {"decision":"Pass 或 Reject","reason":"一句中文原因","signals":["最多 3 个简短中文信号"]}"""
 
 JOBS = {}
@@ -508,6 +571,10 @@ def sanitize_apify_error_text(text, tokens=None):
         sanitized = sanitized.replace(cleaned, mask_apify_token(cleaned))
     sanitized = re.sub(r"""(token=)([^&\s)"']+)""", r"\1***", sanitized)
     return sanitized
+
+
+def redact_url_like_text(text):
+    return re.sub(r"https?://[^\s)\"'>]+", "[redacted-url]", str(text or ""))
 
 
 def split_apify_token_list(value):
@@ -1080,7 +1147,34 @@ def resolve_vision_provider_base_url(provider):
     return normalized
 
 
+def resolve_vision_provider_base_urls(provider):
+    primary_base_url = resolve_vision_provider_base_url(provider)
+    candidates = []
+
+    def _append(value):
+        normalized = str(value or "").strip().rstrip("/")
+        if not normalized or normalized in candidates:
+            return
+        candidates.append(normalized)
+
+    _append(primary_base_url)
+    fallback_env_key = str((provider or {}).get("base_url_fallbacks_env_key") or "").strip()
+    fallback_values = []
+    if fallback_env_key:
+        raw_fallbacks = str(os.getenv(fallback_env_key, "") or "").strip()
+        if raw_fallbacks:
+            fallback_values = [item.strip() for item in raw_fallbacks.split(",")]
+    if not fallback_values:
+        fallback_values = list((provider or {}).get("default_base_url_fallbacks") or [])
+    for value in fallback_values:
+        _append(value)
+    return candidates
+
+
 def resolve_vision_provider_model(provider):
+    model_override = str((provider or {}).get("model_override") or "").strip()
+    if model_override:
+        return model_override
     model_env_key = str((provider or {}).get("model_env_key") or "").strip()
     provider_model = str(os.getenv(model_env_key, "") or "").strip()
     if provider_model:
@@ -1092,6 +1186,9 @@ def resolve_vision_provider_model(provider):
 
 
 def resolve_vision_provider_fallback_model(provider):
+    fallback_override = str((provider or {}).get("fallback_model_override") or "").strip()
+    if fallback_override:
+        return fallback_override
     env_key = str((provider or {}).get("fallback_model_env_key") or "").strip()
     env_value = str(os.getenv(env_key, "") or "").strip() if env_key else ""
     if env_value:
@@ -1213,15 +1310,207 @@ def build_vision_provider_chat_body(provider, messages, model_override=""):
     return body
 
 
-def build_visual_review_prompt(provider_name, platform, username):
-    prompt = MIMO_VISION_PROMPT if normalize_vision_provider_name(provider_name) == "mimo" else VISION_PROMPT
-    return f"平台：{UPLOAD_PLATFORM_RESPONSE_LABELS.get(platform, platform)}\n达人：{username or 'unknown'}\n{prompt}"
+def build_vision_provider_generate_content_body(parts):
+    return {
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {
+            "temperature": 0,
+            "maxOutputTokens": 400,
+            "responseMimeType": "application/json",
+        },
+    }
+
+
+def is_qwen_visual_model(provider_name, model_name=""):
+    normalized_provider = normalize_vision_provider_name(provider_name)
+    normalized_model = str(model_name or "").strip().lower()
+    return "qwen" in normalized_provider or "qwen" in normalized_model
+
+
+def extract_visual_prompt_text(prompt_candidate):
+    if isinstance(prompt_candidate, str):
+        return prompt_candidate.strip()
+    if isinstance(prompt_candidate, dict):
+        for key in ("prompt", "text", "content"):
+            value = str(prompt_candidate.get(key) or "").strip()
+            if value:
+                return value
+    return ""
+
+
+def normalize_visual_prompt_lookup_key(value):
+    return str(value or "").strip().lower()
+
+
+def resolve_visual_prompt_mapping_prompt(mapping, lookup_key):
+    normalized_lookup = normalize_visual_prompt_lookup_key(lookup_key)
+    if not normalized_lookup or not isinstance(mapping, dict):
+        return ""
+    direct = extract_visual_prompt_text(mapping.get(normalized_lookup))
+    if direct:
+        return direct
+    for candidate_key, candidate_value in mapping.items():
+        if normalize_visual_prompt_lookup_key(candidate_key) == normalized_lookup:
+            return extract_visual_prompt_text(candidate_value)
+    return ""
+
+
+def resolve_active_visual_prompt_bundle(active_visual_prompts, platform):
+    if not isinstance(active_visual_prompts, dict):
+        return {}
+    normalized_platform = normalize_visual_prompt_lookup_key(platform)
+    if not normalized_platform:
+        return {}
+    for container_key in ("platform_prompts", "platforms"):
+        container = active_visual_prompts.get(container_key)
+        if isinstance(container, dict):
+            for candidate_key, candidate_value in container.items():
+                if normalize_visual_prompt_lookup_key(candidate_key) == normalized_platform and isinstance(candidate_value, dict):
+                    return candidate_value
+    for candidate_key, candidate_value in active_visual_prompts.items():
+        if normalize_visual_prompt_lookup_key(candidate_key) == normalized_platform and isinstance(candidate_value, dict):
+            return candidate_value
+    return {}
+
+
+def load_active_visual_prompts():
+    payload = load_json_payload(ACTIVE_VISUAL_PROMPTS_PATH, default={})
+    return payload if isinstance(payload, dict) else {}
+
+
+def resolve_generic_visual_review_prompt(provider_name, model_name=""):
+    normalized_provider = normalize_vision_provider_name(provider_name)
+    if normalized_provider == "mimo":
+        return MIMO_VISION_PROMPT
+    if is_qwen_visual_model(normalized_provider, model_name):
+        return QWEN_VISION_PROMPT_V2
+    return VISION_PROMPT
+
+
+def build_rulespec_visual_contract_prompt(platform, visual_contract):
+    if not isinstance(visual_contract, dict):
+        return ""
+
+    goal = str(visual_contract.get("goal") or "").strip()
+    feature_labels = [
+        str(item or "").strip()
+        for item in (visual_contract.get("positive_feature_labels") or [])
+        if str(item or "").strip()
+    ]
+    exclusion_summaries = [
+        str(item or "").strip()
+        for item in (visual_contract.get("exclusion_summaries") or [])
+        if str(item or "").strip()
+    ]
+    cover_count = screening.coerce_positive_int(visual_contract.get("cover_count")) or VISUAL_REVIEW_REQUEST_COVER_LIMIT
+    min_hit_features = screening.coerce_positive_int(visual_contract.get("min_hit_features")) or 1
+    if not goal and not feature_labels and not exclusion_summaries:
+        return ""
+
+    lines = [
+        f"你是 {UPLOAD_PLATFORM_RESPONSE_LABELS.get(platform, platform)} 达人初筛流程中的视觉复核员。输入图片是一位博主最近最多 {cover_count} 张封面，请综合全部输入图片一起判断。",
+        "",
+        "只根据图片画面做初步判断，不要假设看不到的内容。",
+    ]
+    if goal:
+        lines.extend(["", f"审核目标：{goal}"])
+    if feature_labels:
+        lines.extend(["", f"优先确认是否命中以下至少 {min_hit_features} 类视觉特征："])
+        for label in feature_labels:
+            lines.append(f"- {label}")
+        lines.append(f'如果以上特征全部未命中，输出 Reject，reason 写"未命中{"/".join(feature_labels)}"。')
+    if exclusion_summaries:
+        lines.extend(["", "同时排除以下视觉风险："])
+        for label in exclusion_summaries:
+            lines.append(f"- {label}")
+    lines.extend(
+        [
+            "",
+            "如果通过以上检查，输出 Pass。",
+            "",
+            "请只返回 JSON，不要 markdown，不要额外说明，格式固定为：",
+            '{"decision":"Pass 或 Reject","reason":"一句中文原因","signals":["最多 3 个简短中文信号"]}',
+        ]
+    )
+    return "\n".join(lines)
+
+
+def resolve_visual_review_prompt_selection(
+    provider_name,
+    platform,
+    model_name="",
+    active_visual_prompts=None,
+    active_rulespec=None,
+):
+    normalized_provider = normalize_vision_provider_name(provider_name)
+    normalized_model = normalize_visual_prompt_lookup_key(model_name)
+    resolved_active_rulespec = load_active_rulespec() if active_rulespec is None else active_rulespec
+    runtime_rules = screening.get_runtime_rules(resolved_active_rulespec, platform)
+    visual_contract = dict(runtime_rules.get("visual_runtime_contract") or {})
+    visual_contract_source = str(runtime_rules.get("visual_contract_source") or "").strip()
+    resolved_cover_limit = screening.resolve_visual_review_request_cover_limit(runtime_rules)
+    prompt_bundle = resolve_active_visual_prompt_bundle(
+        load_active_visual_prompts() if active_visual_prompts is None else active_visual_prompts,
+        platform,
+    )
+    base_payload = {
+        "platform": normalize_visual_prompt_lookup_key(platform),
+        "provider": normalized_provider,
+        "model": normalized_model,
+        "active_visual_prompts_path": ACTIVE_VISUAL_PROMPTS_PATH,
+        "visual_contract_source": visual_contract_source,
+        "visual_runtime_contract": visual_contract,
+        "resolved_cover_limit": resolved_cover_limit,
+    }
+    provider_prompt = resolve_visual_prompt_mapping_prompt(prompt_bundle.get("provider_prompts"), normalized_provider)
+    if provider_prompt:
+        return {
+            **base_payload,
+            "prompt": provider_prompt,
+            "source": "provider_prompts",
+        }
+    model_prompt = resolve_visual_prompt_mapping_prompt(prompt_bundle.get("model_prompts"), normalized_model)
+    if model_prompt:
+        return {
+            **base_payload,
+            "prompt": model_prompt,
+            "source": "model_prompts",
+        }
+    platform_prompt = extract_visual_prompt_text(prompt_bundle.get("prompt"))
+    if platform_prompt:
+        return {
+            **base_payload,
+            "prompt": platform_prompt,
+            "source": "platform_prompt",
+        }
+    contract_prompt = build_rulespec_visual_contract_prompt(platform, visual_contract)
+    if contract_prompt:
+        return {
+            **base_payload,
+            "prompt": contract_prompt,
+            "source": "rulespec_visual_contract",
+        }
+    return {
+        **base_payload,
+        "prompt": resolve_generic_visual_review_prompt(normalized_provider, normalized_model),
+        "source": "generic_fallback",
+    }
+
+
+def build_visual_review_prompt(provider_name, platform, username, model_name=""):
+    selection = resolve_visual_review_prompt_selection(provider_name, platform, model_name=model_name)
+    return (
+        f"平台：{UPLOAD_PLATFORM_RESPONSE_LABELS.get(platform, platform)}\n"
+        f"达人：{username or 'unknown'}\n"
+        f"{selection['prompt']}"
+    )
 
 
 def build_vision_provider_snapshot(provider):
     normalized_name = normalize_vision_provider_name((provider or {}).get("name"))
     api_key = resolve_vision_provider_api_key(provider)
     base_url = resolve_vision_provider_base_url(provider)
+    base_url_candidates = resolve_vision_provider_base_urls(provider)
     api_style = str((provider or {}).get("api_style") or VISION_API_STYLE_RESPONSES).strip().lower()
     model_env_key = str((provider or {}).get("model_env_key") or "").strip()
     provider_model = str(os.getenv(model_env_key, "") or "").strip()
@@ -1234,7 +1523,7 @@ def build_vision_provider_snapshot(provider):
         issues.append("missing_base_url")
     elif parsed_base_url.scheme not in {"http", "https"} or not parsed_base_url.netloc:
         issues.append("invalid_base_url")
-    if api_style not in {VISION_API_STYLE_RESPONSES, VISION_API_STYLE_CHAT_COMPLETIONS}:
+    if api_style not in {VISION_API_STYLE_RESPONSES, VISION_API_STYLE_CHAT_COMPLETIONS, VISION_API_STYLE_GENERATE_CONTENT}:
         issues.append("unsupported_api_style")
     if not model:
         issues.append("missing_model")
@@ -1259,6 +1548,7 @@ def build_vision_provider_snapshot(provider):
         "api_key_source": resolve_env_source((provider or {}).get("env_key")),
         "api_key_resolution": build_env_resolution_details((provider or {}).get("env_key")),
         "base_url": base_url,
+        "base_url_candidates": base_url_candidates,
         "base_url_env_key": base_url_env_key,
         "base_url_source": base_url_source,
         "base_url_resolution": build_env_resolution_details(base_url_env_key) if base_url_env_key else {},
@@ -1357,6 +1647,7 @@ def get_available_vision_providers(provider_name=None):
             "name": normalized_name,
             "api_key": resolve_vision_provider_api_key(provider),
             "base_url": snapshot.get("base_url") or resolve_vision_provider_base_url(provider),
+            "base_url_candidates": snapshot.get("base_url_candidates") or resolve_vision_provider_base_urls(provider),
             "model": snapshot.get("model") or resolve_vision_provider_model(provider),
             "api_style": snapshot.get("api_style") or str(provider.get("api_style") or VISION_API_STYLE_RESPONSES).strip().lower(),
         })
@@ -1497,7 +1788,7 @@ def build_visual_review_probe_ranked_plan():
         },
         {
             "stage": "preferred_parallel",
-            "group": VISUAL_REVIEW_PROBE_RANKED_GROUP_PREFERRED,
+            "group": VISUAL_REVIEW_PROBE_RANKED_GROUP_FALLBACK,
             "provider": str(
                 os.getenv(
                     "VISION_VISUAL_REVIEW_PROBE_RANKED_PREFERRED_PARALLEL_PROVIDER",
@@ -1567,7 +1858,10 @@ def build_visual_review_probe_ranked_plan():
 def clone_vision_provider_with_overrides(provider, *, model="", timeout_seconds=None):
     cloned = dict(provider or {})
     if model:
+        cloned["model_override"] = str(model).strip()
         cloned["default_model"] = str(model).strip()
+        cloned["fallback_model_override"] = ""
+        cloned["fallback_model_env_key"] = ""
     cloned["default_fallback_model"] = ""
     if timeout_seconds not in (None, ""):
         try:
@@ -1725,7 +2019,7 @@ def build_visual_review_trace_entry(
 def extract_vision_response_model(payload):
     if not isinstance(payload, dict):
         return ""
-    return str(payload.get("model") or "").strip()
+    return str(payload.get("model") or payload.get("modelVersion") or "").strip()
 
 
 def _resolve_probe_ranked_disable_after_failures():
@@ -1868,7 +2162,7 @@ def probe_vision_provider_with_image(provider, platform="instagram", cover_urls=
         "success": True,
         "provider": provider_name,
         "api_style": str((provider or {}).get("api_style") or "").strip().lower(),
-        "base_url": str((provider or {}).get("base_url") or "").rstrip("/"),
+        "base_url": str(result.get("base_url") or (provider or {}).get("base_url") or "").rstrip("/"),
         "model": str(result.get("effective_model") or result.get("model") or resolve_vision_provider_model(provider)).strip(),
         "configured_model": str(result.get("configured_model") or resolve_vision_provider_model(provider)).strip(),
         "requested_model": str(result.get("requested_model") or "").strip(),
@@ -2251,7 +2545,7 @@ def normalize_vision_payload_text(payload):
     return payload
 
 
-def parse_visual_review_result(raw_text):
+def parse_visual_review_payload(raw_text):
     cleaned = repair_mojibake_text(strip_code_fences(raw_text))
     payload = None
     try:
@@ -2265,6 +2559,26 @@ def parse_visual_review_result(raw_text):
                 payload = json.loads(snippet)
             except json.JSONDecodeError:
                 payload = None
+    return cleaned, payload
+
+
+def is_valid_visual_review_payload(payload):
+    if not isinstance(payload, dict):
+        return False
+    decision = str(payload.get("decision") or "").strip().title()
+    if decision not in {"Pass", "Reject"}:
+        return False
+    reason = str(payload.get("reason") or "").strip()
+    if not reason:
+        return False
+    signals = payload.get("signals")
+    if signals is None:
+        return True
+    return isinstance(signals, list)
+
+
+def parse_visual_review_result(raw_text):
+    cleaned, payload = parse_visual_review_payload(raw_text)
 
     if isinstance(payload, dict):
         decision = str(payload.get("decision") or "").strip().title()
@@ -2321,8 +2635,14 @@ def extract_vision_provider_text_error(raw_text):
         "status=522",
         "status 522",
         "http 522",
+        "not supported",
+        "unsupported",
+        "model not found",
+        "unknown model",
+        "invalid model",
+        "not available for model",
     )
-    if any(marker in lowered for marker in error_markers):
+    if (status_code is not None and status_code >= 400) or any(marker in lowered for marker in error_markers):
         return {
             "message": cleaned,
             "status_code": status_code,
@@ -2370,6 +2690,21 @@ def extract_vision_response_text(payload):
                 return "\n".join(text_parts)
         if text_parts:
             return "\n".join(text_parts)
+
+    candidates = payload.get("candidates")
+    if isinstance(candidates, list):
+        text_parts = []
+        for candidate in candidates:
+            content = (candidate or {}).get("content") or {}
+            parts = content.get("parts")
+            if not isinstance(parts, list):
+                continue
+            for part in parts:
+                text_value = (part or {}).get("text")
+                if isinstance(text_value, str) and text_value.strip():
+                    text_parts.append(text_value)
+            if text_parts:
+                return "\n".join(text_parts)
 
     return json.dumps(payload, ensure_ascii=False)
 
@@ -2455,6 +2790,17 @@ def vision_payload_has_text_content(payload):
                     text_value = (content_item or {}).get("text")
                     if isinstance(text_value, str) and text_value.strip():
                         return True
+    candidates = payload.get("candidates")
+    if isinstance(candidates, list):
+        for candidate in candidates:
+            content = (candidate or {}).get("content") or {}
+            parts = content.get("parts")
+            if not isinstance(parts, list):
+                continue
+            for part in parts:
+                text_value = (part or {}).get("text")
+                if isinstance(text_value, str) and text_value.strip():
+                    return True
     return False
 
 
@@ -2502,6 +2848,17 @@ def extract_vision_usage(payload):
         ):
             try:
                 normalized[target_key] = int(prompt_details.get(source_key))
+            except Exception:
+                continue
+    usage_metadata = payload.get("usageMetadata")
+    if isinstance(usage_metadata, dict):
+        for source_key, target_key in (
+            ("promptTokenCount", "prompt_tokens"),
+            ("candidatesTokenCount", "completion_tokens"),
+            ("totalTokenCount", "total_tokens"),
+        ):
+            try:
+                normalized[target_key] = int(usage_metadata.get(source_key))
             except Exception:
                 continue
     return normalized
@@ -2709,6 +3066,19 @@ def normalize_visual_image_source(platform, image_url):
     return build_data_url_from_remote_image(platform, image_url)
 
 
+def data_url_to_inline_part(image_source):
+    cleaned = str(image_source or "").strip()
+    match = re.match(r"^data:(image/[^;]+);base64,(.+)$", cleaned, re.IGNORECASE | re.DOTALL)
+    if not match:
+        raise ValueError("invalid data url image source")
+    return {
+        "inlineData": {
+            "mimeType": str(match.group(1) or "image/jpeg").strip().lower(),
+            "data": str(match.group(2) or "").strip(),
+        }
+    }
+
+
 def dedupe_non_empty_strings(values):
     seen = set()
     normalized = []
@@ -2797,8 +3167,13 @@ def build_visual_review_candidate_cover_urls(platform, review_item):
     return dedupe_non_empty_strings(existing_covers + derived_covers)[:candidate_limit]
 
 
-def build_visual_review_input(provider_name, platform, username, cover_urls):
-    header = build_visual_review_prompt(provider_name, platform, username)
+def build_visual_review_input(provider_name, platform, username, cover_urls, model_name=""):
+    prompt_selection = resolve_visual_review_prompt_selection(provider_name, platform, model_name=model_name)
+    header = (
+        f"平台：{UPLOAD_PLATFORM_RESPONSE_LABELS.get(platform, platform)}\n"
+        f"达人：{username or 'unknown'}\n"
+        f"{prompt_selection['prompt']}"
+    )
     candidate_cover_urls = dedupe_non_empty_strings(cover_urls)
     normalized_image_sources = []
     skipped_cover_count = 0
@@ -2826,12 +3201,20 @@ def build_visual_review_input(provider_name, platform, username, cover_urls):
         {"type": "image_url", "image_url": {"url": image_source}}
         for image_source in normalized_image_sources
     )
+    generate_content_parts = [{"text": header}]
+    generate_content_parts.extend(
+        data_url_to_inline_part(image_source)
+        for image_source in normalized_image_sources
+    )
     return {
         "responses": [{"role": "user", "content": response_content}],
         "chat": [{"role": "user", "content": chat_content}],
+        "generate_content": build_vision_provider_generate_content_body(generate_content_parts),
         "selected_cover_count": len(normalized_image_sources),
         "candidate_cover_count": len(candidate_cover_urls),
         "skipped_cover_count": skipped_cover_count,
+        "prompt_selection": prompt_selection,
+        "prompt_source": prompt_selection.get("source"),
     }
 
 
@@ -2840,7 +3223,8 @@ class VisionProviderError(RuntimeError):
         self.provider_name = normalize_vision_provider_name(provider_name)
         self.status_code = status_code
         self.retryable = bool(retryable)
-        super().__init__(f"{self.provider_name}: {message}")
+        sanitized_message = normalize_upstream_error_text(message, max_length=240) or str(message or "").strip()
+        super().__init__(f"{self.provider_name}: {sanitized_message}")
 
 
 def is_retryable_visual_exception(exc):
@@ -2892,8 +3276,6 @@ def should_use_qiandao_25p_visual_worker_profile(payload=None, requested_provide
     )
     if normalized_routing_strategy == VISUAL_REVIEW_ROUTING_TIERED:
         for stage in build_visual_review_routing_plan():
-            if normalize_vision_provider_name(stage.get("provider")) != "qiandao":
-                continue
             if is_qiandao_25p_visual_model(stage.get("model")):
                 return True
         return False
@@ -2901,11 +3283,23 @@ def should_use_qiandao_25p_visual_worker_profile(payload=None, requested_provide
     provider_name = normalize_vision_provider_name(requested_provider or (payload or {}).get("provider"))
     if not provider_name:
         provider_name, _ = resolve_vision_provider_request()
-    if provider_name != "qiandao":
-        return False
-
     if requested_model:
         return is_qiandao_25p_visual_model(requested_model)
+
+    if provider_name == "reelx":
+        reelx_provider = next(
+            (item for item in VISION_PROVIDER_CONFIGS if normalize_vision_provider_name(item.get("name")) == "reelx"),
+            None,
+        )
+        if not reelx_provider:
+            return False
+        return any(
+            is_qiandao_25p_visual_model(candidate)
+            for candidate in resolve_vision_provider_model_candidates(reelx_provider)
+        )
+
+    if provider_name != "qiandao":
+        return False
 
     qiandao_provider = next(
         (item for item in VISION_PROVIDER_CONFIGS if normalize_vision_provider_name(item.get("name")) == "qiandao"),
@@ -2938,87 +3332,145 @@ def resolve_visual_review_max_workers(payload, target_count, requested_provider=
     return max(1, min(int(target_count or 1), requested_value))
 
 
+def resolve_visual_review_item_timeout_seconds(payload=None):
+    raw_value = None
+    if isinstance(payload, dict):
+        raw_value = payload.get("item_timeout_seconds")
+    if raw_value in (None, ""):
+        raw_value = os.getenv("VISUAL_REVIEW_ITEM_TIMEOUT_SECONDS", "")
+    try:
+        resolved = float(raw_value)
+    except (TypeError, ValueError):
+        resolved = DEFAULT_VISUAL_REVIEW_ITEM_TIMEOUT_SECONDS
+    return max(1.0, resolved)
+
+
 def call_vision_provider(provider, platform, username, cover_urls):
     provider_name = normalize_vision_provider_name(provider.get("name"))
     api_style = str(provider.get("api_style") or VISION_API_STYLE_RESPONSES).strip().lower()
-    base_url = str(provider.get("base_url") or "").rstrip("/")
+    base_urls = [
+        str(item or "").strip().rstrip("/")
+        for item in (provider.get("base_url_candidates") or resolve_vision_provider_base_urls(provider))
+        if str(item or "").strip()
+    ]
+    base_url = base_urls[0] if base_urls else str(provider.get("base_url") or "").rstrip("/")
+    if not base_urls and base_url:
+        base_urls = [base_url]
     if not base_url:
         raise VisionProviderError(provider_name, "base_url 未配置")
     configured_model = str(resolve_vision_provider_model(provider)).strip()
 
-    try:
-        input_payload = build_visual_review_input(provider_name, platform, username, cover_urls)
-    except requests.exceptions.RequestException as exc:
-        raise VisionProviderError(provider_name, str(exc), retryable=True) from exc
     headers = build_vision_provider_headers(provider)
     last_error = None
     request_timeout = resolve_vision_provider_request_timeout(provider)
     model_candidates = (
         resolve_vision_provider_model_candidates(provider)
-        if api_style == VISION_API_STYLE_CHAT_COMPLETIONS
+        if api_style in {VISION_API_STYLE_CHAT_COMPLETIONS, VISION_API_STYLE_GENERATE_CONTENT}
         else [resolve_vision_provider_model(provider)]
     )
     for model_name in model_candidates:
-        if api_style == VISION_API_STYLE_CHAT_COMPLETIONS:
-            url = f"{base_url}/chat/completions"
-            body = build_vision_provider_chat_body(provider, input_payload["chat"], model_override=model_name)
-        else:
-            url = f"{base_url}/responses"
-            body = {
-                "model": model_name,
-                "input": input_payload["responses"],
-            }
-
         try:
-            response = requests.post(url, headers=headers, json=body, timeout=request_timeout)
+            input_payload = build_visual_review_input(
+                provider_name,
+                platform,
+                username,
+                cover_urls,
+                model_name=model_name or configured_model,
+            )
         except requests.exceptions.RequestException as exc:
-            last_error = VisionProviderError(provider_name, str(exc), retryable=True)
-            if model_name != model_candidates[-1]:
-                continue
-            raise last_error from exc
-        if response.status_code >= 400:
-            last_error = VisionProviderError(
+            raise VisionProviderError(
                 provider_name,
-                f"HTTP {response.status_code} {extract_apify_response_error(response)}",
-                status_code=response.status_code,
-                retryable=response.status_code in VISUAL_REVIEW_RETRYABLE_STATUS_CODES,
+                sanitize_vision_provider_exception_message(exc),
+                retryable=True,
+            ) from exc
+        for candidate_index, candidate_base_url in enumerate(base_urls):
+            is_last_candidate = (
+                model_name == model_candidates[-1] and candidate_index == len(base_urls) - 1
             )
-            if model_name != model_candidates[-1]:
-                continue
-            raise last_error
-        payload = parse_vision_provider_response_payload(response)
-        if should_retry_vision_payload(provider_name, payload):
-            last_error = VisionProviderError(provider_name, "模型输出被截断，未返回最终 JSON", retryable=True)
-            if model_name != model_candidates[-1]:
-                continue
-            raise last_error
-        raw_text = extract_vision_response_text(payload)
-        text_error = extract_vision_provider_text_error(raw_text)
-        if text_error:
-            last_error = VisionProviderError(
-                provider_name,
-                text_error["message"],
-                status_code=text_error.get("status_code"),
-                retryable=text_error.get("retryable", False),
-            )
-            if model_name != model_candidates[-1]:
-                continue
-            raise last_error
-        response_model = extract_vision_response_model(payload)
-        effective_model = str(response_model or model_name or configured_model).strip()
-        parsed = parse_visual_review_result(raw_text)
-        parsed["provider"] = provider_name
-        parsed["model"] = effective_model
-        parsed["configured_model"] = configured_model
-        parsed["requested_model"] = str(model_name or "").strip()
-        parsed["response_model"] = response_model
-        parsed["effective_model"] = effective_model
-        parsed["raw_text"] = raw_text
-        parsed["usage"] = extract_vision_usage(payload)
-        parsed["cover_count"] = input_payload.get("selected_cover_count")
-        parsed["candidate_cover_count"] = input_payload.get("candidate_cover_count")
-        parsed["skipped_cover_count"] = input_payload.get("skipped_cover_count")
-        return parsed
+            if api_style == VISION_API_STYLE_CHAT_COMPLETIONS:
+                url = f"{candidate_base_url}/chat/completions"
+                body = build_vision_provider_chat_body(provider, input_payload["chat"], model_override=model_name)
+            elif api_style == VISION_API_STYLE_GENERATE_CONTENT:
+                url = f"{candidate_base_url}/models/{quote(str(model_name or '').strip(), safe='')}:generateContent"
+                body = input_payload["generate_content"]
+            else:
+                url = f"{candidate_base_url}/responses"
+                body = {
+                    "model": model_name,
+                    "input": input_payload["responses"],
+                }
+
+            try:
+                response = requests.post(url, headers=headers, json=body, timeout=request_timeout)
+            except requests.exceptions.RequestException as exc:
+                last_error = VisionProviderError(
+                    provider_name,
+                    sanitize_vision_provider_exception_message(exc),
+                    retryable=True,
+                )
+                if not is_last_candidate:
+                    continue
+                raise last_error from exc
+            if response.status_code >= 400:
+                last_error = VisionProviderError(
+                    provider_name,
+                    build_vision_provider_http_error_message(response),
+                    status_code=response.status_code,
+                    retryable=response.status_code in VISUAL_REVIEW_RETRYABLE_STATUS_CODES,
+                )
+                if not is_last_candidate:
+                    continue
+                raise last_error
+            payload = parse_vision_provider_response_payload(response)
+            if should_retry_vision_payload(provider_name, payload):
+                last_error = VisionProviderError(
+                    provider_name,
+                    "模型输出被截断，未返回最终 JSON",
+                    retryable=True,
+                )
+                if not is_last_candidate:
+                    continue
+                raise last_error
+            raw_text = extract_vision_response_text(payload)
+            text_error = extract_vision_provider_text_error(raw_text)
+            if text_error:
+                last_error = VisionProviderError(
+                    provider_name,
+                    text_error["message"],
+                    status_code=text_error.get("status_code"),
+                    retryable=text_error.get("retryable", False),
+                )
+                if not is_last_candidate:
+                    continue
+                raise last_error
+            _cleaned_visual_text, visual_payload = parse_visual_review_payload(raw_text)
+            if not is_valid_visual_review_payload(visual_payload):
+                last_error = VisionProviderError(
+                    provider_name,
+                    "模型未返回合法的视觉 JSON contract",
+                    retryable=True,
+                )
+                if not is_last_candidate:
+                    continue
+                raise last_error
+            response_model = extract_vision_response_model(payload)
+            effective_model = str(response_model or model_name or configured_model).strip()
+            parsed = parse_visual_review_result(raw_text)
+            parsed["provider"] = provider_name
+            parsed["model"] = effective_model
+            parsed["configured_model"] = configured_model
+            parsed["requested_model"] = str(model_name or "").strip()
+            parsed["response_model"] = response_model
+            parsed["effective_model"] = effective_model
+            parsed["raw_text"] = raw_text
+            parsed["usage"] = extract_vision_usage(payload)
+            parsed["cover_count"] = input_payload.get("selected_cover_count")
+            parsed["candidate_cover_count"] = input_payload.get("candidate_cover_count")
+            parsed["skipped_cover_count"] = input_payload.get("skipped_cover_count")
+            parsed["prompt_source"] = input_payload.get("prompt_source")
+            parsed["prompt_selection"] = dict(input_payload.get("prompt_selection") or {})
+            parsed["base_url"] = candidate_base_url
+            return parsed
     if last_error is not None:
         raise last_error
     raise VisionProviderError(provider_name, "视觉模型调用失败")
@@ -3043,6 +3495,14 @@ def build_vision_provider_probe_request(provider):
                 build_vision_provider_chat_messages(provider, prompt),
             ),
         }
+    if api_style == VISION_API_STYLE_GENERATE_CONTENT:
+        return {
+            "provider_name": provider_name,
+            "api_style": api_style,
+            "url": f"{base_url}/models/{quote(str((provider or {}).get('model') or resolve_vision_provider_model(provider)).strip(), safe='')}:generateContent",
+            "headers": headers,
+            "body": build_vision_provider_generate_content_body([{"text": prompt}]),
+        }
     return {
         "provider_name": provider_name,
         "api_style": api_style,
@@ -3056,34 +3516,69 @@ def build_vision_provider_probe_request(provider):
 
 
 def probe_vision_provider(provider):
-    request_payload = build_vision_provider_probe_request(provider)
-    try:
-        response = requests.post(
-            request_payload["url"],
-            headers=request_payload["headers"],
-            json=request_payload["body"],
-            timeout=min(VISION_REQUEST_TIMEOUT, 20),
-        )
-    except requests.exceptions.RequestException as exc:
-        raise VisionProviderError(request_payload["provider_name"], str(exc), retryable=True) from exc
-    if response.status_code >= 400:
-        raise VisionProviderError(
-            request_payload["provider_name"],
-            f"HTTP {response.status_code} {extract_apify_response_error(response)}",
-            status_code=response.status_code,
-            retryable=response.status_code in VISUAL_REVIEW_RETRYABLE_STATUS_CODES,
-        )
-    payload = parse_vision_provider_response_payload(response)
-    raw_text = extract_vision_response_text(payload) if isinstance(payload, dict) else ""
-    return {
-        "success": True,
-        "provider": request_payload["provider_name"],
-        "api_style": request_payload["api_style"],
-        "base_url": str((provider or {}).get("base_url") or "").rstrip("/"),
-        "model": str((provider or {}).get("model") or resolve_vision_provider_model(provider)),
-        "checked_at": iso_now(),
-        "response_excerpt": str(raw_text or "").strip()[:160],
-    }
+    base_urls = [
+        str(item or "").strip().rstrip("/")
+        for item in ((provider or {}).get("base_url_candidates") or resolve_vision_provider_base_urls(provider))
+        if str(item or "").strip()
+    ]
+    if not base_urls:
+        fallback_base_url = str((provider or {}).get("base_url") or "").rstrip("/")
+        if fallback_base_url:
+            base_urls = [fallback_base_url]
+    last_error = None
+    for candidate_index, candidate_base_url in enumerate(base_urls):
+        request_payload = build_vision_provider_probe_request({**provider, "base_url": candidate_base_url})
+        try:
+            response = requests.post(
+                request_payload["url"],
+                headers=request_payload["headers"],
+                json=request_payload["body"],
+                timeout=min(VISION_REQUEST_TIMEOUT, 20),
+            )
+        except requests.exceptions.RequestException as exc:
+            last_error = VisionProviderError(
+                request_payload["provider_name"],
+                sanitize_vision_provider_exception_message(exc),
+                retryable=True,
+            )
+            if candidate_index != len(base_urls) - 1:
+                continue
+            raise last_error from exc
+        if response.status_code >= 400:
+            last_error = VisionProviderError(
+                request_payload["provider_name"],
+                build_vision_provider_http_error_message(response),
+                status_code=response.status_code,
+                retryable=response.status_code in VISUAL_REVIEW_RETRYABLE_STATUS_CODES,
+            )
+            if candidate_index != len(base_urls) - 1:
+                continue
+            raise last_error
+        payload = parse_vision_provider_response_payload(response)
+        raw_text = extract_vision_response_text(payload) if isinstance(payload, dict) else ""
+        text_error = extract_vision_provider_text_error(raw_text)
+        if text_error:
+            last_error = VisionProviderError(
+                request_payload["provider_name"],
+                text_error["message"],
+                status_code=text_error.get("status_code"),
+                retryable=text_error.get("retryable", False),
+            )
+            if candidate_index != len(base_urls) - 1:
+                continue
+            raise last_error
+        return {
+            "success": True,
+            "provider": request_payload["provider_name"],
+            "api_style": request_payload["api_style"],
+            "base_url": candidate_base_url,
+            "model": str((provider or {}).get("model") or resolve_vision_provider_model(provider)),
+            "checked_at": iso_now(),
+            "response_excerpt": str(raw_text or "").strip()[:160],
+        }
+    if last_error is not None:
+        raise last_error
+    raise VisionProviderError(str((provider or {}).get("name") or "").strip(), "视觉模型探测失败")
 
 
 def evaluate_profile_visual_review(platform, review_item, requested_provider="", routing_strategy="", routing_context=None):
@@ -3695,7 +4190,9 @@ def perform_visual_review(platform, payload, progress_callback=None, cancel_chec
         requested_model=selected_model_name,
         routing_strategy=routing_strategy,
     )
+    item_timeout_seconds = resolve_visual_review_item_timeout_seconds(payload)
     started_at = time.monotonic()
+    future_poll_timeout_seconds = min(0.5, max(0.05, item_timeout_seconds / 4.0))
     if progress_callback:
             progress_callback(
                 "preparing",
@@ -3707,6 +4204,7 @@ def perform_visual_review(platform, payload, progress_callback=None, cancel_chec
                 selected_model=selected_model_name,
                 routing_strategy=routing_strategy or "direct",
                 max_workers=max_workers,
+                item_timeout_seconds=item_timeout_seconds,
                 channel_race=snapshot_probe_ranked_channel_race(routing_context) if routing_strategy == VISUAL_REVIEW_ROUTING_PROBE_RANKED else sanitize_json_compatible(channel_race) if channel_race else None,
                 **build_target_preview(target_identifiers),
             )
@@ -3714,6 +4212,60 @@ def perform_visual_review(platform, payload, progress_callback=None, cancel_chec
     completed = 0
     target_iter = iter(targets)
     future_map = {}
+
+    def finalize_review(identifier, result=None, error_text=None):
+        nonlocal completed
+        if error_text is not None:
+            results[identifier] = {
+                "username": identifier,
+                "success": False,
+                "error": str(error_text),
+                "reviewed_at": iso_now(),
+            }
+        else:
+            results[identifier] = {
+                "username": identifier,
+                "decision": result.get("decision"),
+                "reason": result.get("reason"),
+                "signals": result.get("signals") or [],
+                "provider": result.get("provider"),
+                "model": result.get("model"),
+                "configured_model": result.get("configured_model"),
+                "requested_model": result.get("requested_model"),
+                "response_model": result.get("response_model"),
+                "effective_model": result.get("effective_model"),
+                "route": result.get("route"),
+                "routing_strategy": result.get("routing_strategy"),
+                "trace": result.get("trace") or [],
+                "judge_used": bool(result.get("judge_used")),
+                "escalation_reasons": result.get("escalation_reasons") or [],
+                "usage": result.get("usage") or {},
+                "cover_count": result.get("cover_count"),
+                "candidate_cover_count": result.get("candidate_cover_count"),
+                "skipped_cover_count": result.get("skipped_cover_count"),
+                "reviewed_at": result.get("reviewed_at"),
+                "attempt_count": result.get("attempt_count"),
+                "channel_race": result.get("channel_race") or {},
+            }
+
+        completed += 1
+        save_visual_results(platform, results)
+        partial_result = build_visual_review_partial_result(
+            platform,
+            results,
+            targets,
+            channel_race=snapshot_probe_ranked_channel_race(routing_context) if routing_strategy == VISUAL_REVIEW_ROUTING_PROBE_RANKED else channel_race,
+        )
+        if progress_callback:
+            progress_callback(
+                "reviewing",
+                f"已完成第 {completed}/{len(targets)} 个账号：{identifier}",
+                done=completed,
+                total=len(targets),
+                partial_result=partial_result,
+                current_identifier=identifier,
+                max_workers=max_workers,
+            )
 
     def submit_next(executor):
         if cancel_check and cancel_check():
@@ -3744,10 +4296,15 @@ def perform_visual_review(platform, payload, progress_callback=None, cancel_chec
             routing_strategy,
             routing_context,
         )
-        future_map[future] = (identifier, review_item)
+        future_map[future] = {
+            "identifier": identifier,
+            "review_item": review_item,
+            "submitted_at": time.monotonic(),
+        }
         return True
 
-    with ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=f"{platform}-visual") as executor:
+    executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=f"{platform}-visual")
+    try:
         for _ in range(max_workers):
             if not submit_next(executor):
                 break
@@ -3756,66 +4313,46 @@ def perform_visual_review(platform, payload, progress_callback=None, cancel_chec
             if cancel_check and cancel_check():
                 return build_cancelled_result()
 
-            completed_futures, _ = wait(tuple(future_map.keys()), timeout=0.5, return_when=FIRST_COMPLETED)
+            now = time.monotonic()
+            expired_futures = []
+            for future, metadata in list(future_map.items()):
+                if future.done():
+                    continue
+                submitted_at = float(metadata.get("submitted_at") or 0.0)
+                if submitted_at and (now - submitted_at) >= item_timeout_seconds:
+                    expired_futures.append((future, metadata))
+            if expired_futures:
+                for future, metadata in expired_futures:
+                    identifier = metadata.get("identifier") or ""
+                    future_map.pop(future, None)
+                    future.cancel()
+                    finalize_review(
+                        identifier,
+                        error_text=f"视觉复核超时：{identifier} 超过 {int(item_timeout_seconds)} 秒未完成",
+                    )
+                    submit_next(executor)
+                continue
+
+            completed_futures, _ = wait(
+                tuple(future_map.keys()),
+                timeout=future_poll_timeout_seconds,
+                return_when=FIRST_COMPLETED,
+            )
             if not completed_futures:
                 continue
 
             for future in completed_futures:
-                identifier, review_item = future_map.pop(future)
+                metadata = future_map.pop(future)
+                identifier = metadata.get("identifier") or ""
                 try:
                     result = future.result()
-                    results[identifier] = {
-                        "username": identifier,
-                        "decision": result.get("decision"),
-                        "reason": result.get("reason"),
-                        "signals": result.get("signals") or [],
-                        "provider": result.get("provider"),
-                        "model": result.get("model"),
-                        "configured_model": result.get("configured_model"),
-                        "requested_model": result.get("requested_model"),
-                        "response_model": result.get("response_model"),
-                        "effective_model": result.get("effective_model"),
-                        "route": result.get("route"),
-                        "routing_strategy": result.get("routing_strategy"),
-                        "trace": result.get("trace") or [],
-                        "judge_used": bool(result.get("judge_used")),
-                        "escalation_reasons": result.get("escalation_reasons") or [],
-                        "usage": result.get("usage") or {},
-                        "cover_count": result.get("cover_count"),
-                        "candidate_cover_count": result.get("candidate_cover_count"),
-                        "skipped_cover_count": result.get("skipped_cover_count"),
-                        "reviewed_at": result.get("reviewed_at"),
-                        "attempt_count": result.get("attempt_count"),
-                        "channel_race": result.get("channel_race") or {},
-                    }
+                    finalize_review(identifier, result=result)
                 except Exception as exc:
-                    results[identifier] = {
-                        "username": identifier,
-                        "success": False,
-                        "error": str(exc),
-                        "reviewed_at": iso_now(),
-                    }
-
-                completed += 1
-                save_visual_results(platform, results)
-                partial_result = build_visual_review_partial_result(
-                    platform,
-                    results,
-                    targets,
-                    channel_race=snapshot_probe_ranked_channel_race(routing_context) if routing_strategy == VISUAL_REVIEW_ROUTING_PROBE_RANKED else channel_race,
-                )
-                if progress_callback:
-                    progress_callback(
-                        "reviewing",
-                        f"已完成第 {completed}/{len(targets)} 个账号：{identifier}",
-                        done=completed,
-                        total=len(targets),
-                        partial_result=partial_result,
-                        current_identifier=identifier,
-                        max_workers=max_workers,
-                    )
+                    finalize_review(identifier, error_text=str(exc))
 
                 submit_next(executor)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
 
     final_result = build_visual_review_partial_result(
         platform,
@@ -3870,6 +4407,51 @@ def resolve_requested_identifiers(platform, payload):
     if requested:
         return requested
     return derive_identifiers_from_upload_metadata(platform)
+
+
+def resolve_scrape_missing_retry_attempts(payload):
+    value = (payload or {}).get("missing_retry_attempts")
+    if value in (None, ""):
+        value = (payload or {}).get("missingRetryAttempts")
+    if value in (None, ""):
+        value = DEFAULT_SCRAPE_MISSING_RETRY_ATTEMPTS
+    try:
+        return max(0, int(value))
+    except Exception:
+        return DEFAULT_SCRAPE_MISSING_RETRY_ATTEMPTS
+
+
+def build_requested_identifier_lookup(platform, identifiers):
+    lookup = {}
+    for item in identifiers or []:
+        requested = str(item or "").strip()
+        if not requested:
+            continue
+        identifier = screening.extract_platform_identifier(platform, requested)
+        if identifier and identifier not in lookup:
+            lookup[identifier] = requested
+    return lookup
+
+
+def extract_missing_profile_review_identifiers(platform, profile_reviews):
+    identifiers = []
+    for item in profile_reviews or []:
+        identifier = screening.resolve_profile_review_identifier(platform, item)
+        if identifier:
+            identifiers.append(identifier)
+    return identifiers
+
+
+def select_missing_retry_identifiers(platform, filtered_result, requested_lookup):
+    retry_identifiers = []
+    seen = set()
+    for identifier in extract_missing_profile_review_identifiers(platform, filtered_result.get("missing_profiles") or []):
+        requested = str(requested_lookup.get(identifier) or "").strip()
+        if not requested or requested in seen:
+            continue
+        seen.add(requested)
+        retry_identifiers.append(requested)
+    return retry_identifiers
 
 
 def build_actor_input(platform, batch, payload):
@@ -3929,17 +4511,78 @@ def apify_request(method, url, *, token, params=None, json_payload=None):
     raise RuntimeError("Apify request failed without a captured exception")
 
 
+def normalize_upstream_error_text(text, *, content_type="", max_length=180):
+    normalized = re.sub(r"\s+", " ", redact_url_like_text(text)).strip()
+    if not normalized:
+        return ""
+    lowered = normalized.lower()
+    normalized_content_type = str(content_type or "").strip().lower()
+    if (
+        "text/html" in normalized_content_type
+        or "<html" in lowered
+        or "<!doctype html" in lowered
+        or "<body" in lowered
+        or "<head" in lowered
+    ):
+        title_match = re.search(r"<h1[^>]*>\s*([^<]+?)\s*</h1>", str(text or ""), re.IGNORECASE)
+        title = re.sub(r"\s+", " ", str(title_match.group(1) or "").strip()) if title_match else ""
+        if title:
+            return f"上游返回 HTML 错误页（{title}）"
+        return "上游返回 HTML 错误页"
+    if len(normalized) > max_length:
+        return normalized[: max_length - 1] + "…"
+    return normalized
+
+
+def build_upstream_http_status_summary(status_code):
+    try:
+        resolved = int(status_code or 0)
+    except Exception:
+        resolved = 0
+    return UPSTREAM_HTTP_STATUS_PUBLIC_LABELS.get(resolved, "")
+
+
 def extract_apify_response_error(response):
+    content_type = ""
+    if getattr(response, "headers", None):
+        content_type = (
+            response.headers.get("Content-Type")
+            or response.headers.get("content-type")
+            or ""
+        )
     try:
         payload = response.json()
     except Exception:
-        return response.text.strip() or f"HTTP {response.status_code}"
+        return normalize_upstream_error_text(
+            getattr(response, "text", ""),
+            content_type=content_type,
+        ) or build_upstream_http_status_summary(getattr(response, "status_code", 0))
     if isinstance(payload, dict):
         error = payload.get("error") or {}
         if isinstance(error, dict):
-            return error.get("message") or json.dumps(error, ensure_ascii=False)
-        return str(error or payload)
-    return str(payload)
+            return normalize_upstream_error_text(
+                error.get("message") or json.dumps(error, ensure_ascii=False),
+                content_type=content_type,
+            )
+        return normalize_upstream_error_text(str(error or payload), content_type=content_type)
+    return normalize_upstream_error_text(str(payload), content_type=content_type)
+
+
+def build_vision_provider_http_error_message(response):
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    status_summary = build_upstream_http_status_summary(status_code)
+    detail = extract_apify_response_error(response)
+    if detail:
+        if status_summary and detail != status_summary:
+            return f"HTTP {status_code} {status_summary}；{detail}"
+        return f"HTTP {status_code} {detail}"
+    if status_summary:
+        return f"HTTP {status_code} {status_summary}"
+    return f"HTTP {status_code}"
+
+
+def sanitize_vision_provider_exception_message(exc):
+    return normalize_upstream_error_text(str(exc)) or "视觉模型请求失败"
 
 
 def build_apify_batch_context(
@@ -4404,6 +5047,9 @@ def perform_scrape(platform, payload, progress_callback=None, cancel_check=None)
     batches = chunk_list(identifiers, PLATFORM_BATCH_SIZES.get(platform, 20))
     aggregated_items = []
     apify_runs = []
+    requested_lookup = build_requested_identifier_lookup(platform, identifiers)
+    max_missing_retry_attempts = resolve_scrape_missing_retry_attempts(payload)
+    retry_history = []
 
     if progress_callback:
         progress_callback("preparing", "正在准备抓取任务", done=0, total=len(batches), **build_target_preview(identifiers))
@@ -4443,7 +5089,117 @@ def perform_scrape(platform, payload, progress_callback=None, cancel_check=None)
         upload_metadata_lookup=load_upload_metadata(platform),
         active_rulespec=load_active_rulespec(),
     )
+    for retry_attempt in range(1, max_missing_retry_attempts + 1):
+        retry_identifiers = select_missing_retry_identifiers(platform, filtered, requested_lookup)
+        if not retry_identifiers:
+            break
+        retry_batches = chunk_list(retry_identifiers, PLATFORM_BATCH_SIZES.get(platform, 20))
+        previous_missing_identifiers = set(
+            extract_missing_profile_review_identifiers(platform, filtered.get("missing_profiles") or [])
+        )
+        retry_record = {
+            "attempt": retry_attempt,
+            "requested_identifier_count": len(retry_identifiers),
+            "requested_identifiers": retry_identifiers,
+            "requested_identifier_preview": retry_identifiers[:10],
+            "batch_count": len(retry_batches),
+            "status": "completed",
+            "errors": [],
+        }
+        if progress_callback:
+            progress_callback(
+                "retrying_missing_profiles",
+                f"检测到 {len(retry_identifiers)} 个 Missing 账号，正在自动补抓（{retry_attempt}/{max_missing_retry_attempts}）",
+                retry_attempt=retry_attempt,
+                retry_total=max_missing_retry_attempts,
+                missing_identifier_count=len(retry_identifiers),
+                **build_target_preview(retry_identifiers),
+            )
+        for batch_index, batch in enumerate(retry_batches, start=1):
+            if cancel_check and cancel_check():
+                return build_cancelled_result()
+            try:
+                batch_result = run_apify_batch(
+                    platform,
+                    batch,
+                    payload,
+                    progress_callback=progress_callback,
+                    cancel_check=cancel_check,
+                )
+            except Exception as exc:
+                retry_record["status"] = "completed_with_errors"
+                retry_record["errors"].append({
+                    "batch_index": batch_index,
+                    "targets": list(batch),
+                    "error": str(exc),
+                })
+                if progress_callback:
+                    progress_callback(
+                        "retry_batch_failed",
+                        f"Missing 自动补抓第 {batch_index}/{len(retry_batches)} 批失败：{exc}",
+                        retry_attempt=retry_attempt,
+                        batch_index=batch_index,
+                        batch_total=len(retry_batches),
+                        error=str(exc),
+                        **build_target_preview(batch),
+                    )
+                continue
+            if batch_result.get("cancelled"):
+                return batch_result
+            aggregated_items = merge_scrape_items(platform, aggregated_items, batch_result.get("raw_items") or [])
+            apify_runs.append(batch_result.get("apify") or {})
+            write_json_file(get_raw_data_path(platform), aggregated_items)
+            partial_result = build_partial_scrape_result(platform, aggregated_items, identifiers)
+            if progress_callback:
+                progress_callback(
+                    "retry_batch_completed",
+                    f"Missing 自动补抓第 {batch_index}/{len(retry_batches)} 批完成",
+                    partial_result=partial_result,
+                    retry_attempt=retry_attempt,
+                    batch_index=batch_index,
+                    batch_total=len(retry_batches),
+                    **build_target_preview(batch),
+                )
+        filtered = screening.filter_scraped_items(
+            platform,
+            aggregated_items,
+            expected_profiles=identifiers,
+            upload_metadata_lookup=load_upload_metadata(platform),
+            active_rulespec=load_active_rulespec(),
+        )
+        remaining_missing_identifiers = set(
+            extract_missing_profile_review_identifiers(platform, filtered.get("missing_profiles") or [])
+        )
+        retry_record["recovered_identifier_count"] = len(previous_missing_identifiers - remaining_missing_identifiers)
+        retry_record["remaining_missing_count"] = len(remaining_missing_identifiers)
+        retry_history.append(retry_record)
+        if not remaining_missing_identifiers:
+            break
     save_profile_reviews(platform, filtered.get("profile_reviews") or [])
+    remaining_missing_count = len(filtered.get("missing_profiles") or [])
+    retried_identifier_count = len({
+        item
+        for record in retry_history
+        for item in (record.get("requested_identifiers") or [])
+        if str(item or "").strip()
+    })
+    if retry_history and remaining_missing_count:
+        message = (
+            f"{UPLOAD_PLATFORM_RESPONSE_LABELS.get(platform, platform)} 抓取完成，"
+            f"返回 {len(filtered.get('successful_identifiers') or [])}/{len(identifiers)} 个账号；"
+            f"Missing 自动补抓 {len(retry_history)} 次后仍缺失 {remaining_missing_count} 个账号，已要求下游阻断最终导出。"
+        )
+    elif retry_history:
+        message = (
+            f"{UPLOAD_PLATFORM_RESPONSE_LABELS.get(platform, platform)} 抓取完成，"
+            f"返回 {len(filtered.get('successful_identifiers') or [])}/{len(identifiers)} 个账号；"
+            f"Missing 自动补抓 {len(retry_history)} 次后已补齐。"
+        )
+    else:
+        message = (
+            f"{UPLOAD_PLATFORM_RESPONSE_LABELS.get(platform, platform)} 抓取完成，"
+            f"返回 {len(filtered.get('successful_identifiers') or [])}/{len(identifiers)} 个账号。"
+        )
     result = {
         "success": True,
         "platform": platform,
@@ -4462,10 +5218,19 @@ def perform_scrape(platform, payload, progress_callback=None, cancel_check=None)
                 6,
             ) if apify_runs else None,
         },
-        "message": (
-            f"{UPLOAD_PLATFORM_RESPONSE_LABELS.get(platform, platform)} 抓取完成，"
-            f"返回 {len(filtered.get('successful_identifiers') or [])}/{len(identifiers)} 个账号。"
-        ),
+        "retry_summary": {
+            "enabled": bool(max_missing_retry_attempts > 0),
+            "max_attempts": max_missing_retry_attempts,
+            "attempt_count": len(retry_history),
+            "retried_identifier_count": retried_identifier_count,
+            "remaining_missing_count": remaining_missing_count,
+            "remaining_missing_identifiers": extract_missing_profile_review_identifiers(
+                platform,
+                filtered.get("missing_profiles") or [],
+            ),
+            "history": retry_history,
+        },
+        "message": message,
     }
     return result
 
@@ -4488,6 +5253,32 @@ def merge_upload_metadata_into_review_item(platform, item):
 
 def merge_upload_metadata_into_reviews(platform, profile_reviews):
     return [merge_upload_metadata_into_review_item(platform, item) for item in (profile_reviews or []) if isinstance(item, dict)]
+
+
+def list_missing_profile_reviews(platform, profile_reviews):
+    missing_profiles = []
+    for item in merge_upload_metadata_into_reviews(platform, profile_reviews):
+        if str(item.get("status") or "").strip() != "Missing":
+            continue
+        identifier = screening.resolve_profile_review_identifier(platform, item)
+        missing_profiles.append({
+            "identifier": identifier,
+            "username": str(item.get("username") or "").strip(),
+            "profile_url": str(item.get("profile_url") or "").strip(),
+            "reason": str(item.get("reason") or "").strip(),
+        })
+    return missing_profiles
+
+
+def build_final_review_missing_block_payload(platform, profile_reviews):
+    missing_profiles = list_missing_profile_reviews(platform, profile_reviews)
+    return {
+        "error": "存在名单账号未在本次抓取结果中返回，已阻止导出 final review。请先补抓或重新筛号。",
+        "error_code": "FINAL_REVIEW_BLOCKED_BY_MISSING_PROFILES",
+        "platform": platform,
+        "missing_profile_count": len(missing_profiles),
+        "missing_profiles": missing_profiles,
+    }
 
 
 def append_upload_metadata_to_export_row(row, review_item):
@@ -4520,7 +5311,6 @@ def build_export_row_base(platform, review_item):
     merged_item = merge_upload_metadata_into_review_item(platform, review_item)
     identifier = screening.resolve_profile_review_identifier(platform, merged_item)
     row = {
-        "platform": platform,
         "identifier": identifier,
         "username": merged_item.get("username", ""),
         "profile_url": merged_item.get("profile_url", ""),
@@ -4596,11 +5386,6 @@ def build_final_review_rows(platform, profile_reviews, visual_results):
         visual_status = "Not Reviewed"
         visual_reason = ""
         visual_signals = ""
-        visual_provider = ""
-        visual_model = ""
-        visual_route = ""
-        visual_judge_used = False
-        visual_usage = {}
         final_status = prescreen_status
         final_reason = prescreen_reason
         if prescreen_status == "Pass" and visual:
@@ -4613,29 +5398,14 @@ def build_final_review_rows(platform, profile_reviews, visual_results):
                 visual_status = str(visual.get("decision") or "Pass").strip() or "Pass"
                 visual_reason = str(visual.get("reason") or "").strip()
                 visual_signals = "；".join(str(item) for item in (visual.get("signals") or []) if str(item).strip())
-                visual_provider = str(visual.get("provider") or "").strip()
-                visual_model = str(visual.get("model") or "").strip()
-                visual_route = str(visual.get("route") or "").strip()
-                visual_judge_used = bool(visual.get("judge_used"))
-                visual_usage = dict(visual.get("usage") or {})
                 final_status = visual_status
                 final_reason = visual_reason or prescreen_reason
         row.update({
             "prescreen_status": format_export_review_status(prescreen_status),
             "prescreen_reason": prescreen_reason,
             "visual_status": format_export_review_status(visual_status),
-            "visual_provider": visual_provider,
-            "visual_model": visual_model,
-            "visual_route": visual_route,
-            "visual_judge_used": visual_judge_used,
             "visual_reason": visual_reason,
             "visual_signals": visual_signals,
-            "visual_prompt_tokens": visual_usage.get("prompt_tokens", ""),
-            "visual_completion_tokens": visual_usage.get("completion_tokens", ""),
-            "visual_total_tokens": visual_usage.get("total_tokens", ""),
-            "visual_reasoning_tokens": visual_usage.get("reasoning_tokens", ""),
-            "visual_image_tokens": visual_usage.get("image_tokens", ""),
-            "visual_cached_tokens": visual_usage.get("cached_tokens", ""),
             "status": format_export_review_status(final_status),
             "reason": final_reason,
             "final_status": format_export_review_status(final_status),
@@ -4865,6 +5635,8 @@ def artifact_status(platform):
         return jsonify({"error": "Invalid platform"}), 400
     profile_reviews = load_profile_reviews(platform)
     visual_results = load_visual_results(platform)
+    missing_profiles = list_missing_profile_reviews(platform, profile_reviews)
+    final_review_export_blocked = bool(missing_profiles)
     return jsonify({
         "platform": platform,
         "raw_data_path": get_raw_data_path(platform),
@@ -4872,7 +5644,10 @@ def artifact_status(platform):
         "visual_results_path": get_visual_results_path(platform),
         "raw_count": len(load_json_payload(get_raw_data_path(platform), default=[])),
         "profile_review_count": len(profile_reviews),
-        "saved_final_review_artifacts_available": bool(profile_reviews and visual_results),
+        "missing_profile_count": len(missing_profiles),
+        "missing_profiles_preview": missing_profiles[:20],
+        "final_review_export_blocked": final_review_export_blocked,
+        "saved_final_review_artifacts_available": bool(profile_reviews and visual_results and not final_review_export_blocked),
     })
 
 
@@ -4912,16 +5687,11 @@ def download_image_review(platform):
 def download_test_info(platform):
     if platform not in PLATFORM_ACTORS:
         return jsonify({"error": "Invalid platform"}), 400
-    raw_items = load_json_payload(get_raw_data_path(platform), default=[]) or []
     profile_reviews = load_profile_reviews(platform)
-    if not raw_items and not profile_reviews:
+    if not profile_reviews:
         return jsonify({"error": "No test data available to export"}), 404
     summary_rows = build_prescreen_review_rows(platform, profile_reviews)
-    raw_rows = pd.json_normalize(raw_items, sep=".").to_dict(orient="records") if raw_items else []
-    output = workbook_bytes_from_sheets([
-        ("Profile Reviews", summary_rows),
-        ("Raw Data", raw_rows),
-    ])
+    output = workbook_bytes_from_sheets([("Profile Reviews", summary_rows)])
     return send_file(
         output,
         as_attachment=True,
@@ -4935,14 +5705,11 @@ def download_test_info_json(platform):
     if platform not in PLATFORM_ACTORS:
         return jsonify({"error": "Invalid platform"}), 400
     payload = {
-        "platform": platform,
-        "profile_reviews": merge_upload_metadata_into_reviews(platform, load_profile_reviews(platform)),
-        "raw_items": load_json_payload(get_raw_data_path(platform), default=[]) or [],
-        "upload_metadata": load_upload_metadata(platform),
-        "raw_source_path": get_raw_data_path(platform),
+        "profile_reviews": build_prescreen_review_rows(platform, load_profile_reviews(platform)),
     }
-    if not payload["profile_reviews"] and not payload["raw_items"] and not payload["upload_metadata"]:
+    if not payload["profile_reviews"]:
         return jsonify({"error": "No test data available to export"}), 404
+    payload["row_count"] = len(payload["profile_reviews"])
     response = app.response_class(
         response=json.dumps(payload, ensure_ascii=False, indent=2),
         mimetype="application/json",
@@ -4961,6 +5728,9 @@ def download_final_review(platform):
         profile_reviews = load_profile_reviews(platform)
     if not isinstance(profile_reviews, list) or not profile_reviews:
         return jsonify({"error": "No profile review data available to export"}), 400
+    missing_profiles = list_missing_profile_reviews(platform, profile_reviews)
+    if missing_profiles:
+        return jsonify(build_final_review_missing_block_payload(platform, profile_reviews)), 409
     visual_results = merge_visual_results(platform, payload.get("visual_results") or {})
     rows = build_final_review_rows(platform, profile_reviews, visual_results)
     if not rows:

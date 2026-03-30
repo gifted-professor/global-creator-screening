@@ -459,6 +459,40 @@ class LlmReviewPrepTests(unittest.TestCase):
         self.assertEqual([config.provider_name for config in configs], ["Primary", "Secondary", "Tertiary"])
         self.assertEqual([config.model for config in configs], ["gpt-5.4", "qwen-max", "gemini-2.5-pro"])
 
+    def test_resolve_llm_review_config_prefers_legacy_env_over_env_local_visual_openai(self) -> None:
+        self.env_path.write_text(
+            "\n".join(
+                [
+                    "LLM_API_KEY=sk-legacy",
+                    "LLM_API_BASE=https://legacy.example/v1",
+                    "LLM_MODEL=deepseek-chat",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        env_local_path = self.env_path.with_name(".env.local")
+        env_local_path.write_text(
+            "\n".join(
+                [
+                    "OPENAI_API_KEY=sk-visual",
+                    "OPENAI_BASE_URL=https://visual.example/v1",
+                    "OPENAI_VISION_MODEL=gpt-5.4",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        try:
+            config = _resolve_llm_review_config(str(self.env_path))
+        finally:
+            env_local_path.unlink(missing_ok=True)
+
+        self.assertEqual(config.provider_name, "legacy-llm")
+        self.assertEqual(config.api_key, "sk-legacy")
+        self.assertEqual(config.base_url, "https://legacy.example/v1")
+        self.assertEqual(config.model, "deepseek-chat")
+
     def test_run_and_apply_llm_review_supports_responses_wire_api(self) -> None:
         self._make_workbook()
         db = self._seed_messages()

@@ -1,38 +1,36 @@
 ---
 gsd_state_version: 1.0
 milestone: v1.3.0
-milestone_name: external-email-dependency-decoupling
-status: phase_ready_for_discuss
-stopped_at: Phase 21 completed on 2026-03-29; next workflow step is `$gsd-discuss-phase 22`
-last_updated: "2026-03-29T18:24:00+08:00"
+milestone_name: External Email Dependency Decoupling
+status: unknown
+stopped_at: Phase 23 planned on 2026-03-30; next workflow step is `$gsd-execute-phase 23`
+last_updated: "2026-03-30T01:08:46.289Z"
 progress:
-  total_phases: 3
-  completed_phases: 2
-  total_plans: 4
-  completed_plans: 4
+  total_phases: 4
+  completed_phases: 3
+  total_plans: 9
+  completed_plans: 6
 ---
 
 # Project State
 
 ## Project Reference
 
-See: .planning/PROJECT.md (updated 2026-03-29)
+See: .planning/PROJECT.md (updated 2026-03-30)
 
 **Core value:** 在不打断现有本地工作流的前提下，把飞书内容获取、筛选导入和相关配置集中到一个可持续维护的仓库里。
-**Current focus:** Phase 22 discussion prep — validate decoupled runtime stability and operator fallback contract
+**Current focus:** Phase 23 — Wire template-compiled visual prompts into runtime and define visual feature-group contract
 
 ## Current Position
 
-Phase: 22 of 22 (ready to discuss)
-Plan: —
-Status: Ready to discuss
-Last activity: 2026-03-29 — Completed Phase 21 repo-local replacement work for workbook / dashboard / project-home
+Phase: 23 (Wire template-compiled visual prompts into runtime and define visual feature-group contract) — EXECUTING
+Plan: 1 of 3
 
 ## Performance Metrics
 
 **Velocity:**
 
-- Total plans completed: 11
+- Total plans completed: 33
 - Average duration: n/a
 - Total execution time: n/a
 
@@ -56,6 +54,9 @@ Last activity: 2026-03-29 — Completed Phase 21 repo-local replacement work for
 | 17 | 2 | n/a | n/a |
 | 18 | 2 | n/a | n/a |
 | 19 | 3 | n/a | n/a |
+| 20 | 2 | n/a | n/a |
+| 21 | 2 | n/a | n/a |
+| 22 | 2 | n/a | n/a |
 
 **Recent Trend:**
 
@@ -81,6 +82,15 @@ Recent decisions affecting current work:
 - [Phase 21 Plan]: `21-02` 再移除默认 external project-home/workbench rebuild 依赖，用 repo-local project-state artifact 完成 `DEP-03`
 - [Phase 21]: `import-from-feishu` / `sync-task-upload-view` 默认分支现在会直接生成 repo-local `summary.json`、`project_state.json` 和本地 `dashboard.html`
 - [Phase 21]: 默认 workbook/dashboard/project-home path 已不再要求 external full `email` project 存在；external root 只保留为显式 compatibility mode
+- [Phase 22]: 本轮只验证 decoupled 后 canonical bounded mainline 和 operator fallback contract，不插入新的 task-name orchestration API、UI、或更大样本 proof 范围
+- [Phase 22]: fallback/recovery 需要统一成三层说法：repo-local single-entry mainline resume、repo-local bridge outputs、以及显式 legacy compatibility mode
+- [Phase 22 Plan]: `22-01` 先重跑 repo-local bridge + final-wrapper 的 targeted regression，并在 `temp/phase22_decoupled_bounded_validation` 留下一轮 fresh bounded proof 和 `.planning/.../22-BOUNDED-REGRESSION.md`
+- [Phase 22 Plan]: `22-02` 再把 README / CLI / planning docs 收口成统一 runbook，明确 single-entry resume、repo-local bridge outputs、以及 explicit legacy compatibility mode 三条 operator 路径
+- [Phase 22]: decoupled 后的 targeted regression suite 通过，`task upload -> final export` bounded mainline 没有因为 repo-local runtime replacement 而回退
+- [Phase 22]: fresh bounded wrapper 顶层失败点是外部 `openai` vision probe 503；上游仍然成功达到 keep-list，说明问题在 provider/channel availability，不在 decoupling contract
+- [Phase 22]: summary-driven recovery 已实证成立；operator 可以从 `resume_points.keep_list.recommended_command` 接过 keep-list boundary，并在改用健康 provider 后继续完成 downstream
+- [Phase 22]: operator fallback/runbook 现在固定成三层说法：`repo-local single-entry mainline resume`、`repo-local bridge outputs`、`explicit legacy compatibility mode`
+- [Phase 23 Plan]: runtime visual contract 先拆成三段：持久化 `active_visual_prompts.json`、把 `visual_feature_group` / 视觉排除项接入 runtime cover/prompt contract、再用 smoke artifact + README 把 prompt precedence 和 fallback 顺序固定下来
 - [Reference Intake]: 外部 `筛号/docs/2026-03-29-qwen-prompt-benchmark.md` 可作为后续视觉优化基线；优先保留 `gpt-5.4` 原 prompt，给 `qwen-vl-max` 单独挂 `v2`，并按 `gpt-5.4 -> qwen-vl-max` 路由，而不是继续强行用单 prompt 逼近 GPT
 - [Reference Intake]: 外部 `apify` 项目的 handoff 文档模式可直接复用到当前仓库；开发接手应先看 `README + .planning`，再从 `scripts/run_task_upload_to_final_export_pipeline.py`、`scripts/run_task_upload_to_keep_list_pipeline.py`、`scripts/run_keep_list_screening_pipeline.py`、`backend/app.py` 4 个入口下钻
 - [Phase 1]: 先补最小 `.planning` 再迁移代码
@@ -140,18 +150,20 @@ Recent decisions affecting current work:
 - Phase 20 added: Baseline legacy dependency surfaces and lock repo-local replacement contract
 - Phase 21 added: Replace workbook/dashboard/project-home runtime paths with repo-local implementations
 - Phase 22 added: Validate decoupled runtime stability and operator fallback contract
+- Phase 23 added: Wire template-compiled visual prompts into runtime and define visual feature-group contract
 
 ### Pending Todos
 
-- Phase 21: 分入口替换 workbook / dashboard / project-home 的 external runtime 依赖并移除剩余硬编码 fallback
-- Phase 22: 完成 decoupled bounded 回归、整理 fallback/runbook，并确认无关键回归
+- Phase 23: 执行 visual runtime contract 三个 plans，验证品牌 prompt / `visual_feature_group` 已真正接入 runtime
+- Milestone audit / closeout: 待 Phase 23 交付后再决定继续留在 `v1.3.0` 收尾，还是拆到新 milestone
 - Deferred debt intake: `backend/app.py` 模块化 + app factory、shared settings loader、`pipeline_runtime.py` 抽取、SQLite WAL/FTS、upload/job hardening、LLM config consolidation、`pyproject.toml`/lint/typecheck、以及 workbook handle cleanup
+- Post-decoupling follow-up candidate: task-name single-entry orchestration API / thin operator UI，放到下一里程碑再开
 
 ### Blockers/Concerns
 
-- workbook / dashboard / project-home 历史路径仍有 external full `email` 耦合，Phase 21 改动面较广，需避免误伤已稳定的单入口链路
-- 当前里程碑故意 deferred 了 `QTE-01` 与 `REL-01`，如果中途混入会导致验证边界失焦
-- `v1.2.0` 的 bounded proof 与 reliability contract 是当前回归基线；拆依赖期间必须持续对齐这组 contract
+- `visual_prompts.json` 和 `active_rulespec.rules` 现在是分离产物；如果 runtime 只接其中一边，仍会留下“编译有品牌规则、运行不消费”的断裂
+- 当前仓库仍要兼容 lite `active_rulespec.json`；Phase 23 不能假设所有入口都会先产出 full `rules`
+- 外部 qwen benchmark 仍在 sibling docs；Phase 23 应先接入 override capability，不把外部 benchmark 文件迁入变成阻塞项
 
 ### Quick Tasks Completed
 
@@ -199,6 +211,7 @@ Recent decisions affecting current work:
 - 2026-03-29: Complete Phase 19 19-01 by hardening Apify lifecycle salvage semantics, persisting live downstream platform stages, and reserving `scrape_failed` for true no-output failures
 - 2026-03-29: Complete Phase 19 19-02 by adding multi-candidate upstream LLM fallback, selected provider/model observability, and absorbed-failure reporting to keep-list summary
 - 2026-03-29: Complete Phase 19 19-03 by tightening visual preferred-pool retry behavior, normalizing model diagnostics, preserving `completed_with_partial_scrape` in the final wrapper, and aligning README/operator docs
+- 2026-03-30: Quick Task `260330-bsm` — add one automatic Missing re-scrape pass before final export, keep blocking remaining Missing from downstream export, and record artifacts under `.planning/quick/260330-bsm-missing-missing-300-250-missing-final-ex/`
 - 2026-03-29: Clarify in README/PROJECT that the Phase 18 bounded proof only proves the repo-local single-entry mainline, not full-batch or multi-platform stability, full legacy-entry decoupling, or non-`openai` provider readiness
 - 2026-03-29: Intake external qwen prompt benchmark into local context: future visual tuning should prefer dual-prompt routing (`gpt-5.4` original + `qwen-vl-max` v2) with fixed benchmark harness instead of more blind prompt chasing
 - 2026-03-29: Add docs-first developer handoff guidance modeled on the external `apify` project: docs explain the full chain, while 4 code entrypoints are enough to start safe changes
@@ -207,6 +220,6 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-Last session: 2026-03-29 18:24
-Stopped at: Phase 21 completed on 2026-03-29; next workflow step is `$gsd-discuss-phase 22`
+Last session: 2026-03-30 09:00
+Stopped at: Phase 23 planned on 2026-03-30; next workflow step is `$gsd-execute-phase 23`
 Resume file: None

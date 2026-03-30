@@ -24,6 +24,7 @@ REASON_NO_DATA = "未抓到可用数据"
 REASON_NO_POSTS = "最近内容为空"
 REASON_INACTIVE = "最近 30 天无更新"
 REASON_MISSING_PROFILE = "名单账号未在本次抓取结果中返回"
+REASON_PROFILE_UNAVAILABLE = "抓取返回账号不存在或不可访问"
 
 DEFAULT_RULES = {
     "shared": {
@@ -42,6 +43,140 @@ DEFAULT_RULES = {
         "paid_content_window": 10,
     },
 }
+
+
+def coerce_positive_int(value):
+    try:
+        resolved = int(value)
+    except Exception:
+        return None
+    return max(1, resolved)
+
+
+def normalize_rule_type(rule):
+    if not isinstance(rule, dict):
+        return ""
+    return str(rule.get("rule_type") or rule.get("type") or "").strip().lower()
+
+
+def normalize_rule_platforms(rule):
+    if not isinstance(rule, dict):
+        return []
+    raw_platforms = rule.get("platforms")
+    if raw_platforms in (None, ""):
+        raw_platforms = rule.get("platform_scope")
+    if isinstance(raw_platforms, str):
+        raw_platforms = [raw_platforms]
+    return [
+        str(item or "").strip().lower()
+        for item in (raw_platforms or [])
+        if str(item or "").strip()
+    ]
+
+
+def iter_rulespec_rules(active_rulespec):
+    if not isinstance(active_rulespec, dict):
+        return []
+    rules = active_rulespec.get("rules")
+    if not isinstance(rules, list):
+        return []
+    return [item for item in rules if isinstance(item, dict)]
+
+
+def format_ratio_operator(value):
+    normalized = str(value or "").strip().lower()
+    return {
+        "ratio_gt": ">",
+        "gt": ">",
+        ">": ">",
+        "ratio_gte": ">=",
+        "gte": ">=",
+        ">=": ">=",
+        "ratio_lt": "<",
+        "lt": "<",
+        "<": "<",
+        "ratio_lte": "<=",
+        "lte": "<=",
+        "<=": "<=",
+        "must_not_appear": "must_not_appear",
+    }.get(normalized, normalized or ">")
+
+
+def extract_visual_feature_label(feature):
+    if not isinstance(feature, dict):
+        return str(feature or "").strip()
+    return str(feature.get("label") or feature.get("source_label") or feature.get("key") or "").strip()
+
+
+def render_visual_exclusion_summary(rule):
+    rule_type = normalize_rule_type(rule)
+    operator = format_ratio_operator(rule.get("operator"))
+    threshold_percent = rule.get("threshold_percent")
+    threshold_text = (
+        f" {operator} {int(threshold_percent)}%"
+        if threshold_percent not in (None, "") and operator != "must_not_appear"
+        else ""
+    )
+
+    if rule_type == "green_screen":
+        return "出现绿幕背景"
+    if rule_type == "multi_dance_ratio":
+        return f"多人跳舞占比{threshold_text}".strip()
+    if rule_type == "selfie_or_couple_ratio":
+        return f"自拍/情侣出镜占比{threshold_text}".strip()
+    if rule_type == "content_keyword_ratio":
+        keyword_values = [str(item or "").strip() for item in (rule.get("keyword_values") or []) if str(item or "").strip()]
+        if keyword_values:
+            return f"{'/'.join(keyword_values[:3])} 关键词占比{threshold_text}".strip()
+    return ""
+
+
+def resolve_visual_runtime_contract(active_rulespec, platform):
+    normalized_platform = str(platform or "").strip().lower()
+    if not normalized_platform:
+        return {}
+
+    goal = str((active_rulespec or {}).get("goal") or "").strip()
+    positive_feature_labels = []
+    exclusion_summaries = []
+    cover_count = None
+    min_hit_features = None
+
+    for rule in iter_rulespec_rules(active_rulespec):
+        platforms = normalize_rule_platforms(rule)
+        if platforms and normalized_platform not in platforms:
+            continue
+        rule_type = normalize_rule_type(rule)
+        if rule_type == "visual_feature_group":
+            cover_count = coerce_positive_int(rule.get("cover_count"))
+            min_hit_features = coerce_positive_int(rule.get("min_hit_features")) or 1
+            for feature in rule.get("features") or []:
+                label = extract_visual_feature_label(feature)
+                if label and label not in positive_feature_labels:
+                    positive_feature_labels.append(label)
+            continue
+        summary = render_visual_exclusion_summary(rule)
+        if summary and summary not in exclusion_summaries:
+            exclusion_summaries.append(summary)
+
+    if (
+        cover_count is None
+        and min_hit_features is None
+        and not positive_feature_labels
+        and not exclusion_summaries
+        and not goal
+    ):
+        return {}
+
+    return {
+        "platform": normalized_platform,
+        "source": "active_rulespec.rules",
+        "goal": goal,
+        "cover_count": cover_count,
+        "min_hit_features": min_hit_features or 1,
+        "positive_feature_labels": positive_feature_labels,
+        "exclusion_summaries": exclusion_summaries,
+    }
 
 
 def normalize_identifier(value):
@@ -122,6 +257,10 @@ def get_runtime_rules(active_rulespec, platform):
         **DEFAULT_RULES.get("shared", {}),
         **DEFAULT_RULES.get(platform, {}),
     }
+    resolved["_visual_review_cover_limit_explicit"] = False
+    visual_contract = resolve_visual_runtime_contract(active_rulespec, platform)
+    resolved["visual_runtime_contract"] = visual_contract
+    resolved["visual_contract_source"] = str((visual_contract or {}).get("source") or "").strip()
 
     if not isinstance(active_rulespec, dict):
         return resolved
@@ -132,18 +271,38 @@ def get_runtime_rules(active_rulespec, platform):
 
     shared_override = overrides.get("shared")
     if isinstance(shared_override, dict):
+        if shared_override.get("visual_review_cover_limit") not in (None, ""):
+            resolved["_visual_review_cover_limit_explicit"] = True
         resolved.update({key: value for key, value in shared_override.items() if value not in (None, "")})
 
     platform_override = overrides.get(platform)
     if isinstance(platform_override, dict):
+        if platform_override.get("visual_review_cover_limit") not in (None, ""):
+            resolved["_visual_review_cover_limit_explicit"] = True
         resolved.update({key: value for key, value in platform_override.items() if value not in (None, "")})
 
     return resolved
 
 
-def resolve_visual_review_candidate_cover_limit(runtime_rules=None):
+def resolve_visual_review_request_cover_limit(runtime_rules=None):
     rules = runtime_rules or {}
-    requested_limit = int(rules.get("visual_review_cover_limit") or DEFAULT_RULES["shared"]["visual_review_cover_limit"])
+    default_limit = DEFAULT_RULES["shared"]["visual_review_cover_limit"]
+
+    if rules.get("_visual_review_cover_limit_explicit"):
+        explicit_limit = coerce_positive_int(rules.get("visual_review_cover_limit"))
+        if explicit_limit is not None:
+            return explicit_limit
+
+    contract_limit = coerce_positive_int(((rules.get("visual_runtime_contract") or {}).get("cover_count")))
+    if contract_limit is not None:
+        return contract_limit
+
+    requested_limit = coerce_positive_int(rules.get("visual_review_cover_limit"))
+    return requested_limit if requested_limit is not None else default_limit
+
+
+def resolve_visual_review_candidate_cover_limit(runtime_rules=None):
+    requested_limit = resolve_visual_review_request_cover_limit(runtime_rules)
     return max(1, requested_limit, VISUAL_REVIEW_CANDIDATE_COVER_LIMIT_FLOOR)
 
 
@@ -191,6 +350,8 @@ def build_profile_review_record(
     soft_flags=None,
     stats=None,
     upload_metadata=None,
+    resolved_cover_limit=None,
+    visual_contract_source="",
 ):
     normalized_status = status if status in PROFILE_REVIEW_ALLOWED_STATUSES else "Reject"
     normalized_covers = []
@@ -208,6 +369,8 @@ def build_profile_review_record(
         "soft_flags": list(soft_flags or []),
         "stats": dict(stats or {}),
         "upload_metadata": dict(upload_metadata or {}),
+        "resolved_cover_limit": coerce_positive_int(resolved_cover_limit),
+        "visual_contract_source": str(visual_contract_source or "").strip(),
     }
 
 
@@ -347,8 +510,9 @@ def check_tiktok_profile(items, runtime_rules=None):
             },
         }
 
-    cover_limit = resolve_visual_review_candidate_cover_limit(rules)
-    covers = extract_tiktok_cover_urls(sorted_items, cover_limit)
+    resolved_cover_limit = resolve_visual_review_request_cover_limit(rules)
+    candidate_cover_limit = resolve_visual_review_candidate_cover_limit(rules)
+    covers = extract_tiktok_cover_urls(sorted_items, candidate_cover_limit)
 
     return {
         "status": "Pass",
@@ -358,6 +522,8 @@ def check_tiktok_profile(items, runtime_rules=None):
         ),
         "latest_post_time": latest_post_time,
         "covers": covers,
+        "resolved_cover_limit": resolved_cover_limit,
+        "visual_contract_source": rules.get("visual_contract_source") or "",
         "stats": {
             "avg_views": round(avg_views, 1),
             "median_views": round(median_views, 1),
@@ -389,13 +555,16 @@ def check_instagram_profile(profile, upload_metadata=None, runtime_rules=None):
     if latest_dt and (datetime.now(timezone.utc) - latest_dt).days > active_days_max:
         return {"status": "Reject", "reason": f"最近 {active_days_max} 天无更新", "latest_post_time": latest_post_time}
 
-    cover_limit = resolve_visual_review_candidate_cover_limit(rules)
-    covers = extract_instagram_cover_urls(sorted_posts, cover_limit)
+    resolved_cover_limit = resolve_visual_review_request_cover_limit(rules)
+    candidate_cover_limit = resolve_visual_review_candidate_cover_limit(rules)
+    covers = extract_instagram_cover_urls(sorted_posts, candidate_cover_limit)
     return {
         "status": "Pass",
         "reason": f"地区符合；近 {active_days_max} 天有更新；已提取 {len(covers)} 张封面",
         "latest_post_time": latest_post_time,
         "covers": covers,
+        "resolved_cover_limit": resolved_cover_limit,
+        "visual_contract_source": rules.get("visual_contract_source") or "",
     }
 
 
@@ -425,13 +594,16 @@ def check_youtube_profile(items, runtime_rules=None):
             "latest_post_time": latest_post_time,
         }
 
-    cover_limit = resolve_visual_review_candidate_cover_limit(rules)
-    covers = extract_youtube_cover_urls(sorted_items, cover_limit)
+    resolved_cover_limit = resolve_visual_review_request_cover_limit(rules)
+    candidate_cover_limit = resolve_visual_review_candidate_cover_limit(rules)
+    covers = extract_youtube_cover_urls(sorted_items, candidate_cover_limit)
     return {
         "status": "Pass",
         "reason": f"近 {active_days_max} 天有更新；已提取 {len(covers)} 张封面",
         "latest_post_time": latest_post_time,
         "covers": covers,
+        "resolved_cover_limit": resolved_cover_limit,
+        "visual_contract_source": rules.get("visual_contract_source") or "",
     }
 
 
@@ -465,6 +637,16 @@ def build_missing_review(platform, candidate, metadata_lookup):
     )
 
 
+def build_scrape_error_reason(error_message):
+    message = str(error_message or "").strip()
+    if not message:
+        return REASON_NO_DATA
+    lowered = message.lower()
+    if "does not exist" in lowered or "not exist" in lowered:
+        return REASON_PROFILE_UNAVAILABLE
+    return f"抓取返回错误：{message}"
+
+
 def filter_scraped_items(platform, items, expected_profiles=None, upload_metadata_lookup=None, active_rulespec=None):
     expected_profiles = [item for item in (expected_profiles or []) if str(item or "").strip()]
     upload_metadata_lookup = upload_metadata_lookup or {}
@@ -477,17 +659,47 @@ def filter_scraped_items(platform, items, expected_profiles=None, upload_metadat
     if platform == "tiktok":
         grouped = {}
         for item in raw_items:
-            author_name = ((item.get("authorMeta") or {}).get("name")) or ""
-            identifier = extract_platform_identifier(platform, ((item.get("authorMeta") or {}).get("profileUrl")) or author_name)
+            author_meta = item.get("authorMeta") or {}
+            identifier = (
+                extract_platform_identifier(platform, author_meta.get("profileUrl"))
+                or extract_platform_identifier(platform, author_meta.get("name"))
+                or extract_platform_identifier(platform, item.get("url"))
+                or extract_platform_identifier(platform, item.get("input"))
+                or extract_platform_identifier(platform, item.get("webVideoUrl"))
+            )
             if not identifier:
                 continue
             grouped.setdefault(identifier, []).append(item)
 
         for identifier, grouped_items in grouped.items():
-            first_item = grouped_items[0]
-            profile_url = ((first_item.get("authorMeta") or {}).get("profileUrl")) or build_canonical_profile_url(platform, identifier)
-            upload_metadata = resolve_upload_metadata(upload_metadata_lookup, profile_url, identifier)
-            review = check_tiktok_profile(grouped_items, runtime_rules=runtime_rules)
+            content_items = [
+                item
+                for item in grouped_items
+                if ((item.get("authorMeta") or {}).get("profileUrl")) or ((item.get("authorMeta") or {}).get("name"))
+            ]
+            first_item = content_items[0] if content_items else grouped_items[0]
+            profile_url = (
+                ((first_item.get("authorMeta") or {}).get("profileUrl"))
+                or first_item.get("url")
+                or build_canonical_profile_url(platform, identifier)
+            )
+            upload_metadata = resolve_upload_metadata(
+                upload_metadata_lookup,
+                profile_url,
+                identifier,
+                first_item.get("input"),
+            )
+            if content_items:
+                review = check_tiktok_profile(content_items, runtime_rules=runtime_rules)
+            else:
+                error_message = next(
+                    (str(item.get("error") or "").strip() for item in grouped_items if str(item.get("error") or "").strip()),
+                    "",
+                )
+                review = {
+                    "status": "Reject",
+                    "reason": build_scrape_error_reason(error_message),
+                }
             profile_reviews.append(
                 build_profile_review_record(
                     platform,
@@ -499,11 +711,13 @@ def filter_scraped_items(platform, items, expected_profiles=None, upload_metadat
                     latest_post_time=review.get("latest_post_time"),
                     stats=review.get("stats"),
                     upload_metadata=upload_metadata,
+                    resolved_cover_limit=review.get("resolved_cover_limit"),
+                    visual_contract_source=review.get("visual_contract_source"),
                 )
             )
             returned_identifiers.add(identifier)
             if review.get("status") == "Pass":
-                passed_items.extend(grouped_items)
+                passed_items.extend(content_items)
 
     elif platform == "instagram":
         for item in raw_items:
@@ -528,6 +742,8 @@ def filter_scraped_items(platform, items, expected_profiles=None, upload_metadat
                     soft_flags=review.get("soft_flags"),
                     stats=review.get("stats"),
                     upload_metadata=upload_metadata,
+                    resolved_cover_limit=review.get("resolved_cover_limit"),
+                    visual_contract_source=review.get("visual_contract_source"),
                 )
             )
             returned_identifiers.add(identifier)
@@ -581,6 +797,8 @@ def filter_scraped_items(platform, items, expected_profiles=None, upload_metadat
                     soft_flags=review.get("soft_flags"),
                     stats=review.get("stats"),
                     upload_metadata=upload_metadata,
+                    resolved_cover_limit=review.get("resolved_cover_limit"),
+                    visual_contract_source=review.get("visual_contract_source"),
                 )
             )
             returned_identifiers.add(identifier)

@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import unittest
 
-from backend.screening import check_instagram_profile, has_instagram_allowed_region
+from backend.screening import check_instagram_profile, filter_scraped_items, has_instagram_allowed_region
 
 
 def _active_post() -> dict[str, str]:
@@ -59,3 +59,61 @@ class InstagramRegionDetectionTests(unittest.TestCase):
 
         self.assertEqual(review["status"], "Reject")
         self.assertEqual(review["reason"], "简介或资料字段未识别到允许地区线索")
+
+
+class TikTokScrapeErrorHandlingTests(unittest.TestCase):
+    def test_tiktok_error_placeholder_is_exported_as_reject_not_missing(self) -> None:
+        result = filter_scraped_items(
+            "tiktok",
+            [
+                {
+                    "url": "https://www.tiktok.com/@farrobear",
+                    "input": "farrobear",
+                    "error": "This profile/hashtag does not exist.",
+                }
+            ],
+            expected_profiles=["farrobear"],
+            upload_metadata_lookup={
+                "farrobear": {
+                    "handle": "farrobear",
+                    "url": "https://www.tiktok.com/@farrobear",
+                }
+            },
+        )
+
+        self.assertEqual(result["successful_identifiers"], ["farrobear"])
+        self.assertEqual(len(result["missing_profiles"]), 0)
+        self.assertEqual(len(result["profile_reviews"]), 1)
+        review = result["profile_reviews"][0]
+        self.assertEqual(review["status"], "Reject")
+        self.assertEqual(review["reason"], "抓取返回账号不存在或不可访问")
+        self.assertEqual(review["username"], "farrobear")
+
+    def test_tiktok_real_content_wins_over_error_placeholder_for_same_identifier(self) -> None:
+        active_now = datetime.now(timezone.utc).isoformat()
+        result = filter_scraped_items(
+            "tiktok",
+            [
+                {
+                    "url": "https://www.tiktok.com/@farrobear",
+                    "input": "farrobear",
+                    "error": "This profile/hashtag does not exist.",
+                },
+                {
+                    "authorMeta": {
+                        "name": "farrobear",
+                        "profileUrl": "https://www.tiktok.com/@farrobear",
+                    },
+                    "createTimeISO": active_now,
+                    "playCount": 25000,
+                    "videoMeta": {"coverUrl": "https://example.com/cover.jpg"},
+                },
+            ],
+            expected_profiles=["farrobear"],
+        )
+
+        self.assertEqual(result["successful_identifiers"], ["farrobear"])
+        self.assertEqual(len(result["profile_reviews"]), 1)
+        review = result["profile_reviews"][0]
+        self.assertEqual(review["status"], "Pass")
+        self.assertIn("播放量达标", review["reason"])

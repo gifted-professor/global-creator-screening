@@ -114,11 +114,36 @@ def normalize_platforms(values: list[str] | None) -> list[str]:
     return normalized
 
 
+def _build_platform_scrape_identifier(backend_app, platform: str, raw_identifier: str, metadata: dict[str, Any] | None) -> str:
+    normalized_metadata = dict(metadata or {})
+    fallback_identifier = str(raw_identifier or "").strip()
+    if platform in {"tiktok", "youtube"}:
+        for candidate in (normalized_metadata.get("url"), normalized_metadata.get("profile_url")):
+            value = str(candidate or "").strip()
+            if value:
+                return value
+        screening_module = getattr(backend_app, "screening", None)
+        if fallback_identifier and "://" not in fallback_identifier and hasattr(screening_module, "build_canonical_profile_url"):
+            canonical = str(screening_module.build_canonical_profile_url(platform, fallback_identifier) or "").strip()
+            if canonical:
+                return canonical
+    if platform == "instagram":
+        for candidate in (normalized_metadata.get("handle"), fallback_identifier, normalized_metadata.get("url")):
+            value = str(candidate or "").strip()
+            if value:
+                return value
+    return fallback_identifier
+
+
 def select_platform_identifiers(platform: str, max_identifiers_per_platform: int) -> list[str]:
     runtime = _load_runtime_dependencies()
     backend_app = runtime["backend_app"]
     metadata_lookup = backend_app.load_upload_metadata(platform)
-    identifiers = [str(item).strip() for item in metadata_lookup.keys() if str(item).strip()]
+    identifiers = []
+    for identifier, metadata in metadata_lookup.items():
+        selected = _build_platform_scrape_identifier(backend_app, platform, str(identifier or "").strip(), metadata)
+        if selected:
+            identifiers.append(selected)
     if max_identifiers_per_platform > 0:
         return identifiers[:max_identifiers_per_platform]
     return identifiers
@@ -148,6 +173,8 @@ def summarize_platform_statuses(platforms: dict[str, dict[str, Any]]) -> str:
         return "failed"
     if any(status == "scrape_failed" for status in statuses):
         return "scrape_failed"
+    if any(status == "missing_profiles_blocked" for status in statuses):
+        return "missing_profiles_blocked"
     if any(status == "completed_with_partial_scrape" for status in statuses):
         return "completed_with_partial_scrape"
     if statuses and all(status in {"staged_only", "skipped"} for status in statuses):
@@ -204,6 +231,27 @@ def _resolve_scrape_pass_count(scrape_job: dict[str, Any], count_passed_profiles
             ]
         )
     return int(count_passed_profiles(scrape_job) or 0)
+
+
+def _extract_missing_profile_reviews(scrape_job: dict[str, Any] | None) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in _extract_scrape_profile_reviews(scrape_job)
+        if str((item or {}).get("status") or "").strip() == "Missing"
+    ]
+
+
+def _build_missing_profile_summary(profile_reviews: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    for item in profile_reviews:
+        upload_metadata = dict(item.get("upload_metadata") or {})
+        identifier = str(item.get("username") or upload_metadata.get("handle") or "").strip()
+        summaries.append({
+            "identifier": identifier,
+            "profile_url": str(item.get("profile_url") or upload_metadata.get("url") or "").strip(),
+            "reason": str(item.get("reason") or "").strip(),
+        })
+    return summaries
 
 
 def _extract_scrape_failure_stage(scrape_job: dict[str, Any] | None) -> str:
@@ -430,15 +478,45 @@ def run_keep_list_screening_pipeline(
 
     try:
         client = backend_app.app.test_client()
+        resolve_routing_strategy = getattr(backend_app, "resolve_visual_review_routing_strategy", None)
+        active_routing_strategy = ""
+        if callable(resolve_routing_strategy):
+            active_routing_strategy = str(resolve_routing_strategy({}) or "").strip().lower()
         if not skip_visual or probe_vision_provider_only:
-            probe_response = client.post("/api/vision/providers/probe", json={"provider": vision_provider or ""})
-            probe_payload = probe_response.get_json(silent=True) or {
-                "success": False,
-                "error": f"unexpected HTTP {probe_response.status_code}",
-            }
+            if (
+                not str(vision_provider or "").strip()
+                and active_routing_strategy == "probe_ranked"
+                and hasattr(backend_app, "run_probe_ranked_visual_provider_race")
+            ):
+                race_payload = backend_app.run_probe_ranked_visual_provider_race(
+                    platform=requested_platforms[0] if requested_platforms else "instagram"
+                )
+                probe_payload = {
+                    "success": bool(race_payload.get("success")),
+                    "provider": race_payload.get("selected_provider") or "",
+                    "probe": {
+                        "success": bool(race_payload.get("success")),
+                        "provider": race_payload.get("selected_provider") or "",
+                        "model": race_payload.get("selected_model") or "",
+                        "checked_at": race_payload.get("checked_at") or "",
+                    },
+                    "channel_race": race_payload,
+                    "vision_preflight": summary["vision_preflight"],
+                }
+                probe_status_code = 200 if probe_payload.get("success") else 400
+                if not probe_payload.get("success"):
+                    probe_payload["error_code"] = "VISION_CHANNEL_RACE_FAILED"
+                    probe_payload["error"] = "视觉通道赛马失败：当前优先链路都不可用。"
+            else:
+                probe_response = client.post("/api/vision/providers/probe", json={"provider": vision_provider or ""})
+                probe_payload = probe_response.get_json(silent=True) or {
+                    "success": False,
+                    "error": f"unexpected HTTP {probe_response.status_code}",
+                }
+                probe_status_code = probe_response.status_code
             summary["vision_probe"] = probe_payload
             summary["vision_preflight"] = probe_payload.get("vision_preflight") or summary["vision_preflight"]
-            if probe_response.status_code >= 400 or probe_payload.get("success") is False:
+            if probe_status_code >= 400 or probe_payload.get("success") is False:
                 summary["status"] = "vision_probe_failed"
                 summary["finished_at"] = backend_app.iso_now()
                 _write_summary(run_summary_path, summary)
@@ -568,8 +646,15 @@ def run_keep_list_screening_pipeline(
                     )
                     continue
 
+            scrape_profile_reviews = _extract_scrape_profile_reviews(scrape_job)
             pass_count = _resolve_scrape_pass_count(scrape_job, count_passed_profiles)
+            missing_reviews = _extract_missing_profile_reviews(scrape_job)
+            missing_profiles = _build_missing_profile_summary(missing_reviews)
+            platform_summary["profile_review_count"] = len(scrape_profile_reviews)
             platform_summary["prescreen_pass_count"] = pass_count
+            platform_summary["missing_profile_count"] = len(missing_profiles)
+            if missing_profiles:
+                platform_summary["missing_profiles"] = missing_profiles
             platform_summary["visual_gate"] = {
                 "executed": False,
                 "skip_visual_flag": bool(skip_visual),
@@ -578,6 +663,28 @@ def run_keep_list_screening_pipeline(
                 "configured_provider_names": platform_summary["vision_preflight"]["configured_provider_names"],
                 "selected_provider": platform_summary["vision_preflight"].get("preferred_provider") or "",
             }
+            if missing_profiles:
+                platform_summary["visual_gate"]["blocked"] = True
+                platform_summary["visual_gate"]["reason"] = "prescreen contains Missing targets"
+                platform_summary["visual_job"] = {
+                    "status": "skipped",
+                    "reason": "名单账号未在本次抓取结果中返回，已阻断视觉复核和最终导出",
+                }
+                platform_summary["artifact_status"] = require_success(
+                    client.get(f"/api/artifacts/{platform}/status"),
+                    f"{platform} artifact status",
+                )
+                platform_summary["exports"] = {}
+                platform_summary["status"] = "missing_profiles_blocked"
+                _persist_platform_summary(
+                    summary=summary,
+                    run_summary_path=run_summary_path,
+                    backend_app=backend_app,
+                    platform=platform,
+                    platform_summary=platform_summary,
+                    current_stage="missing_profiles_blocked",
+                )
+                continue
             if skip_visual:
                 platform_summary["visual_job"] = {"status": "skipped", "reason": "skip_visual flag set"}
             elif pass_count <= 0:

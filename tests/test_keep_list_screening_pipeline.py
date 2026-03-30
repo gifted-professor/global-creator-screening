@@ -20,6 +20,7 @@ class FakeResponse:
 class FakeClient:
     def __init__(self, preflight=None):
         self.probe_calls = []
+        self.scrape_start_calls = []
         self.visual_start_calls = []
         self.preflight = json.loads(json.dumps(preflight or {}))
 
@@ -40,6 +41,7 @@ class FakeClient:
                 "vision_preflight": self.preflight,
             })
         if url == "/api/jobs/scrape":
+            self.scrape_start_calls.append(json or {})
             return FakeResponse({"success": True, "job": {"id": "scrape-job-1"}})
         if url == "/api/jobs/visual-review":
             self.visual_start_calls.append(json or {})
@@ -61,13 +63,15 @@ class FakeFlaskApp:
 
 
 class FakeBackendApp:
-    PLATFORM_ACTORS = {"instagram": "actor"}
+    PLATFORM_ACTORS = {"instagram": "actor", "tiktok": "actor", "youtube": "actor"}
 
-    def __init__(self, preflight):
+    def __init__(self, preflight, routing_strategy="", channel_race=None, metadata=None):
         self._preflight = json.loads(json.dumps(preflight))
-        self._metadata = {"instagram": {"alpha": {"handle": "alpha"}}}
+        self._metadata = json.loads(json.dumps(metadata or {"instagram": {"alpha": {"handle": "alpha"}}}))
         self._client = FakeClient(preflight=preflight)
         self.app = FakeFlaskApp(self._client)
+        self._routing_strategy = str(routing_strategy or "")
+        self._channel_race = json.loads(json.dumps(channel_race or {}))
 
     def iso_now(self):
         return "2026-03-28T01:02:03Z"
@@ -89,6 +93,12 @@ class FakeBackendApp:
             payload["requested_provider"] = requested
             payload["preferred_provider"] = requested
         return payload
+
+    def resolve_visual_review_routing_strategy(self, payload=None):
+        return self._routing_strategy
+
+    def run_probe_ranked_visual_provider_race(self, platform="instagram", cover_urls=None):
+        return json.loads(json.dumps(self._channel_race))
 
     def write_json_file(self, path, payload):
         output_path = Path(path)
@@ -197,6 +207,72 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         )
         self.assertEqual(summary["vision_probe"]["success"], True)
         self.assertEqual(summary["vision_probe"]["provider"], "openai")
+
+    def test_probe_ranked_summary_uses_channel_race_when_no_explicit_provider_is_requested(self) -> None:
+        preflight = {
+            "status": "configured",
+            "error_code": "",
+            "message": "视觉模型已就绪：openai",
+            "preferred_provider": "openai",
+            "configured_provider_names": ["openai", "reelx"],
+            "runnable_provider_names": ["openai", "reelx"],
+            "providers": [
+                {"name": "openai", "runnable": True},
+                {"name": "reelx", "runnable": True},
+            ],
+        }
+        channel_race = {
+            "strategy": "probe_ranked",
+            "checked_at": "2026-03-29T00:00:00Z",
+            "success": True,
+            "selected_stage": "preferred_parallel",
+            "selected_provider": "reelx",
+            "selected_model": "qwen-vl-max",
+            "candidates": [
+                {"stage": "preferred", "group": "preferred", "provider": "openai", "model": "gpt-5.4", "ok": False},
+                {"stage": "preferred_parallel", "group": "fallback", "provider": "reelx", "model": "qwen-vl-max", "ok": True},
+                {"stage": "secondary", "group": "fallback", "provider": "reelx", "model": "gemini-3-flash-preview", "ok": True},
+            ],
+        }
+        backend_app = FakeBackendApp(preflight, routing_strategy="probe_ranked", channel_race=channel_race)
+
+        def fake_prepare_screening_inputs(**kwargs):
+            return {
+                "prepared_at": "2026-03-28T01:02:03Z",
+                "upload": {"stats": {"Instagram": 1}},
+            }
+
+        keep_list_runner._load_runtime_dependencies = lambda: {
+            "backend_app": backend_app,
+            "prepare_screening_inputs": fake_prepare_screening_inputs,
+            "count_passed_profiles": lambda scrape_job: 0,
+            "export_platform_artifacts": lambda client, platform, export_dir: {},
+            "poll_job": lambda client, job_id, label, interval: {},
+            "require_success": lambda response, label: response.get_json(),
+            "reset_backend_runtime_state": lambda: None,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            keep_path = temp_root / "keep.xlsx"
+            template_path = temp_root / "template.xlsx"
+            keep_path.touch()
+            template_path.touch()
+
+            summary = keep_list_runner.run_keep_list_screening_pipeline(
+                keep_workbook=keep_path,
+                template_workbook=template_path,
+                output_root=temp_root / "run",
+                platform_filters=["instagram"],
+                probe_vision_provider_only=True,
+            )
+
+        self.assertEqual(summary["status"], "vision_probe_only")
+        self.assertEqual(summary["vision_probe"]["success"], True)
+        self.assertEqual(summary["vision_probe"]["provider"], "reelx")
+        self.assertEqual(summary["vision_probe"]["probe"]["model"], "qwen-vl-max")
+        self.assertEqual(summary["vision_probe"]["channel_race"]["selected_provider"], "reelx")
+        self.assertEqual(backend_app._client.probe_calls, [])
 
     def test_summary_records_preflight_reason_when_visual_is_not_runnable(self) -> None:
         preflight = {
@@ -331,6 +407,137 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             backend_app.app.test_client().visual_start_calls[0]["payload"]["provider"],
             "openai",
         )
+
+    def test_runner_prefers_staged_urls_for_tiktok_scrape_payload(self) -> None:
+        backend_app = FakeBackendApp(
+            {"status": "configured", "runnable_provider_names": [], "configured_provider_names": []},
+            metadata={
+                "tiktok": {
+                    "alpha": {
+                        "handle": "alpha",
+                        "url": "https://tiktok.com/@alpha",
+                    }
+                }
+            },
+        )
+
+        def fake_prepare_screening_inputs(**kwargs):
+            return {
+                "prepared_at": "2026-03-28T01:02:03Z",
+                "upload": {"stats": {"TikTok": 1}},
+            }
+
+        def fake_poll_job(client, job_id, label, interval):
+            return {
+                "id": job_id,
+                "status": "completed",
+                "result": {
+                    "profile_reviews": [{"status": "Pass", "username": "alpha"}],
+                },
+            }
+
+        keep_list_runner._load_runtime_dependencies = lambda: {
+            "backend_app": backend_app,
+            "prepare_screening_inputs": fake_prepare_screening_inputs,
+            "count_passed_profiles": lambda scrape_job: 1,
+            "export_platform_artifacts": lambda client, platform, export_dir: {},
+            "poll_job": fake_poll_job,
+            "require_success": lambda response, label: response.get_json(),
+            "reset_backend_runtime_state": lambda: None,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            keep_path = temp_root / "keep.xlsx"
+            template_path = temp_root / "template.xlsx"
+            keep_path.touch()
+            template_path.touch()
+
+            summary = keep_list_runner.run_keep_list_screening_pipeline(
+                keep_workbook=keep_path,
+                template_workbook=template_path,
+                output_root=temp_root / "run",
+                platform_filters=["tiktok"],
+                skip_visual=True,
+            )
+
+        self.assertEqual(
+            summary["platforms"]["tiktok"]["requested_identifier_preview"],
+            ["https://tiktok.com/@alpha"],
+        )
+        self.assertEqual(
+            backend_app.app.test_client().scrape_start_calls[0]["payload"]["profiles"],
+            ["https://tiktok.com/@alpha"],
+        )
+
+    def test_runner_blocks_visual_and_export_when_scrape_contains_missing_profiles(self) -> None:
+        preflight = {
+            "status": "configured",
+            "error_code": "",
+            "message": "视觉模型已就绪：openai",
+            "configured_provider_names": ["openai"],
+            "runnable_provider_names": ["openai"],
+            "preferred_provider": "openai",
+            "providers": [{"name": "openai", "runnable": True}],
+        }
+        backend_app = FakeBackendApp(preflight)
+        export_calls = []
+
+        def fake_prepare_screening_inputs(**kwargs):
+            return {
+                "prepared_at": "2026-03-28T01:02:03Z",
+                "upload": {"stats": {"Instagram": 1}},
+            }
+
+        def fake_poll_job(client, job_id, label, interval):
+            return {
+                "id": job_id,
+                "status": "completed",
+                "result": {
+                    "profile_reviews": [
+                        {"status": "Pass", "username": "alpha"},
+                        {"status": "Missing", "username": "ghost", "reason": "名单账号未在本次抓取结果中返回"},
+                    ],
+                },
+            }
+
+        def fake_export_platform_artifacts(client, platform, export_dir):
+            export_calls.append(platform)
+            return {}
+
+        keep_list_runner._load_runtime_dependencies = lambda: {
+            "backend_app": backend_app,
+            "prepare_screening_inputs": fake_prepare_screening_inputs,
+            "count_passed_profiles": lambda scrape_job: 1,
+            "export_platform_artifacts": fake_export_platform_artifacts,
+            "poll_job": fake_poll_job,
+            "require_success": lambda response, label: response.get_json(),
+            "reset_backend_runtime_state": lambda: None,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            keep_path = temp_root / "keep.xlsx"
+            template_path = temp_root / "template.xlsx"
+            keep_path.touch()
+            template_path.touch()
+
+            summary = keep_list_runner.run_keep_list_screening_pipeline(
+                keep_workbook=keep_path,
+                template_workbook=template_path,
+                output_root=temp_root / "run",
+                platform_filters=["instagram"],
+                vision_provider="openai",
+            )
+
+        platform_summary = summary["platforms"]["instagram"]
+        self.assertEqual(summary["status"], "missing_profiles_blocked")
+        self.assertEqual(platform_summary["status"], "missing_profiles_blocked")
+        self.assertEqual(platform_summary["missing_profile_count"], 1)
+        self.assertEqual(platform_summary["missing_profiles"][0]["identifier"], "ghost")
+        self.assertTrue(platform_summary["visual_gate"]["blocked"])
+        self.assertEqual(backend_app.app.test_client().visual_start_calls, [])
+        self.assertEqual(export_calls, [])
 
     def test_runner_persists_live_platform_stage_before_scrape_poll_returns(self) -> None:
         preflight = {

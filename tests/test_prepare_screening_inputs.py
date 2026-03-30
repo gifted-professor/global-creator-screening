@@ -153,7 +153,10 @@ class PrepareScreeningInputsTests(unittest.TestCase):
             self.assertEqual(summary["upload"]["metadata_count_by_platform"]["youtube"], 0, summary)
 
             active_rulespec_path = Path(summary["active_rulespec_path"])
+            active_visual_prompts_path = Path(summary["active_visual_prompts_path"])
             self.assertTrue(active_rulespec_path.exists(), active_rulespec_path)
+            self.assertTrue(active_visual_prompts_path.exists(), active_visual_prompts_path)
+            self.assertTrue(Path(summary["rulespec"]["visual_prompts_json_path"]).exists(), summary)
 
             instagram_metadata_path = Path(summary["upload"]["upload_metadata_paths"]["instagram"])
             tiktok_metadata_path = Path(summary["upload"]["upload_metadata_paths"]["tiktok"])
@@ -309,6 +312,77 @@ class PrepareScreeningInputsTests(unittest.TestCase):
             self.assertEqual(summary["upload"]["metadata_count_by_platform"]["tiktok"], 2, summary)
             self.assertEqual(summary["upload"]["metadata_count_by_platform"]["youtube"], 1, summary)
             self.assertTrue(summary_json.exists(), summary_json)
+
+    def test_prepare_screening_inputs_skips_task_upload_resolution_when_local_inputs_are_complete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            creator_workbook = tmp_path / "keep.xlsx"
+            screening_data_dir = tmp_path / "screening_data"
+            config_dir = tmp_path / "config"
+            temp_dir = tmp_path / "temp"
+
+            build_keep_workbook(creator_workbook)
+
+            with patch("scripts.prepare_screening_inputs.resolve_task_upload_source_files") as mocked_resolver:
+                summary = prepare_screening_inputs(
+                    creator_workbook=creator_workbook,
+                    template_workbook=FIXTURE_TEMPLATE,
+                    task_name="MINISO",
+                    screening_data_dir=screening_data_dir,
+                    config_dir=config_dir,
+                    temp_dir=temp_dir,
+                )
+
+            mocked_resolver.assert_not_called()
+            self.assertEqual(summary["preflight"]["creator_input_mode"], "creator_workbook", summary)
+            self.assertEqual(summary["preflight"]["template_input_mode"], "template_workbook", summary)
+            self.assertEqual(summary["rulespec"]["source"], "template_workbook", summary)
+
+    def test_prepare_screening_inputs_clears_stale_active_visual_prompts_for_rulespec_json(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            creator_workbook = tmp_path / "creator_upload.xlsx"
+            rulespec_json = tmp_path / "rulespec.json"
+            screening_data_dir = tmp_path / "screening_data"
+            config_dir = tmp_path / "config"
+            temp_dir = tmp_path / "temp"
+
+            build_creator_workbook(creator_workbook)
+            rulespec_json.write_text(
+                json.dumps(
+                    {
+                        "platform_overrides": {
+                            "instagram": {"visual_review_cover_limit": 9},
+                            "tiktok": {"visual_review_cover_limit": 9},
+                        }
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            seeded = prepare_screening_inputs(
+                creator_workbook=creator_workbook,
+                template_workbook=FIXTURE_TEMPLATE,
+                screening_data_dir=screening_data_dir,
+                config_dir=config_dir,
+                temp_dir=temp_dir,
+            )
+            self.assertTrue(Path(seeded["active_visual_prompts_path"]).exists(), seeded)
+
+            summary = prepare_screening_inputs(
+                creator_workbook=creator_workbook,
+                rulespec_json=rulespec_json,
+                screening_data_dir=screening_data_dir,
+                config_dir=config_dir,
+                temp_dir=temp_dir,
+            )
+
+            self.assertEqual(summary["rulespec"]["source"], "rulespec_json", summary)
+            self.assertEqual(summary["rulespec"]["visual_prompts_json_path"], "", summary)
+            self.assertFalse(Path(summary["active_visual_prompts_path"]).exists(), summary)
 
 
 if __name__ == "__main__":

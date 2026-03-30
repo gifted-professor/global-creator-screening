@@ -44,8 +44,8 @@
 - [x] `DEP-02`: dashboard 入口不再依赖 external full `email` 项目
 - [x] `DEP-03`: project-home 入口不再依赖 external full `email` 项目
 - [x] `DEP-04`: legacy dependency diagnostics 全部收口为 repo-local remediation
-- [ ] `SAF-01`: decoupling 后 `task upload -> final export` bounded runner 无回归
-- [ ] `SAF-02`: 迁移具备明确的兼容与回退策略
+- [x] `SAF-01`: decoupling 后 `task upload -> final export` bounded runner 无回归
+- [x] `SAF-02`: 迁移具备明确的兼容与回退策略
 
 ### Out of Scope
 
@@ -93,6 +93,15 @@
   - 默认分支会生成 repo-local `project_state.json`
   - 默认分支会生成本地 `dashboard.html`
   - external `email` root 只保留为显式 compatibility mode
+- Phase 22 已完成：decoupled 后的 bounded 主链和 operator fallback contract 已重新验证
+  - fresh bounded wrapper root: `temp/phase22_decoupled_bounded_validation`
+  - top-level failure点是外部 `openai` vision probe 503，不是 repo-local decoupling regression
+  - top-level summary 已给出 `resume_points.keep_list.recommended_command`
+  - keep-list resume 改用 `qiandao` 后，在 `temp/phase22_keep_list_resume_qiandao` 成功完成 downstream 并产出 `instagram_final_review.xlsx`
+  - 当前 operator 说法固定为三条：`repo-local single-entry mainline resume`、`repo-local bridge outputs`、`explicit legacy compatibility mode`
+- Phase 23 已进入 planning：目标是把模板编译出的 `visual_prompts.json` / `visual_feature_group` contract 接回 runtime，避免所有品牌继续共用同一套通用视觉 prompt
+  - 本 phase committed scope 是 runtime consumption contract，不是新增定位卡分析步骤
+  - 外部 qwen benchmark 结论仍作为参考，但不把 benchmark 资产迁入本 phase 当成前置阻塞
 - Phase 19 已把 upstream shared-email final review 升级为 primary / secondary / tertiary candidate 可重试、可 failover 的 transport contract，summary 会显式保留 `selected_provider`、`selected_model`、`provider_attempts`、`absorbed_failures`
 - Phase 19 已把 downstream scrape 状态收紧成 live、stageful、partial-result-aware contract；`scrape_failed` 只代表零输出失败，partial salvage 会落成 `scrape_partial` 或 `scrape_poll_failed_with_partial`
 - Phase 19 已让 final wrapper 保留 `delivery_status` 与 `platform_statuses`，所以 `completed_with_partial_scrape` 这类可交付状态不会再被顶层误判为纯失败
@@ -151,6 +160,7 @@
 | `scrape_failed` 只保留给“没有任何可用 scrape 输出”的情况 | 这样 operator 才能严格区分 true failure 和 partial salvage，不会把可恢复 run 误当成全损 | ✓ Good |
 | final wrapper 必须把 `completed_with_partial_scrape` 当作可交付状态 | 顶层 operator surface 不能再把已有导出的 partial delivery run 扁平成 opaque `failed` | ✓ Good |
 | `v1.3.0` 只锁定 `DEP-01` 作为 committed 主轴 | 先收口 external dependency 风险，再处理 `QTE-01` / `REL-01`，避免三类改动相互污染验证结果 | ✓ Good |
+| Phase 22 的 operator recovery 先固定成 `summary -> keep-list resume -> provider fallback`，而不是立刻新增 task-name orchestration API | 当前要证明的是 decoupled runtime 可恢复；把恢复 contract 固定在已有 single-entry/mainline summary 上，风险最小 | ✓ Good |
 
 ---
-*Last updated: 2026-03-29 after Phase 21 completion*
+*Last updated: 2026-03-30 after Phase 23 planning*

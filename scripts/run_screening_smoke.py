@@ -17,7 +17,12 @@ if str(REPO_ROOT) not in sys.path:
 
 
 import backend.app as backend_app
-from scripts.prepare_screening_inputs import configure_backend_runtime, persist_active_rulespec
+from scripts.prepare_screening_inputs import (
+    clear_active_visual_prompts,
+    configure_backend_runtime,
+    persist_active_rulespec,
+    persist_active_visual_prompts,
+)
 from workbook_template_parser import compile_workbook
 
 
@@ -247,6 +252,11 @@ def run_smoke(
 
     compile_report = compile_workbook(template_workbook, parsed_output_dir)
     persist_active_rulespec(Path(compile_report["artifacts"]["rulespec_json"]))
+    visual_prompts_path = compile_report.get("artifacts", {}).get("visual_prompts_json")
+    if visual_prompts_path:
+        persist_active_visual_prompts(Path(visual_prompts_path))
+    else:
+        clear_active_visual_prompts()
 
     client = backend_app.app.test_client()
     with sample_workbook_path.open("rb") as handle:
@@ -266,9 +276,11 @@ def run_smoke(
         "output_root": str(output_root),
         "sample_workbook": str(sample_workbook_path),
         "sample": sample_summary,
+        "active_visual_prompts_path": backend_app.ACTIVE_VISUAL_PROMPTS_PATH,
         "rulespec": {
             "compile_report_path": str(Path(compile_report["output_dir"]) / "compile_report.json"),
             "rulespec_json_path": str(compile_report["artifacts"]["rulespec_json"]),
+            "visual_prompts_json_path": str(visual_prompts_path or ""),
             "warning_count": len(compile_report.get("warnings") or []),
         },
         "upload": upload_payload,
