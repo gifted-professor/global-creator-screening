@@ -4,7 +4,7 @@ milestone: v1.3.0
 milestone_name: External Email Dependency Decoupling
 status: ready_for_phase_planning
 stopped_at: Gap-closure phases 26-29 were added on 2026-03-31 to close milestone audit evidence gaps; next workflow step is `$gsd-plan-phase 26`
-last_updated: "2026-03-31T13:47:24+08:00"
+last_updated: "2026-03-31T14:10:27+08:00"
 progress:
   total_phases: 10
   completed_phases: 6
@@ -239,6 +239,7 @@ Recent decisions affecting current work:
 - 2026-03-31: Quick Task `260331-h43` — keep the local `CLIProxyAPI openai` provider guard in code, revert this machine's default visual concurrency back to `6`, and re-verify `6`-way project-code visual review runs
 - 2026-03-31: Quick Task `260331-hf8` — verify shared mailbox `partnerships@amagency.biz` on enterprise IMAP, confirm `MINISO` mail lives under `其他文件夹/邮件备份`, and prove retrieval with a repo-local recent-mail sample under `.planning/quick/260331-hf8-partnerships-amagency-biz-imap-miniso/`
 - 2026-03-31: Quick Task `260331-jq7` — bind final-review payloads to carry row-level raw `.eml` attachment candidates plus shared workbook candidates, and teach the Feishu bitable uploader to populate attachment fields from local files
+- 2026-03-31: Quick Task `260331-k2m` — switch default mail sync routing to shared mailbox first, default sent-since to today, and prefer `其他文件夹/邮件备份` when the shared mailbox lacks a task-specific folder
 - 2026-03-31: Remove remaining `.planning` absolute workstation paths so the repo can move under a new parent directory without stale local path references
 - 2026-03-29: Clarify in README/PROJECT that the Phase 18 bounded proof only proves the repo-local single-entry mainline, not full-batch or multi-platform stability, full legacy-entry decoupling, or non-`openai` provider readiness
 - 2026-03-29: Intake external qwen prompt benchmark into local context: future visual tuning should prefer dual-prompt routing (`gpt-5.4` original + `qwen-vl-max` v2) with fixed benchmark harness instead of more blind prompt chasing

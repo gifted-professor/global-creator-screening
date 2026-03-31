@@ -441,14 +441,14 @@ def sync_task_upload_mailboxes(
             employee_email = str(inspected.get("employeeEmail") or "").strip()
             imap_code = str(inspected.get("imapCode") or "").strip()
             has_employee_credentials = bool(employee_email and imap_code)
-            if has_employee_credentials:
-                resolved_account_email = employee_email
-                resolved_auth_code = imap_code
-                credential_source = "employee_directory"
-            elif default_credentials_requested:
+            if default_credentials_requested:
                 resolved_account_email = normalized_default_account_email
                 resolved_auth_code = normalized_default_auth_code
                 credential_source = "default_account"
+            elif has_employee_credentials:
+                resolved_account_email = employee_email
+                resolved_auth_code = imap_code
+                credential_source = "employee_directory"
             else:
                 resolved_account_email = employee_email
                 resolved_auth_code = imap_code
@@ -487,6 +487,7 @@ def sync_task_upload_mailboxes(
                 task_name=inspected["taskName"],
                 explicit_folder=requested_folder,
                 folder_prefixes=normalized_folder_prefixes,
+                prefer_shared_backup_folder=(credential_source == "default_account"),
             )
 
             db = Database(settings.db_path)
@@ -563,7 +564,7 @@ def sync_task_upload_mailboxes(
         "imapHost": str(imap_host or "imap.qq.com").strip() or "imap.qq.com",
         "imapPort": int(imap_port),
         "defaultCredentialMode": (
-            "employee_directory_preferred_with_default_fallback"
+            "default_account_preferred_with_employee_fallback"
             if default_credentials_requested
             else "employee_directory"
         ),
@@ -964,6 +965,7 @@ def _resolve_task_mailbox_selection(
     task_name: str,
     explicit_folder: str = "",
     folder_prefixes: list[str] | tuple[str, ...] | None = None,
+    prefer_shared_backup_folder: bool = False,
 ) -> TaskMailboxSelection:
     selectable = resolve_mailboxes(discovered_mailboxes, None)
     try:
@@ -983,6 +985,16 @@ def _resolve_task_mailbox_selection(
     except ValueError as exc:
         if not selectable:
             raise
+        if prefer_shared_backup_folder:
+            backup_folder = _find_shared_backup_mailbox(selectable)
+            if backup_folder:
+                return TaskMailboxSelection(
+                    strategy="shared_backup_folder",
+                    requested_folders=[backup_folder],
+                    resolved_folder=backup_folder,
+                    resolved_folders=[backup_folder],
+                    fallback_reason=str(exc),
+                )
         return TaskMailboxSelection(
             strategy="all_selectable_fallback",
             requested_folders=None,
@@ -990,6 +1002,25 @@ def _resolve_task_mailbox_selection(
             resolved_folders=[mailbox.display_name for mailbox in selectable],
             fallback_reason=str(exc),
         )
+
+
+def _find_shared_backup_mailbox(selectable: list[MailboxInfo]) -> str:
+    preferred_names = (
+        "其他文件夹/邮件备份",
+        "邮件备份",
+    )
+    normalized_preferred = {_normalize_lookup_key(name) for name in preferred_names}
+    for mailbox in selectable:
+        display_name = str(mailbox.display_name or "").strip()
+        normalized = _normalize_lookup_key(display_name)
+        if normalized in normalized_preferred:
+            return display_name
+    for mailbox in selectable:
+        display_name = str(mailbox.display_name or "").strip()
+        normalized = _normalize_lookup_key(display_name)
+        if normalized.endswith("/邮件备份") or normalized.endswith("邮件备份"):
+            return display_name
+    return ""
 
 
 def _parse_task_upload_workbook(*, workbook_path: Path, output_root: Path) -> dict[str, Any]:

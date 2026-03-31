@@ -459,7 +459,7 @@ class FeishuScreeningBridgeTests(unittest.TestCase):
             )
 
         self.assertTrue(result["ok"])
-        self.assertEqual(result["defaultCredentialMode"], "employee_directory_preferred_with_default_fallback")
+        self.assertEqual(result["defaultCredentialMode"], "default_account_preferred_with_employee_fallback")
         self.assertEqual(result["defaultAccountEmail"], "partnerships@amagency.biz")
         item = result["items"][0]
         self.assertFalse(item["employeeMatched"])
@@ -540,8 +540,59 @@ class FeishuScreeningBridgeTests(unittest.TestCase):
         self.assertIsNone(kwargs["requested_folders"])
         self.assertEqual(kwargs["sent_since"], date(2026, 3, 1))
 
-    def test_sync_task_upload_mailboxes_prefers_employee_credentials_before_default_account(self) -> None:
-        mail_data_dir = self.base_path / "task-mail-data-employee-priority"
+    def test_sync_task_upload_mailboxes_prefers_shared_backup_folder_for_default_account(self) -> None:
+        mail_data_dir = self.base_path / "task-mail-data-shared-backup"
+
+        class _FakeImapClient:
+            def close(self) -> None:
+                return None
+
+            def logout(self) -> None:
+                return None
+
+        with (
+            patch("feishu_screening_bridge.task_upload_sync.connect", return_value=_FakeImapClient()),
+            patch(
+                "feishu_screening_bridge.task_upload_sync.discover_mailboxes",
+                return_value=[
+                    MailboxInfo(display_name="INBOX", imap_name="INBOX", delimiter="/", flags=["\\HasNoChildren"]),
+                    MailboxInfo(display_name="其他文件夹/邮件备份", imap_name="其他文件夹/邮件备份", delimiter="/", flags=["\\HasNoChildren"]),
+                ],
+            ),
+            patch(
+                "feishu_screening_bridge.task_upload_sync.sync_mailboxes",
+                return_value=[
+                    SyncResult(
+                        folder_name="其他文件夹/邮件备份",
+                        fetched=8,
+                        skipped_state_advance=False,
+                        last_seen_uid=88,
+                        uidvalidity=9527,
+                        message_count_on_server=31195,
+                    )
+                ],
+            ) as sync_mock,
+        ):
+            result = sync_task_upload_mailboxes(
+                client=_FakeInspectionClient(self._build_new_template_workbook_bytes()),
+                task_upload_url="https://bcnorxdfy50v.feishu.cn/wiki/S0bbwTnlZiJlVMk1Q04ctPXBnje?table=tblYvtOYLoGWCRna&view=vewNwYvkQL",
+                employee_info_url="https://bcnorxdfy50v.feishu.cn/wiki/S0bbwTnlZiJlVMk1Q04ctPXBnje?table=tblQho4xE6SrOtmw&view=vewHoxVXaC",
+                download_dir=self.base_path / "downloads",
+                mail_data_dir=mail_data_dir,
+                default_account_email="partnerships@amagency.biz",
+                default_auth_code="xYeGKyNmK5jFN7Y2",
+            )
+
+        item = result["items"][0]
+        self.assertTrue(item["mailSyncOk"])
+        self.assertEqual(item["mailCredentialSource"], "default_account")
+        self.assertEqual(item["mailSyncStrategy"], "shared_backup_folder")
+        self.assertEqual(item["resolvedFolder"], "其他文件夹/邮件备份")
+        _, kwargs = sync_mock.call_args
+        self.assertEqual(kwargs["requested_folders"], ["其他文件夹/邮件备份"])
+
+    def test_sync_task_upload_mailboxes_prefers_default_account_before_employee_credentials(self) -> None:
+        mail_data_dir = self.base_path / "task-mail-data-default-priority"
 
         class _FakeImapClient:
             def close(self) -> None:
@@ -583,16 +634,16 @@ class FeishuScreeningBridgeTests(unittest.TestCase):
             )
 
         self.assertTrue(result["ok"])
-        self.assertEqual(result["defaultCredentialMode"], "employee_directory_preferred_with_default_fallback")
+        self.assertEqual(result["defaultCredentialMode"], "default_account_preferred_with_employee_fallback")
         item = result["items"][0]
         self.assertTrue(item["employeeMatched"])
-        self.assertEqual(item["mailCredentialSource"], "employee_directory")
-        self.assertEqual(item["mailLoginEmail"], "yvette@amagency.biz")
+        self.assertEqual(item["mailCredentialSource"], "default_account")
+        self.assertEqual(item["mailLoginEmail"], "partnerships@amagency.biz")
         settings = sync_mock.call_args.args[0]
-        self.assertEqual(settings.account_email, "yvette@amagency.biz")
-        self.assertEqual(settings.auth_code, "imap-yvette-123")
+        self.assertEqual(settings.account_email, "partnerships@amagency.biz")
+        self.assertEqual(settings.auth_code, "xYeGKyNmK5jFN7Y2")
 
-    def test_sync_task_upload_mail_cli_defaults_to_recent_three_months_when_omitted(self) -> None:
+    def test_sync_task_upload_mail_cli_defaults_to_today_when_omitted(self) -> None:
         mail_data_dir = self.base_path / "task-mail-data-default-window"
         env_path = self.base_path / "mail.env"
         env_path.write_text(

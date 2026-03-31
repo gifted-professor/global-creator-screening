@@ -499,7 +499,7 @@ def run_task_upload_to_keep_list_pipeline(
             },
             "mail_sync": {
                 "sent_since": resolved_sent_since,
-                "sent_since_source": "cli" if str(sent_since or "").strip() else "default_recent_3_calendar_months",
+                "sent_since_source": "cli" if str(sent_since or "").strip() else "default_today_only",
                 "mail_limit": int(max(0, int(mail_limit))),
                 "mail_workers": int(max(1, int(mail_workers))),
                 "folder_prefixes": list(folder_prefixes or ["其他文件夹"]),
@@ -609,7 +609,7 @@ def run_task_upload_to_keep_list_pipeline(
             ("TASK_UPLOAD_MAIL_AUTH_CODE", "EMAIL_AUTH_CODE"),
         )
         if resolved_default_account_email and resolved_default_auth_code:
-            credential_mode = "employee_directory_preferred_with_default_fallback"
+            credential_mode = "default_account_preferred_with_employee_fallback"
         elif resolved_default_account_email or resolved_default_auth_code:
             credential_mode = "incomplete_default_account"
         else:

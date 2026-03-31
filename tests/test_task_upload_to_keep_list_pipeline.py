@@ -264,7 +264,7 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
         self.assertIn("exists", summary["resolved_inputs"]["env_file"])
         self.assertTrue(summary["resolved_inputs"]["env_file"]["path"].endswith(".env"))
         self.assertEqual(summary["resolved_inputs"]["feishu"]["task_upload_url_source"], "env_file")
-        self.assertEqual(summary["resolved_inputs"]["mail_sync"]["sent_since_source"], "default_recent_3_calendar_months")
+        self.assertEqual(summary["resolved_inputs"]["mail_sync"]["sent_since_source"], "default_today_only")
         self.assertEqual(summary["resolved_inputs"]["paths"]["downloads_dir"]["source"], "output_root_default")
         self.assertTrue(summary["preflight"]["downloads_dir_ready"])
         self.assertEqual(summary["steps"]["mail_sync"]["resume_policy"]["stage_policy"], "always_rerun_incremental")
@@ -594,7 +594,7 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
         self.assertEqual(summary["resolved_inputs"]["mail_sync"]["default_auth_code_source"], "env_file:EMAIL_AUTH_CODE")
         self.assertEqual(
             summary["resolved_inputs"]["mail_sync"]["credential_mode"],
-            "employee_directory_preferred_with_default_fallback",
+            "default_account_preferred_with_employee_fallback",
         )
 
     def test_runner_can_reuse_existing_artifacts_from_prior_summary(self) -> None:
