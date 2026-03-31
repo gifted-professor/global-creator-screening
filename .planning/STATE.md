@@ -2,13 +2,13 @@
 gsd_state_version: 1.0
 milestone: v1.3.0
 milestone_name: External Email Dependency Decoupling
-status: ready_for_milestone_audit
-stopped_at: Phase 25 completed on 2026-03-30; next workflow step is `$gsd-audit-milestone`
-last_updated: "2026-03-30T15:07:01+08:00"
+status: ready_for_phase_planning
+stopped_at: Gap-closure phases 26-29 were added on 2026-03-31 to close milestone audit evidence gaps; next workflow step is `$gsd-plan-phase 26`
+last_updated: "2026-03-31T11:35:37+08:00"
 progress:
-  total_phases: 6
+  total_phases: 10
   completed_phases: 6
-  total_plans: 13
+  total_plans: 22
   completed_plans: 13
 ---
 
@@ -19,12 +19,12 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-30)
 
 **Core value:** 在不打断现有本地工作流的前提下，把飞书内容获取、筛选导入和相关配置集中到一个可持续维护的仓库里。
-**Current focus:** Milestone closeout after Phase 25 local operator UI delivery
+**Current focus:** Plan and execute gap-closure phases 26-29 so `v1.3.0` can pass re-audit
 
 ## Current Position
 
-Phase: 25 (Build local thin operator UI for task-driven screening runs) — COMPLETED
-Plan: 2 of 2 completed
+Gap-closure planning ready: `v1.3.0` phases `26-29`
+Current route: plan Phase 26, then close remaining audit evidence gaps before re-audit
 
 ## Performance Metrics
 
@@ -60,6 +60,10 @@ Plan: 2 of 2 completed
 | 23 | 3 | n/a | n/a |
 | 24 | 2 | n/a | n/a |
 | 25 | 2 | n/a | n/a |
+| 26 | 2 | n/a | n/a |
+| 27 | 2 | n/a | n/a |
+| 28 | 3 | n/a | n/a |
+| 29 | 2 | n/a | n/a |
 
 **Recent Trend:**
 
@@ -162,11 +166,18 @@ Recent decisions affecting current work:
 - Phase 23 added: Wire template-compiled visual prompts into runtime and define visual feature-group contract
 - Phase 24 added: Add post-visual-review positioning-card analysis step for approved creators
 - Phase 25 added: Build local thin operator UI for task-driven screening runs
+- Phase 26 added: Backfill decoupling verification bundle for Phases 20-21
+- Phase 27 added: Reconstruct runtime safety proof and fallback certification for Phase 22
+- Phase 28 added: Reconstruct visual runtime and positioning evidence chain for Phases 23-24
+- Phase 29 added: Reconstruct operator UI evidence bundle and milestone closeout consistency
 
 ### Pending Todos
 
-- Milestone audit / closeout: 执行 `v1.3.0` closeout，确认 Phases 20-25 与 deferred follow-ups 的边界
-- Milestone closeout: `v1.3.0` 的 audit / closeout 顺延到 Phase 25 完成之后，再一起确认 Phases 20-25 与 deferred follow-ups 的边界
+- Phase 26 planning: 为 Phases 20-21 补齐 verification bundle、summary frontmatter 与 DEP traceability 收口
+- Phase 27 planning: 重建 Phase 22 planning/sumary/verification artifact，并把 bounded proof 与 fallback contract 固化到正式 phase 文档
+- Phase 28 planning: 补建 Phase 23 artifact bundle，并为 Phase 24 增加正式 verification 和 `23 -> 24` integration 证据
+- Phase 29 planning: 补建 Phase 25 operator UI artifact bundle，并收口 roadmap/state/audit closeout 口径
+- Milestone closeout: gap phases 完成后重新执行 `v1.3.0` audit / closeout，再确认 deferred follow-ups 边界
 - Deferred debt intake: `backend/app.py` 模块化 + app factory、shared settings loader、`pipeline_runtime.py` 抽取、SQLite WAL/FTS、upload/job hardening、LLM config consolidation、`pyproject.toml`/lint/typecheck、以及 workbook handle cleanup
 
 ### Blockers/Concerns
@@ -234,6 +245,6 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-Last session: 2026-03-30 15:07
-Stopped at: Phase 25 completed on 2026-03-30; next workflow step is `$gsd-audit-milestone`
+Last session: 2026-03-31 11:35
+Stopped at: Gap-closure phases 26-29 created; next workflow step is `$gsd-plan-phase 26`
 Resume file: None
