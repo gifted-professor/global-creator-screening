@@ -51,11 +51,11 @@ class MainCliTests(unittest.TestCase):
     def test_subtract_calendar_months_clamps_end_of_month(self) -> None:
         self.assertEqual(subtract_calendar_months(date(2026, 5, 31), 3), date(2026, 2, 28))
 
-    def test_resolve_sync_sent_since_defaults_to_recent_three_months(self) -> None:
-        self.assertEqual(resolve_sync_sent_since(None, today=date(2026, 3, 27)), date(2025, 12, 27))
+    def test_resolve_sync_sent_since_defaults_to_today(self) -> None:
+        self.assertEqual(resolve_sync_sent_since(None, today=date(2026, 3, 27)), date(2026, 3, 27))
 
-    def test_default_sync_sent_since_uses_calendar_month_window(self) -> None:
-        self.assertEqual(default_sync_sent_since(today=date(2026, 3, 27)), date(2025, 12, 27))
+    def test_default_sync_sent_since_uses_today_window(self) -> None:
+        self.assertEqual(default_sync_sent_since(today=date(2026, 3, 27)), date(2026, 3, 27))
 
     def test_query_parser_keeps_filters(self) -> None:
         args = self.parser.parse_args(

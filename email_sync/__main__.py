@@ -39,7 +39,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sync.add_argument("--limit", type=int, help="只抓最新 N 封用于测试，不推进增量游标")
     sync.add_argument("--reset-state", action="store_true", help="忽略本地游标，重新全量扫描")
     sync.add_argument("--workers", type=int, default=1, help="并发抓取 worker 数，默认 1")
-    sync.add_argument("--sent-since", help="只抓这个日期及之后的邮件，格式 YYYY-MM-DD；默认最近 3 个月")
+    sync.add_argument("--sent-since", help="只抓这个日期及之后的邮件，格式 YYYY-MM-DD；默认今天")
 
     stats = subparsers.add_parser("stats", help="查看本地 SQLite 里的统计")
     stats.add_argument("--env-file", default=".env", help="配置文件路径，默认 ./.env")
