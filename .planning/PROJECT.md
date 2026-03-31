@@ -67,7 +67,7 @@
 
 `v1.1.0` 已证明此前的 `auth_not_found` 不是“现在 apikey 没填好”，而是旧 provider 路径不稳定；当前显式 `openai` 路径已经 real run 成功。与此同时，用户还提供了一条在 `MINISO` 三个月真实邮件上验证过的更快上游路径：按品牌关键词筛信、邮箱精确匹配总表、按 IGlink 去重、拆唯一/共享邮箱、共享邮箱先看邮件内容再决定，只有极少数尾部交给 LLM / 人工。`16.1` 已经把这条 fast-path 泛化并串进单入口上游 runner；`18-01` 则进一步把它和 keep-list 下游串成一个 thin final wrapper，并在 `temp/phase18_real_bounded_e2e_final2` 留下了一轮真实 bounded `task upload -> final export` proof。
 
-另外，`/Users/a1234/Desktop/Coding/网红/chuhai/筛号/docs/2026-03-29-qwen-prompt-benchmark.md` 里已经沉淀了一轮独立的视觉 prompt benchmark，可作为后续视觉优化参考：当前更实用的路线不是继续强行用 prompt 追平 GPT，而是保留 `gpt-5.4` 原始 prompt，给 `qwen-vl-max` 单独使用最佳 `v2` prompt，并按 `gpt-5.4 -> qwen-vl-max` 顺序路由。该 benchmark 还验证了 provider-specific prompt file、`SKIP_OPENAI=1`、`REFERENCE_RUN_PATH` 与结果落盘 harness，这些做法如果未来重新开启视觉优化或 fallback 调优，可以直接复用。
+另外，外部 sibling `筛号` 项目的 `docs/2026-03-29-qwen-prompt-benchmark.md` 里已经沉淀了一轮独立的视觉 prompt benchmark，可作为后续视觉优化参考：当前更实用的路线不是继续强行用 prompt 追平 GPT，而是保留 `gpt-5.4` 原始 prompt，给 `qwen-vl-max` 单独使用最佳 `v2` prompt，并按 `gpt-5.4 -> qwen-vl-max` 顺序路由。该 benchmark 还验证了 provider-specific prompt file、`SKIP_OPENAI=1`、`REFERENCE_RUN_PATH` 与结果落盘 harness，这些做法如果未来重新开启视觉优化或 fallback 调优，可以直接复用。
 
 ## Current State
 
