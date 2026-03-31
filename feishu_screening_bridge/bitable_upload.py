@@ -30,7 +30,6 @@ _INTERNAL_PAYLOAD_KEYS = {
     "达人对接人_employee_email",
     "达人对接人_owner_name",
     "linked_bitable_url",
-    "任务名",
     "__last_mail_raw_path",
     "__feishu_attachment_local_paths",
     "__feishu_shared_attachment_local_paths",
@@ -46,7 +45,8 @@ _MAIL_ONLY_FIELD_NAMES = (
     "达人回复的最后一封邮件内容",
 )
 
-_UPLOAD_KEY_FIELDS = ("达人ID", "平台")
+_UPLOAD_BASE_KEY_FIELDS = ("达人ID", "平台")
+_OWNER_SCOPE_FIELD_CANDIDATES = ("达人对接人",)
 _PREFERRED_TARGET_TABLE_NAMES = ("AI回信管理", "达人管理")
 _PREFERRED_TARGET_VIEW_NAMES = ("表格", "总视图")
 
@@ -63,6 +63,7 @@ class FieldSchema:
 class ExistingRecordSnapshot:
     record_id: str
     fields: dict[str, Any]
+    owner_scope_value: str
     creator_id: str
     platform: str
 
@@ -71,6 +72,10 @@ class ExistingRecordSnapshot:
 class ExistingRecordAnalysis:
     index: dict[str, dict[str, Any]]
     duplicate_groups: list[dict[str, Any]]
+    key_field_names: tuple[str, ...]
+    key_display_name: str
+    owner_scope_field_name: str
+    owner_scope_missing_record_count: int
 
 
 def upload_final_review_payload_to_bitable(
@@ -110,8 +115,13 @@ def upload_final_review_payload_to_bitable(
     resolved_view = resolve_bitable_view_from_url(client, target_url)
     field_schemas = _fetch_field_schemas(client, resolved_view)
     attachment_schema = _select_attachment_field_schema(field_schemas)
-    existing_record_analysis = _build_existing_record_analysis(_fetch_existing_records(client, resolved_view))
+    existing_record_analysis = _build_existing_record_analysis(
+        _fetch_existing_records(client, resolved_view),
+        field_schemas=field_schemas,
+    )
     existing_records = existing_record_analysis.index
+    key_field_names = existing_record_analysis.key_field_names
+    key_display_name = existing_record_analysis.key_display_name or "达人对接人+达人ID+平台"
 
     rows = list(payload.get("rows") or [])
     if limit > 0:
@@ -121,10 +131,37 @@ def upload_final_review_payload_to_bitable(
     updated_rows: list[dict[str, Any]] = []
     skipped_existing_rows: list[dict[str, Any]] = []
     failed_rows: list[dict[str, Any]] = []
-    payload_duplicate_groups = _find_payload_duplicate_groups(rows)
+    payload_duplicate_groups = _find_payload_duplicate_groups(rows, key_field_names=key_field_names)
     duplicate_existing_groups = list(existing_record_analysis.duplicate_groups)
+    payload_owner_scopes = _extract_payload_owner_scopes(rows)
+    missing_owner_scope_field = bool(payload_owner_scopes) and not existing_record_analysis.owner_scope_field_name
+    has_unscoped_existing_records = bool(payload_owner_scopes) and int(
+        existing_record_analysis.owner_scope_missing_record_count or 0
+    ) > 0
 
-    if duplicate_existing_groups or payload_duplicate_groups:
+    if missing_owner_scope_field or has_unscoped_existing_records or duplicate_existing_groups or payload_duplicate_groups:
+        if missing_owner_scope_field:
+            failed_rows.append(
+                {
+                    "status": "blocked_missing_owner_scope_field",
+                    "record_key": "",
+                    "record_id": "",
+                    "existing_record_id": "",
+                    "row": {},
+                    "error": "目标飞书表缺少 `达人对接人` 字段，无法区分不同负责人下重复的达人记录，已阻止继续写入。",
+                }
+            )
+        if has_unscoped_existing_records:
+            failed_rows.append(
+                {
+                    "status": "blocked_missing_owner_scope_existing_records",
+                    "record_key": "",
+                    "record_id": "",
+                    "existing_record_id": "",
+                    "row": {},
+                    "error": "目标飞书表已存在未填写 `达人对接人` 的历史记录，当前无法安全区分不同负责人下的达人，已阻止继续写入。",
+                }
+            )
         for group in duplicate_existing_groups:
             keep_record = dict(group.get("keep_record") or {})
             for duplicate_record in list(group.get("duplicate_records") or []):
@@ -135,7 +172,7 @@ def upload_final_review_payload_to_bitable(
                         "record_id": duplicate_record.get("record_id") or "",
                         "existing_record_id": keep_record.get("record_id") or "",
                         "row": dict(duplicate_record.get("fields") or {}),
-                        "error": "目标飞书表已存在重复的 达人ID+平台 记录，已阻止继续写入。",
+                        "error": f"目标飞书表已存在重复的 {key_display_name} 记录，已阻止继续写入。",
                     }
                 )
         for group in payload_duplicate_groups:
@@ -148,7 +185,7 @@ def upload_final_review_payload_to_bitable(
                         "record_id": "",
                         "existing_record_id": "",
                         "row": dict(duplicate_row or {}),
-                        "error": "当前上传 payload 内部存在重复的 达人ID+平台 记录，已阻止继续写入。",
+                        "error": f"当前上传 payload 内部存在重复的 {key_display_name} 记录，已阻止继续写入。",
                     }
                 )
             if not failed_rows and first_row:
@@ -159,9 +196,16 @@ def upload_final_review_payload_to_bitable(
                         "record_id": "",
                         "existing_record_id": "",
                         "row": first_row,
-                        "error": "当前上传 payload 内部存在重复的 达人ID+平台 记录，已阻止继续写入。",
+                        "error": f"当前上传 payload 内部存在重复的 {key_display_name} 记录，已阻止继续写入。",
                     }
                 )
+        error_messages: list[str] = []
+        if missing_owner_scope_field:
+            error_messages.append("目标飞书表缺少 `达人对接人` 字段")
+        if has_unscoped_existing_records:
+            error_messages.append("目标飞书表存在未填写 `达人对接人` 的历史记录")
+        if duplicate_existing_groups or payload_duplicate_groups:
+            error_messages.append(f"目标飞书表或当前 payload 存在重复的 {key_display_name} 记录")
         summary = {
             "ok": False,
             "dry_run": bool(dry_run),
@@ -182,7 +226,11 @@ def upload_final_review_payload_to_bitable(
             "skipped_existing_count": 0,
             "failed_count": len(failed_rows),
             "guard_blocked": True,
-            "error": "目标飞书表或当前 payload 存在重复的 达人ID+平台 记录，已阻止继续写入。",
+            "error": "；".join(error_messages) + "，已阻止继续写入。",
+            "key_field_names": list(key_field_names),
+            "key_display_name": key_display_name,
+            "owner_scope_field_name": existing_record_analysis.owner_scope_field_name,
+            "owner_scope_missing_record_count": existing_record_analysis.owner_scope_missing_record_count,
             "duplicate_existing_group_count": len(duplicate_existing_groups),
             "duplicate_payload_group_count": len(payload_duplicate_groups),
             "duplicate_existing_groups": duplicate_existing_groups,
@@ -200,7 +248,7 @@ def upload_final_review_payload_to_bitable(
     for row in rows:
         if not isinstance(row, dict):
             continue
-        record_key = _build_record_key(row.get("达人ID"), row.get("平台"))
+        record_key = _build_payload_record_key(row, key_field_names=key_field_names)
         existing_record = existing_records.get(record_key) if record_key else None
         update_mode = _resolve_row_update_mode(row)
         should_update_existing = existing_record is not None and update_mode in {
@@ -214,7 +262,7 @@ def upload_final_review_payload_to_bitable(
                     "record_key": record_key,
                     "existing_record_id": "",
                     "row": row,
-                    "reason": "邮件字段更新模式要求飞书中已存在同达人ID+平台记录",
+                    "reason": f"邮件字段更新模式要求飞书中已存在同 {key_display_name} 记录",
                 }
             )
             continue
@@ -225,7 +273,7 @@ def upload_final_review_payload_to_bitable(
                     "record_key": record_key,
                     "existing_record_id": existing_record["record_id"],
                     "row": row,
-                    "reason": "飞书表已存在同达人ID+平台记录",
+                    "reason": f"飞书表已存在同 {key_display_name} 记录",
                 }
             )
             continue
@@ -564,18 +612,33 @@ def _build_existing_record_index(existing_records: list[tuple[str, dict[str, Any
     return _build_existing_record_analysis(existing_records).index
 
 
-def _build_existing_record_analysis(existing_records: list[tuple[str, dict[str, Any]]]) -> ExistingRecordAnalysis:
+def _build_existing_record_analysis(
+    existing_records: list[tuple[str, dict[str, Any]]],
+    *,
+    field_schemas: dict[str, FieldSchema] | None = None,
+) -> ExistingRecordAnalysis:
+    owner_scope_field_name = _resolve_owner_scope_field_name(field_schemas or {})
+    key_field_names = _resolve_key_field_names(owner_scope_field_name)
+    key_display_name = _format_key_field_names(key_field_names)
     grouped: dict[str, list[ExistingRecordSnapshot]] = {}
+    owner_scope_missing_record_count = 0
     for record_id, fields in existing_records:
         creator_id = _flatten_field_value(fields.get("达人ID"))
         platform = _flatten_field_value(fields.get("平台"))
-        key = _build_record_key(creator_id, platform)
+        if not creator_id or not platform:
+            continue
+        owner_scope_value = _extract_existing_owner_scope(fields, owner_scope_field_name)
+        if owner_scope_field_name and not owner_scope_value:
+            owner_scope_missing_record_count += 1
+            continue
+        key = _build_record_key(*([owner_scope_value] if owner_scope_field_name else []), creator_id, platform)
         if not key:
             continue
         grouped.setdefault(key, []).append(
             ExistingRecordSnapshot(
                 record_id=record_id,
                 fields=dict(fields or {}),
+                owner_scope_value=owner_scope_value,
                 creator_id=creator_id,
                 platform=platform,
             )
@@ -595,6 +658,7 @@ def _build_existing_record_analysis(existing_records: list[tuple[str, dict[str, 
         duplicate_groups.append(
             {
                 "record_key": record_key,
+                "owner_scope_value": keep.owner_scope_value,
                 "creator_id": keep.creator_id,
                 "platform": keep.platform,
                 "keep_record": {
@@ -610,7 +674,14 @@ def _build_existing_record_analysis(existing_records: list[tuple[str, dict[str, 
                 ],
             }
         )
-    return ExistingRecordAnalysis(index=index, duplicate_groups=duplicate_groups)
+    return ExistingRecordAnalysis(
+        index=index,
+        duplicate_groups=duplicate_groups,
+        key_field_names=key_field_names,
+        key_display_name=key_display_name,
+        owner_scope_field_name=owner_scope_field_name,
+        owner_scope_missing_record_count=owner_scope_missing_record_count,
+    )
 
 
 def fetch_existing_bitable_record_index(
@@ -619,8 +690,9 @@ def fetch_existing_bitable_record_index(
     linked_bitable_url: str,
 ) -> tuple[ResolvedBitableView, dict[str, dict[str, Any]]]:
     resolved_view = resolve_bitable_view_from_url(client, _canonicalize_target_url(client, linked_bitable_url))
+    field_schemas = _fetch_field_schemas(client, resolved_view)
     existing_records = _fetch_existing_records(client, resolved_view)
-    return resolved_view, _build_existing_record_index(existing_records)
+    return resolved_view, _build_existing_record_analysis(existing_records, field_schemas=field_schemas).index
 
 
 def fetch_existing_bitable_record_analysis(
@@ -629,16 +701,16 @@ def fetch_existing_bitable_record_analysis(
     linked_bitable_url: str,
 ) -> tuple[ResolvedBitableView, ExistingRecordAnalysis]:
     resolved_view = resolve_bitable_view_from_url(client, _canonicalize_target_url(client, linked_bitable_url))
+    field_schemas = _fetch_field_schemas(client, resolved_view)
     existing_records = _fetch_existing_records(client, resolved_view)
-    return resolved_view, _build_existing_record_analysis(existing_records)
+    return resolved_view, _build_existing_record_analysis(existing_records, field_schemas=field_schemas)
 
 
-def _build_record_key(creator_id: Any, platform: Any) -> str:
-    left = _flatten_field_value(creator_id).casefold()
-    right = _flatten_field_value(platform).casefold()
-    if not left or not right:
+def _build_record_key(*parts: Any) -> str:
+    normalized_parts = [_flatten_field_value(part).casefold() for part in parts]
+    if any(not part for part in normalized_parts):
         return ""
-    return f"{left}::{right}"
+    return "::".join(normalized_parts)
 
 
 def _flatten_field_value(value: Any) -> str:
@@ -679,12 +751,16 @@ def _existing_record_sort_key(snapshot: ExistingRecordSnapshot) -> tuple[Any, ..
     )
 
 
-def _find_payload_duplicate_groups(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _find_payload_duplicate_groups(
+    rows: list[dict[str, Any]],
+    *,
+    key_field_names: tuple[str, ...] = _UPLOAD_BASE_KEY_FIELDS,
+) -> list[dict[str, Any]]:
     grouped: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         if not isinstance(row, dict):
             continue
-        record_key = _build_record_key(row.get("达人ID"), row.get("平台"))
+        record_key = _build_payload_record_key(row, key_field_names=key_field_names)
         if not record_key:
             continue
         grouped.setdefault(record_key, []).append(dict(row))
@@ -695,12 +771,87 @@ def _find_payload_duplicate_groups(rows: list[dict[str, Any]]) -> list[dict[str,
         duplicates.append(
             {
                 "record_key": record_key,
+                "owner_scope_value": _extract_payload_owner_scope(grouped_rows[0])
+                if len(key_field_names) > 2
+                else "",
                 "creator_id": _flatten_field_value(grouped_rows[0].get("达人ID")),
                 "platform": _flatten_field_value(grouped_rows[0].get("平台")),
                 "rows": grouped_rows,
             }
         )
     return duplicates
+
+
+def _resolve_owner_scope_field_name(field_schemas: dict[str, FieldSchema]) -> str:
+    for candidate in _OWNER_SCOPE_FIELD_CANDIDATES:
+        schema = _lookup_field_schema(field_schemas, candidate)
+        if schema is not None:
+            return schema.field_name
+    return ""
+
+
+def _resolve_key_field_names(owner_scope_field_name: str) -> tuple[str, ...]:
+    if _clean_text(owner_scope_field_name):
+        return (owner_scope_field_name, *_UPLOAD_BASE_KEY_FIELDS)
+    return _UPLOAD_BASE_KEY_FIELDS
+
+
+def _format_key_field_names(key_field_names: tuple[str, ...]) -> str:
+    return "+".join(str(name).strip() for name in key_field_names if str(name).strip())
+
+
+def _get_field_value_by_candidates(fields: dict[str, Any], *candidates: str) -> Any:
+    normalized_candidates = {_normalize_field_key(name) for name in candidates if _clean_text(name)}
+    for key, value in (fields or {}).items():
+        if _normalize_field_key(str(key or "")) in normalized_candidates:
+            return value
+    return ""
+
+
+def _build_payload_record_key(row: dict[str, Any], *, key_field_names: tuple[str, ...]) -> str:
+    values: list[Any] = []
+    for field_name in key_field_names:
+        if field_name == "达人对接人":
+            values.append(_extract_payload_owner_scope(row))
+        else:
+            values.append(row.get(field_name))
+    return _build_record_key(*values)
+
+
+def _extract_payload_owner_scopes(rows: list[dict[str, Any]]) -> set[str]:
+    owner_scopes: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        owner_scope = _extract_payload_owner_scope(row)
+        if owner_scope:
+            owner_scopes.add(owner_scope)
+    return owner_scopes
+
+
+def _extract_payload_owner_scope(row: dict[str, Any]) -> str:
+    return (
+        _clean_text(row.get("达人对接人_employee_id"))
+        or _clean_text(row.get("达人对接人"))
+        or _clean_text(row.get("达人对接人_owner_name"))
+        or _clean_text(row.get("达人对接人_employee_email"))
+    )
+
+
+def _extract_existing_owner_scope(fields: dict[str, Any], owner_scope_field_name: str) -> str:
+    if not _clean_text(owner_scope_field_name):
+        return ""
+    value = _get_field_value_by_candidates(fields, owner_scope_field_name)
+    if isinstance(value, list):
+        parts = [_extract_existing_owner_scope({"达人对接人": item}, "达人对接人") for item in value]
+        return "；".join(part for part in parts if part)
+    if isinstance(value, dict):
+        for key in ("id", "email", "name", "en_name", "text", "value", "link"):
+            candidate = _clean_text(value.get(key))
+            if candidate:
+                return candidate
+        return ""
+    return _clean_text(value)
 
 
 def _normalize_field_key(name: str) -> str:

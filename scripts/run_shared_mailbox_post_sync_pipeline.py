@@ -4,6 +4,7 @@ import argparse
 from datetime import datetime
 import json
 from pathlib import Path
+import re
 import sys
 from typing import Any, Sequence
 
@@ -34,10 +35,12 @@ _TASK_GROUP_ALIASES = {
 _TASK_GROUP_DEFAULT_BRAND_KEYWORDS = {
     "skg": "SKG",
 }
+_TASK_GROUP_SUFFIX_PATTERN = re.compile(r"(?:[-_\s]*\d+)$")
 
 
 def _load_runtime_dependencies() -> dict[str, Any]:
     from feishu_screening_bridge.bitable_upload import (
+        fetch_existing_bitable_record_analysis,
         fetch_existing_bitable_record_index,
         upload_final_review_payload_to_bitable,
     )
@@ -50,6 +53,7 @@ def _load_runtime_dependencies() -> dict[str, Any]:
     return {
         "DEFAULT_FEISHU_BASE_URL": DEFAULT_FEISHU_BASE_URL,
         "FeishuOpenClient": FeishuOpenClient,
+        "fetch_existing_bitable_record_analysis": fetch_existing_bitable_record_analysis,
         "fetch_existing_bitable_record_index": fetch_existing_bitable_record_index,
         "inspect_task_upload_assignments": inspect_task_upload_assignments,
         "load_local_env": load_local_env,
@@ -165,12 +169,11 @@ def _get_field_value(fields: dict[str, Any], *candidates: str) -> Any:
     return ""
 
 
-def _build_record_key(creator_id: Any, platform: Any) -> str:
-    left = _clean_text(creator_id).casefold()
-    right = _clean_text(platform).casefold()
-    if not left or not right:
+def _build_record_key(*parts: Any) -> str:
+    normalized_parts = [_clean_text(part).casefold() for part in parts]
+    if any(not part for part in normalized_parts):
         return ""
-    return f"{left}::{right}"
+    return "::".join(normalized_parts)
 
 
 def _extract_creator_id(keep_row: dict[str, Any]) -> str:
@@ -391,10 +394,20 @@ def _combine_payloads(
     }
 
 
-def _filter_keep_frame_for_full_screening(keep_frame: pd.DataFrame, full_screening_keys: set[str]) -> pd.DataFrame:
+def _filter_keep_frame_for_full_screening(
+    keep_frame: pd.DataFrame,
+    full_screening_keys: set[str],
+    *,
+    owner_scope_value: str,
+    owner_scope_enabled: bool,
+) -> pd.DataFrame:
     rows: list[dict[str, Any]] = []
     for record in keep_frame.to_dict(orient="records"):
-        key = _build_record_key(_extract_creator_id(record), _extract_platform(record))
+        key = (
+            _build_record_key(owner_scope_value, _extract_creator_id(record), _extract_platform(record))
+            if owner_scope_enabled
+            else _build_record_key(_extract_creator_id(record), _extract_platform(record))
+        )
         if key in full_screening_keys:
             rows.append(dict(record))
     return pd.DataFrame(rows, columns=list(keep_frame.columns))
@@ -419,19 +432,75 @@ def _collect_task_filters(values: Sequence[str] | None) -> set[str]:
     return expanded
 
 
+def _derive_task_group_key(value: str) -> str:
+    normalized = _clean_text(value).casefold()
+    if not normalized:
+        return ""
+    stripped = _TASK_GROUP_SUFFIX_PATTERN.sub("", normalized).rstrip("-_ ")
+    compact = re.sub(r"[\s\-_]+", "", stripped)
+    if compact:
+        return compact
+    return re.sub(r"[\s\-_]+", "", normalized)
+
+
+def _derive_default_brand_keyword(task_name: str) -> str:
+    text = _clean_text(task_name)
+    if not text:
+        return ""
+    stripped = _TASK_GROUP_SUFFIX_PATTERN.sub("", text).rstrip("-_ ")
+    return stripped or text
+
+
+def _resolve_requested_task_names(
+    inspection_items: Sequence[dict[str, Any]],
+    requested_filters: set[str],
+) -> set[str]:
+    if not requested_filters:
+        return {
+            _clean_text(item.get("taskName")).casefold()
+            for item in inspection_items
+            if _clean_text(item.get("taskName"))
+        }
+
+    exact_names: set[str] = set()
+    grouped_names: dict[str, set[str]] = {}
+    for item in inspection_items:
+        normalized_name = _clean_text(item.get("taskName")).casefold()
+        if not normalized_name:
+            continue
+        exact_names.add(normalized_name)
+        group_key = _derive_task_group_key(normalized_name)
+        if group_key:
+            grouped_names.setdefault(group_key, set()).add(normalized_name)
+
+    resolved: set[str] = set()
+    for task_filter in requested_filters:
+        if task_filter in exact_names:
+            resolved.add(task_filter)
+            continue
+        alias_values = _TASK_GROUP_ALIASES.get(task_filter)
+        if alias_values:
+            alias_matches = {name for name in exact_names if name in alias_values}
+            if alias_matches:
+                resolved.update(alias_matches)
+                continue
+        group_key = _derive_task_group_key(task_filter)
+        if group_key in grouped_names:
+            resolved.update(grouped_names[group_key])
+    return resolved
+
+
 def _resolve_group_brand_keyword(
     *,
     task_name: str,
-    requested_filters: set[str],
     explicit_brand_keyword: str,
 ) -> str:
     if _clean_text(explicit_brand_keyword):
         return _clean_text(explicit_brand_keyword)
-    normalized_task_name = _clean_text(task_name).casefold()
-    for group_name, alias_values in _TASK_GROUP_ALIASES.items():
-        if normalized_task_name in alias_values and requested_filters.intersection(alias_values):
-            return _TASK_GROUP_DEFAULT_BRAND_KEYWORDS.get(group_name, "")
-    return ""
+    group_key = _derive_task_group_key(task_name)
+    if group_key in _TASK_GROUP_DEFAULT_BRAND_KEYWORDS:
+        return _TASK_GROUP_DEFAULT_BRAND_KEYWORDS[group_key]
+    return _derive_default_brand_keyword(task_name)
 
 
 def _build_feishu_client(
@@ -495,7 +564,7 @@ def run_shared_mailbox_post_sync_pipeline(
     timeout_seconds: float = 0.0,
     owner_email_overrides: dict[str, str] | None = None,
     folder_prefixes: list[str] | None = None,
-    matching_strategy: str = "legacy-enrichment",
+    matching_strategy: str = "brand-keyword-fast-path",
     brand_keyword: str = "",
     brand_match_include_from: bool = False,
     platform_filters: list[str] | None = None,
@@ -510,7 +579,7 @@ def run_shared_mailbox_post_sync_pipeline(
 ) -> dict[str, Any]:
     runtime = _load_runtime_dependencies()
     inspect_task_upload_assignments = runtime["inspect_task_upload_assignments"]
-    fetch_existing_bitable_record_index = runtime["fetch_existing_bitable_record_index"]
+    fetch_existing_bitable_record_analysis = runtime["fetch_existing_bitable_record_analysis"]
     run_task_upload_to_keep_list_pipeline = runtime["run_task_upload_to_keep_list_pipeline"]
     run_keep_list_screening_pipeline = runtime["run_keep_list_screening_pipeline"]
     upload_final_review_payload_to_bitable = runtime["upload_final_review_payload_to_bitable"]
@@ -546,6 +615,7 @@ def run_shared_mailbox_post_sync_pipeline(
         "existing_unscreened_count": 0,
         "full_screening_count": 0,
         "mail_only_update_count": 0,
+        "skipped_existing_count": 0,
         "created_record_count": 0,
         "updated_record_count": 0,
         "failed_record_count": 0,
@@ -587,11 +657,12 @@ def run_shared_mailbox_post_sync_pipeline(
         for item in (inspection.get("items") or [])
         if isinstance(item, dict) and _clean_text(item.get("taskName"))
     ]
+    resolved_task_names = _resolve_requested_task_names(inspection_items, requested_task_filters)
     if requested_task_filters:
         inspection_items = [
             item
             for item in inspection_items
-            if _clean_text(item.get("taskName")).casefold() in requested_task_filters
+            if _clean_text(item.get("taskName")).casefold() in resolved_task_names
         ]
 
     summary["task_count"] = len(inspection_items)
@@ -605,6 +676,7 @@ def run_shared_mailbox_post_sync_pipeline(
     _write_json(run_summary_path, summary)
 
     aggregate_failed_rows: list[dict[str, Any]] = []
+    aggregate_existing_skip_rows: list[dict[str, Any]] = []
     any_task_failed = False
 
     for item in inspection_items:
@@ -619,6 +691,7 @@ def run_shared_mailbox_post_sync_pipeline(
             "matched_mail_count": 0,
             "full_screening_count": 0,
             "mail_only_update_count": 0,
+            "skipped_existing_count": 0,
             "created_count": 0,
             "updated_count": 0,
             "failed_count": 0,
@@ -654,7 +727,6 @@ def run_shared_mailbox_post_sync_pipeline(
                 matching_strategy=matching_strategy,
                 brand_keyword=_resolve_group_brand_keyword(
                     task_name=task_name,
-                    requested_filters=requested_task_filters,
                     explicit_brand_keyword=brand_keyword,
                 ),
                 brand_match_include_from=bool(brand_match_include_from),
@@ -701,9 +773,45 @@ def run_shared_mailbox_post_sync_pipeline(
             keep_frame = pd.read_excel(keep_workbook)
             owner_context = _build_owner_context_from_upstream(upstream_summary, item)
             linked_bitable_url = _clean_text(owner_context.get("linked_bitable_url")) or _clean_text(item.get("linkedBitableUrl"))
-            _, existing_index = fetch_existing_bitable_record_index(
+            _, existing_analysis = fetch_existing_bitable_record_analysis(
                 client,
                 linked_bitable_url=linked_bitable_url,
+            )
+            duplicate_existing_groups = list(existing_analysis.duplicate_groups)
+            if duplicate_existing_groups:
+                failure = _build_failure_payload(
+                    stage="feishu_existing_guard",
+                    error_code="FEISHU_DUPLICATE_RECORDS_DETECTED",
+                    message="目标飞书表存在重复的 达人ID+平台 记录，已阻止继续执行当前任务。",
+                    remediation="先清理目标飞书表中的重复记录，再重跑共享邮箱 post-sync 主线。",
+                    details={
+                        "task_name": task_name,
+                        "linked_bitable_url": linked_bitable_url,
+                        "duplicate_group_count": len(duplicate_existing_groups),
+                    },
+                )
+                task_result["status"] = "guard_blocked_duplicate_existing"
+                task_result["failed_count"] = len(duplicate_existing_groups)
+                task_result["failure"] = failure
+                task_result["duplicate_existing_group_count"] = len(duplicate_existing_groups)
+                summary["failed_record_count"] += task_result["failed_count"]
+                any_task_failed = True
+                aggregate_failed_rows.append(
+                    {
+                        "task_name": task_name,
+                        "stage": failure["stage"],
+                        "reason": failure["message"],
+                        "row": {},
+                    }
+                )
+                summary["task_results"].append(task_result)
+                _write_json(task_summary_path, task_result)
+                _write_json(run_summary_path, summary)
+                continue
+            existing_index = existing_analysis.index
+            owner_scope_enabled = bool(_clean_text(getattr(existing_analysis, "owner_scope_field_name", "")))
+            owner_scope_value = _clean_text(owner_context.get("employee_id")) or _clean_text(
+                owner_context.get("responsible_name")
             )
 
             matched_mail_count = _extract_matched_mail_count(upstream_summary, keep_frame)
@@ -717,7 +825,11 @@ def run_shared_mailbox_post_sync_pipeline(
             for keep_row in keep_frame.to_dict(orient="records"):
                 creator_id = _extract_creator_id(keep_row)
                 platform = _extract_platform(keep_row)
-                record_key = _build_record_key(creator_id, platform)
+                record_key = (
+                    _build_record_key(owner_scope_value, creator_id, platform)
+                    if owner_scope_enabled
+                    else _build_record_key(creator_id, platform)
+                )
                 existing_record = existing_index.get(record_key) if record_key else None
                 if existing_record is None:
                     new_creator_count += 1
@@ -744,7 +856,12 @@ def run_shared_mailbox_post_sync_pipeline(
                 if record_key:
                     full_screening_keys.add(record_key)
 
-            full_screening_frame = _filter_keep_frame_for_full_screening(keep_frame, full_screening_keys)
+            full_screening_frame = _filter_keep_frame_for_full_screening(
+                keep_frame,
+                full_screening_keys,
+                owner_scope_value=owner_scope_value,
+                owner_scope_enabled=owner_scope_enabled,
+            )
             full_screening_display_rows: list[dict[str, Any]] = []
             full_screening_payload_rows: list[dict[str, Any]] = []
             combined_skipped_rows: list[dict[str, Any]] = []
@@ -844,12 +961,14 @@ def run_shared_mailbox_post_sync_pipeline(
 
             task_failed_count = int(combined_payload_artifacts["payload"]["skipped_row_count"]) + int(
                 upload_summary.get("failed_count") or 0
-            ) + int(upload_summary.get("skipped_existing_count") or 0)
+            )
+            skipped_existing_count = int(upload_summary.get("skipped_existing_count") or 0)
             task_result.update(
                 {
                     "matched_mail_count": matched_mail_count,
                     "full_screening_count": len(full_screening_frame.index),
                     "mail_only_update_count": len(mail_only_payload_rows),
+                    "skipped_existing_count": skipped_existing_count,
                     "created_count": int(upload_summary.get("created_count") or 0),
                     "updated_count": int(upload_summary.get("updated_count") or 0),
                     "failed_count": task_failed_count,
@@ -884,7 +1003,7 @@ def run_shared_mailbox_post_sync_pipeline(
                     }
                 )
             for skipped in list(upload_summary.get("skipped_existing_rows") or []):
-                aggregate_failed_rows.append(
+                aggregate_existing_skip_rows.append(
                     {
                         "task_name": task_name,
                         "stage": "feishu_upload",
@@ -899,6 +1018,7 @@ def run_shared_mailbox_post_sync_pipeline(
             summary["existing_unscreened_count"] += int(existing_unscreened_count)
             summary["full_screening_count"] += int(len(full_screening_frame.index))
             summary["mail_only_update_count"] += int(len(mail_only_payload_rows))
+            summary["skipped_existing_count"] += skipped_existing_count
             summary["created_record_count"] += int(upload_summary.get("created_count") or 0)
             summary["updated_record_count"] += int(upload_summary.get("updated_count") or 0)
             summary["failed_record_count"] += int(task_failed_count)
@@ -922,6 +1042,8 @@ def run_shared_mailbox_post_sync_pipeline(
 
     aggregate_json_path = aggregate_archive_dir / "failed_or_skipped_records.json"
     aggregate_xlsx_path = aggregate_archive_dir / "failed_or_skipped_records.xlsx"
+    aggregate_existing_skip_json_path = aggregate_archive_dir / "existing_record_skips.json"
+    aggregate_existing_skip_xlsx_path = aggregate_archive_dir / "existing_record_skips.xlsx"
     aggregate_json_path.write_text(
         json.dumps(
             {
@@ -946,10 +1068,36 @@ def run_shared_mailbox_post_sync_pipeline(
     with pd.ExcelWriter(aggregate_xlsx_path, engine="openpyxl") as writer:
         aggregate_frame.to_excel(writer, index=False, sheet_name="failed_or_skipped")
 
+    aggregate_existing_skip_json_path.write_text(
+        json.dumps(
+            {
+                "skipped_existing_count": len(aggregate_existing_skip_rows),
+                "skipped_existing_rows": aggregate_existing_skip_rows,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    flattened_existing_skip_rows: list[dict[str, Any]] = []
+    for item in aggregate_existing_skip_rows:
+        row = dict(item.get("row") or {})
+        row["任务名"] = _clean_text(item.get("task_name"))
+        row["跳过阶段"] = _clean_text(item.get("stage"))
+        row["跳过原因"] = _clean_text(item.get("reason"))
+        flattened_existing_skip_rows.append(row)
+    existing_skip_columns = ("任务名", "跳过阶段", "跳过原因", *FINAL_UPLOAD_COLUMNS)
+    existing_skip_frame = pd.DataFrame(flattened_existing_skip_rows, columns=existing_skip_columns)
+    with pd.ExcelWriter(aggregate_existing_skip_xlsx_path, engine="openpyxl") as writer:
+        existing_skip_frame.to_excel(writer, index=False, sheet_name="existing_skips")
+
     summary["finished_at"] = iso_now()
     summary["status"] = "completed_with_failures" if any_task_failed else "completed"
     summary["aggregate_archive_json"] = str(aggregate_json_path)
     summary["aggregate_archive_xlsx"] = str(aggregate_xlsx_path)
+    summary["aggregate_existing_skip_json"] = str(aggregate_existing_skip_json_path)
+    summary["aggregate_existing_skip_xlsx"] = str(aggregate_existing_skip_xlsx_path)
     _write_json(run_summary_path, summary)
     return summary
 
@@ -975,7 +1123,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--folder-prefix", action="append", help="任务邮箱目录前缀；共享邮箱模式默认 其他文件夹/邮件备份。")
     parser.add_argument(
         "--matching-strategy",
-        default="legacy-enrichment",
+        default="brand-keyword-fast-path",
         choices=("legacy-enrichment", "brand-keyword-fast-path"),
         help="上游匹配策略。",
     )

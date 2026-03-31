@@ -79,6 +79,7 @@ def _build_report_rows(duplicate_groups: list[dict[str, Any]]) -> tuple[list[dic
         report_rows.append(
             {
                 "record_key": _clean_text(group.get("record_key")),
+                "owner_scope_value": _clean_text(group.get("owner_scope_value")),
                 "creator_id": _clean_text(group.get("creator_id")),
                 "platform": _clean_text(group.get("platform")),
                 "action": "keep",
@@ -96,6 +97,7 @@ def _build_report_rows(duplicate_groups: list[dict[str, Any]]) -> tuple[list[dic
             report_rows.append(
                 {
                     "record_key": _clean_text(group.get("record_key")),
+                    "owner_scope_value": _clean_text(group.get("owner_scope_value")),
                     "creator_id": _clean_text(group.get("creator_id")),
                     "platform": _clean_text(group.get("platform")),
                     "action": "delete",
@@ -107,7 +109,7 @@ def _build_report_rows(duplicate_groups: list[dict[str, Any]]) -> tuple[list[dic
                     "last_mail_time": _flatten_field_value(duplicate_fields.get("达人最后一次回复邮件时间")),
                     "quote": _flatten_field_value(duplicate_fields.get("当前网红报价")),
                     "profile_url": _flatten_field_value(duplicate_fields.get("主页链接")),
-                    "reason": "与保留记录共享同一 达人ID+平台 键，判定为重复脏记录。",
+                    "reason": "与保留记录共享同一去重主键，判定为重复脏记录。",
                 }
             )
     return report_rows, histogram
@@ -122,6 +124,7 @@ def _write_report(output_root: Path, *, summary: dict[str, Any], report_rows: li
         report_rows,
         columns=(
             "record_key",
+            "owner_scope_value",
             "creator_id",
             "platform",
             "action",
@@ -149,7 +152,39 @@ def cleanup_duplicate_records(
     resolved_view, analysis = fetch_existing_bitable_record_analysis(client, linked_bitable_url=linked_bitable_url)
     report_rows, histogram = _build_report_rows(analysis.duplicate_groups)
     deleted_record_ids: list[str] = []
+    blocked_reason = ""
+    if execute and not _clean_text(analysis.owner_scope_field_name):
+        blocked_reason = "目标飞书表缺少 `达人对接人` 字段，当前不允许执行重复清理，避免误删不同负责人下的达人记录。"
+    elif execute and int(analysis.owner_scope_missing_record_count or 0) > 0:
+        blocked_reason = "目标飞书表存在未填写 `达人对接人` 的历史记录，当前不允许执行重复清理，需先补齐负责人维度。"
     if execute:
+        if blocked_reason:
+            summary = {
+                "ok": False,
+                "execute": True,
+                "guard_blocked": True,
+                "error": blocked_reason,
+                "target_url": resolved_view.source_url,
+                "target_table_id": resolved_view.table_id,
+                "target_table_name": resolved_view.table_name,
+                "target_view_id": resolved_view.view_id,
+                "target_view_name": resolved_view.view_name,
+                "key_field_names": list(analysis.key_field_names),
+                "key_display_name": analysis.key_display_name,
+                "owner_scope_field_name": analysis.owner_scope_field_name,
+                "owner_scope_missing_record_count": analysis.owner_scope_missing_record_count,
+                "duplicate_group_count": len(analysis.duplicate_groups),
+                "duplicate_row_count": sum(len(group.get("duplicate_records") or []) for group in analysis.duplicate_groups),
+                "unique_record_count": len(analysis.index),
+                "group_histogram": dict(histogram),
+                "deleted_record_count": 0,
+                "deleted_record_ids": [],
+            }
+            summary_path, report_path = _write_report(output_root, summary=summary, report_rows=report_rows)
+            summary["summary_path"] = str(summary_path)
+            summary["report_xlsx_path"] = str(report_path)
+            summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            return summary
         for group in analysis.duplicate_groups:
             for duplicate_record in list(group.get("duplicate_records") or []):
                 record_id = _clean_text(duplicate_record.get("record_id"))
@@ -168,6 +203,10 @@ def cleanup_duplicate_records(
         "target_table_name": resolved_view.table_name,
         "target_view_id": resolved_view.view_id,
         "target_view_name": resolved_view.view_name,
+        "key_field_names": list(analysis.key_field_names),
+        "key_display_name": analysis.key_display_name,
+        "owner_scope_field_name": analysis.owner_scope_field_name,
+        "owner_scope_missing_record_count": analysis.owner_scope_missing_record_count,
         "duplicate_group_count": len(analysis.duplicate_groups),
         "duplicate_row_count": sum(len(group.get("duplicate_records") or []) for group in analysis.duplicate_groups),
         "unique_record_count": len(analysis.index),
@@ -183,7 +222,7 @@ def cleanup_duplicate_records(
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="清理飞书多维表格里重复的 达人ID+平台 记录。")
+    parser = argparse.ArgumentParser(description="清理飞书多维表格里重复记录；若存在项目维度字段，则按项目维度分组。")
     parser.add_argument("--env-file", default=".env", help="本地 env 文件路径，默认当前目录 ./.env")
     parser.add_argument("--url", required=True, help="目标飞书多维表 URL")
     parser.add_argument("--output-root", default="", help="本地清理报告目录，默认 ./temp/bitable_duplicate_cleanup_<timestamp>")

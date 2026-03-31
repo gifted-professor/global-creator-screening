@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import pandas as pd
 
@@ -185,6 +186,10 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
             pipeline._load_runtime_dependencies = lambda: {
                 "DEFAULT_FEISHU_BASE_URL": "https://open.feishu.cn",
                 "FeishuOpenClient": FakeClient,
+                "fetch_existing_bitable_record_analysis": lambda client, *, linked_bitable_url: (
+                    object(),
+                    SimpleNamespace(index={}, duplicate_groups=[]),
+                ),
                 "fetch_existing_bitable_record_index": fake_fetch_existing_bitable_record_index,
                 "inspect_task_upload_assignments": lambda **kwargs: {
                     "items": [
@@ -383,6 +388,10 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
             pipeline._load_runtime_dependencies = lambda: {
                 "DEFAULT_FEISHU_BASE_URL": "https://open.feishu.cn",
                 "FeishuOpenClient": FakeClient,
+                "fetch_existing_bitable_record_analysis": lambda client, *, linked_bitable_url: (
+                    object(),
+                    SimpleNamespace(index={}, duplicate_groups=[]),
+                ),
                 "fetch_existing_bitable_record_index": fake_fetch_existing_bitable_record_index,
                 "inspect_task_upload_assignments": lambda **kwargs: {
                     "items": [
@@ -697,6 +706,13 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
             pipeline._load_runtime_dependencies = lambda: {
                 "DEFAULT_FEISHU_BASE_URL": "https://open.feishu.cn",
                 "FeishuOpenClient": FakeClient,
+                "fetch_existing_bitable_record_analysis": lambda client, *, linked_bitable_url: (
+                    object(),
+                    SimpleNamespace(
+                        index=fake_fetch_existing_bitable_record_index(client, linked_bitable_url=linked_bitable_url)[1],
+                        duplicate_groups=[],
+                    ),
+                ),
                 "fetch_existing_bitable_record_index": fake_fetch_existing_bitable_record_index,
                 "inspect_task_upload_assignments": lambda **kwargs: {
                     "items": [
@@ -778,3 +794,466 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
         self.assertEqual(miniso_result["updated_count"], 2)
         self.assertTrue(miniso_workbook_exists)
         self.assertTrue(miniso_payload_exists)
+
+    def test_project_name_filter_expands_numbered_tasks_without_hardcoded_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            shared_root = root / "shared_mailbox"
+            shared_db_path = shared_root / "email_sync.db"
+            shared_raw_dir = shared_root / "raw"
+            shared_db_path.parent.mkdir(parents=True, exist_ok=True)
+            shared_db_path.touch()
+            shared_raw_dir.mkdir(parents=True, exist_ok=True)
+            (shared_raw_dir / "duet.eml").write_text("Subject: duet\n\nbody", encoding="utf-8")
+
+            upstream_calls: list[dict[str, object]] = []
+
+            class FakeClient:
+                pass
+
+            def fake_run_task_upload_to_keep_list_pipeline(**kwargs):
+                upstream_calls.append(
+                    {
+                        "task_name": kwargs["task_name"],
+                        "brand_keyword": kwargs["brand_keyword"],
+                        "matching_strategy": kwargs["matching_strategy"],
+                    }
+                )
+                output_root = Path(kwargs["output_root"])
+                output_root.mkdir(parents=True, exist_ok=True)
+                keep_workbook = output_root / f"{kwargs['task_name']}_keep.xlsx"
+                template_workbook = output_root / f"{kwargs['task_name']}_template.xlsx"
+                template_workbook.touch()
+                pd.DataFrame(
+                    [
+                        {
+                            "Platform": "TikTok",
+                            "@username": "duet",
+                            "URL": "https://www.tiktok.com/@duet",
+                            "brand_message_sent_at": "2026-03-31T10:00:00+08:00",
+                            "brand_message_snippet": "Latest duet reply $100",
+                            "brand_message_raw_path": "raw/duet.eml",
+                        }
+                    ]
+                ).to_excel(keep_workbook, index=False)
+                summary = {
+                    "status": "stopped_after_keep-list",
+                    "resume_points": {
+                        "keep_list": {
+                            "keep_workbook": str(keep_workbook),
+                            "template_workbook": str(template_workbook),
+                        }
+                    },
+                    "artifacts": {
+                        "keep_workbook": str(keep_workbook),
+                        "template_workbook": str(template_workbook),
+                    },
+                    "steps": {"brand_match": {"stats": {"message_hit_count": 1}}},
+                    "downstream_handoff": {
+                        "task_owner": {
+                            "task_name": kwargs["task_name"],
+                            "linked_bitable_url": f"https://bitable.example/{kwargs['task_name']}",
+                            "responsible_name": "唐瑞霞",
+                            "employee_name": "唐瑞霞",
+                            "employee_id": "ou_rhea",
+                            "employee_record_id": f"rec_{kwargs['task_name']}",
+                            "employee_email": "rhea@amagency.biz",
+                            "owner_name": "rhea@amagency.biz",
+                        }
+                    },
+                }
+                Path(kwargs["summary_json"]).write_text(json.dumps(summary, ensure_ascii=False), encoding="utf-8")
+                return summary
+
+            def fake_run_keep_list_screening_pipeline(**kwargs):
+                output_root = Path(kwargs["output_root"])
+                output_root.mkdir(parents=True, exist_ok=True)
+                exports_dir = output_root / "exports"
+                exports_dir.mkdir(parents=True, exist_ok=True)
+                final_review_path = exports_dir / "all_platforms_final_review.xlsx"
+                payload_path = exports_dir / "all_platforms_upload_payload.json"
+                pd.DataFrame(
+                    [
+                        {
+                            "达人ID": "duet",
+                            "平台": "tiktok",
+                            "主页链接": "https://www.tiktok.com/@duet",
+                            "达人对接人": kwargs["task_owner_name"],
+                            "ai是否通过": "否",
+                            "ai筛号反馈理由": "screened",
+                            "标签(ai)": "",
+                            "ai评价": "good fit",
+                        }
+                    ]
+                ).to_excel(final_review_path, index=False)
+                payload = {
+                    "task_owner": {"task_name": kwargs["task_name"]},
+                    "columns": [],
+                    "source_row_count": 1,
+                    "row_count": 1,
+                    "skipped_row_count": 0,
+                    "rows": [{"达人ID": "duet", "平台": "tiktok", "ai是否通过": "否"}],
+                    "skipped_rows": [],
+                }
+                payload_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+                summary = {
+                    "status": "completed",
+                    "artifacts": {
+                        "all_platforms_final_review": str(final_review_path),
+                        "all_platforms_upload_payload_json": str(payload_path),
+                    },
+                }
+                Path(kwargs["summary_json"]).write_text(json.dumps(summary, ensure_ascii=False), encoding="utf-8")
+                return summary
+
+            def fake_upload_final_review_payload_to_bitable(client, **kwargs):
+                archive_dir = Path(kwargs["payload_json_path"]).parent / "feishu_upload_local_archive"
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                result_json = archive_dir / "feishu_bitable_upload_result.json"
+                result_xlsx = archive_dir / "feishu_bitable_upload_result.xlsx"
+                result_json.write_text(json.dumps({"ok": True}, ensure_ascii=False), encoding="utf-8")
+                pd.DataFrame([{"status": "ok"}]).to_excel(result_xlsx, index=False)
+                return {
+                    "ok": True,
+                    "payload_json_path": kwargs["payload_json_path"],
+                    "result_json_path": str(result_json),
+                    "result_xlsx_path": str(result_xlsx),
+                    "created_count": 1,
+                    "updated_count": 0,
+                    "failed_count": 0,
+                    "skipped_existing_count": 0,
+                    "failed_rows": [],
+                    "skipped_existing_rows": [],
+                }
+
+            pipeline._build_feishu_client = lambda **kwargs: (
+                FakeClient(),
+                {
+                    "TASK_UPLOAD_URL": "https://task-upload.example.com",
+                    "EMPLOYEE_INFO_URL": "https://employee.example.com",
+                },
+                {"feishu_base_url": "https://open.feishu.cn", "timeout_seconds": 30.0},
+            )
+            pipeline._load_runtime_dependencies = lambda: {
+                "DEFAULT_FEISHU_BASE_URL": "https://open.feishu.cn",
+                "FeishuOpenClient": FakeClient,
+                "fetch_existing_bitable_record_analysis": lambda client, *, linked_bitable_url: (
+                    object(),
+                    SimpleNamespace(index={}, duplicate_groups=[]),
+                ),
+                "fetch_existing_bitable_record_index": lambda client, *, linked_bitable_url: (object(), {}),
+                "inspect_task_upload_assignments": lambda **kwargs: {
+                    "items": [
+                        {"recordId": "rec_duet_1", "taskName": "Duet1", "linkedBitableUrl": "https://bitable.example/duet1"},
+                        {"recordId": "rec_duet_2", "taskName": "Duet2", "linkedBitableUrl": "https://bitable.example/duet2"},
+                    ]
+                },
+                "load_local_env": lambda env_file: {},
+                "run_keep_list_screening_pipeline": fake_run_keep_list_screening_pipeline,
+                "run_task_upload_to_keep_list_pipeline": fake_run_task_upload_to_keep_list_pipeline,
+                "upload_final_review_payload_to_bitable": fake_upload_final_review_payload_to_bitable,
+            }
+
+            summary = pipeline.run_shared_mailbox_post_sync_pipeline(
+                shared_mail_db_path=shared_db_path,
+                shared_mail_raw_dir=shared_raw_dir,
+                task_name_filters=["Duet"],
+                upload_dry_run=False,
+            )
+
+        self.assertEqual(summary["status"], "completed")
+        self.assertEqual(summary["task_names"], ["Duet1", "Duet2"])
+        self.assertEqual(
+            [(item["task_name"], item["brand_keyword"], item["matching_strategy"]) for item in upstream_calls],
+            [("Duet1", "Duet", "brand-keyword-fast-path"), ("Duet2", "Duet", "brand-keyword-fast-path")],
+        )
+
+    def test_skipped_existing_rows_do_not_count_as_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            shared_root = root / "shared_mailbox"
+            shared_db_path = shared_root / "email_sync.db"
+            shared_raw_dir = shared_root / "raw"
+            shared_db_path.parent.mkdir(parents=True, exist_ok=True)
+            shared_db_path.touch()
+            shared_raw_dir.mkdir(parents=True, exist_ok=True)
+            (shared_raw_dir / "alpha.eml").write_text("Subject: alpha\n\nbody", encoding="utf-8")
+
+            class FakeClient:
+                pass
+
+            def fake_run_task_upload_to_keep_list_pipeline(**kwargs):
+                output_root = Path(kwargs["output_root"])
+                output_root.mkdir(parents=True, exist_ok=True)
+                keep_workbook = output_root / "MINISO_keep.xlsx"
+                template_workbook = output_root / "MINISO_template.xlsx"
+                template_workbook.touch()
+                pd.DataFrame(
+                    [
+                        {
+                            "Platform": "Instagram",
+                            "@username": "alpha",
+                            "URL": "https://www.instagram.com/alpha",
+                            "brand_message_sent_at": "2026-03-31T10:00:00+08:00",
+                            "brand_message_snippet": "Latest alpha reply $100",
+                            "brand_message_raw_path": "raw/alpha.eml",
+                        }
+                    ]
+                ).to_excel(keep_workbook, index=False)
+                summary = {
+                    "status": "stopped_after_keep-list",
+                    "resume_points": {
+                        "keep_list": {
+                            "keep_workbook": str(keep_workbook),
+                            "template_workbook": str(template_workbook),
+                        }
+                    },
+                    "artifacts": {
+                        "keep_workbook": str(keep_workbook),
+                        "template_workbook": str(template_workbook),
+                    },
+                    "steps": {"brand_match": {"stats": {"message_hit_count": 1}}},
+                    "downstream_handoff": {
+                        "task_owner": {
+                            "task_name": "MINISO",
+                            "linked_bitable_url": "https://bitable.example/miniso",
+                            "responsible_name": "陈俊仁",
+                            "employee_name": "陈俊仁",
+                            "employee_id": "ou_miniso",
+                            "employee_record_id": "rec_miniso",
+                            "employee_email": "miniso@amagency.biz",
+                            "owner_name": "陈俊仁",
+                        }
+                    },
+                }
+                Path(kwargs["summary_json"]).write_text(json.dumps(summary, ensure_ascii=False), encoding="utf-8")
+                return summary
+
+            def fake_run_keep_list_screening_pipeline(**kwargs):
+                output_root = Path(kwargs["output_root"])
+                output_root.mkdir(parents=True, exist_ok=True)
+                exports_dir = output_root / "exports"
+                exports_dir.mkdir(parents=True, exist_ok=True)
+                final_review_path = exports_dir / "all_platforms_final_review.xlsx"
+                payload_path = exports_dir / "all_platforms_upload_payload.json"
+                pd.DataFrame(
+                    [
+                        {
+                            "达人ID": "alpha",
+                            "平台": "instagram",
+                            "主页链接": "https://www.instagram.com/alpha",
+                            "达人对接人": kwargs["task_owner_name"],
+                            "ai是否通过": "是",
+                            "ai筛号反馈理由": "screened",
+                            "标签(ai)": "家庭用品和家电-家庭博主",
+                            "ai评价": "good fit",
+                        }
+                    ]
+                ).to_excel(final_review_path, index=False)
+                payload = {
+                    "task_owner": {"task_name": kwargs["task_name"]},
+                    "columns": [],
+                    "source_row_count": 1,
+                    "row_count": 1,
+                    "skipped_row_count": 0,
+                    "rows": [{"达人ID": "alpha", "平台": "instagram", "ai是否通过": "是"}],
+                    "skipped_rows": [],
+                }
+                payload_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+                summary = {
+                    "status": "completed",
+                    "artifacts": {
+                        "all_platforms_final_review": str(final_review_path),
+                        "all_platforms_upload_payload_json": str(payload_path),
+                    },
+                }
+                Path(kwargs["summary_json"]).write_text(json.dumps(summary, ensure_ascii=False), encoding="utf-8")
+                return summary
+
+            def fake_upload_final_review_payload_to_bitable(client, **kwargs):
+                archive_dir = Path(kwargs["payload_json_path"]).parent / "feishu_upload_local_archive"
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                result_json = archive_dir / "feishu_bitable_upload_result.json"
+                result_xlsx = archive_dir / "feishu_bitable_upload_result.xlsx"
+                result_json.write_text(json.dumps({"ok": True}, ensure_ascii=False), encoding="utf-8")
+                pd.DataFrame([{"status": "ok"}]).to_excel(result_xlsx, index=False)
+                return {
+                    "ok": True,
+                    "payload_json_path": kwargs["payload_json_path"],
+                    "result_json_path": str(result_json),
+                    "result_xlsx_path": str(result_xlsx),
+                    "created_count": 0,
+                    "updated_count": 0,
+                    "failed_count": 0,
+                    "skipped_existing_count": 1,
+                    "failed_rows": [],
+                    "skipped_existing_rows": [
+                        {
+                            "reason": "飞书表已存在同达人ID+平台记录",
+                            "row": {"达人ID": "alpha", "平台": "instagram"},
+                        }
+                    ],
+                }
+
+            pipeline._build_feishu_client = lambda **kwargs: (
+                FakeClient(),
+                {
+                    "TASK_UPLOAD_URL": "https://task-upload.example.com",
+                    "EMPLOYEE_INFO_URL": "https://employee.example.com",
+                },
+                {"feishu_base_url": "https://open.feishu.cn", "timeout_seconds": 30.0},
+            )
+            pipeline._load_runtime_dependencies = lambda: {
+                "DEFAULT_FEISHU_BASE_URL": "https://open.feishu.cn",
+                "FeishuOpenClient": FakeClient,
+                "fetch_existing_bitable_record_analysis": lambda client, *, linked_bitable_url: (
+                    object(),
+                    SimpleNamespace(index={}, duplicate_groups=[]),
+                ),
+                "fetch_existing_bitable_record_index": lambda client, *, linked_bitable_url: (object(), {}),
+                "inspect_task_upload_assignments": lambda **kwargs: {
+                    "items": [
+                        {"recordId": "rec_miniso", "taskName": "MINISO", "linkedBitableUrl": "https://bitable.example/miniso"},
+                    ]
+                },
+                "load_local_env": lambda env_file: {},
+                "run_keep_list_screening_pipeline": fake_run_keep_list_screening_pipeline,
+                "run_task_upload_to_keep_list_pipeline": fake_run_task_upload_to_keep_list_pipeline,
+                "upload_final_review_payload_to_bitable": fake_upload_final_review_payload_to_bitable,
+            }
+
+            summary = pipeline.run_shared_mailbox_post_sync_pipeline(
+                shared_mail_db_path=shared_db_path,
+                shared_mail_raw_dir=shared_raw_dir,
+                task_name_filters=["MINISO"],
+                upload_dry_run=False,
+            )
+
+            self.assertEqual(summary["status"], "completed")
+            self.assertEqual(summary["failed_record_count"], 0)
+            self.assertEqual(summary["skipped_existing_count"], 1)
+            self.assertTrue(Path(summary["aggregate_existing_skip_json"]).exists())
+            self.assertTrue(Path(summary["aggregate_existing_skip_xlsx"]).exists())
+            task_result = summary["task_results"][0]
+            self.assertEqual(task_result["status"], "completed")
+            self.assertEqual(task_result["failed_count"], 0)
+            self.assertEqual(task_result["skipped_existing_count"], 1)
+
+    def test_pipeline_blocks_before_downstream_when_target_table_has_duplicate_existing_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            shared_root = root / "shared_mailbox"
+            shared_db_path = shared_root / "email_sync.db"
+            shared_raw_dir = shared_root / "raw"
+            shared_db_path.parent.mkdir(parents=True, exist_ok=True)
+            shared_db_path.touch()
+            shared_raw_dir.mkdir(parents=True, exist_ok=True)
+
+            class FakeClient:
+                pass
+
+            downstream_called = {"value": False}
+
+            def fake_run_task_upload_to_keep_list_pipeline(**kwargs):
+                output_root = Path(kwargs["output_root"])
+                output_root.mkdir(parents=True, exist_ok=True)
+                keep_workbook = output_root / "MINISO_keep.xlsx"
+                template_workbook = output_root / "MINISO_template.xlsx"
+                template_workbook.touch()
+                pd.DataFrame(
+                    [
+                        {
+                            "Platform": "Instagram",
+                            "@username": "alpha",
+                            "URL": "https://www.instagram.com/alpha",
+                            "brand_message_sent_at": "2026-03-31T10:00:00+08:00",
+                            "brand_message_snippet": "Latest alpha reply $100",
+                            "brand_message_raw_path": "raw/alpha.eml",
+                        }
+                    ]
+                ).to_excel(keep_workbook, index=False)
+                summary = {
+                    "status": "stopped_after_keep-list",
+                    "resume_points": {
+                        "keep_list": {
+                            "keep_workbook": str(keep_workbook),
+                            "template_workbook": str(template_workbook),
+                        }
+                    },
+                    "artifacts": {
+                        "keep_workbook": str(keep_workbook),
+                        "template_workbook": str(template_workbook),
+                    },
+                    "steps": {"brand_match": {"stats": {"message_hit_count": 1}}},
+                    "downstream_handoff": {
+                        "task_owner": {
+                            "task_name": "MINISO",
+                            "linked_bitable_url": "https://bitable.example/miniso",
+                            "responsible_name": "陈俊仁",
+                            "employee_name": "陈俊仁",
+                            "employee_id": "ou_miniso",
+                            "employee_record_id": "rec_miniso",
+                            "employee_email": "miniso@amagency.biz",
+                            "owner_name": "陈俊仁",
+                        }
+                    },
+                }
+                Path(kwargs["summary_json"]).write_text(json.dumps(summary, ensure_ascii=False), encoding="utf-8")
+                return summary
+
+            def fake_run_keep_list_screening_pipeline(**kwargs):
+                downstream_called["value"] = True
+                raise AssertionError("downstream should not run when duplicate existing records are detected")
+
+            pipeline._build_feishu_client = lambda **kwargs: (
+                FakeClient(),
+                {
+                    "TASK_UPLOAD_URL": "https://task-upload.example.com",
+                    "EMPLOYEE_INFO_URL": "https://employee.example.com",
+                },
+                {"feishu_base_url": "https://open.feishu.cn", "timeout_seconds": 30.0},
+            )
+            pipeline._load_runtime_dependencies = lambda: {
+                "DEFAULT_FEISHU_BASE_URL": "https://open.feishu.cn",
+                "FeishuOpenClient": FakeClient,
+                "fetch_existing_bitable_record_analysis": lambda client, *, linked_bitable_url: (
+                    object(),
+                    SimpleNamespace(
+                        index={"alpha::instagram": {"record_id": "rec_keep", "fields": {"达人ID": "alpha", "平台": "instagram"}}},
+                        duplicate_groups=[
+                            {
+                                "record_key": "alpha::instagram",
+                                "creator_id": "alpha",
+                                "platform": "instagram",
+                                "keep_record": {"record_id": "rec_keep", "fields": {"达人ID": "alpha", "平台": "instagram"}},
+                                "duplicate_records": [
+                                    {"record_id": "rec_dup", "fields": {"达人ID": "alpha", "平台": "instagram"}}
+                                ],
+                            }
+                        ],
+                    ),
+                ),
+                "fetch_existing_bitable_record_index": lambda client, *, linked_bitable_url: (object(), {}),
+                "inspect_task_upload_assignments": lambda **kwargs: {
+                    "items": [
+                        {"recordId": "rec_miniso", "taskName": "MINISO", "linkedBitableUrl": "https://bitable.example/miniso"},
+                    ]
+                },
+                "load_local_env": lambda env_file: {},
+                "run_keep_list_screening_pipeline": fake_run_keep_list_screening_pipeline,
+                "run_task_upload_to_keep_list_pipeline": fake_run_task_upload_to_keep_list_pipeline,
+                "upload_final_review_payload_to_bitable": lambda client, **kwargs: {"ok": True},
+            }
+
+            summary = pipeline.run_shared_mailbox_post_sync_pipeline(
+                shared_mail_db_path=shared_db_path,
+                shared_mail_raw_dir=shared_raw_dir,
+                task_name_filters=["MINISO"],
+                upload_dry_run=False,
+            )
+
+            self.assertFalse(downstream_called["value"])
+            self.assertEqual(summary["status"], "completed_with_failures")
+            task_result = summary["task_results"][0]
+            self.assertEqual(task_result["status"], "guard_blocked_duplicate_existing")
+            self.assertEqual(task_result["duplicate_existing_group_count"], 1)
