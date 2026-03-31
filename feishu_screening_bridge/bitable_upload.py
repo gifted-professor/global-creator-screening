@@ -23,6 +23,18 @@ _FIELD_NAME_ALIASES = {
     "标签（ai）": "标签（ai）",
     "ai评价": "ai 评价",
 }
+_INTERNAL_PAYLOAD_KEYS = {
+    "达人对接人_employee_id",
+    "达人对接人_employee_record_id",
+    "达人对接人_employee_email",
+    "达人对接人_owner_name",
+    "linked_bitable_url",
+    "任务名",
+    "__last_mail_raw_path",
+    "__feishu_attachment_local_paths",
+    "__feishu_shared_attachment_local_paths",
+}
+_ATTACHMENT_FIELD_PREFERRED_NAMES = ("附件", "附件列", "上传附件", "文本 12", "文本12")
 
 _UPLOAD_KEY_FIELDS = ("达人ID", "平台")
 
@@ -71,6 +83,7 @@ def upload_final_review_payload_to_bitable(
     )
     resolved_view = resolve_bitable_view_from_url(client, target_url)
     field_schemas = _fetch_field_schemas(client, resolved_view)
+    attachment_schema = _select_attachment_field_schema(field_schemas)
     existing_records = _fetch_existing_records(client, resolved_view)
     existing_keys = {
         _build_record_key(fields.get("达人ID"), fields.get("平台")): record_id
@@ -104,6 +117,13 @@ def upload_final_review_payload_to_bitable(
 
         try:
             fields = _build_feishu_fields(row, field_schemas)
+            _attach_local_files_to_fields(
+                client,
+                row=row,
+                fields=fields,
+                attachment_schema=attachment_schema,
+                app_token=resolved_view.app_token,
+            )
         except Exception as exc:  # noqa: BLE001
             failed_rows.append(
                 {
@@ -263,6 +283,19 @@ def _fetch_field_schemas(client: FeishuOpenClient, resolved: ResolvedBitableView
     return results
 
 
+def _select_attachment_field_schema(field_schemas: dict[str, FieldSchema]) -> FieldSchema | None:
+    candidates = [schema for schema in field_schemas.values() if int(schema.field_type or 0) == 17]
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        return candidates[0]
+    normalized_preferences = {_normalize_field_key(name) for name in _ATTACHMENT_FIELD_PREFERRED_NAMES}
+    for schema in candidates:
+        if _normalize_field_key(schema.field_name) in normalized_preferences:
+            return schema
+    return candidates[0]
+
+
 def _fetch_existing_records(client: FeishuOpenClient, resolved: ResolvedBitableView) -> list[tuple[str, dict[str, Any]]]:
     collected: list[tuple[str, dict[str, Any]]] = []
     page_token = ""
@@ -323,14 +356,7 @@ def _lookup_field_schema(field_schemas: dict[str, FieldSchema], desired_name: st
 def _build_feishu_fields(row: dict[str, Any], field_schemas: dict[str, FieldSchema]) -> dict[str, Any]:
     fields: dict[str, Any] = {}
     for payload_name, raw_value in row.items():
-        if payload_name in {
-            "达人对接人_employee_id",
-            "达人对接人_employee_record_id",
-            "达人对接人_employee_email",
-            "达人对接人_owner_name",
-            "linked_bitable_url",
-            "任务名",
-        }:
+        if payload_name in _INTERNAL_PAYLOAD_KEYS or str(payload_name).startswith("__"):
             continue
         schema = _lookup_field_schema(field_schemas, payload_name)
         if schema is None:
@@ -345,6 +371,49 @@ def _build_feishu_fields(row: dict[str, Any], field_schemas: dict[str, FieldSche
         fields[person_schema.field_name] = [{"id": employee_id}]
 
     return fields
+
+
+def _attach_local_files_to_fields(
+    client: FeishuOpenClient,
+    *,
+    row: dict[str, Any],
+    fields: dict[str, Any],
+    attachment_schema: FieldSchema | None,
+    app_token: str,
+) -> None:
+    if attachment_schema is None:
+        return
+    upload_items: list[dict[str, str]] = []
+    for local_path in _normalize_attachment_local_paths(row.get("__feishu_attachment_local_paths")):
+        uploaded = client.upload_local_file(
+            local_path,
+            parent_type="bitable_file",
+            parent_node=app_token,
+        )
+        upload_items.append(
+            {
+                "file_token": uploaded.file_token,
+                "name": uploaded.file_name,
+            }
+        )
+    if upload_items:
+        fields[attachment_schema.field_name] = upload_items
+
+
+def _normalize_attachment_local_paths(raw_value: Any) -> list[str]:
+    values: list[str] = []
+    if isinstance(raw_value, (list, tuple, set)):
+        iterator = raw_value
+    else:
+        iterator = [raw_value]
+    seen: set[str] = set()
+    for item in iterator:
+        cleaned = _clean_text(item)
+        if not cleaned or cleaned in seen:
+            continue
+        seen.add(cleaned)
+        values.append(cleaned)
+    return values
 
 
 def _convert_field_value(schema: FieldSchema, raw_value: Any, *, row: dict[str, Any]) -> tuple[Any, bool]:

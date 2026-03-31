@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import mimetypes
 from pathlib import Path
 import re
 from typing import Any
@@ -23,6 +24,14 @@ class DownloadedFeishuFile:
     file_name: str
     content_type: str
     content: bytes
+    source_url: str
+
+
+@dataclass(frozen=True)
+class UploadedFeishuFile:
+    file_token: str
+    file_name: str
+    size_bytes: int
     source_url: str
 
 
@@ -107,6 +116,65 @@ class FeishuOpenClient:
         if last_error is not None:
             raise FeishuApiError(str(last_error)) from last_error
         raise FeishuApiError(f"无法下载飞书文件: {file_token}")
+
+    def upload_local_file(
+        self,
+        local_path: str | Path,
+        *,
+        parent_type: str = "bitable_file",
+        parent_node: str = "",
+        file_name: str | None = None,
+    ) -> UploadedFeishuFile:
+        path = Path(str(local_path)).expanduser().resolve()
+        if not path.exists() or not path.is_file():
+            raise FileNotFoundError(f"待上传文件不存在: {path}")
+        normalized_parent_node = str(parent_node or "").strip()
+        if not normalized_parent_node:
+            raise ValueError("上传飞书附件缺少 parent_node。")
+
+        file_bytes = path.read_bytes()
+        multipart_body, boundary = _build_multipart_form_data(
+            fields={
+                "file_name": str(file_name or path.name),
+                "parent_type": str(parent_type or "bitable_file"),
+                "parent_node": normalized_parent_node,
+                "size": str(len(file_bytes)),
+            },
+            file_field_name="file",
+            file_name=str(file_name or path.name),
+            file_bytes=file_bytes,
+            content_type=mimetypes.guess_type(str(path.name))[0] or "application/octet-stream",
+        )
+        access_token = self.get_tenant_access_token()
+        status, _, response_body, resolved_url = self._open(
+            "POST",
+            "/drive/v1/medias/upload_all",
+            data=multipart_body,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": f"multipart/form-data; boundary={boundary}",
+            },
+        )
+        if status != 200:
+            raise FeishuApiError(f"飞书附件上传失败: status={status} url={resolved_url}")
+        try:
+            payload = json.loads(response_body.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise FeishuApiError("飞书附件上传返回了非 JSON 响应。") from exc
+        if int(payload.get("code") or 0) != 0:
+            raise FeishuApiError(
+                f"飞书附件上传失败: code={payload.get('code')} msg={payload.get('msg') or payload.get('message') or ''}"
+            )
+        data = payload.get("data") or {}
+        file_token = str(data.get("file_token") or data.get("fileToken") or "").strip()
+        if not file_token:
+            raise FeishuApiError("飞书附件上传成功，但响应里没有 file_token。")
+        return UploadedFeishuFile(
+            file_token=file_token,
+            file_name=str(data.get("name") or data.get("file_name") or file_name or path.name),
+            size_bytes=len(file_bytes),
+            source_url=resolved_url,
+        )
 
     def get_api_json(self, url_path: str, *, headers: dict[str, str] | None = None) -> dict[str, Any]:
         access_token = self.get_tenant_access_token()
@@ -306,3 +374,37 @@ def _normalize_download_name(file_name: str) -> str:
     candidate = Path(str(file_name or "").strip()).name
     candidate = candidate.replace("\x00", "")
     return candidate or "downloaded-workbook.xlsx"
+
+
+def _build_multipart_form_data(
+    *,
+    fields: dict[str, str],
+    file_field_name: str,
+    file_name: str,
+    file_bytes: bytes,
+    content_type: str,
+) -> tuple[bytes, str]:
+    boundary = f"----CodexFeishuBoundary{Path(file_name).stem[:24]}{len(file_bytes)}"
+    chunks: list[bytes] = []
+    for key, value in fields.items():
+        chunks.extend(
+            [
+                f"--{boundary}\r\n".encode("utf-8"),
+                f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode("utf-8"),
+                str(value).encode("utf-8"),
+                b"\r\n",
+            ]
+        )
+    chunks.extend(
+        [
+            f"--{boundary}\r\n".encode("utf-8"),
+            (
+                f'Content-Disposition: form-data; name="{file_field_name}"; filename="{Path(file_name).name}"\r\n'
+            ).encode("utf-8"),
+            f"Content-Type: {content_type}\r\n\r\n".encode("utf-8"),
+            file_bytes,
+            b"\r\n",
+            f"--{boundary}--\r\n".encode("utf-8"),
+        ]
+    )
+    return b"".join(chunks), boundary

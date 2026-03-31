@@ -14,6 +14,7 @@ from feishu_screening_bridge.task_upload_sync import TaskUploadEntry
 class _FakeBitableUploadClient:
     def __init__(self) -> None:
         self.created_records: list[dict[str, object]] = []
+        self.uploaded_local_files: list[dict[str, str]] = []
         self.search_items = [
             {
                 "record_id": "rec_existing",
@@ -53,6 +54,7 @@ class _FakeBitableUploadClient:
                             "property": {"options": [{"name": "母婴用品-家庭/宝妈"}, {"name": "家庭用品和家电-家庭博主"}]},
                         },
                         {"field_id": "fld14", "field_name": "ai 评价", "type": 1, "property": None},
+                        {"field_id": "fld15", "field_name": "文本 12", "type": 17, "property": None},
                     ]
                 }
             }
@@ -74,6 +76,26 @@ class _FakeBitableUploadClient:
             return {"data": {"record": {"record_id": record_id, "fields": fields}}}
         raise AssertionError(f"unexpected POST {url_path}")
 
+    def upload_local_file(self, local_path: str | Path, *, parent_type: str = "bitable_file", parent_node: str = "", file_name: str | None = None):  # type: ignore[override]
+        from feishu_screening_bridge.feishu_api import UploadedFeishuFile
+
+        path = Path(str(local_path))
+        self.uploaded_local_files.append(
+            {
+                "local_path": str(path),
+                "parent_type": str(parent_type),
+                "parent_node": str(parent_node),
+                "file_name": str(file_name or path.name),
+            }
+        )
+        index = len(self.uploaded_local_files)
+        return UploadedFeishuFile(
+            file_token=f"boxcn-upload-{index}",
+            file_name=str(file_name or path.name),
+            size_bytes=len(path.read_bytes()),
+            source_url=f"https://unit-test.feishu.mock/upload/{index}",
+        )
+
 
 class BitableUploadTests(unittest.TestCase):
     def test_upload_payload_maps_fields_and_skips_existing_rows(self) -> None:
@@ -92,6 +114,8 @@ class BitableUploadTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             payload_path = root / "payload.json"
+            raw_mail_path = root / "alpha-last.eml"
+            raw_mail_path.write_text("Subject: hello\n\nbody", encoding="utf-8")
             payload_path.write_text(
                 json.dumps(
                     {
@@ -117,6 +141,7 @@ class BitableUploadTests(unittest.TestCase):
                                 "标签(ai)": "家庭用品和家电-家庭博主；美食",
                                 "ai评价": "nice",
                                 "达人对接人_employee_id": "ou_alpha",
+                                "__feishu_attachment_local_paths": [str(raw_mail_path)],
                             },
                             {
                                 "达人ID": "beta",
@@ -165,6 +190,10 @@ class BitableUploadTests(unittest.TestCase):
             )
             self.assertEqual(created_fields["达人对接人"], [{"id": "ou_alpha"}])
             self.assertIsInstance(created_fields["达人最后一次回复邮件时间"], int)
+            self.assertEqual(created_fields["文本 12"], [{"file_token": "boxcn-upload-1", "name": "alpha-last.eml"}])
+            self.assertEqual(client.uploaded_local_files[0]["local_path"], str(raw_mail_path))
+            self.assertEqual(client.uploaded_local_files[0]["parent_type"], "bitable_file")
+            self.assertEqual(client.uploaded_local_files[0]["parent_node"], "app_token")
 
     def test_upload_prefers_task_upload_resolved_target_over_payload_link(self) -> None:
         client = _FakeBitableUploadClient()

@@ -25,6 +25,9 @@ FINAL_UPLOAD_COLUMNS = (
     "标签(ai)",
     "ai评价",
 )
+_ROW_ATTACHMENT_PATHS_KEY = "__feishu_attachment_local_paths"
+_SHARED_ATTACHMENT_PATHS_KEY = "__feishu_shared_attachment_local_paths"
+_LAST_MAIL_RAW_PATH_KEY = "__last_mail_raw_path"
 
 _PLATFORM_ALIASES = {
     "tiktok": "tiktok",
@@ -77,6 +80,18 @@ def _clean_text(value: Any) -> str:
     if _is_blank(value):
         return ""
     return str(value).strip()
+
+
+def _dedupe_preserve_order(values: list[str]) -> list[str]:
+    seen: set[str] = set()
+    deduped: list[str] = []
+    for value in values:
+        normalized = _clean_text(value)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(normalized)
+    return deduped
 
 
 def _normalize_platform(value: Any) -> str:
@@ -282,6 +297,37 @@ def _resolve_run_root_from_export(final_review_path: Path) -> Path | None:
         return None
 
 
+def _resolve_existing_local_paths(*values: Any, base_dirs: list[Path | None] | None = None) -> list[str]:
+    candidates: list[str] = []
+    for value in values:
+        if isinstance(value, (list, tuple, set)):
+            for item in value:
+                candidates.extend(_resolve_existing_local_paths(item, base_dirs=base_dirs))
+            continue
+        raw = _clean_text(value)
+        if not raw:
+            continue
+        path = Path(raw).expanduser()
+        path_candidates: list[Path] = []
+        if path.is_absolute():
+            path_candidates.append(path)
+        else:
+            path_candidates.append(path)
+            for base_dir in base_dirs or []:
+                if base_dir is None:
+                    continue
+                path_candidates.append(base_dir / path)
+        for candidate in path_candidates:
+            try:
+                resolved = candidate.resolve()
+            except Exception:
+                continue
+            if resolved.exists() and resolved.is_file():
+                candidates.append(str(resolved))
+                break
+    return _dedupe_preserve_order(candidates)
+
+
 def _build_apify_metric_lookup(platform: str, final_review_path: str | Path | None) -> dict[str, dict[str, float | None]]:
     if not final_review_path:
         return {}
@@ -484,6 +530,8 @@ def build_all_platforms_final_review_artifacts(
         or _clean_text(owner_context.get("employee_name"))
         or _clean_text(owner_context.get("owner_name"))
     )
+    keep_workbook_path = Path(str(keep_workbook)).expanduser().resolve() if keep_workbook else None
+    shared_attachment_paths = [str(workbook_path)]
     rows: list[dict[str, Any]] = []
     payload_rows: list[dict[str, Any]] = []
     skipped_payload_rows: list[dict[str, Any]] = []
@@ -492,6 +540,7 @@ def build_all_platforms_final_review_artifacts(
         final_review_path = Path(_clean_text((export_map or {}).get("final_review"))).expanduser()
         if not final_review_path.exists():
             continue
+        run_root = _resolve_run_root_from_export(final_review_path)
         apify_metrics = _build_apify_metric_lookup(platform, final_review_path)
         positioning_handle_lookup, positioning_url_lookup = _build_positioning_lookup(
             (export_map or {}).get("positioning_card_review")
@@ -511,6 +560,18 @@ def build_all_platforms_final_review_artifacts(
             keep_row = keep_handle_lookup.get((platform, handle)) or keep_url_lookup.get((platform, normalized_url)) or {}
             positioning_row = positioning_handle_lookup.get(handle) or positioning_url_lookup.get(normalized_url) or {}
             apify_row = apify_metrics.get(handle) or {}
+            row_attachment_paths = _resolve_existing_local_paths(
+                keep_row.get("last_mail_raw_path"),
+                base_dirs=[
+                    Path.cwd(),
+                    keep_workbook_path.parent if keep_workbook_path else None,
+                    final_review_path.parent,
+                    run_root,
+                    run_root / "upstream" if run_root else None,
+                    run_root / "upstream" / "exports" if run_root else None,
+                    run_root / "upstream" / "mail_data" if run_root else None,
+                ],
+            )
             avg_views = _first_non_blank(apify_row.get("avg_views"), record.get("runtime_avg_views"), record.get("upload_avg_views"))
             avg_likes = _first_non_blank(apify_row.get("avg_likes"), record.get("upload_avg_likes"))
             engagement_rate = ""
@@ -587,6 +648,8 @@ def build_all_platforms_final_review_artifacts(
                     "达人对接人_owner_name": _clean_text(owner_context.get("owner_name")),
                     "linked_bitable_url": _clean_text(owner_context.get("linked_bitable_url")),
                     "任务名": _clean_text(owner_context.get("task_name")),
+                    _LAST_MAIL_RAW_PATH_KEY: _clean_text(keep_row.get("last_mail_raw_path")),
+                    _ROW_ATTACHMENT_PATHS_KEY: row_attachment_paths,
                 }
             )
             validation_errors = _collect_upload_validation_errors(payload_row)
@@ -622,6 +685,7 @@ def build_all_platforms_final_review_artifacts(
         "source_row_count": len(rows),
         "row_count": len(payload_rows),
         "skipped_row_count": len(skipped_payload_rows),
+        _SHARED_ATTACHMENT_PATHS_KEY: shared_attachment_paths,
         "rows": payload_rows,
         "skipped_rows": skipped_payload_rows,
     }
@@ -656,6 +720,7 @@ def build_all_platforms_final_review_artifacts(
         "all_platforms_upload_local_archive_dir": str(archive_dir),
         "all_platforms_upload_skipped_archive_json": str(skipped_archive_json_path),
         "all_platforms_upload_skipped_archive_xlsx": str(skipped_archive_xlsx_path),
+        "all_platforms_upload_shared_attachment_local_paths": shared_attachment_paths,
         "row_count": len(payload_rows),
         "source_row_count": len(rows),
         "skipped_row_count": len(skipped_payload_rows),

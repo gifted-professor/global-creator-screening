@@ -11,6 +11,80 @@ from backend.final_export_merge import build_all_platforms_final_review_artifact
 
 
 class FinalExportMergeTests(unittest.TestCase):
+    def test_payload_carries_row_mail_file_and_shared_workbook_attachment_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            exports_dir = root / "exports"
+            instagram_export = exports_dir / "instagram" / "instagram_final_review.xlsx"
+            instagram_export.parent.mkdir(parents=True, exist_ok=True)
+
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "alpha",
+                        "username": "alpha",
+                        "profile_url": "https://www.instagram.com/alpha",
+                        "upload_handle": "alpha",
+                        "final_status": "Pass",
+                        "final_reason": "内容契合",
+                    }
+                ]
+            ).to_excel(instagram_export, index=False)
+
+            keep_workbook = root / "upstream" / "exports" / "keep.xlsx"
+            keep_workbook.parent.mkdir(parents=True, exist_ok=True)
+            positioning_review = exports_dir / "instagram" / "instagram_positioning_card_review.xlsx"
+            raw_dir = root / "upstream" / "raw"
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            raw_mail_path = raw_dir / "alpha-last.eml"
+            raw_mail_path.write_text("Subject: alpha\n\nhello", encoding="utf-8")
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "alpha",
+                        "username": "alpha",
+                        "profile_url": "https://www.instagram.com/alpha",
+                        "upload_handle": "alpha",
+                        "positioning_stage_status": "Completed",
+                        "positioning_labels": "家庭用品和家电-家庭博主",
+                        "fit_summary": "适合家庭类合作",
+                    }
+                ]
+            ).to_excel(positioning_review, index=False)
+            pd.DataFrame(
+                [
+                    {
+                        "Platform": "instagram",
+                        "@username": "alpha",
+                        "URL": "https://www.instagram.com/alpha",
+                        "last_mail_time": "2026-03-31",
+                        "last_mail_snippet": "hello",
+                        "last_mail_raw_path": str(raw_mail_path),
+                    }
+                ]
+            ).to_excel(keep_workbook, index=False)
+
+            output_path = exports_dir / "all_platforms_final_review.xlsx"
+            payload_path = exports_dir / "all_platforms_final_review_payload.json"
+            artifacts = build_all_platforms_final_review_artifacts(
+                output_path=output_path,
+                payload_json_path=payload_path,
+                final_exports={
+                    "instagram": {
+                        "final_review": str(instagram_export),
+                        "positioning_card_review": str(positioning_review),
+                    }
+                },
+                keep_workbook=keep_workbook,
+                task_owner={"responsible_name": "陈俊仁"},
+            )
+
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["rows"][0]["__last_mail_raw_path"], str(raw_mail_path))
+            self.assertEqual(payload["rows"][0]["__feishu_attachment_local_paths"], [str(raw_mail_path.resolve())])
+            self.assertEqual(payload["__feishu_shared_attachment_local_paths"], [str(output_path.resolve())])
+            self.assertEqual(artifacts["all_platforms_upload_shared_attachment_local_paths"], [str(output_path.resolve())])
+
     def test_payload_skips_processing_failures_and_preserves_uploadable_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
