@@ -19,6 +19,14 @@ UID_PATTERN = re.compile(rb"UID (\d+)")
 SIZE_PATTERN = re.compile(rb"RFC822\.SIZE (\d+)")
 INTERNALDATE_PATTERN = re.compile(rb'INTERNALDATE "([^"]+)"')
 PARALLEL_FETCH_BATCH_SIZE = 20
+SHARED_BACKUP_FOLDER_RETRY_LIMIT = 3
+RETRYABLE_IMAP_ERROR_MARKERS = (
+    "socket error: eof",
+    "connection aborted",
+    "server closed connection",
+    "timed out",
+    "system busy",
+)
 
 
 @dataclass
@@ -156,6 +164,44 @@ def _response_number(client: imaplib.IMAP4_SSL, code: str) -> Optional[int]:
 
 def _format_imap_date(value: date) -> str:
     return value.strftime("%d-%b-%Y")
+
+
+def _is_retryable_imap_error(error: object) -> bool:
+    text = str(error or "").strip().lower()
+    if not text:
+        return False
+    return any(marker in text for marker in RETRYABLE_IMAP_ERROR_MARKERS)
+
+
+def _is_shared_backup_mailbox(mailbox: MailboxInfo) -> bool:
+    display_name = str(mailbox.display_name or "").strip()
+    return "邮件备份" in display_name
+
+
+def _mailbox_retry_limit(mailbox: MailboxInfo) -> int:
+    return SHARED_BACKUP_FOLDER_RETRY_LIMIT if _is_shared_backup_mailbox(mailbox) else 1
+
+
+def _checkpoint_sync_state(
+    db: Database,
+    *,
+    settings: Settings,
+    mailbox: MailboxInfo,
+    uidvalidity: Optional[int],
+    highest_uid: int,
+    fetched_count: int,
+    started_at: str,
+) -> None:
+    db.update_sync_state(
+        account_email=settings.account_email,
+        folder_name=mailbox.display_name,
+        uidvalidity=uidvalidity,
+        last_seen_uid=highest_uid,
+        last_run_synced=fetched_count,
+        last_sync_started_at=started_at,
+        last_sync_completed_at=None,
+        last_error=None,
+    )
 
 
 def _search_uids(
@@ -349,128 +395,186 @@ def sync_mailboxes(
             uidvalidity: Optional[int] = None
             message_count_on_server: Optional[int] = None
 
-            try:
-                status, data = client.select(_quote_mailbox_name(mailbox.imap_name), readonly=settings.readonly)
-                if status != "OK":
-                    raise RuntimeError(f"无法选择文件夹 {mailbox.display_name}")
+            retry_limit = _mailbox_retry_limit(mailbox)
+            for attempt_index in range(retry_limit):
+                mailbox_client: Optional[imaplib.IMAP4_SSL] = None
+                try:
+                    mailbox_client = connect(settings)
+                    status, data = mailbox_client.select(_quote_mailbox_name(mailbox.imap_name), readonly=settings.readonly)
+                    if status != "OK":
+                        raise RuntimeError(f"无法选择文件夹 {mailbox.display_name}")
 
-                message_count_on_server = int(data[0]) if data and data[0] else None
-                uidvalidity = _response_number(client, "UIDVALIDITY")
+                    message_count_on_server = int(data[0]) if data and data[0] else None
+                    uidvalidity = _response_number(mailbox_client, "UIDVALIDITY")
 
-                db.record_mailbox(
-                    account_email=settings.account_email,
-                    folder_name=mailbox.display_name,
-                    imap_name=mailbox.imap_name,
-                    delimiter=mailbox.delimiter,
-                    flags=mailbox.flags,
-                    uidvalidity=uidvalidity,
-                    message_count_on_server=message_count_on_server,
-                )
+                    db.record_mailbox(
+                        account_email=settings.account_email,
+                        folder_name=mailbox.display_name,
+                        imap_name=mailbox.imap_name,
+                        delimiter=mailbox.delimiter,
+                        flags=mailbox.flags,
+                        uidvalidity=uidvalidity,
+                        message_count_on_server=message_count_on_server,
+                    )
 
-                state = db.get_sync_state(settings.account_email, mailbox.display_name)
-                last_seen_uid = 0
-                if state and not reset_state:
-                    state_uidvalidity = state["uidvalidity"]
-                    if state_uidvalidity == uidvalidity:
-                        last_seen_uid = int(state["last_seen_uid"])
+                    state = db.get_sync_state(settings.account_email, mailbox.display_name)
+                    last_seen_uid = 0
+                    if state and not reset_state:
+                        state_uidvalidity = state["uidvalidity"]
+                        if state_uidvalidity == uidvalidity:
+                            last_seen_uid = int(state["last_seen_uid"])
 
-                candidate_uids = _search_uids(client, last_seen_uid, sent_since=sent_since)
-                selected_uids = candidate_uids
-                if limit is not None and limit > 0 and len(candidate_uids) > limit:
-                    selected_uids = candidate_uids[-limit:]
-                    skipped_state_advance = True
+                    candidate_uids = _search_uids(mailbox_client, last_seen_uid, sent_since=sent_since)
+                    selected_uids = candidate_uids
+                    if limit is not None and limit > 0 and len(candidate_uids) > limit:
+                        selected_uids = candidate_uids[-limit:]
+                        skipped_state_advance = True
 
-                highest_uid = last_seen_uid
-                processed_count = 0
-                last_reported = 0
+                    highest_uid = max(highest_uid, last_seen_uid)
+                    processed_count = 0
+                    last_reported = 0
 
-                if workers > 1 and len(selected_uids) > 1:
-                    for fetched_messages, message_errors in _iter_parallel_fetch_batches(
-                        settings,
-                        mailbox,
-                        uidvalidity or 0,
-                        selected_uids,
-                        workers,
-                    ):
-                        for fetched_message in fetched_messages:
-                            _persist_fetched_message(settings, db, fetched_message)
-                            highest_uid = max(highest_uid, fetched_message.parsed.uid)
-                            fetched_count += 1
+                    if workers > 1 and len(selected_uids) > 1:
+                        for fetched_messages, message_errors in _iter_parallel_fetch_batches(
+                            settings,
+                            mailbox,
+                            uidvalidity or 0,
+                            selected_uids,
+                            workers,
+                        ):
+                            for fetched_message in fetched_messages:
+                                _persist_fetched_message(settings, db, fetched_message)
+                                highest_uid = max(highest_uid, fetched_message.parsed.uid)
+                                fetched_count += 1
 
-                        for uid, error_message in message_errors:
-                            _record_message_error(
-                                db,
-                                settings.account_email,
+                            if not skipped_state_advance and fetched_messages:
+                                _checkpoint_sync_state(
+                                    db,
+                                    settings=settings,
+                                    mailbox=mailbox,
+                                    uidvalidity=uidvalidity,
+                                    highest_uid=highest_uid,
+                                    fetched_count=fetched_count,
+                                    started_at=started_at,
+                                )
+
+                            if message_errors and not fetched_messages and all(
+                                _is_retryable_imap_error(error_message)
+                                for _, error_message in message_errors
+                            ):
+                                raise RuntimeError(message_errors[0][1])
+
+                            for uid, error_message in message_errors:
+                                _record_message_error(
+                                    db,
+                                    settings.account_email,
+                                    mailbox.display_name,
+                                    uid,
+                                    error_message,
+                                )
+
+                            processed_count += len(fetched_messages) + len(message_errors)
+                            last_reported = _emit_progress(
                                 mailbox.display_name,
-                                uid,
-                                error_message,
+                                processed_count,
+                                len(selected_uids),
+                                last_reported,
+                            )
+                    else:
+                        for uid in selected_uids:
+                            try:
+                                payload = _fetch_raw_message(mailbox_client, uid)
+                                fetched_message = _build_fetched_message(settings, mailbox, uidvalidity or 0, payload)
+                                _persist_fetched_message(settings, db, fetched_message)
+                                highest_uid = max(highest_uid, fetched_message.parsed.uid)
+                                fetched_count += 1
+                                if not skipped_state_advance:
+                                    _checkpoint_sync_state(
+                                        db,
+                                        settings=settings,
+                                        mailbox=mailbox,
+                                        uidvalidity=uidvalidity,
+                                        highest_uid=highest_uid,
+                                        fetched_count=fetched_count,
+                                        started_at=started_at,
+                                    )
+                            except Exception as message_error:  # noqa: BLE001
+                                if _is_retryable_imap_error(message_error):
+                                    raise RuntimeError(str(message_error)) from message_error
+                                _record_message_error(
+                                    db,
+                                    settings.account_email,
+                                    mailbox.display_name,
+                                    uid,
+                                    str(message_error),
+                                )
+
+                            processed_count += 1
+                            last_reported = _emit_progress(
+                                mailbox.display_name,
+                                processed_count,
+                                len(selected_uids),
+                                last_reported,
                             )
 
-                        processed_count += len(fetched_messages) + len(message_errors)
-                        last_reported = _emit_progress(
+                    state_last_seen_uid = highest_uid if not skipped_state_advance else last_seen_uid
+                    completed_at = _utc_now()
+                    db.update_sync_state(
+                        account_email=settings.account_email,
+                        folder_name=mailbox.display_name,
+                        uidvalidity=uidvalidity,
+                        last_seen_uid=state_last_seen_uid,
+                        last_run_synced=fetched_count,
+                        last_sync_started_at=started_at,
+                        last_sync_completed_at=completed_at,
+                        last_error=None,
+                    )
+                    break
+                except Exception as folder_error:  # noqa: BLE001
+                    retryable_error = _is_retryable_imap_error(folder_error)
+                    should_retry = retryable_error and attempt_index + 1 < retry_limit
+                    if should_retry:
+                        db.record_sync_error(
+                            settings.account_email,
                             mailbox.display_name,
-                            processed_count,
-                            len(selected_uids),
-                            last_reported,
+                            None,
+                            "folder_retry",
+                            f"{folder_error} (retry {attempt_index + 1}/{retry_limit - 1})",
                         )
-                else:
-                    for uid in selected_uids:
+                        print(f"[warn] {mailbox.display_name}: {folder_error}，准备重连重试 ({attempt_index + 1}/{retry_limit - 1})")
+                        continue
+
+                    db.record_sync_error(
+                        settings.account_email,
+                        mailbox.display_name,
+                        None,
+                        "folder",
+                        str(folder_error),
+                    )
+                    existing_state = db.get_sync_state(settings.account_email, mailbox.display_name)
+                    db.update_sync_state(
+                        account_email=settings.account_email,
+                        folder_name=mailbox.display_name,
+                        uidvalidity=uidvalidity,
+                        last_seen_uid=int(existing_state["last_seen_uid"]) if existing_state else 0,
+                        last_run_synced=fetched_count,
+                        last_sync_started_at=started_at,
+                        last_sync_completed_at=_utc_now(),
+                        last_error=str(folder_error),
+                    )
+                    print(f"[error] {mailbox.display_name}: {folder_error}")
+                    state_last_seen_uid = int(existing_state["last_seen_uid"]) if existing_state else 0
+                    break
+                finally:
+                    if mailbox_client is not None:
                         try:
-                            payload = _fetch_raw_message(client, uid)
-                            fetched_message = _build_fetched_message(settings, mailbox, uidvalidity or 0, payload)
-                            _persist_fetched_message(settings, db, fetched_message)
-                            highest_uid = max(highest_uid, fetched_message.parsed.uid)
-                            fetched_count += 1
-                        except Exception as message_error:  # noqa: BLE001
-                            _record_message_error(
-                                db,
-                                settings.account_email,
-                                mailbox.display_name,
-                                uid,
-                                str(message_error),
-                            )
-
-                        processed_count += 1
-                        last_reported = _emit_progress(
-                            mailbox.display_name,
-                            processed_count,
-                            len(selected_uids),
-                            last_reported,
-                        )
-
-                state_last_seen_uid = highest_uid if not skipped_state_advance else last_seen_uid
-                completed_at = _utc_now()
-                db.update_sync_state(
-                    account_email=settings.account_email,
-                    folder_name=mailbox.display_name,
-                    uidvalidity=uidvalidity,
-                    last_seen_uid=state_last_seen_uid,
-                    last_run_synced=fetched_count,
-                    last_sync_started_at=started_at,
-                    last_sync_completed_at=completed_at,
-                    last_error=None,
-                )
-            except Exception as folder_error:  # noqa: BLE001
-                db.record_sync_error(
-                    settings.account_email,
-                    mailbox.display_name,
-                    None,
-                    "folder",
-                    str(folder_error),
-                )
-                existing_state = db.get_sync_state(settings.account_email, mailbox.display_name)
-                db.update_sync_state(
-                    account_email=settings.account_email,
-                    folder_name=mailbox.display_name,
-                    uidvalidity=uidvalidity,
-                    last_seen_uid=int(existing_state["last_seen_uid"]) if existing_state else 0,
-                    last_run_synced=0,
-                    last_sync_started_at=started_at,
-                    last_sync_completed_at=_utc_now(),
-                    last_error=str(folder_error),
-                )
-                print(f"[error] {mailbox.display_name}: {folder_error}")
-                state_last_seen_uid = int(existing_state["last_seen_uid"]) if existing_state else 0
+                            mailbox_client.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        try:
+                            mailbox_client.logout()
+                        except Exception:  # noqa: BLE001
+                            pass
 
             results.append(
                 SyncResult(
@@ -482,11 +586,11 @@ def sync_mailboxes(
                     message_count_on_server=message_count_on_server,
                 )
             )
-            try:
-                client.close()
-            except Exception:  # noqa: BLE001
-                pass
     finally:
+        try:
+            client.close()
+        except Exception:  # noqa: BLE001
+            pass
         try:
             client.logout()
         except Exception:  # noqa: BLE001
