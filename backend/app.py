@@ -11,6 +11,7 @@ import uuid
 import base64
 import hashlib
 import random
+from contextlib import contextmanager
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from datetime import datetime
 from io import BytesIO
@@ -255,6 +256,7 @@ VISUAL_IMAGE_DOWNLOAD_MAX_RETRIES = max(1, int(os.getenv("VISUAL_IMAGE_DOWNLOAD_
 VISUAL_IMAGE_CACHE_ENABLED = parse_env_flag("VISUAL_IMAGE_CACHE_ENABLED", default=True)
 VISUAL_IMAGE_CACHE_DIR = str(os.getenv("VISUAL_IMAGE_CACHE_DIR", "") or "").strip()
 VISUAL_REVIEW_RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504, 522}
+DEFAULT_LOCAL_OPENAI_MAX_INFLIGHT_REQUESTS = 8
 VISION_PROVIDER_CONFIGS = (
     {
         "name": "openai",
@@ -263,6 +265,7 @@ VISION_PROVIDER_CONFIGS = (
         "env_key": "OPENAI_API_KEY",
         "api_style": VISION_API_STYLE_RESPONSES,
         "model_env_key": "OPENAI_VISION_MODEL",
+        "max_inflight_env_key": "OPENAI_MAX_INFLIGHT_REQUESTS",
     },
     {
         "name": "reelx",
@@ -438,6 +441,8 @@ OPERATOR_RUNS_LOCK = threading.Lock()
 OPERATOR_RUNS: dict[str, dict[str, Any]] = {}
 OPERATOR_RUN_PROCESSES: dict[str, subprocess.Popen[Any]] = {}
 OPERATOR_RUN_LOG_HANDLES: dict[str, Any] = {}
+VISION_PROVIDER_REQUEST_GATES_LOCK = threading.Lock()
+VISION_PROVIDER_REQUEST_GATES: dict[tuple[str, str, int], threading.BoundedSemaphore] = {}
 OPERATOR_RUNS_ROOT = BASE_DIR / "temp" / "operator_runs"
 OPERATOR_RUN_TERMINAL_STATUSES = {"completed", "completed_with_partial_scrape", "failed", "cancelled"}
 
@@ -3986,6 +3991,67 @@ def compute_visual_retry_delay_seconds(attempt_index):
     return round(delay + jitter, 3)
 
 
+def is_local_cliproxyapi_base_url(base_url):
+    parsed = urlparse(str(base_url or "").strip())
+    hostname = str(parsed.hostname or "").strip().lower()
+    try:
+        port = int(parsed.port) if parsed.port is not None else None
+    except Exception:
+        port = None
+    return hostname in {"127.0.0.1", "localhost"} and port == 8317
+
+
+def resolve_vision_provider_max_inflight_requests(provider, base_url=""):
+    provider_name = normalize_vision_provider_name((provider or {}).get("name"))
+    env_key = str((provider or {}).get("max_inflight_env_key") or "").strip()
+    if env_key:
+        raw_value = os.getenv(env_key, "")
+        if str(raw_value or "").strip():
+            try:
+                return max(0, int(raw_value))
+            except (TypeError, ValueError):
+                return 0
+    if provider_name == "openai" and is_local_cliproxyapi_base_url(base_url or (provider or {}).get("base_url")):
+        return DEFAULT_LOCAL_OPENAI_MAX_INFLIGHT_REQUESTS
+    return 0
+
+
+def get_vision_provider_request_gate(provider_name, base_url, limit):
+    normalized_provider = normalize_vision_provider_name(provider_name)
+    normalized_base_url = str(base_url or "").strip().rstrip("/")
+    normalized_limit = max(0, int(limit or 0))
+    if normalized_limit <= 0:
+        return None
+    key = (normalized_provider, normalized_base_url, normalized_limit)
+    with VISION_PROVIDER_REQUEST_GATES_LOCK:
+        gate = VISION_PROVIDER_REQUEST_GATES.get(key)
+        if gate is None:
+            gate = threading.BoundedSemaphore(normalized_limit)
+            VISION_PROVIDER_REQUEST_GATES[key] = gate
+        return gate
+
+
+@contextmanager
+def acquire_vision_provider_request_slot(provider, base_url, request_timeout):
+    provider_name = normalize_vision_provider_name((provider or {}).get("name"))
+    limit = resolve_vision_provider_max_inflight_requests(provider, base_url=base_url)
+    gate = get_vision_provider_request_gate(provider_name, base_url, limit)
+    if gate is None:
+        yield
+        return
+    acquired = gate.acquire(timeout=max(float(request_timeout or 0), 30.0))
+    if not acquired:
+        raise VisionProviderError(
+            provider_name,
+            f"{provider_name} 并发闸门等待超时（limit={limit}）",
+            retryable=True,
+        )
+    try:
+        yield
+    finally:
+        gate.release()
+
+
 def is_qiandao_25p_visual_model(model_name):
     return str(model_name or "").strip() == QIANDAO_25P_VISION_MODEL
 
@@ -4131,7 +4197,8 @@ def call_vision_provider_with_json_contract(
                 }
 
             try:
-                response = requests.post(url, headers=headers, json=body, timeout=request_timeout)
+                with acquire_vision_provider_request_slot(provider, candidate_base_url, request_timeout):
+                    response = requests.post(url, headers=headers, json=body, timeout=request_timeout)
             except requests.exceptions.RequestException as exc:
                 last_error = VisionProviderError(
                     provider_name,
@@ -4285,12 +4352,14 @@ def probe_vision_provider(provider):
     for candidate_index, candidate_base_url in enumerate(base_urls):
         request_payload = build_vision_provider_probe_request({**provider, "base_url": candidate_base_url})
         try:
-            response = requests.post(
-                request_payload["url"],
-                headers=request_payload["headers"],
-                json=request_payload["body"],
-                timeout=min(VISION_REQUEST_TIMEOUT, 20),
-            )
+            probe_timeout = min(VISION_REQUEST_TIMEOUT, 20)
+            with acquire_vision_provider_request_slot(provider, candidate_base_url, probe_timeout):
+                response = requests.post(
+                    request_payload["url"],
+                    headers=request_payload["headers"],
+                    json=request_payload["body"],
+                    timeout=probe_timeout,
+                )
         except requests.exceptions.RequestException as exc:
             last_error = VisionProviderError(
                 request_payload["provider_name"],
