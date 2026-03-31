@@ -5617,11 +5617,57 @@ def build_actor_input(platform, batch, payload):
 
 
 def apify_request(method, url, *, token, params=None, json_payload=None):
+    def _curl_get_fallback(prepared_url):
+        curl_result = subprocess.run(
+            [
+                "curl",
+                "--silent",
+                "--show-error",
+                "--location",
+                "--max-time",
+                str(APIFY_REQUEST_TIMEOUT),
+                "--request",
+                "GET",
+                prepared_url,
+                "--write-out",
+                "\n__CODEX_HTTP_STATUS__:%{http_code}\n",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=APIFY_REQUEST_TIMEOUT + 5,
+            check=False,
+        )
+        if curl_result.returncode != 0:
+            stderr = str(curl_result.stderr or "").strip()
+            raise RuntimeError(stderr or f"curl exited with code {curl_result.returncode}")
+        marker = "\n__CODEX_HTTP_STATUS__:"
+        marker_index = curl_result.stdout.rfind(marker)
+        if marker_index < 0:
+            raise RuntimeError("curl fallback missing status marker")
+        body = curl_result.stdout[:marker_index]
+        status_text = (
+            curl_result.stdout[marker_index + len(marker):].strip().splitlines()[0].strip()
+        )
+        status_code = int(status_text or "0")
+
+        class CurlResponse:
+            def __init__(self, status_code, text):
+                self.status_code = status_code
+                self.text = text
+                self.headers = {}
+                self.content = str(text or "").encode("utf-8")
+
+            def json(self):
+                return json.loads(self.text or "null")
+
+        return CurlResponse(status_code=status_code, text=body)
+
     request_params = dict(params or {})
     request_params["token"] = token
     normalized_method = str(method or "GET").strip().upper()
     max_attempts = APIFY_TRANSPORT_MAX_RETRIES if normalized_method == "GET" else 1
     last_error = None
+    prepared = requests.Request(normalized_method, url, params=request_params).prepare()
     for attempt in range(1, max_attempts + 1):
         try:
             return requests.request(
@@ -5633,8 +5679,15 @@ def apify_request(method, url, *, token, params=None, json_payload=None):
             )
         except requests.exceptions.RequestException as exc:
             last_error = exc
+            if normalized_method == "GET":
+                try:
+                    return _curl_get_fallback(prepared.url)
+                except Exception as curl_exc:
+                    last_error = RuntimeError(
+                        f"{exc}; curl fallback failed: {curl_exc}"
+                    )
             if attempt >= max_attempts:
-                raise
+                break
             time.sleep(APIFY_TRANSPORT_RETRY_BACKOFF_SECONDS * attempt)
     if last_error is not None:
         raise last_error

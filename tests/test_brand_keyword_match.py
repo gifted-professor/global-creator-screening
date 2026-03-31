@@ -46,6 +46,14 @@ class BrandKeywordMatchTests(unittest.TestCase):
         sheet.append(["Alice", "US", "https://instagram.com/alice", "alice@mgmt.com"])
         workbook.save(self.input_path)
 
+    def _make_handle_email_workbook(self) -> None:
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "results"
+        sheet.append(["博主用户名", "地区", "平台", "邮箱"])
+        sheet.append(["alice", "US", "Instagram", "alice@mgmt.com"])
+        workbook.save(self.input_path)
+
     def _seed_messages(self) -> Database:
         db = Database(self.db_path)
         db.init_schema()
@@ -263,6 +271,33 @@ class BrandKeywordMatchTests(unittest.TestCase):
         headers = list(rows[0])
         region_index = headers.index("Region")
         self.assertEqual(rows[1][region_index], "US")
+
+    def test_match_brand_keyword_accepts_blog_username_and_email_columns(self) -> None:
+        self._make_handle_email_workbook()
+        db = self._seed_messages()
+        try:
+            result = match_brand_keyword(
+                db=db,
+                input_path=self.input_path,
+                output_prefix=self.output_prefix,
+                keyword="MINISO",
+                include_from=True,
+            )
+        finally:
+            db.close()
+
+        self.assertEqual(result["source_kind"], "custom_columns")
+        deduped_path = Path(result["deduped_xlsx_path"])
+        workbook = load_workbook(deduped_path, read_only=True, data_only=True)
+        try:
+            rows = list(workbook.active.iter_rows(values_only=True))
+        finally:
+            workbook.close()
+        headers = list(rows[0])
+        username_index = headers.index("@username")
+        email_index = headers.index("Email")
+        self.assertEqual(rows[1][username_index], "alice")
+        self.assertEqual(rows[1][email_index], "alice@mgmt.com")
 
 
 if __name__ == "__main__":

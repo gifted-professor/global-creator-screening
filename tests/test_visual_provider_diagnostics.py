@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import os
+import subprocess
 import struct
 import tempfile
 import time
@@ -12,6 +13,7 @@ from unittest import mock
 
 import backend.app as backend_app
 import pandas as pd
+import requests
 
 
 class DummyProviderResponse:
@@ -97,6 +99,30 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
         self.assertEqual(preflight["configured_provider_names"], ["openai"])
         self.assertEqual(preflight["runnable_provider_names"], [])
         self.assertIn("invalid_base_url", preflight["providers"][0]["issues"])
+
+    def test_apify_request_falls_back_to_curl_after_requests_ssl_error(self) -> None:
+        ssl_error = requests.exceptions.SSLError("EOF occurred in violation of protocol")
+        completed = subprocess.CompletedProcess(
+            args=["curl"],
+            returncode=0,
+            stdout='{"data":{"status":"RUNNING"}}\n__CODEX_HTTP_STATUS__:200\n',
+            stderr="",
+        )
+
+        with mock.patch.object(backend_app.requests, "request", side_effect=ssl_error), mock.patch.object(
+            backend_app.subprocess,
+            "run",
+            return_value=completed,
+        ) as mocked_run:
+            response = backend_app.apify_request(
+                "GET",
+                "https://api.apify.com/v2/actor-runs/example",
+                token="apify_api_test",
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["data"]["status"], "RUNNING")
+        mocked_run.assert_called_once()
 
     def test_health_check_includes_rich_vision_preflight_contract(self) -> None:
         os.environ["OPENAI_API_KEY"] = "sk-live-12345678"

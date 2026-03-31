@@ -22,10 +22,15 @@ class TaskUploadToFinalExportRunnerTests(unittest.TestCase):
             observed["upstream_kwargs"] = kwargs
             keep_path = Path(kwargs["output_root"]) / "exports" / "MINISO_final_keep.xlsx"
             template_path = Path(kwargs["output_root"]) / "downloads" / "template.xlsx"
+            prompt_summary_path = Path(kwargs["output_root"]) / "task_assets_prompt_artifacts" / "summary.json"
+            prompt_artifacts_path = Path(kwargs["output_root"]) / "task_assets_prompt_artifacts" / "runtime_prompt_artifacts.json"
             keep_path.parent.mkdir(parents=True, exist_ok=True)
             keep_path.touch()
             template_path.parent.mkdir(parents=True, exist_ok=True)
             template_path.touch()
+            prompt_summary_path.parent.mkdir(parents=True, exist_ok=True)
+            prompt_summary_path.touch()
+            prompt_artifacts_path.touch()
             return {
                 "status": "stopped_after_keep-list",
                 "contract": {"canonical_boundary": "keep-list"},
@@ -38,6 +43,8 @@ class TaskUploadToFinalExportRunnerTests(unittest.TestCase):
                 "artifacts": {
                     "keep_workbook": str(keep_path),
                     "template_workbook": str(template_path),
+                    "template_prepare_summary_json": str(prompt_summary_path),
+                    "template_runtime_prompt_artifacts_json": str(prompt_artifacts_path),
                 },
                 "downstream_handoff": {"runner_script": "scripts/run_keep_list_screening_pipeline.py"},
             }
@@ -96,6 +103,8 @@ class TaskUploadToFinalExportRunnerTests(unittest.TestCase):
         self.assertTrue(summary["artifacts"]["keep_workbook"].endswith("MINISO_final_keep.xlsx"))
         self.assertIn("instagram", summary["artifacts"]["final_exports"])
         self.assertTrue(summary["artifacts"]["all_platforms_final_review"].endswith("all_platforms_final_review.xlsx"))
+        self.assertTrue(summary["artifacts"]["template_prepare_summary_json"].endswith("summary.json"))
+        self.assertTrue(summary["artifacts"]["template_runtime_prompt_artifacts_json"].endswith("runtime_prompt_artifacts.json"))
         self.assertIn("--keep-workbook", summary["resume_points"]["keep_list"]["recommended_command"])
         self.assertIn("--platform instagram", summary["resume_points"]["keep_list"]["recommended_command"])
         self.assertIn("--vision-provider openai", summary["resume_points"]["keep_list"]["recommended_command"])

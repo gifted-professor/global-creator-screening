@@ -4,7 +4,7 @@ milestone: v1.3.0
 milestone_name: External Email Dependency Decoupling
 status: ready_for_phase_planning
 stopped_at: Gap-closure phases 26-29 were added on 2026-03-31 to close milestone audit evidence gaps; next workflow step is `$gsd-plan-phase 26`
-last_updated: "2026-03-31T14:33:20+08:00"
+last_updated: "2026-03-31T16:25:00+08:00"
 progress:
   total_phases: 10
   completed_phases: 6
@@ -166,6 +166,7 @@ Recent decisions affecting current work:
 - Phase 23 added: Wire template-compiled visual prompts into runtime and define visual feature-group contract
 - Phase 24 added: Add post-visual-review positioning-card analysis step for approved creators
 - Phase 25 added: Build local thin operator UI for task-driven screening runs
+- Phase 25.1 inserted after Phase 25: Fix MINISO LLM auth failures, redact summary secrets, surface missing duet sending-list diagnostics, and clarify LLM stage observability (URGENT)
 - Phase 26 added: Backfill decoupling verification bundle for Phases 20-21
 - Phase 27 added: Reconstruct runtime safety proof and fallback certification for Phase 22
 - Phase 28 added: Reconstruct visual runtime and positioning evidence chain for Phases 23-24
@@ -173,15 +174,18 @@ Recent decisions affecting current work:
 
 ### Pending Todos
 
+- Phase 25.1 execution: 收口 upstream summary 脱敏、`发信名单` 缺件诊断、以及 LLM review auth / stage observability
 - Phase 26 planning: 为 Phases 20-21 补齐 verification bundle、summary frontmatter 与 DEP traceability 收口
 - Phase 27 planning: 重建 Phase 22 planning/sumary/verification artifact，并把 bounded proof 与 fallback contract 固化到正式 phase 文档
 - Phase 28 planning: 补建 Phase 23 artifact bundle，并为 Phase 24 增加正式 verification 和 `23 -> 24` integration 证据
 - Phase 29 planning: 补建 Phase 25 operator UI artifact bundle，并收口 roadmap/state/audit closeout 口径
 - Milestone closeout: gap phases 完成后重新执行 `v1.3.0` audit / closeout，再确认 deferred follow-ups 边界
+- Next milestone intake: `v1.4.0 / Phase 30` 已登记为共享邮箱 post-sync routing + 飞书增量更新主线，详见 `.planning/v1.4.0-PHASE-30-INTAKE.md`
 - Deferred debt intake: `backend/app.py` 模块化 + app factory、shared settings loader、`pipeline_runtime.py` 抽取、SQLite WAL/FTS、upload/job hardening、LLM config consolidation、`pyproject.toml`/lint/typecheck、以及 workbook handle cleanup
 
 ### Blockers/Concerns
 
+- Phase 25.1 当前是基于用户提供的 `temp/miniso_step1_keep_list_20260331_1611` 与 `temp/duet_full_rerun_20260331_1606` 结论来 planning；这两个 run root 目前不在工作区里，执行时应优先保住 fixture/regression 覆盖，并在拿到真实 artifact 后再补 live 证据
 - 当前仓库仍要兼容 lite `active_rulespec.json`；后续优化不能假设所有入口都会先产出 full `rules`
 - 外部 qwen benchmark 仍在 sibling docs；后续 prompt 调优应继续走 override / benchmark route，而不是把 sibling benchmark 文件迁入变成阻塞项
 - UI v1 不能假设统一邮箱 `partnerships@amagency.biz` 已经通过 IMAP 暴露 `邮件备份(30316)` 或项目专属目录；默认执行路径要继续沿用已验证的老邮箱 route
@@ -241,6 +245,7 @@ Recent decisions affecting current work:
 - 2026-03-31: Quick Task `260331-jq7` — bind final-review payloads to carry row-level raw `.eml` attachment candidates plus shared workbook candidates, and teach the Feishu bitable uploader to populate attachment fields from local files
 - 2026-03-31: Quick Task `260331-k2m` — switch default mail sync routing to shared mailbox first, default sent-since to today, and prefer `其他文件夹/邮件备份` when the shared mailbox lacks a task-specific folder
 - 2026-03-31: Quick Task `260331-m9r` — add shared-backup IMAP retry/reconnect/resume semantics so `其他文件夹/邮件备份` can continue from the latest synced UID after retryable `EOF` failures
+- 2026-03-31: Quick Task `260331-m9z` — export resolved runtime LLM prompt artifacts after task-upload template download, surface them through `prepare_screening_inputs` / upstream keep-list summary / final-export wrapper, and verify with targeted prompt-artifact tests
 - 2026-03-31: Remove remaining `.planning` absolute workstation paths so the repo can move under a new parent directory without stale local path references
 - 2026-03-29: Clarify in README/PROJECT that the Phase 18 bounded proof only proves the repo-local single-entry mainline, not full-batch or multi-platform stability, full legacy-entry decoupling, or non-`openai` provider readiness
 - 2026-03-29: Intake external qwen prompt benchmark into local context: future visual tuning should prefer dual-prompt routing (`gpt-5.4` original + `qwen-vl-max` v2) with fixed benchmark harness instead of more blind prompt chasing

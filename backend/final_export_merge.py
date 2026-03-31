@@ -56,6 +56,14 @@ _PROCESSING_ERROR_PATTERNS = (
     re.compile(r"额度已用尽", re.IGNORECASE),
     re.compile(r"\btimeout\b", re.IGNORECASE),
     re.compile(r"\breelx:", re.IGNORECASE),
+    re.compile(r"\bquan2go:", re.IGNORECASE),
+    re.compile(r"\bqiandao:", re.IGNORECASE),
+    re.compile(r"\bopenai:", re.IGNORECASE),
+)
+_VISUAL_MANUAL_REVIEW_PATTERNS = (
+    re.compile(r"视觉复核", re.IGNORECASE),
+    re.compile(r"\bvisual\b", re.IGNORECASE),
+    re.compile(r"\bimage review\b", re.IGNORECASE),
 )
 _REQUIRED_UPLOAD_FIELDS = (
     "达人ID",
@@ -189,7 +197,11 @@ def _combine_reason_with_note(base_text: Any, note: str) -> str:
 
 def _build_quote_text(keep_row: dict[str, Any]) -> str:
     latest_quote_text = _clean_text(keep_row.get("latest_quote_text"))
-    for candidate in (latest_quote_text, _clean_text(keep_row.get("last_mail_snippet"))):
+    for candidate in (
+        latest_quote_text,
+        _clean_text(keep_row.get("last_mail_snippet")),
+        _clean_text(keep_row.get("brand_message_snippet")),
+    ):
         if not candidate:
             continue
         for pattern in _QUOTE_PATTERNS:
@@ -253,13 +265,44 @@ def _is_processing_error(*values: Any) -> bool:
     return False
 
 
-def _resolve_ai_pass_value(final_status: Any, *error_candidates: Any) -> str:
-    if _is_processing_error(*error_candidates):
+def _is_visual_manual_review_needed(*values: Any) -> bool:
+    for value in values:
+        text = _clean_text(value)
+        if not text:
+            continue
+        if not _is_processing_error(text):
+            continue
+        if any(pattern.search(text) for pattern in _VISUAL_MANUAL_REVIEW_PATTERNS):
+            return True
+    return False
+
+
+def _resolve_ai_pass_value(
+    final_status: Any,
+    *,
+    visual_error_candidates: list[Any] | tuple[Any, ...] = (),
+    other_error_candidates: list[Any] | tuple[Any, ...] = (),
+) -> str:
+    if _is_processing_error(*visual_error_candidates) or _is_visual_manual_review_needed(*visual_error_candidates):
+        return "转人工"
+    if _is_processing_error(*other_error_candidates):
         return "处理失败"
     normalized_status = _clean_text(final_status).lower()
     if normalized_status == "pass":
         return "是"
     return "否"
+
+
+def _resolve_visual_manual_reason(*values: Any) -> str:
+    normalized_values = [_clean_text(value) for value in values if _clean_text(value)]
+    if not normalized_values:
+        return ""
+    for text in normalized_values:
+        if "视觉复核超时" in text:
+            return "视觉复核超时，需人工确认"
+    if _is_processing_error(*normalized_values) or _is_visual_manual_review_needed(*normalized_values):
+        return "视觉复核异常，需人工确认"
+    return ""
 
 
 def _resolve_positioning_stage_note(positioning_row: dict[str, Any]) -> tuple[str, str]:
@@ -560,8 +603,14 @@ def build_all_platforms_final_review_artifacts(
             keep_row = keep_handle_lookup.get((platform, handle)) or keep_url_lookup.get((platform, normalized_url)) or {}
             positioning_row = positioning_handle_lookup.get(handle) or positioning_url_lookup.get(normalized_url) or {}
             apify_row = apify_metrics.get(handle) or {}
+            last_mail_raw_path = _clean_text(
+                _first_non_blank(
+                    keep_row.get("last_mail_raw_path"),
+                    keep_row.get("brand_message_raw_path"),
+                )
+            )
             row_attachment_paths = _resolve_existing_local_paths(
-                keep_row.get("last_mail_raw_path"),
+                last_mail_raw_path,
                 base_dirs=[
                     Path.cwd(),
                     keep_workbook_path.parent if keep_workbook_path else None,
@@ -583,16 +632,32 @@ def build_all_platforms_final_review_artifacts(
             else:
                 engagement_rate = _compute_engagement_rate(record)
 
-            ai_pass_value = _resolve_ai_pass_value(
-                _first_non_blank(record.get("final_status"), record.get("status")),
+            visual_manual_reason = _resolve_visual_manual_reason(
                 record.get("final_reason"),
                 record.get("reason"),
                 record.get("visual_reason"),
-                positioning_row.get("positioning_error"),
+            )
+            if visual_manual_reason:
+                metric_note = ""
+
+            ai_pass_value = _resolve_ai_pass_value(
+                _first_non_blank(record.get("final_status"), record.get("status")),
+                visual_error_candidates=[
+                    record.get("final_reason"),
+                    record.get("reason"),
+                    record.get("visual_reason"),
+                ],
+                other_error_candidates=[
+                    positioning_row.get("positioning_error"),
+                ],
             )
             positioning_label_note, positioning_comment_note = _resolve_positioning_stage_note(positioning_row)
+            if visual_manual_reason:
+                positioning_label_note = ""
+                positioning_comment_note = ""
 
             base_reason = _first_non_blank(
+                visual_manual_reason,
                 positioning_row.get("positioning_error")
                 if _is_processing_error(positioning_row.get("positioning_error"))
                 else "",
@@ -604,6 +669,7 @@ def build_all_platforms_final_review_artifacts(
             screening_reason = _combine_reason_with_note(base_reason, metric_note)
             screening_reason = _combine_reason_with_note(screening_reason, positioning_comment_note)
             base_comment = _first_non_blank(
+                visual_manual_reason,
                 positioning_row.get("positioning_error")
                 if _is_processing_error(positioning_row.get("positioning_error"))
                 else "",
@@ -629,8 +695,18 @@ def build_all_platforms_final_review_artifacts(
                 "Average Views (K)": _format_k_value(avg_views),
                 "互动率": engagement_rate,
                 "当前网红报价": _build_quote_text(keep_row),
-                "达人最后一次回复邮件时间": _format_date(keep_row.get("last_mail_time")),
-                "达人回复的最后一封邮件内容": _clean_text(keep_row.get("last_mail_snippet")),
+                "达人最后一次回复邮件时间": _format_date(
+                    _first_non_blank(
+                        keep_row.get("last_mail_time"),
+                        keep_row.get("brand_message_sent_at"),
+                    )
+                ),
+                "达人回复的最后一封邮件内容": _clean_text(
+                    _first_non_blank(
+                        keep_row.get("last_mail_snippet"),
+                        keep_row.get("brand_message_snippet"),
+                    )
+                ),
                 "达人对接人": owner_display_name,
                 "ai是否通过": ai_pass_value,
                 "ai筛号反馈理由": screening_reason,
@@ -648,7 +724,7 @@ def build_all_platforms_final_review_artifacts(
                     "达人对接人_owner_name": _clean_text(owner_context.get("owner_name")),
                     "linked_bitable_url": _clean_text(owner_context.get("linked_bitable_url")),
                     "任务名": _clean_text(owner_context.get("task_name")),
-                    _LAST_MAIL_RAW_PATH_KEY: _clean_text(keep_row.get("last_mail_raw_path")),
+                    _LAST_MAIL_RAW_PATH_KEY: last_mail_raw_path,
                     _ROW_ATTACHMENT_PATHS_KEY: row_attachment_paths,
                 }
             )

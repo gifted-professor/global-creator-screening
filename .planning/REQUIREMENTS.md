@@ -37,6 +37,12 @@
 - [ ] **POS-02**: positioning-card analysis 产出 machine-readable 的结构化结果，至少包含定位标签、品牌适配结论/建议、以及支撑这些判断的简明证据
 - [ ] **POS-03**: keep-list downstream runner 与 final wrapper 必须显式暴露 positioning-card analysis 的 stage 状态、artifact 路径或摘要；第一版默认不把该步骤失败变成 final export 的硬阻塞
 
+### Task-Driven Runtime Hardening
+
+- [ ] **OPS-REL-01**: `task upload -> keep-list` 文本 LLM review 路径必须显式暴露最终选中的 provider/base/model/wire_api 与候选链，鉴权或路由失败时能在 `llm_review` 阶段直接归因，而不是依赖视觉模型配置猜测
+- [ ] **OPS-REL-02**: operator-facing `summary.json` / 中间产物不得持久化 raw `imapCode`、飞书 file token、未脱敏邮箱地址或整包 raw task/mail payload；如 downstream 仍需精确 owner 上下文，必须通过单独的最小 handoff artifact 提供
+- [ ] **OPS-REL-03**: 上游任务驱动运行必须把缺 `发信名单`、任务上传重复/未命中、`llm_candidates_prepare`、`llm_review_call`、`llm_review_writeback` 拆成独立、可机读的诊断块，便于 operator 直接从 summary 归因
+
 ### Local Operator UI
 
 - [ ] **OPS-UI-01**: operator 可以在本地页面查看 task-upload 任务列表，并基于任务名选择要执行的 screening run
@@ -55,6 +61,9 @@
 
 | Requirement | Phase | Status |
 |-------------|-------|--------|
+| OPS-REL-01 | Phase 25.1 | Pending |
+| OPS-REL-02 | Phase 25.1 | Pending |
+| OPS-REL-03 | Phase 25.1 | Pending |
 | DEP-04 | Phase 26 | Pending |
 | DEP-01 | Phase 26 | Pending |
 | DEP-02 | Phase 26 | Pending |
@@ -73,8 +82,8 @@
 
 **Coverage:**
 - v1 requirements: 6 total
-- Follow-up requirements: 11 total
-- Mapped to phases: 15
+- Follow-up requirements: 14 total
+- Mapped to phases: 18
 - Unmapped follow-ups: 2 (`QTE-01`, `REL-01`)
 
 ---

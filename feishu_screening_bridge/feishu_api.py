@@ -199,6 +199,36 @@ class FeishuOpenClient:
             headers={"Authorization": f"Bearer {access_token}", **(headers or {})},
         )
 
+    def put_api_json(
+        self,
+        url_path: str,
+        *,
+        body: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        access_token = self.get_tenant_access_token()
+        return self._request_api_json(
+            "PUT",
+            url_path,
+            body=body,
+            headers={"Authorization": f"Bearer {access_token}", **(headers or {})},
+        )
+
+    def delete_api_json(
+        self,
+        url_path: str,
+        *,
+        body: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        access_token = self.get_tenant_access_token()
+        return self._request_api_json(
+            "DELETE",
+            url_path,
+            body=body,
+            headers={"Authorization": f"Bearer {access_token}", **(headers or {})},
+        )
+
     def resolve_wiki_node(self, wiki_token: str) -> dict[str, Any]:
         encoded = parse.quote(str(wiki_token or "").strip(), safe="")
         payload = self.get_api_json(f"/wiki/v2/spaces/get_node?token={encoded}")

@@ -7,11 +7,12 @@ import math
 from pathlib import Path
 import re
 from typing import Any
+from urllib import parse
 
 import pandas as pd
 
 from .bitable_export import ResolvedBitableView, resolve_bitable_view_from_url
-from .feishu_api import FeishuOpenClient
+from .feishu_api import FeishuApiError, FeishuOpenClient
 from .task_upload_sync import resolve_task_upload_entry
 
 
@@ -35,8 +36,19 @@ _INTERNAL_PAYLOAD_KEYS = {
     "__feishu_shared_attachment_local_paths",
 }
 _ATTACHMENT_FIELD_PREFERRED_NAMES = ("附件", "附件列", "上传附件", "文本 12", "文本12")
+_ROW_UPDATE_MODE_KEY = "__feishu_update_mode"
+_UPDATE_MODE_CREATE_ONLY = "create_only"
+_UPDATE_MODE_CREATE_OR_UPDATE = "create_or_update"
+_UPDATE_MODE_MAIL_ONLY = "mail_only_update"
+_MAIL_ONLY_FIELD_NAMES = (
+    "当前网红报价",
+    "达人最后一次回复邮件时间",
+    "达人回复的最后一封邮件内容",
+)
 
 _UPLOAD_KEY_FIELDS = ("达人ID", "平台")
+_PREFERRED_TARGET_TABLE_NAMES = ("AI回信管理", "达人管理")
+_PREFERRED_TARGET_VIEW_NAMES = ("表格", "总视图")
 
 
 @dataclass(frozen=True)
@@ -45,6 +57,20 @@ class FieldSchema:
     field_name: str
     field_type: int
     property: dict[str, Any]
+
+
+@dataclass(frozen=True)
+class ExistingRecordSnapshot:
+    record_id: str
+    fields: dict[str, Any]
+    creator_id: str
+    platform: str
+
+
+@dataclass(frozen=True)
+class ExistingRecordAnalysis:
+    index: dict[str, dict[str, Any]]
+    duplicate_groups: list[dict[str, Any]]
 
 
 def upload_final_review_payload_to_bitable(
@@ -84,31 +110,120 @@ def upload_final_review_payload_to_bitable(
     resolved_view = resolve_bitable_view_from_url(client, target_url)
     field_schemas = _fetch_field_schemas(client, resolved_view)
     attachment_schema = _select_attachment_field_schema(field_schemas)
-    existing_records = _fetch_existing_records(client, resolved_view)
-    existing_keys = {
-        _build_record_key(fields.get("达人ID"), fields.get("平台")): record_id
-        for record_id, fields in existing_records
-        if _build_record_key(fields.get("达人ID"), fields.get("平台"))
-    }
+    existing_record_analysis = _build_existing_record_analysis(_fetch_existing_records(client, resolved_view))
+    existing_records = existing_record_analysis.index
 
     rows = list(payload.get("rows") or [])
     if limit > 0:
         rows = rows[: int(limit)]
 
     created_rows: list[dict[str, Any]] = []
+    updated_rows: list[dict[str, Any]] = []
     skipped_existing_rows: list[dict[str, Any]] = []
     failed_rows: list[dict[str, Any]] = []
+    payload_duplicate_groups = _find_payload_duplicate_groups(rows)
+    duplicate_existing_groups = list(existing_record_analysis.duplicate_groups)
+
+    if duplicate_existing_groups or payload_duplicate_groups:
+        for group in duplicate_existing_groups:
+            keep_record = dict(group.get("keep_record") or {})
+            for duplicate_record in list(group.get("duplicate_records") or []):
+                failed_rows.append(
+                    {
+                        "status": "blocked_duplicate_existing",
+                        "record_key": group.get("record_key"),
+                        "record_id": duplicate_record.get("record_id") or "",
+                        "existing_record_id": keep_record.get("record_id") or "",
+                        "row": dict(duplicate_record.get("fields") or {}),
+                        "error": "目标飞书表已存在重复的 达人ID+平台 记录，已阻止继续写入。",
+                    }
+                )
+        for group in payload_duplicate_groups:
+            first_row = dict(group.get("rows") or [{}])[0]
+            for duplicate_row in list(group.get("rows") or [])[1:]:
+                failed_rows.append(
+                    {
+                        "status": "blocked_duplicate_payload",
+                        "record_key": group.get("record_key"),
+                        "record_id": "",
+                        "existing_record_id": "",
+                        "row": dict(duplicate_row or {}),
+                        "error": "当前上传 payload 内部存在重复的 达人ID+平台 记录，已阻止继续写入。",
+                    }
+                )
+            if not failed_rows and first_row:
+                failed_rows.append(
+                    {
+                        "status": "blocked_duplicate_payload",
+                        "record_key": group.get("record_key"),
+                        "record_id": "",
+                        "existing_record_id": "",
+                        "row": first_row,
+                        "error": "当前上传 payload 内部存在重复的 达人ID+平台 记录，已阻止继续写入。",
+                    }
+                )
+        summary = {
+            "ok": False,
+            "dry_run": bool(dry_run),
+            "payload_json_path": str(payload_path),
+            "result_json_path": str(resolved_result_json),
+            "result_xlsx_path": str(resolved_result_xlsx),
+            "target_url": target_url,
+            "target_url_source": target_url_source,
+            "target_app_token": resolved_view.app_token,
+            "target_table_id": resolved_view.table_id,
+            "target_table_name": resolved_view.table_name,
+            "target_view_id": resolved_view.view_id,
+            "target_view_name": resolved_view.view_name,
+            "source_row_count": int(payload.get("row_count") or len(payload.get("rows") or [])),
+            "selected_row_count": len(rows),
+            "created_count": 0,
+            "updated_count": 0,
+            "skipped_existing_count": 0,
+            "failed_count": len(failed_rows),
+            "guard_blocked": True,
+            "error": "目标飞书表或当前 payload 存在重复的 达人ID+平台 记录，已阻止继续写入。",
+            "duplicate_existing_group_count": len(duplicate_existing_groups),
+            "duplicate_payload_group_count": len(payload_duplicate_groups),
+            "duplicate_existing_groups": duplicate_existing_groups,
+            "duplicate_payload_groups": payload_duplicate_groups,
+            "created_rows": [],
+            "updated_rows": [],
+            "skipped_existing_rows": [],
+            "failed_rows": failed_rows,
+        }
+        resolved_result_json.parent.mkdir(parents=True, exist_ok=True)
+        resolved_result_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        _write_upload_result_xlsx(resolved_result_xlsx, [], [], [], failed_rows)
+        return summary
 
     for row in rows:
         if not isinstance(row, dict):
             continue
         record_key = _build_record_key(row.get("达人ID"), row.get("平台"))
-        if record_key and record_key in existing_keys:
+        existing_record = existing_records.get(record_key) if record_key else None
+        update_mode = _resolve_row_update_mode(row)
+        should_update_existing = existing_record is not None and update_mode in {
+            _UPDATE_MODE_CREATE_OR_UPDATE,
+            _UPDATE_MODE_MAIL_ONLY,
+        }
+        if update_mode == _UPDATE_MODE_MAIL_ONLY and existing_record is None:
+            skipped_existing_rows.append(
+                {
+                    "status": "skipped_missing_existing_for_mail_only_update",
+                    "record_key": record_key,
+                    "existing_record_id": "",
+                    "row": row,
+                    "reason": "邮件字段更新模式要求飞书中已存在同达人ID+平台记录",
+                }
+            )
+            continue
+        if existing_record is not None and not should_update_existing:
             skipped_existing_rows.append(
                 {
                     "status": "skipped_existing",
                     "record_key": record_key,
-                    "existing_record_id": existing_keys[record_key],
+                    "existing_record_id": existing_record["record_id"],
                     "row": row,
                     "reason": "飞书表已存在同达人ID+平台记录",
                 }
@@ -116,7 +231,10 @@ def upload_final_review_payload_to_bitable(
             continue
 
         try:
-            fields = _build_feishu_fields(row, field_schemas)
+            if update_mode == _UPDATE_MODE_MAIL_ONLY:
+                fields = _build_mail_only_feishu_fields(row, field_schemas)
+            else:
+                fields = _build_feishu_fields(row, field_schemas)
             _attach_local_files_to_fields(
                 client,
                 row=row,
@@ -136,31 +254,45 @@ def upload_final_review_payload_to_bitable(
             continue
 
         if dry_run:
-            created_rows.append(
+            bucket = updated_rows if should_update_existing else created_rows
+            bucket.append(
                 {
-                    "status": "dry_run_ready",
+                    "status": "dry_run_ready_update" if should_update_existing else "dry_run_ready",
                     "record_key": record_key,
                     "row": row,
                     "fields": fields,
-                    "record_id": "",
+                    "record_id": existing_record["record_id"] if existing_record else "",
+                    "existing_record_id": existing_record["record_id"] if existing_record else "",
                 }
             )
             continue
 
         try:
-            response = client.post_api_json(
-                f"/bitable/v1/apps/{resolved_view.app_token}/tables/{resolved_view.table_id}/records",
-                body={"fields": fields},
-            )
+            if should_update_existing:
+                response = client.put_api_json(
+                    f"/bitable/v1/apps/{resolved_view.app_token}/tables/{resolved_view.table_id}/records/{existing_record['record_id']}",
+                    body={"fields": fields},
+                )
+            else:
+                response = client.post_api_json(
+                    f"/bitable/v1/apps/{resolved_view.app_token}/tables/{resolved_view.table_id}/records",
+                    body={"fields": fields},
+                )
         except Exception as exc:  # noqa: BLE001
-            if "URLFieldConvFail" in str(exc) and "主页链接" in fields:
+            if "URLFieldConvFail" in str(exc) and "主页链接" in fields and update_mode != _UPDATE_MODE_MAIL_ONLY:
                 fallback_fields = dict(fields)
                 fallback_fields.pop("主页链接", None)
                 try:
-                    response = client.post_api_json(
-                        f"/bitable/v1/apps/{resolved_view.app_token}/tables/{resolved_view.table_id}/records",
-                        body={"fields": fallback_fields},
-                    )
+                    if should_update_existing:
+                        response = client.put_api_json(
+                            f"/bitable/v1/apps/{resolved_view.app_token}/tables/{resolved_view.table_id}/records/{existing_record['record_id']}",
+                            body={"fields": fallback_fields},
+                        )
+                    else:
+                        response = client.post_api_json(
+                            f"/bitable/v1/apps/{resolved_view.app_token}/tables/{resolved_view.table_id}/records",
+                            body={"fields": fallback_fields},
+                        )
                 except Exception as retry_exc:  # noqa: BLE001
                     failed_rows.append(
                         {
@@ -173,18 +305,23 @@ def upload_final_review_payload_to_bitable(
                     )
                     continue
                 record_id = str((((response.get("data") or {}).get("record") or {}).get("record_id")) or "").strip()
-                created_rows.append(
+                bucket = updated_rows if should_update_existing else created_rows
+                bucket.append(
                     {
-                        "status": "created",
+                        "status": "updated" if should_update_existing else "created",
                         "record_key": record_key,
-                        "record_id": record_id,
+                        "record_id": record_id or (existing_record["record_id"] if existing_record else ""),
+                        "existing_record_id": existing_record["record_id"] if existing_record else "",
                         "row": row,
                         "fields": fallback_fields,
                         "warning": "主页链接字段触发 URLFieldConvFail，已自动省略该列后重试成功",
                     }
                 )
                 if record_key:
-                    existing_keys[record_key] = record_id
+                    existing_records[record_key] = {
+                        "record_id": record_id or (existing_record["record_id"] if existing_record else ""),
+                        "fields": dict(existing_record.get("fields") or {}) if existing_record else {},
+                    }
                 continue
             failed_rows.append(
                 {
@@ -198,17 +335,22 @@ def upload_final_review_payload_to_bitable(
             continue
 
         record_id = str((((response.get("data") or {}).get("record") or {}).get("record_id")) or "").strip()
-        created_rows.append(
+        bucket = updated_rows if should_update_existing else created_rows
+        bucket.append(
             {
-                "status": "created",
+                "status": "updated" if should_update_existing else "created",
                 "record_key": record_key,
-                "record_id": record_id,
+                "record_id": record_id or (existing_record["record_id"] if existing_record else ""),
+                "existing_record_id": existing_record["record_id"] if existing_record else "",
                 "row": row,
                 "fields": fields,
             }
         )
         if record_key:
-            existing_keys[record_key] = record_id
+            existing_records[record_key] = {
+                "record_id": record_id or (existing_record["record_id"] if existing_record else ""),
+                "fields": dict(existing_record.get("fields") or {}) if existing_record else {},
+            }
 
     summary = {
         "ok": True,
@@ -226,15 +368,17 @@ def upload_final_review_payload_to_bitable(
         "source_row_count": int(payload.get("row_count") or len(payload.get("rows") or [])),
         "selected_row_count": len(rows),
         "created_count": len(created_rows),
+        "updated_count": len(updated_rows),
         "skipped_existing_count": len(skipped_existing_rows),
         "failed_count": len(failed_rows),
         "created_rows": created_rows,
+        "updated_rows": updated_rows,
         "skipped_existing_rows": skipped_existing_rows,
         "failed_rows": failed_rows,
     }
     resolved_result_json.parent.mkdir(parents=True, exist_ok=True)
     resolved_result_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    _write_upload_result_xlsx(resolved_result_xlsx, created_rows, skipped_existing_rows, failed_rows)
+    _write_upload_result_xlsx(resolved_result_xlsx, created_rows, updated_rows, skipped_existing_rows, failed_rows)
     return summary
 
 
@@ -248,7 +392,7 @@ def _resolve_target_url(
 ) -> tuple[str, str]:
     explicit = str(explicit_linked_bitable_url or "").strip()
     if explicit:
-        return explicit, "explicit"
+        return _canonicalize_target_url(client, explicit), "explicit"
     normalized_task_upload_url = str(task_upload_url or "").strip()
     normalized_task_name = str(task_name or "").strip() or str(((payload.get("task_owner") or {}).get("task_name")) or "").strip()
     if normalized_task_upload_url and normalized_task_name:
@@ -258,11 +402,107 @@ def _resolve_target_url(
             task_name=normalized_task_name,
         )
         if str(entry.linked_bitable_url or "").strip():
-            return str(entry.linked_bitable_url).strip(), "task_upload_entry"
+            return _canonicalize_target_url(client, str(entry.linked_bitable_url).strip()), "task_upload_entry"
     payload_link = str(((payload.get("task_owner") or {}).get("linked_bitable_url")) or "").strip()
     if payload_link:
-        return payload_link, "payload_task_owner"
+        return _canonicalize_target_url(client, payload_link), "payload_task_owner"
     raise ValueError("缺少 linked_bitable_url，且无法从 task upload 任务记录中解析目标飞书表。")
+
+
+def _canonicalize_target_url(client: FeishuOpenClient, raw_url: str) -> str:
+    normalized = str(raw_url or "").strip()
+    if not normalized:
+        return ""
+    try:
+        resolved = resolve_bitable_view_from_url(client, normalized)
+        return resolved.source_url
+    except ValueError as exc:
+        if "缺少 table 参数" not in str(exc) and "缺少 view 参数" not in str(exc):
+            raise
+    resolved = _resolve_short_bitable_target(client, normalized)
+    parsed = parse.urlparse(normalized)
+    base_url = parse.urlunparse((parsed.scheme, parsed.netloc, f"/base/{resolved.app_token}", "", "", ""))
+    query = parse.urlencode({"table": resolved.table_id, "view": resolved.view_id})
+    return f"{base_url}?{query}"
+
+
+def _resolve_short_bitable_target(client: FeishuOpenClient, url: str) -> ResolvedBitableView:
+    parsed = parse.urlparse(str(url or "").strip())
+    if not parsed.scheme or not parsed.netloc:
+        raise ValueError("飞书多维表格 URL 不合法。")
+    segments = [item for item in parsed.path.split("/") if item]
+    source_kind = ""
+    source_token = ""
+    app_token = ""
+    title = ""
+    if len(segments) >= 2 and segments[0] == "base":
+        source_kind = "base"
+        source_token = segments[1]
+        app_token = source_token
+    elif len(segments) >= 2 and segments[0] == "wiki":
+        source_kind = "wiki"
+        source_token = segments[1]
+        node = client.resolve_wiki_node(source_token)
+        obj_type = str(node.get("obj_type") or "").strip()
+        if obj_type != "bitable":
+            raise FeishuApiError(f"当前 wiki 节点不是 bitable，而是 {obj_type or 'unknown'}。")
+        app_token = str(node.get("obj_token") or "").strip()
+        title = str(node.get("title") or "").strip()
+    else:
+        raise ValueError("当前 URL 不是支持的飞书 base/wiki 多维表格链接。")
+    if not app_token:
+        raise ValueError("无法从飞书多维表格链接解析 app_token。")
+
+    tables_payload = client.get_api_json(f"/bitable/v1/apps/{app_token}/tables")
+    table_items = list((tables_payload.get("data") or {}).get("items") or [])
+    table_item = _select_named_item(
+        table_items,
+        id_key="table_id",
+        name_key="name",
+        preferred_names=_PREFERRED_TARGET_TABLE_NAMES,
+        missing_message="无法在目标飞书 base 内定位可用数据表。",
+    )
+    table_id = str(table_item.get("table_id") or "").strip()
+    table_name = str(table_item.get("name") or "").strip()
+
+    views_payload = client.get_api_json(f"/bitable/v1/apps/{app_token}/tables/{table_id}/views")
+    view_items = list((views_payload.get("data") or {}).get("items") or [])
+    view_item = _select_named_item(
+        view_items,
+        id_key="view_id",
+        name_key="view_name",
+        preferred_names=_PREFERRED_TARGET_VIEW_NAMES,
+        missing_message=f"无法在飞书表 {table_name or table_id} 内定位可用视图。",
+    )
+    return ResolvedBitableView(
+        source_url=str(url or "").strip(),
+        source_kind=source_kind,
+        source_token=source_token,
+        app_token=app_token,
+        table_id=table_id,
+        view_id=str(view_item.get("view_id") or "").strip(),
+        table_name=table_name,
+        view_name=str(view_item.get("view_name") or "").strip(),
+        title=title,
+    )
+
+
+def _select_named_item(
+    items: list[dict[str, Any]],
+    *,
+    id_key: str,
+    name_key: str,
+    preferred_names: tuple[str, ...],
+    missing_message: str,
+) -> dict[str, Any]:
+    normalized_preferences = {str(name or "").strip().casefold() for name in preferred_names if str(name or "").strip()}
+    for item in items:
+        if str(item.get(name_key) or "").strip().casefold() in normalized_preferences:
+            return item
+    if len(items) == 1:
+        return items[0]
+    available = ", ".join(str(item.get(name_key) or item.get(id_key) or "").strip() for item in items if str(item.get(name_key) or item.get(id_key) or "").strip())
+    raise ValueError(missing_message + (f" 可用项：{available}" if available else ""))
 
 
 def _fetch_field_schemas(client: FeishuOpenClient, resolved: ResolvedBitableView) -> dict[str, FieldSchema]:
@@ -320,12 +560,100 @@ def _fetch_existing_records(client: FeishuOpenClient, resolved: ResolvedBitableV
     return collected
 
 
+def _build_existing_record_index(existing_records: list[tuple[str, dict[str, Any]]]) -> dict[str, dict[str, Any]]:
+    return _build_existing_record_analysis(existing_records).index
+
+
+def _build_existing_record_analysis(existing_records: list[tuple[str, dict[str, Any]]]) -> ExistingRecordAnalysis:
+    grouped: dict[str, list[ExistingRecordSnapshot]] = {}
+    for record_id, fields in existing_records:
+        creator_id = _flatten_field_value(fields.get("达人ID"))
+        platform = _flatten_field_value(fields.get("平台"))
+        key = _build_record_key(creator_id, platform)
+        if not key:
+            continue
+        grouped.setdefault(key, []).append(
+            ExistingRecordSnapshot(
+                record_id=record_id,
+                fields=dict(fields or {}),
+                creator_id=creator_id,
+                platform=platform,
+            )
+        )
+
+    index: dict[str, dict[str, Any]] = {}
+    duplicate_groups: list[dict[str, Any]] = []
+    for record_key, snapshots in grouped.items():
+        ordered = sorted(snapshots, key=_existing_record_sort_key, reverse=True)
+        keep = ordered[0]
+        index[record_key] = {
+            "record_id": keep.record_id,
+            "fields": dict(keep.fields or {}),
+        }
+        if len(ordered) <= 1:
+            continue
+        duplicate_groups.append(
+            {
+                "record_key": record_key,
+                "creator_id": keep.creator_id,
+                "platform": keep.platform,
+                "keep_record": {
+                    "record_id": keep.record_id,
+                    "fields": dict(keep.fields or {}),
+                },
+                "duplicate_records": [
+                    {
+                        "record_id": item.record_id,
+                        "fields": dict(item.fields or {}),
+                    }
+                    for item in ordered[1:]
+                ],
+            }
+        )
+    return ExistingRecordAnalysis(index=index, duplicate_groups=duplicate_groups)
+
+
+def fetch_existing_bitable_record_index(
+    client: FeishuOpenClient,
+    *,
+    linked_bitable_url: str,
+) -> tuple[ResolvedBitableView, dict[str, dict[str, Any]]]:
+    resolved_view = resolve_bitable_view_from_url(client, _canonicalize_target_url(client, linked_bitable_url))
+    existing_records = _fetch_existing_records(client, resolved_view)
+    return resolved_view, _build_existing_record_index(existing_records)
+
+
+def fetch_existing_bitable_record_analysis(
+    client: FeishuOpenClient,
+    *,
+    linked_bitable_url: str,
+) -> tuple[ResolvedBitableView, ExistingRecordAnalysis]:
+    resolved_view = resolve_bitable_view_from_url(client, _canonicalize_target_url(client, linked_bitable_url))
+    existing_records = _fetch_existing_records(client, resolved_view)
+    return resolved_view, _build_existing_record_analysis(existing_records)
+
+
 def _build_record_key(creator_id: Any, platform: Any) -> str:
-    left = _clean_text(creator_id).casefold()
-    right = _clean_text(platform).casefold()
+    left = _flatten_field_value(creator_id).casefold()
+    right = _flatten_field_value(platform).casefold()
     if not left or not right:
         return ""
     return f"{left}::{right}"
+
+
+def _flatten_field_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        parts = [_flatten_field_value(item) for item in value]
+        return "；".join(part for part in parts if part)
+    if isinstance(value, dict):
+        for key in ("name", "text", "link", "value", "id"):
+            candidate = _clean_text(value.get(key))
+            if candidate:
+                return candidate
+        return ""
+    return _clean_text(value)
 
 
 def _clean_text(value: Any) -> str:
@@ -334,6 +662,45 @@ def _clean_text(value: Any) -> str:
     if isinstance(value, float) and math.isnan(value):
         return ""
     return str(value).strip()
+
+
+def _existing_record_sort_key(snapshot: ExistingRecordSnapshot) -> tuple[Any, ...]:
+    fields = snapshot.fields or {}
+    return (
+        bool(_flatten_field_value(fields.get("ai 是否通过") or fields.get("ai是否通过"))),
+        bool(_flatten_field_value(fields.get("ai筛号反馈理由"))),
+        bool(_flatten_field_value(fields.get("标签(ai)") or fields.get("标签（ai）"))),
+        bool(_flatten_field_value(fields.get("ai评价") or fields.get("ai 评价"))),
+        bool(_flatten_field_value(fields.get("当前网红报价"))),
+        _coerce_date_to_ms(_flatten_field_value(fields.get("达人最后一次回复邮件时间"))) or 0,
+        len(_flatten_field_value(fields.get("达人回复的最后一封邮件内容"))),
+        len(_flatten_field_value(fields.get("主页链接"))),
+        snapshot.record_id,
+    )
+
+
+def _find_payload_duplicate_groups(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        record_key = _build_record_key(row.get("达人ID"), row.get("平台"))
+        if not record_key:
+            continue
+        grouped.setdefault(record_key, []).append(dict(row))
+    duplicates: list[dict[str, Any]] = []
+    for record_key, grouped_rows in grouped.items():
+        if len(grouped_rows) <= 1:
+            continue
+        duplicates.append(
+            {
+                "record_key": record_key,
+                "creator_id": _flatten_field_value(grouped_rows[0].get("达人ID")),
+                "platform": _flatten_field_value(grouped_rows[0].get("平台")),
+                "rows": grouped_rows,
+            }
+        )
+    return duplicates
 
 
 def _normalize_field_key(name: str) -> str:
@@ -370,6 +737,18 @@ def _build_feishu_fields(row: dict[str, Any], field_schemas: dict[str, FieldSche
     if person_schema is not None and employee_id:
         fields[person_schema.field_name] = [{"id": employee_id}]
 
+    return fields
+
+
+def _build_mail_only_feishu_fields(row: dict[str, Any], field_schemas: dict[str, FieldSchema]) -> dict[str, Any]:
+    fields: dict[str, Any] = {}
+    for payload_name in _MAIL_ONLY_FIELD_NAMES:
+        schema = _lookup_field_schema(field_schemas, payload_name)
+        if schema is None:
+            continue
+        converted, include = _convert_field_value(schema, row.get(payload_name), row=row)
+        if include:
+            fields[schema.field_name] = converted
     return fields
 
 
@@ -414,6 +793,17 @@ def _normalize_attachment_local_paths(raw_value: Any) -> list[str]:
         seen.add(cleaned)
         values.append(cleaned)
     return values
+
+
+def _resolve_row_update_mode(row: dict[str, Any]) -> str:
+    mode = _clean_text(row.get(_ROW_UPDATE_MODE_KEY)).lower()
+    if mode in {
+        _UPDATE_MODE_CREATE_ONLY,
+        _UPDATE_MODE_CREATE_OR_UPDATE,
+        _UPDATE_MODE_MAIL_ONLY,
+    }:
+        return mode
+    return _UPDATE_MODE_CREATE_ONLY
 
 
 def _convert_field_value(schema: FieldSchema, raw_value: Any, *, row: dict[str, Any]) -> tuple[Any, bool]:
@@ -523,12 +913,15 @@ def _resolve_url_value(raw_value: Any) -> dict[str, str] | None:
 def _write_upload_result_xlsx(
     output_path: Path,
     created_rows: list[dict[str, Any]],
+    updated_rows: list[dict[str, Any]],
     skipped_existing_rows: list[dict[str, Any]],
     failed_rows: list[dict[str, Any]],
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     status_rows: list[dict[str, Any]] = []
     for item in created_rows:
+        status_rows.append(_flatten_status_row(item, default_reason=""))
+    for item in updated_rows:
         status_rows.append(_flatten_status_row(item, default_reason=""))
     for item in skipped_existing_rows:
         status_rows.append(_flatten_status_row(item, default_reason=str(item.get("reason") or "")))
@@ -558,10 +951,10 @@ def _flatten_status_row(item: dict[str, Any], *, default_reason: str) -> dict[st
         "reason": _clean_text(item.get("reason")) or _clean_text(item.get("warning")) or _clean_text(item.get("error")) or default_reason,
         "record_id": _clean_text(item.get("record_id")),
         "existing_record_id": _clean_text(item.get("existing_record_id")),
-        "达人ID": _clean_text(row.get("达人ID")),
-        "平台": _clean_text(row.get("平台")),
-        "主页链接": _clean_text(row.get("主页链接")),
-        "达人对接人": _clean_text(row.get("达人对接人")),
-        "ai是否通过": _clean_text(row.get("ai是否通过")),
-        "标签(ai)": _clean_text(row.get("标签(ai)")),
+        "达人ID": _flatten_field_value(row.get("达人ID")),
+        "平台": _flatten_field_value(row.get("平台")),
+        "主页链接": _flatten_field_value(row.get("主页链接")),
+        "达人对接人": _flatten_field_value(row.get("达人对接人")),
+        "ai是否通过": _flatten_field_value(row.get("ai是否通过") or row.get("ai 是否通过")),
+        "标签(ai)": _flatten_field_value(row.get("标签(ai)") or row.get("标签（ai）")),
     }

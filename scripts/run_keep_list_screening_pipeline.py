@@ -308,6 +308,131 @@ def _build_positioning_stage_payload(status: str, reason: str = "", **extra: Any
     return payload
 
 
+def _extract_visual_partial_result(visual_job: dict[str, Any] | None) -> dict[str, Any]:
+    payload = dict(visual_job or {})
+    result = payload.get("result")
+    if isinstance(result, dict):
+        partial_result = result.get("partial_result")
+        if isinstance(partial_result, dict):
+            return dict(partial_result)
+        if result.get("visual_results") or result.get("summary"):
+            return dict(result)
+    partial_result = payload.get("partial_result")
+    if isinstance(partial_result, dict):
+        return dict(partial_result)
+    return {}
+
+
+def _extract_visual_results_map(platform: str, visual_job: dict[str, Any] | None, backend_app) -> dict[str, dict[str, Any]]:
+    partial_result = _extract_visual_partial_result(visual_job)
+    visual_results = partial_result.get("visual_results")
+    if isinstance(visual_results, dict) and visual_results:
+        return {
+            str(key or (value or {}).get("username") or "").strip(): dict(value)
+            for key, value in visual_results.items()
+            if isinstance(value, dict) and str(key or (value or {}).get("username") or "").strip()
+        }
+    loader = getattr(backend_app, "load_visual_results", None)
+    if callable(loader):
+        loaded = loader(platform)
+        if isinstance(loaded, dict):
+            return {
+                str(key or (value or {}).get("username") or "").strip(): dict(value)
+                for key, value in loaded.items()
+                if isinstance(value, dict) and str(key or (value or {}).get("username") or "").strip()
+            }
+    return {}
+
+
+def _extract_failed_visual_identifiers(platform: str, visual_job: dict[str, Any] | None, backend_app) -> list[str]:
+    visual_results = _extract_visual_results_map(platform, visual_job, backend_app)
+    failed_identifiers: list[str] = []
+    seen: set[str] = set()
+    for key, item in visual_results.items():
+        identifier = str(key or item.get("username") or "").strip()
+        if not identifier or identifier in seen:
+            continue
+        if item.get("success") is False:
+            failed_identifiers.append(identifier)
+            seen.add(identifier)
+    return failed_identifiers
+
+
+def _run_visual_postcheck_retries(
+    *,
+    client,
+    backend_app,
+    platform: str,
+    platform_summary: dict[str, Any],
+    vision_provider: str,
+    poll_job,
+    require_success,
+    poll_interval: float,
+    max_rounds: int,
+) -> dict[str, Any]:
+    retry_summary: dict[str, Any] = {
+        "enabled": True,
+        "max_rounds": max(0, int(max_rounds)),
+        "rounds": [],
+        "initial_error_count": 0,
+        "final_error_count": 0,
+        "status": "not_needed",
+        "reason": "",
+    }
+    visual_job = dict(platform_summary.get("visual_job") or {})
+    if not visual_job:
+        retry_summary["status"] = "skipped"
+        retry_summary["reason"] = "visual job was not started"
+        return retry_summary
+
+    failed_identifiers = _extract_failed_visual_identifiers(platform, visual_job, backend_app)
+    retry_summary["initial_error_count"] = len(failed_identifiers)
+    retry_summary["final_error_count"] = len(failed_identifiers)
+    if not failed_identifiers:
+        return retry_summary
+    if retry_summary["max_rounds"] <= 0:
+        retry_summary["status"] = "exhausted"
+        retry_summary["reason"] = "visual postcheck retry disabled by max rounds"
+        return retry_summary
+
+    remaining = list(failed_identifiers)
+    for round_index in range(1, retry_summary["max_rounds"] + 1):
+        visual_payload_body = build_visual_payload(platform, remaining)
+        if vision_provider:
+            visual_payload_body["provider"] = str(vision_provider).strip().lower()
+        retry_payload = require_success(
+            client.post("/api/jobs/visual-review", json={"platform": platform, "payload": visual_payload_body}),
+            f"{platform} visual retry round {round_index} start",
+        )
+        retry_job = poll_job(
+            client,
+            retry_payload["job"]["id"],
+            f"{platform} visual retry round {round_index} poll",
+            max(1.0, float(poll_interval)),
+        )
+        unresolved = _extract_failed_visual_identifiers(platform, retry_job, backend_app)
+        retry_summary["rounds"].append({
+            "round": round_index,
+            "requested_identifier_count": len(remaining),
+            "requested_identifier_preview": remaining[:10],
+            "job": retry_job,
+            "resolved_count": max(0, len(remaining) - len(unresolved)),
+            "remaining_error_count": len(unresolved),
+        })
+        remaining = unresolved
+        if not remaining:
+            retry_summary["status"] = "completed"
+            retry_summary["final_error_count"] = 0
+            retry_summary["reason"] = "all failed visual rows were recovered by postcheck rerun"
+            return retry_summary
+
+    retry_summary["status"] = "exhausted"
+    retry_summary["final_error_count"] = len(remaining)
+    retry_summary["remaining_identifier_preview"] = remaining[:10]
+    retry_summary["reason"] = "visual postcheck rerun exhausted max rounds with unresolved failures"
+    return retry_summary
+
+
 def run_keep_list_screening_pipeline(
     *,
     keep_workbook: Path,
@@ -325,6 +450,7 @@ def run_keep_list_screening_pipeline(
     skip_scrape: bool = False,
     skip_visual: bool = False,
     skip_positioning_card_analysis: bool = False,
+    visual_postcheck_max_rounds: int = 3,
     task_owner_name: str = "",
     task_owner_employee_id: str = "",
     task_owner_employee_record_id: str = "",
@@ -384,6 +510,7 @@ def run_keep_list_screening_pipeline(
             "skip_scrape": bool(skip_scrape),
             "skip_visual": bool(skip_visual),
             "skip_positioning_card_analysis": bool(skip_positioning_card_analysis),
+            "visual_postcheck_max_rounds": max(0, int(visual_postcheck_max_rounds)),
             "probe_vision_provider_only": bool(probe_vision_provider_only),
             "ready": False,
             "errors": [],
@@ -394,6 +521,7 @@ def run_keep_list_screening_pipeline(
         "skip_scrape": bool(skip_scrape),
         "skip_visual": bool(skip_visual),
         "skip_positioning_card_analysis": bool(skip_positioning_card_analysis),
+        "visual_postcheck_max_rounds": max(0, int(visual_postcheck_max_rounds)),
         "probe_vision_provider_only": bool(probe_vision_provider_only),
         "vision_providers": [],
         "vision_preflight": {},
@@ -771,6 +899,29 @@ def run_keep_list_screening_pipeline(
                     "vision_preflight": platform_summary["vision_preflight"],
                 }
 
+            if not skip_visual and pass_count > 0:
+                platform_summary["visual_retry"] = _run_visual_postcheck_retries(
+                    client=client,
+                    backend_app=backend_app,
+                    platform=platform,
+                    platform_summary=platform_summary,
+                    vision_provider=vision_provider,
+                    poll_job=poll_job,
+                    require_success=require_success,
+                    poll_interval=poll_interval,
+                    max_rounds=visual_postcheck_max_rounds,
+                )
+            else:
+                platform_summary["visual_retry"] = {
+                    "enabled": True,
+                    "max_rounds": max(0, int(visual_postcheck_max_rounds)),
+                    "rounds": [],
+                    "initial_error_count": 0,
+                    "final_error_count": 0,
+                    "status": "skipped",
+                    "reason": "visual review was skipped or no prescreen-pass targets",
+                }
+
             if skip_positioning_card_analysis:
                 platform_summary["positioning_card_analysis"] = _build_positioning_stage_payload(
                     "skipped",
@@ -916,12 +1067,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--output-root", default="", help="输出目录；默认写到 temp/keep_list_screening_<timestamp>。")
     parser.add_argument("--summary-json", default="", help="最终 run summary.json 输出路径。")
     parser.add_argument("--platform", action="append", help="只跑指定平台，可重复传入：tiktok / instagram / youtube。")
-    parser.add_argument("--vision-provider", default="", help="指定视觉 provider，例如 openai / mimo / quan2go / lemonapi。")
+    parser.add_argument("--vision-provider", default="", help="指定视觉 provider，例如 openai / reelx。")
     parser.add_argument("--max-identifiers-per-platform", type=int, default=0, help="每个平台最多跑多少个账号；0 表示不截断。")
     parser.add_argument("--poll-interval", type=float, default=5.0, help="轮询 job 状态的秒数。")
     parser.add_argument("--probe-vision-provider-only", action="store_true", help="只做视觉 provider live probe，不继续 scrape/visual/export。")
     parser.add_argument("--skip-scrape", action="store_true", help="只做 staging，不触发 scrape/visual/export。")
     parser.add_argument("--skip-visual", action="store_true", help="跑 scrape 和导出，但跳过视觉复核。")
+    parser.add_argument("--visual-postcheck-max-rounds", type=int, default=3, help="视觉完成后自动补跑失败账号的最大轮数；默认 3。")
     parser.add_argument("--skip-positioning-card-analysis", action="store_true", help="跳过 visual-pass 后的定位卡分析。")
     parser.add_argument("--task-owner-name", default="", help="任务负责人展示名，用于总表 `达人对接人`。")
     parser.add_argument("--task-owner-employee-id", default="", help="任务负责人飞书 employeeId，用于总表 payload。")
@@ -950,6 +1102,7 @@ def main(argv: list[str] | None = None) -> int:
         probe_vision_provider_only=bool(args.probe_vision_provider_only),
         skip_scrape=bool(args.skip_scrape),
         skip_visual=bool(args.skip_visual),
+        visual_postcheck_max_rounds=max(0, int(args.visual_postcheck_max_rounds)),
         skip_positioning_card_analysis=bool(args.skip_positioning_card_analysis),
         task_owner_name=args.task_owner_name or "",
         task_owner_employee_id=args.task_owner_employee_id or "",

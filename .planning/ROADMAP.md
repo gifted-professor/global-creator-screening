@@ -141,6 +141,21 @@ Plans:
 **Details:**
 Phase 25 已完成。`25-01` 落下第一版 backend-served control plane：`/operator` 页面、`/api/operator/tasks`、`/api/operator/runs`、`/api/operator/runs/<id>`、`/api/operator/file` 已落地，并通过 `backend/.venv/bin/python -m unittest tests.test_visual_provider_diagnostics tests.test_task_upload_to_final_export_pipeline -v` 的 77 个 targeted tests。`25-02` 又用 operator API 真实发起了一轮 bounded `MINISO`，运行根目录留在 `temp/operator_runs/20260330_150053_MINISO_5a2afccf`，最终 top-level `summary.json` 与 `downstream/summary.json` 都为 `completed`，并产出 `instagram_final_review.xlsx` 与定位卡导出。
 
+### Phase 25.1: Fix MINISO LLM auth failures, redact summary secrets, surface missing duet sending-list diagnostics, and clarify LLM stage observability (INSERTED)
+
+**Goal**: 修复 `task upload -> keep-list` 上游链路里已经实跑暴露的紧急问题：让文本 LLM 调用的鉴权/路由可以被清晰归因、让 summary 不再落敏感字段、并把缺 `发信名单` 与 `llm_candidates`/`llm_review` 的失败边界拆清楚。
+**Requirements**: [OPS-REL-01, OPS-REL-02, OPS-REL-03]
+**Depends on:** Phase 25
+**Success Criteria** (what must be TRUE):
+  1. `task upload -> keep-list` 上游 summary 会显式暴露文本 LLM review 实际使用的 provider/base/model/wire_api，并且 `auth_not_found` 之类的失败归因到 `llm_review` 调用面，而不是模糊地挂到 `llm_candidates`
+  2. `summary.json` 不再直接持久化 `imapCode`、飞书 file token、未脱敏邮箱地址或整包 raw task/mail payload，同时 downstream 仍能通过最小 handoff contract 读取任务 owner 上下文
+  3. 缺 `发信名单`、任务上传重复命中、`llm_candidates_prepare`、`llm_review_call`、`llm_review_writeback` 都会成为独立、可机读的诊断块，排查时不需要靠聊天上下文还原失败位置
+**Plans:** 2 plans
+
+Plans:
+- [ ] 25.1-01: Redact upstream summary payloads and surface explicit task-assets diagnostics
+- [ ] 25.1-02: Add LLM review config diagnostics and split `llm_review` failure attribution
+
 ### Phase 26: Backfill decoupling verification bundle for Phases 20-21
 
 **Goal**: 把 Phase 20-21 已经实现的 repo-local decoupling 结果补齐成可审计的 phase-local evidence bundle，并让 DEP requirements 的 traceability 从“历史完成”切回“待重新认证”。

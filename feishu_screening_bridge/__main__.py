@@ -631,7 +631,18 @@ def _cmd_upload_final_review_payload(args: argparse.Namespace) -> int:
     )
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 0
+        return 0 if bool(result.get("ok", True)) else 2
+
+    if not bool(result.get("ok", True)):
+        print(
+            "final review payload upload blocked: "
+            f"table={result['target_table_name'] or result['target_table_id']}  "
+            f"selected={result['selected_row_count']}  "
+            f"failed={result['failed_count']}  "
+            f"error={result.get('error') or 'unknown'}  "
+            f"result_json={result['result_json_path']}"
+        )
+        return 2
 
     print(
         "final review payload uploaded: "

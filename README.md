@@ -16,6 +16,40 @@
 5. 把模板 rulespec + 达人匹配名单写入筛号当前输入状态
 6. Apify 抓取 -> 预筛 -> 视觉复核 -> 导出
 
+## 共享邮箱后半段增量路由
+
+如果共享邮箱最新邮件已经由外部程序同步到本地 `email_sync.db`，现在还多了一条 repo-local 后半段入口：
+
+```bash
+python3 scripts/run_shared_mailbox_post_sync_pipeline.py \
+  --shared-mail-db-path "/path/to/shared/email_sync.db" \
+  --task-upload-url "$TASK_UPLOAD_URL" \
+  --employee-info-url "$EMPLOYEE_INFO_URL" \
+  --env-file .env \
+  --upload-dry-run
+```
+
+这条入口不会重新抓 IMAP，而是直接消费已经同步好的共享邮箱本地库，然后：
+
+- 从飞书 `task-upload` 拉当前有效任务
+- 按 `task_name` 分堆
+- 对每个任务识别“新达人”和“已筛号达人”
+- 新达人继续走完整 `keep-list -> Apify -> visual -> positioning -> total export`
+- 已筛号达人只更新邮件字段和最新 `.eml` 附件
+- 最终把每个任务写回各自的目标飞书表
+
+输出 contract 会额外给出：
+
+- top-level `summary.json`
+- 每个任务各自的 summary / total export / upload payload
+- 本地失败归档 `failed_or_skipped_records.json` / `.xlsx`
+
+同项目内的判定键固定是 `达人ID + 平台`：
+
+- 飞书里不存在该键：创建新记录并跑完整筛号
+- 飞书里存在该键且 `ai是否通过` 为空：补跑完整筛号并更新该记录
+- 飞书里存在该键且 `ai是否通过` 非空：只更新邮件相关字段，不再重跑下游筛号
+
 ## 视觉复核后定位卡分析
 
 下游 screening runner 现在在 `visual review` 后面多了一段非阻塞的 `positioning_card_analysis`：
@@ -113,7 +147,7 @@ python3 -m feishu_screening_bridge --help
 python3 -m email_sync --help
 ```
 
-邮件抓取如果不显式传 `--sent-since`，默认只抓最近 `3` 个自然月内的邮件；例如在 `2026-03-27` 运行时，默认等价于 `--sent-since 2025-12-27`。如果要改窗口，显式传 `--sent-since YYYY-MM-DD` 即可覆盖默认值。
+邮件抓取如果不显式传 `--sent-since`，默认从“今天”开始抓；当前共享邮箱主线默认优先走 `partnerships@amagency.biz` 的 `其他文件夹/邮件备份`。如果要改窗口，显式传 `--sent-since YYYY-MM-DD` 即可覆盖默认值。
 
 以后达人匹配默认应直接使用任务上传里的飞书 `发信名单`，而不是本地测试达人库 workbook。可以直接按任务名下载 `发信名单` 并做匹配：
 
