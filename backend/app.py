@@ -25,6 +25,13 @@ if str(REPO_ROOT) not in sys.path:
 import pandas as pd
 import requests
 from flask import Flask, jsonify, render_template, request, send_file
+from harness.config import (
+    load_env_file_snapshot,
+    resolve_operator_launch_config,
+    resolve_operator_task_candidates_config,
+)
+from harness.paths import resolve_operator_run_paths
+from harness.spec import build_operator_task_spec, write_task_spec
 from openpyxl import Workbook
 from werkzeug.utils import secure_filename
 
@@ -37,7 +44,6 @@ from backend import rules as rules_module
 from backend import screening
 from backend.final_export_merge import build_all_platforms_final_review_artifacts, extract_task_owner_context
 from feishu_screening_bridge.feishu_api import DEFAULT_FEISHU_BASE_URL, FeishuOpenClient
-from feishu_screening_bridge.local_env import get_preferred_value, load_local_env
 from feishu_screening_bridge.task_upload_sync import inspect_task_upload_assignments
 
 
@@ -515,11 +521,83 @@ def _path_is_within_root(path: Path, root: Path) -> bool:
         return False
 
 
+def _resolve_operator_env_snapshot(env_file: str = ""):
+    return load_env_file_snapshot(env_file or ".env")
+
+
 def _resolve_operator_env_file(env_file: str = "") -> Path:
-    candidate = Path(str(env_file or ".env").strip() or ".env").expanduser()
-    if not candidate.is_absolute():
-        candidate = (BASE_DIR / candidate).resolve()
-    return candidate
+    return _resolve_operator_env_snapshot(env_file).path
+
+
+def _build_operator_resolved_config_sources(
+    *,
+    env_file: str = "",
+    task_upload_url: str = "",
+    employee_info_url: str = "",
+    matching_strategy: str = "",
+    brand_keyword: str = "",
+    platforms: list[str] | None = None,
+    vision_provider: str = "",
+    max_identifiers_per_platform: int = 0,
+    mail_limit: int = 0,
+    sent_since: str = "",
+    reuse_existing: bool = True,
+    probe_vision_provider_only: bool = False,
+    skip_scrape: bool = False,
+    skip_visual: bool = False,
+    skip_positioning_card_analysis: bool = False,
+) -> tuple[dict[str, Any], Any]:
+    return resolve_operator_launch_config(
+        env_file=env_file,
+        task_upload_url=task_upload_url,
+        employee_info_url=employee_info_url,
+        matching_strategy=matching_strategy,
+        brand_keyword=brand_keyword,
+        platforms=platforms,
+        vision_provider=vision_provider,
+        max_identifiers_per_platform=max_identifiers_per_platform,
+        mail_limit=mail_limit,
+        sent_since=sent_since,
+        reuse_existing=reuse_existing,
+        probe_vision_provider_only=probe_vision_provider_only,
+        skip_scrape=skip_scrape,
+        skip_visual=skip_visual,
+        skip_positioning_card_analysis=skip_positioning_card_analysis,
+    )
+
+
+def _build_operator_bootstrap_summary(
+    *,
+    started_at: str,
+    task_name: str,
+    operator_paths,
+    env_snapshot,
+    env_file_raw: str,
+    resolved_config_sources: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "started_at": str(started_at or ""),
+        "finished_at": "",
+        "status": "running",
+        "task_name": str(task_name or "").strip(),
+        "run_id": operator_paths.run_id,
+        "run_root": str(operator_paths.run_root),
+        "env_file_raw": str(env_file_raw or ""),
+        "env_file": str(env_snapshot.path),
+        "output_root": str(operator_paths.output_root),
+        "summary_json": str(operator_paths.summary_json),
+        "task_spec_json": str(operator_paths.task_spec_json),
+        "resolved_config_sources": resolved_config_sources,
+        "resolved_inputs": {
+            "env_file": {
+                "path": str(env_snapshot.path),
+                "exists": env_snapshot.exists,
+                "source": env_snapshot.source,
+            }
+        },
+        "resolved_paths": {},
+        "artifacts": {},
+    }
 
 
 def _operator_file_ref(path_value: str) -> dict[str, Any]:
@@ -621,31 +699,29 @@ def load_operator_task_candidates(
     task_upload_url: str = "",
     employee_info_url: str = "",
 ) -> dict[str, Any]:
-    resolved_env_file = _resolve_operator_env_file(env_file)
-    env_values = load_local_env(resolved_env_file)
-    app_id = get_preferred_value("", env_values, "FEISHU_APP_ID")
-    if not app_id:
+    _, resolved_config = resolve_operator_task_candidates_config(
+        env_file=env_file,
+        task_upload_url=task_upload_url,
+        employee_info_url=employee_info_url,
+    )
+    resolved_env_file = resolved_config["env_snapshot"].path
+    app_id = resolved_config["feishu_app_id"].value
+    if not resolved_config["feishu_app_id"].present:
         raise ValueError("缺少 FEISHU_APP_ID，请在本地 .env 或参数里填写。")
-    app_secret = get_preferred_value("", env_values, "FEISHU_APP_SECRET")
-    if not app_secret:
+    app_secret = resolved_config["feishu_app_secret"].value
+    if not resolved_config["feishu_app_secret"].present:
         raise ValueError("缺少 FEISHU_APP_SECRET，请在本地 .env 或参数里填写。")
-    resolved_task_upload_url = (
-        get_preferred_value(task_upload_url, env_values, "TASK_UPLOAD_URL")
-        or get_preferred_value(task_upload_url, env_values, "FEISHU_SOURCE_URL")
-    )
-    if not resolved_task_upload_url:
+    resolved_task_upload_url = resolved_config["task_upload_url"].value
+    if not resolved_config["task_upload_url"].present:
         raise ValueError("缺少 TASK_UPLOAD_URL，请在本地 .env 或参数里填写。")
-    resolved_employee_info_url = (
-        get_preferred_value(employee_info_url, env_values, "EMPLOYEE_INFO_URL")
-        or get_preferred_value(employee_info_url, env_values, "FEISHU_SOURCE_URL")
-    )
-    if not resolved_employee_info_url:
+    resolved_employee_info_url = resolved_config["employee_info_url"].value
+    if not resolved_config["employee_info_url"].present:
         raise ValueError("缺少 EMPLOYEE_INFO_URL，请在本地 .env 或参数里填写。")
-    timeout_seconds = float(get_preferred_value("", env_values, "TIMEOUT_SECONDS", "30") or "30")
+    timeout_seconds = float(resolved_config["timeout_seconds"].value or "30")
     client = FeishuOpenClient(
         app_id=app_id,
         app_secret=app_secret,
-        base_url=get_preferred_value("", env_values, "FEISHU_OPEN_BASE_URL", DEFAULT_FEISHU_BASE_URL),
+        base_url=resolved_config["feishu_base_url"].value or DEFAULT_FEISHU_BASE_URL,
         timeout_seconds=timeout_seconds,
     )
     inspection = inspect_task_upload_assignments(
@@ -742,7 +818,10 @@ def _load_persisted_operator_run(run_id: str) -> dict[str, Any] | None:
         "status": status,
         "stage": _collect_operator_summary_stage(summary),
         "env_file": str(summary.get("env_file") or "").strip(),
+        "env_file_raw": str(summary.get("env_file_raw") or "").strip(),
+        "run_root": str(summary.get("run_root") or output_root),
         "output_root": str(output_root),
+        "task_spec_json": str(summary.get("task_spec_json") or (output_root / "task_spec.json")),
         "summary_path": str(summary_path),
         "log_path": str(log_path),
         "pid": None,
@@ -939,20 +1018,73 @@ def launch_operator_run(
         raise ValueError("task_name 不能为空。")
     ensure_runtime_dirs()
     OPERATOR_RUNS_ROOT.mkdir(parents=True, exist_ok=True)
-    resolved_env_file = _resolve_operator_env_file(env_file)
-    safe_task_name = re.sub(r"[^0-9A-Za-z._-]+", "_", normalized_task_name).strip("_") or "task"
-    run_id = uuid.uuid4().hex
-    output_root = (OPERATOR_RUNS_ROOT / f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{safe_task_name}_{run_id[:8]}").resolve()
+    resolved_config_sources, resolved_config = _build_operator_resolved_config_sources(
+        env_file=env_file,
+        task_upload_url=task_upload_url,
+        employee_info_url=employee_info_url,
+        matching_strategy=matching_strategy,
+        brand_keyword=brand_keyword,
+        platforms=_normalize_operator_platforms(platforms),
+        vision_provider=vision_provider,
+        max_identifiers_per_platform=max_identifiers_per_platform,
+        mail_limit=mail_limit,
+        sent_since=sent_since,
+        reuse_existing=reuse_existing,
+        probe_vision_provider_only=probe_vision_provider_only,
+        skip_scrape=skip_scrape,
+        skip_visual=skip_visual,
+        skip_positioning_card_analysis=skip_positioning_card_analysis,
+    )
+    env_snapshot = resolved_config["env_snapshot"]
+    operator_paths = resolve_operator_run_paths(
+        task_name=normalized_task_name,
+        runs_root=OPERATOR_RUNS_ROOT,
+    )
+    output_root = operator_paths.output_root
     output_root.mkdir(parents=True, exist_ok=True)
-    summary_path = output_root / "summary.json"
-    log_path = output_root / "operator_run.log"
+    summary_path = operator_paths.summary_json
+    log_path = operator_paths.log_path
+    started_at = iso_now()
+    task_spec = build_operator_task_spec(
+        generated_at=started_at,
+        operator_paths=operator_paths,
+        env_snapshot=env_snapshot,
+        env_file_raw=str(env_file or ""),
+        resolved_config_sources=resolved_config_sources,
+        task_name=normalized_task_name,
+        task_upload_url=resolved_config["task_upload_url"].value,
+        employee_info_url=resolved_config["employee_info_url"].value,
+        matching_strategy=str(matching_strategy or "brand-keyword-fast-path").strip() or "brand-keyword-fast-path",
+        brand_keyword=str(brand_keyword or "").strip(),
+        brand_match_include_from=bool(brand_match_include_from),
+        requested_platforms=_normalize_operator_platforms(platforms),
+        vision_provider=str(vision_provider or "").strip(),
+        max_identifiers_per_platform=int(max_identifiers_per_platform or 0),
+        mail_limit=int(mail_limit or 0),
+        sent_since=str(sent_since or "").strip(),
+        reuse_existing=bool(reuse_existing),
+        probe_vision_provider_only=bool(probe_vision_provider_only),
+        skip_scrape=bool(skip_scrape),
+        skip_visual=bool(skip_visual),
+        skip_positioning_card_analysis=bool(skip_positioning_card_analysis),
+    )
+    bootstrap_summary = _build_operator_bootstrap_summary(
+        started_at=started_at,
+        task_name=normalized_task_name,
+        operator_paths=operator_paths,
+        env_snapshot=env_snapshot,
+        env_file_raw=str(env_file or ""),
+        resolved_config_sources=resolved_config_sources,
+    )
+    write_task_spec(operator_paths.task_spec_json, task_spec)
+    write_json_file(summary_path, bootstrap_summary)
     command = [
         sys.executable,
         str((BASE_DIR / "scripts" / "run_task_upload_to_final_export_pipeline.py").resolve()),
         "--task-name",
         normalized_task_name,
         "--env-file",
-        str(resolved_env_file),
+        str(env_snapshot.path),
         "--output-root",
         str(output_root),
         "--summary-json",
@@ -999,12 +1131,15 @@ def launch_operator_run(
         text=True,
     )
     run = {
-        "id": run_id,
+        "id": operator_paths.run_id,
         "task_name": normalized_task_name,
         "status": "running",
         "stage": "starting",
-        "env_file": str(resolved_env_file),
+        "env_file_raw": str(env_file or ""),
+        "env_file": str(env_snapshot.path),
+        "run_root": str(operator_paths.run_root),
         "output_root": str(output_root),
+        "task_spec_json": str(operator_paths.task_spec_json),
         "summary_path": str(summary_path),
         "log_path": str(log_path),
         "command": command,
@@ -1014,7 +1149,7 @@ def launch_operator_run(
         "finished_at": "",
         "return_code": None,
         "error": "",
-        "summary": None,
+        "summary": bootstrap_summary,
         "requested_options": {
             "task_upload_url": str(task_upload_url or "").strip(),
             "employee_info_url": str(employee_info_url or "").strip(),
@@ -1034,10 +1169,10 @@ def launch_operator_run(
         },
     }
     with OPERATOR_RUNS_LOCK:
-        OPERATOR_RUNS[run_id] = run
-        OPERATOR_RUN_PROCESSES[run_id] = process
-        OPERATOR_RUN_LOG_HANDLES[run_id] = log_handle
-    refreshed = refresh_operator_run(run_id)
+        OPERATOR_RUNS[operator_paths.run_id] = run
+        OPERATOR_RUN_PROCESSES[operator_paths.run_id] = process
+        OPERATOR_RUN_LOG_HANDLES[operator_paths.run_id] = log_handle
+    refreshed = refresh_operator_run(operator_paths.run_id)
     return _serialize_operator_run(refreshed or run)
 
 

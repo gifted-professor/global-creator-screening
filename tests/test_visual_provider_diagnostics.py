@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import os
 import struct
 import tempfile
@@ -1949,6 +1950,67 @@ class OperatorConsoleRoutesTests(unittest.TestCase):
         self.assertEqual(launcher.call_args.kwargs["platforms"], ["instagram"])
         self.assertEqual(launcher.call_args.kwargs["vision_provider"], "reelx")
 
+    def test_launch_operator_run_uses_harness_paths_and_bootstrap_summary(self) -> None:
+        class FakeProcess:
+            def __init__(self, command):
+                self.command = command
+                self.pid = 43210
+
+            def poll(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            env_path = temp_root / ".env"
+            env_path.write_text(
+                "TASK_UPLOAD_URL=https://env.example/task\nEMPLOYEE_INFO_URL=https://env.example/employee\n",
+                encoding="utf-8",
+            )
+            operator_root = temp_root / "operator_runs"
+
+            with mock.patch.object(backend_app, "OPERATOR_RUNS_ROOT", operator_root):
+                with mock.patch.object(backend_app.subprocess, "Popen", side_effect=lambda command, **kwargs: FakeProcess(command)):
+                    payload = backend_app.launch_operator_run(
+                        task_name="MINISO",
+                        env_file=str(env_path),
+                        platforms=["instagram"],
+                        vision_provider="openai",
+                    )
+
+            summary = payload["summary"]
+            self.assertEqual(payload["id"], summary["run_id"])
+            self.assertEqual(payload["run_root"], summary["run_root"])
+            self.assertEqual(payload["output_root"], summary["run_root"])
+            self.assertTrue(summary["run_root"].startswith(str(operator_root.resolve())))
+            self.assertEqual(summary["env_file_raw"], str(env_path))
+            self.assertEqual(summary["env_file"], str(env_path.resolve()))
+            self.assertEqual(summary["resolved_inputs"]["env_file"]["path"], str(env_path.resolve()))
+            self.assertEqual(summary["resolved_config_sources"]["task_upload_url"], "env_file:TASK_UPLOAD_URL")
+            self.assertEqual(summary["resolved_config_sources"]["employee_info_url"], "env_file:EMPLOYEE_INFO_URL")
+            task_spec = json.loads(Path(summary["task_spec_json"]).read_text(encoding="utf-8"))
+            self.assertEqual(task_spec["scope"], "task-upload-to-final-export")
+            self.assertEqual(task_spec["intent"]["task_name"], "MINISO")
+            self.assertEqual(task_spec["controls"]["requested_platforms"], ["instagram"])
+            self.assertTrue(task_spec["paths"]["upstream_task_spec_json"].endswith("/upstream/task_spec.json"))
+            self.assertTrue(Path(payload["summary_path"]).exists())
+            self.assertEqual(Path(payload["summary_path"]).parent, Path(summary["run_root"]))
+            self.assertEqual(Path(payload["log_path"]).parent, Path(summary["run_root"]))
+            self.assertEqual(Path(payload["task_spec_json"]).parent, Path(summary["run_root"]))
+            self.assertIn("--output-root", payload["command"])
+            self.assertEqual(
+                payload["command"][payload["command"].index("--output-root") + 1],
+                summary["run_root"],
+            )
+            self.assertEqual(
+                payload["command"][payload["command"].index("--env-file") + 1],
+                str(env_path.resolve()),
+            )
+            self.assertNotIn("/temp/runs/task_upload_to_final_export/", summary["run_root"])
+            backend_app._close_operator_log_handle(payload["id"])
+            backend_app.OPERATOR_RUN_PROCESSES.pop(payload["id"], None)
+            with backend_app.OPERATOR_RUNS_LOCK:
+                backend_app.OPERATOR_RUNS.pop(payload["id"], None)
+
     def test_operator_run_detail_serializes_summary_artifacts(self) -> None:
         refreshed_run = {
             "id": "run-2",
@@ -1956,6 +2018,8 @@ class OperatorConsoleRoutesTests(unittest.TestCase):
             "status": "completed",
             "stage": "completed",
             "env_file": "/tmp/.env",
+            "env_file_raw": ".env",
+            "run_root": "/tmp/operator",
             "output_root": "/tmp/operator",
             "summary_path": "/tmp/operator/summary.json",
             "log_path": "/tmp/operator/operator_run.log",
@@ -1968,7 +2032,11 @@ class OperatorConsoleRoutesTests(unittest.TestCase):
             "requested_options": {},
             "summary": {
                 "status": "completed",
+                "run_id": "run-2",
+                "run_root": "/tmp/operator",
+                "env_file_raw": ".env",
                 "summary_json": str(backend_app.BASE_DIR / "temp" / "operator_runs" / "summary.json"),
+                "resolved_config_sources": {"task_upload_url": "env_file:TASK_UPLOAD_URL"},
                 "resolved_paths": {},
                 "artifacts": {
                     "keep_workbook": "",
@@ -1985,6 +2053,8 @@ class OperatorConsoleRoutesTests(unittest.TestCase):
         self.assertTrue(payload["success"])
         self.assertEqual(payload["run"]["status"], "completed")
         self.assertIn("artifacts", payload["run"])
+        self.assertEqual(payload["run"]["summary"]["run_root"], "/tmp/operator")
+        self.assertEqual(payload["run"]["summary"]["env_file_raw"], ".env")
         self.assertIn("summary_json", payload["run"]["artifacts"])
         self.assertIn("all_platforms_final_review", payload["run"]["artifacts"])
 
@@ -2096,9 +2166,13 @@ class OperatorConsoleRoutesTests(unittest.TestCase):
                     "finished_at": "2026-03-30T15:05:00+08:00",
                     "status": "completed",
                     "task_name": "MINISO",
+                    "run_id": run_id,
+                    "run_root": str(output_root),
+                    "env_file_raw": ".env",
                     "env_file": str(backend_app.BASE_DIR / ".env"),
                     "output_root": str(output_root),
                     "summary_json": str(summary_path),
+                    "resolved_config_sources": {"task_upload_url": "env_file:TASK_UPLOAD_URL"},
                     "resolved_paths": {},
                     "artifacts": {
                         "keep_workbook": "",
@@ -2118,6 +2192,9 @@ class OperatorConsoleRoutesTests(unittest.TestCase):
             self.assertTrue(payload["success"])
             self.assertEqual(payload["run"]["id"], run_id)
             self.assertEqual(payload["run"]["status"], "completed")
+            self.assertEqual(payload["run"]["run_root"], str(output_root))
+            self.assertEqual(payload["run"]["env_file_raw"], ".env")
+            self.assertEqual(payload["run"]["summary"]["resolved_config_sources"]["task_upload_url"], "env_file:TASK_UPLOAD_URL")
         finally:
             with backend_app.OPERATOR_RUNS_LOCK:
                 backend_app.OPERATOR_RUNS.pop(run_id, None)

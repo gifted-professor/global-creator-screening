@@ -17,6 +17,7 @@ import backend.app as backend_app
 from feishu_screening_bridge import download_task_upload_screening_assets
 from feishu_screening_bridge.feishu_api import DEFAULT_FEISHU_BASE_URL, FeishuOpenClient
 from feishu_screening_bridge.local_env import get_preferred_value, load_local_env
+from harness.config import load_env_file_snapshot, resolve_string, source_record
 from workbook_template_parser import compile_workbook
 
 
@@ -75,6 +76,72 @@ def _path_summary(path: Path | None, *, source: str, kind: str) -> dict[str, Any
     }
 
 
+def _build_resolved_config_sources(
+    *,
+    env_file: str | Path,
+    task_name: str,
+    task_upload_url: str,
+    feishu_app_id: str,
+    feishu_app_secret: str,
+    feishu_base_url: str,
+    timeout_seconds: float,
+    task_download_dir: Path | None,
+    template_output_dir: Path | None,
+    screening_data_dir: Path | None,
+    config_dir: Path | None,
+    temp_dir: Path | None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    env_snapshot = load_env_file_snapshot(env_file)
+    resolved_task_upload_url = resolve_string(
+        cli_value=task_upload_url,
+        env_snapshot=env_snapshot,
+        env_keys=("TASK_UPLOAD_URL", "FEISHU_SOURCE_URL"),
+    )
+    resolved_feishu_app_id = resolve_string(
+        cli_value=feishu_app_id,
+        env_snapshot=env_snapshot,
+        env_keys=("FEISHU_APP_ID",),
+    )
+    resolved_feishu_app_secret = resolve_string(
+        cli_value=feishu_app_secret,
+        env_snapshot=env_snapshot,
+        env_keys=("FEISHU_APP_SECRET",),
+    )
+    resolved_feishu_base_url = resolve_string(
+        cli_value=feishu_base_url,
+        env_snapshot=env_snapshot,
+        env_keys=("FEISHU_OPEN_BASE_URL",),
+        default=DEFAULT_FEISHU_BASE_URL,
+    )
+    resolved_timeout_seconds = resolve_string(
+        cli_value=timeout_seconds if float(timeout_seconds or 0.0) > 0 else "",
+        env_snapshot=env_snapshot,
+        env_keys=("TIMEOUT_SECONDS",),
+        default="30",
+    )
+    resolved_task_name = resolve_string(
+        cli_value=task_name,
+        env_snapshot=env_snapshot,
+    )
+    return (
+        {
+            "env_file": env_snapshot.source,
+            "task_name": source_record(resolved_task_name),
+            "task_upload_url": source_record(resolved_task_upload_url),
+            "feishu_app_id": source_record(resolved_feishu_app_id, sensitive=True),
+            "feishu_app_secret": source_record(resolved_feishu_app_secret, sensitive=True),
+            "feishu_base_url": source_record(resolved_feishu_base_url),
+            "timeout_seconds": source_record(resolved_timeout_seconds),
+            "task_download_dir": "cli" if task_download_dir is not None else "default",
+            "template_output_dir": "cli" if template_output_dir is not None else "default",
+            "screening_data_dir": "cli" if screening_data_dir is not None else "runtime_default",
+            "config_dir": "cli" if config_dir is not None else "runtime_default",
+            "temp_dir": "cli" if temp_dir is not None else "runtime_default",
+        },
+        {"env_snapshot": env_snapshot},
+    )
+
+
 def configure_backend_runtime(
     *,
     screening_data_dir: Path | None = None,
@@ -98,6 +165,46 @@ def configure_backend_runtime(
     backend_app.APIFY_BALANCE_CACHE_FILE = str(Path(backend_app.DATA_DIR) / "apify_balance_cache.json")
     backend_app.APIFY_RUN_GUARDS_FILE = str(Path(backend_app.DATA_DIR) / "apify_run_guards.json")
     backend_app.app.config["UPLOAD_FOLDER"] = backend_app.UPLOAD_FOLDER
+
+
+def snapshot_backend_runtime_state() -> dict[str, Any]:
+    return {
+        "DATA_DIR": str(getattr(backend_app, "DATA_DIR", "")),
+        "CONFIG_DIR": str(getattr(backend_app, "CONFIG_DIR", "")),
+        "TEMP_DIR": str(getattr(backend_app, "TEMP_DIR", "")),
+        "UPLOAD_FOLDER": str(getattr(backend_app, "UPLOAD_FOLDER", "")),
+        "ACTIVE_RULESPEC_PATH": str(getattr(backend_app, "ACTIVE_RULESPEC_PATH", "")),
+        "ACTIVE_VISUAL_PROMPTS_PATH": str(getattr(backend_app, "ACTIVE_VISUAL_PROMPTS_PATH", "")),
+        "FIELD_MATCH_REPORT_PATH": str(getattr(backend_app, "FIELD_MATCH_REPORT_PATH", "")),
+        "MISSING_CAPABILITIES_PATH": str(getattr(backend_app, "MISSING_CAPABILITIES_PATH", "")),
+        "REVIEW_NOTES_PATH": str(getattr(backend_app, "REVIEW_NOTES_PATH", "")),
+        "APIFY_TOKEN_POOL_STATE_FILE": str(getattr(backend_app, "APIFY_TOKEN_POOL_STATE_FILE", "")),
+        "APIFY_BALANCE_CACHE_FILE": str(getattr(backend_app, "APIFY_BALANCE_CACHE_FILE", "")),
+        "APIFY_RUN_GUARDS_FILE": str(getattr(backend_app, "APIFY_RUN_GUARDS_FILE", "")),
+        "app_upload_folder": str(getattr(getattr(backend_app, "app", None), "config", {}).get("UPLOAD_FOLDER", "")),
+    }
+
+
+def restore_backend_runtime_state(snapshot: dict[str, Any]) -> None:
+    for attribute in (
+        "DATA_DIR",
+        "CONFIG_DIR",
+        "TEMP_DIR",
+        "UPLOAD_FOLDER",
+        "ACTIVE_RULESPEC_PATH",
+        "ACTIVE_VISUAL_PROMPTS_PATH",
+        "FIELD_MATCH_REPORT_PATH",
+        "MISSING_CAPABILITIES_PATH",
+        "REVIEW_NOTES_PATH",
+        "APIFY_TOKEN_POOL_STATE_FILE",
+        "APIFY_BALANCE_CACHE_FILE",
+        "APIFY_RUN_GUARDS_FILE",
+    ):
+        if attribute in snapshot:
+            setattr(backend_app, attribute, snapshot[attribute])
+    app_config = getattr(getattr(backend_app, "app", None), "config", None)
+    if isinstance(app_config, dict):
+        app_config["UPLOAD_FOLDER"] = str(snapshot.get("app_upload_folder", snapshot.get("UPLOAD_FOLDER", "")))
 
 
 def resolve_task_upload_source_files(
@@ -543,9 +650,26 @@ def prepare_screening_inputs(
         temp_dir=temp_dir,
     )
     backend_app.ensure_runtime_dirs()
+    resolved_config_sources, resolved_config = _build_resolved_config_sources(
+        env_file=env_file,
+        task_name=task_name,
+        task_upload_url=task_upload_url,
+        feishu_app_id=feishu_app_id,
+        feishu_app_secret=feishu_app_secret,
+        feishu_base_url=feishu_base_url,
+        timeout_seconds=timeout_seconds,
+        task_download_dir=task_download_dir,
+        template_output_dir=template_output_dir,
+        screening_data_dir=screening_data_dir,
+        config_dir=config_dir,
+        temp_dir=temp_dir,
+    )
 
     summary: dict[str, Any] = {
         "prepared_at": backend_app.iso_now(),
+        "env_file_raw": str(env_file),
+        "env_file": str(resolved_config["env_snapshot"].path),
+        "resolved_config_sources": resolved_config_sources,
         "screening_data_dir": backend_app.DATA_DIR,
         "config_dir": backend_app.CONFIG_DIR,
         "temp_dir": backend_app.TEMP_DIR,
@@ -561,18 +685,27 @@ def prepare_screening_inputs(
     resolved_creator_workbook = creator_workbook
     resolved_template_workbook = template_workbook
     normalized_task_name = str(task_name or "").strip()
-    env_path = Path(env_file).expanduser()
     summary["resolved_inputs"] = {
         "env_file": {
-            "path": str(env_path.resolve()),
-            "exists": env_path.exists(),
-            "source": "cli_or_default",
+            "path": str(resolved_config["env_snapshot"].path),
+            "exists": resolved_config["env_snapshot"].exists,
+            "source": resolved_config["env_snapshot"].source,
         },
         "runtime_dirs": {
             "screening_data_dir": _path_summary(Path(backend_app.DATA_DIR), source="runtime_config", kind="dir"),
             "config_dir": _path_summary(Path(backend_app.CONFIG_DIR), source="runtime_config", kind="dir"),
             "temp_dir": _path_summary(Path(backend_app.TEMP_DIR), source="runtime_config", kind="dir"),
         },
+        "task_download_dir": _path_summary(
+            task_download_dir.expanduser() if task_download_dir is not None else DEFAULT_TASK_UPLOAD_DOWNLOAD_DIR,
+            source="cli" if task_download_dir is not None else "default",
+            kind="dir",
+        ),
+        "template_output_dir": _path_summary(
+            template_output_dir.expanduser() if template_output_dir is not None else DEFAULT_TEMPLATE_OUTPUT_DIR,
+            source="cli" if template_output_dir is not None else "default",
+            kind="dir",
+        ),
         "creator_input": _path_summary(
             resolved_creator_workbook.expanduser() if resolved_creator_workbook else None,
             source="cli" if resolved_creator_workbook is not None else "pending",

@@ -12,6 +12,22 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from harness.contract import attach_run_contract
+from harness.config import (
+    RequiredConfigSpec,
+    build_required_config_errors,
+    resolve_keep_list_upstream_config,
+)
+from harness.failures import attach_failure_to_summary, build_failure_payload as build_harness_failure_payload
+from harness.paths import resolve_keep_list_upstream_paths
+from harness.preflight import (
+    build_preflight_error,
+    build_preflight_payload,
+    inspect_directory_materialization_target,
+)
+from harness.setup import materialize_setup
+from harness.spec import build_keep_list_upstream_task_spec, write_task_spec
+
 
 def _load_runtime_dependencies():
     from email_sync.brand_keyword_match import match_brand_keyword
@@ -61,8 +77,7 @@ CONTRACT_VERSION = "phase16.keep-list.v2"
 
 
 def default_output_root() -> Path:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return REPO_ROOT / "temp" / f"task_upload_to_keep_list_{timestamp}"
+    return resolve_keep_list_upstream_paths(task_name="task").run_root
 
 
 def iso_now() -> str:
@@ -117,15 +132,17 @@ def _build_failure_payload(
     error_code: str,
     message: str,
     remediation: str,
+    failure_layer: str = "runtime",
     details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
-        "stage": stage,
-        "error_code": error_code,
-        "message": message,
-        "remediation": remediation,
-        "details": details or {},
-    }
+    return build_harness_failure_payload(
+        stage=stage,
+        error_code=error_code,
+        message=message,
+        remediation=remediation,
+        failure_layer=failure_layer,
+        details=details,
+    )
 
 
 def _classify_failure(exc: Exception, *, failed_step: str) -> dict[str, Any]:
@@ -213,6 +230,168 @@ def _resolve_cli_env_value(
     if env_candidate:
         return env_candidate, "env_file"
     return str(default or "").strip(), "default"
+
+
+def _build_resolved_config_sources(
+    *,
+    env_file: str,
+    task_upload_url: str,
+    employee_info_url: str,
+    feishu_app_id: str,
+    feishu_app_secret: str,
+    feishu_base_url: str,
+    timeout_seconds: float,
+    imap_host: str,
+    imap_port: int,
+    matching_strategy: str,
+    brand_keyword: str,
+    task_name: str,
+    mail_limit: int,
+    mail_workers: int,
+    sent_since: str,
+    reset_state: bool,
+    stop_after: str,
+    reuse_existing: bool,
+    task_download_dir_source: str,
+    mail_data_dir_source: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    return resolve_keep_list_upstream_config(
+        env_file=env_file,
+        task_upload_url=task_upload_url,
+        employee_info_url=employee_info_url,
+        feishu_app_id=feishu_app_id,
+        feishu_app_secret=feishu_app_secret,
+        feishu_base_url=feishu_base_url,
+        timeout_seconds=timeout_seconds,
+        imap_host=imap_host,
+        imap_port=imap_port,
+        matching_strategy=matching_strategy,
+        brand_keyword=brand_keyword,
+        task_name=task_name,
+        mail_limit=mail_limit,
+        mail_workers=mail_workers,
+        sent_since=sent_since,
+        reset_state=reset_state,
+        stop_after=stop_after,
+        reuse_existing=reuse_existing,
+        task_download_dir_source=task_download_dir_source,
+        mail_data_dir_source=mail_data_dir_source,
+    )
+
+
+def _build_upstream_preflight(
+    *,
+    task_name: str,
+    matching_strategy: str,
+    stop_after: str,
+    run_root: Path,
+    downloads_dir: Path,
+    mail_root: Path,
+    exports_dir: Path,
+    env_snapshot: Any,
+    resolved_task_upload_url: Any,
+    resolved_employee_info_url: Any,
+    resolved_feishu_app_id: Any,
+    resolved_feishu_app_secret: Any,
+) -> dict[str, Any]:
+    errors: list[dict[str, Any]] = []
+    run_root_target = inspect_directory_materialization_target(run_root)
+    downloads_dir_target = inspect_directory_materialization_target(downloads_dir)
+    mail_root_target = inspect_directory_materialization_target(mail_root)
+    exports_dir_target = inspect_directory_materialization_target(exports_dir)
+    if not str(task_name or "").strip():
+        errors.append(
+            build_preflight_error(
+                error_code="TASK_NAME_MISSING",
+                message="缺少 task_name。",
+                remediation="通过 `--task-name` 传入任务名后重试。",
+            )
+        )
+    if str(matching_strategy or "").strip().lower() not in MATCHING_STRATEGIES:
+        errors.append(
+            build_preflight_error(
+                error_code="MATCHING_STRATEGY_INVALID",
+                message=f"不支持的 matching_strategy: {matching_strategy}",
+                remediation=f"改用 {', '.join(MATCHING_STRATEGIES)} 之一后重试。",
+            )
+        )
+    if str(stop_after or "").strip().lower() and str(stop_after).strip().lower() not in STOP_AFTER_CHOICES:
+        errors.append(
+            build_preflight_error(
+                error_code="STOP_AFTER_INVALID",
+                message=f"不支持的 stop_after: {stop_after}",
+                remediation=f"改用 {', '.join(STOP_AFTER_CHOICES)} 之一后重试。",
+            )
+        )
+    errors.extend(
+        build_required_config_errors(
+            [
+                RequiredConfigSpec(
+                    resolved=resolved_task_upload_url,
+                    error_code="TASK_UPLOAD_URL_MISSING",
+                    message="缺少 TASK_UPLOAD_URL。",
+                    remediation="在 `.env` 或 `--task-upload-url` 中提供 TASK_UPLOAD_URL 后重试。",
+                ),
+                RequiredConfigSpec(
+                    resolved=resolved_employee_info_url,
+                    error_code="EMPLOYEE_INFO_URL_MISSING",
+                    message="缺少 EMPLOYEE_INFO_URL。",
+                    remediation="在 `.env` 或 `--employee-info-url` 中提供 EMPLOYEE_INFO_URL 后重试。",
+                ),
+                RequiredConfigSpec(
+                    resolved=resolved_feishu_app_id,
+                    error_code="FEISHU_APP_ID_MISSING",
+                    message="缺少 FEISHU_APP_ID。",
+                    remediation="在 `.env` 或 `--feishu-app-id` 中提供 FEISHU_APP_ID 后重试。",
+                ),
+                RequiredConfigSpec(
+                    resolved=resolved_feishu_app_secret,
+                    error_code="FEISHU_APP_SECRET_MISSING",
+                    message="缺少 FEISHU_APP_SECRET。",
+                    remediation="在 `.env` 或 `--feishu-app-secret` 中提供 FEISHU_APP_SECRET 后重试。",
+                ),
+            ]
+        )
+    )
+    dir_error_map = (
+        ("RUN_ROOT_UNAVAILABLE", run_root, "run_root", run_root_target),
+        ("DOWNLOADS_DIR_UNAVAILABLE", downloads_dir, "downloads_dir", downloads_dir_target),
+        ("MAIL_ROOT_UNAVAILABLE", mail_root, "mail_root", mail_root_target),
+        ("EXPORTS_DIR_UNAVAILABLE", exports_dir, "exports_dir", exports_dir_target),
+    )
+    for error_code, path_value, label, inspection in dir_error_map:
+        if not bool(inspection["materializable"]):
+            errors.append(
+                build_preflight_error(
+                    error_code=error_code,
+                    message=f"{label} 无法创建: {path_value}",
+                    remediation="检查路径权限或显式传入可写目录后重试。",
+                    details={
+                        "path": str(path_value),
+                        "nearest_existing_parent": str(inspection["nearest_existing_parent"]),
+                    },
+                )
+            )
+    return build_preflight_payload(
+        checks={
+            "scope": "task-upload-to-keep-list",
+            "lightweight_only": True,
+            "canonical_boundary": "keep-list",
+            "task_name_present": bool(str(task_name or "").strip()),
+            "matching_strategy": str(matching_strategy or "").strip().lower(),
+            "stop_after": str(stop_after or "").strip().lower(),
+            "env_file_exists": bool(getattr(env_snapshot, "exists", False)),
+            "task_upload_url_present": bool(getattr(resolved_task_upload_url, "present", False)),
+            "employee_info_url_present": bool(getattr(resolved_employee_info_url, "present", False)),
+            "feishu_app_id_present": bool(getattr(resolved_feishu_app_id, "present", False)),
+            "feishu_app_secret_present": bool(getattr(resolved_feishu_app_secret, "present", False)),
+            "run_root_materializable": bool(run_root_target["materializable"]),
+            "downloads_dir_materializable": bool(downloads_dir_target["materializable"]),
+            "mail_root_materializable": bool(mail_root_target["materializable"]),
+            "exports_dir_materializable": bool(exports_dir_target["materializable"]),
+        },
+        errors=errors,
+    )
 
 
 def _resolve_env_fallback_value(
@@ -309,7 +488,6 @@ def _build_feishu_client(
 ) -> tuple[Any, dict[str, str], dict[str, Any]]:
     runtime = _load_runtime_dependencies()
     load_local_env = runtime["load_local_env"]
-    get_preferred_value = runtime["get_preferred_value"]
     FeishuOpenClient = runtime["FeishuOpenClient"]
 
     env_values = load_local_env(env_file)
@@ -382,36 +560,19 @@ def run_task_upload_to_keep_list_pipeline(
     model: str = "",
     wire_api: str = "",
 ) -> dict[str, Any]:
-    runtime = _load_runtime_dependencies()
-    get_preferred_value = runtime["get_preferred_value"]
-    resolve_sync_sent_since = runtime["resolve_sync_sent_since"]
-    download_task_upload_screening_assets = runtime["download_task_upload_screening_assets"]
-    sync_task_upload_mailboxes = runtime["sync_task_upload_mailboxes"]
-    Database = runtime["Database"]
-    match_brand_keyword = runtime["match_brand_keyword"]
-    resolve_shared_email_candidates = runtime["resolve_shared_email_candidates"]
-    run_shared_email_final_review = runtime["run_shared_email_final_review"]
-    enrich_creator_workbook = runtime["enrich_creator_workbook"]
-    prepare_llm_review_candidates = runtime["prepare_llm_review_candidates"]
-    run_and_apply_llm_review = runtime["run_and_apply_llm_review"]
-
     normalized_task_name = str(task_name or "").strip()
-    if not normalized_task_name:
-        raise ValueError("缺少 task_name。")
     normalized_matching_strategy = str(matching_strategy or "").strip().lower() or MATCHING_STRATEGIES[0]
-    if normalized_matching_strategy not in MATCHING_STRATEGIES:
-        raise ValueError(f"不支持的 matching_strategy: {matching_strategy}")
     resolved_brand_keyword = str(brand_keyword or "").strip() or normalized_task_name
     normalized_stop_after = str(stop_after or "").strip().lower()
-    if normalized_stop_after and normalized_stop_after not in STOP_AFTER_CHOICES:
-        raise ValueError(f"不支持的 stop_after: {stop_after}")
-    resolved_sent_since = resolve_sync_sent_since(sent_since or None).isoformat()
-
-    resolved_output_root = (output_root or default_output_root()).expanduser().resolve()
-    resolved_output_root.mkdir(parents=True, exist_ok=True)
-    run_summary_path = (
-        summary_json.expanduser().resolve() if summary_json else resolved_output_root / "summary.json"
+    runner_paths = resolve_keep_list_upstream_paths(
+        task_name=normalized_task_name or "task",
+        output_root=output_root,
+        summary_json=summary_json,
+        task_download_dir=task_download_dir,
+        mail_data_dir=mail_data_dir,
     )
+    resolved_output_root = runner_paths.output_root
+    run_summary_path = runner_paths.summary_json
     summary_path_exists = run_summary_path.exists()
     existing_summary = _load_existing_summary(run_summary_path) if reuse_existing else None
     resume_reset_reason = ""
@@ -429,19 +590,49 @@ def run_task_upload_to_keep_list_pipeline(
         resume_reset_reason = "reuse_disabled"
     existing_summary_accepted = existing_summary is not None
 
+    resolved_config_sources, resolved_config = _build_resolved_config_sources(
+        env_file=env_file,
+        task_upload_url=task_upload_url,
+        employee_info_url=employee_info_url,
+        feishu_app_id=feishu_app_id,
+        feishu_app_secret=feishu_app_secret,
+        feishu_base_url=feishu_base_url,
+        timeout_seconds=timeout_seconds,
+        imap_host=imap_host,
+        imap_port=imap_port,
+        matching_strategy=normalized_matching_strategy,
+        brand_keyword=brand_keyword,
+        task_name=normalized_task_name,
+        mail_limit=mail_limit,
+        mail_workers=mail_workers,
+        sent_since=sent_since,
+        reset_state=reset_state,
+        stop_after=normalized_stop_after,
+        reuse_existing=reuse_existing,
+        task_download_dir_source=runner_paths.downloads_dir_source,
+        mail_data_dir_source=runner_paths.mail_root_source,
+    )
+    preflight = _build_upstream_preflight(
+        task_name=normalized_task_name,
+        matching_strategy=normalized_matching_strategy,
+        stop_after=normalized_stop_after,
+        run_root=runner_paths.run_root,
+        downloads_dir=runner_paths.downloads_dir,
+        mail_root=runner_paths.mail_root,
+        exports_dir=runner_paths.exports_dir,
+        env_snapshot=resolved_config["env_snapshot"],
+        resolved_task_upload_url=resolved_config["task_upload_url"],
+        resolved_employee_info_url=resolved_config["employee_info_url"],
+        resolved_feishu_app_id=resolved_config["feishu_app_id"],
+        resolved_feishu_app_secret=resolved_config["feishu_app_secret"],
+    )
+
+    resolved_sent_since = str(sent_since or "").strip()
+
     task_slug = _safe_name(normalized_task_name)
-    downloads_dir = (
-        Path(task_download_dir).expanduser().resolve()
-        if str(task_download_dir or "").strip()
-        else (resolved_output_root / "downloads").resolve()
-    )
-    mail_root = (
-        Path(mail_data_dir).expanduser().resolve()
-        if str(mail_data_dir or "").strip()
-        else (resolved_output_root / "mail_sync").resolve()
-    )
-    exports_dir = (resolved_output_root / "exports").resolve()
-    exports_dir.mkdir(parents=True, exist_ok=True)
+    downloads_dir = runner_paths.downloads_dir
+    mail_root = runner_paths.mail_root
+    exports_dir = runner_paths.exports_dir
     enrichment_prefix = exports_dir / f"{task_slug}_匹配结果"
     llm_prefix = exports_dir / f"{task_slug}_匹配结果_高置信_按我们去重"
     brand_match_prefix = exports_dir / f"{task_slug}_brand_keyword_match"
@@ -455,13 +646,18 @@ def run_task_upload_to_keep_list_pipeline(
     summary: dict[str, Any] = {
         "started_at": iso_now(),
         "finished_at": "",
-        "status": "running",
+        "status": "running" if preflight["ready"] else "failed",
+        "run_id": runner_paths.run_id,
+        "run_root": str(runner_paths.run_root),
         "task_name": normalized_task_name,
         "matching_strategy": normalized_matching_strategy,
         "brand_keyword": resolved_brand_keyword,
-        "env_file": str(env_file),
+        "env_file_raw": str(env_file),
+        "env_file": str(resolved_config["env_snapshot"].path),
         "output_root": str(resolved_output_root),
         "summary_json": str(run_summary_path),
+        "task_spec_json": str(runner_paths.task_spec_json),
+        "resolved_config_sources": resolved_config_sources,
         "stop_after": normalized_stop_after,
         "reuse_existing": bool(reuse_existing),
         "inputs": {
@@ -478,6 +674,8 @@ def run_task_upload_to_keep_list_pipeline(
             "brand_match_include_from": bool(brand_match_include_from),
         },
         "resolved_paths": {
+            "run_root": str(runner_paths.run_root),
+            "task_spec_json": str(runner_paths.task_spec_json),
             "downloads_dir": str(downloads_dir),
             "mail_root": str(mail_root),
             "exports_dir": str(exports_dir),
@@ -488,13 +686,13 @@ def run_task_upload_to_keep_list_pipeline(
         },
         "resolved_inputs": {
             "env_file": {
-                "path": str(Path(env_file).expanduser().resolve()),
-                "exists": Path(env_file).expanduser().exists(),
-                "source": "cli_or_default",
+                "path": str(resolved_config["env_snapshot"].path),
+                "exists": resolved_config["env_snapshot"].exists,
+                "source": resolved_config["env_snapshot"].source,
             },
             "paths": {
-                "downloads_dir": _path_summary(downloads_dir, source=("cli" if str(task_download_dir or "").strip() else "output_root_default"), kind="dir"),
-                "mail_root": _path_summary(mail_root, source=("cli" if str(mail_data_dir or "").strip() else "output_root_default"), kind="dir"),
+                "downloads_dir": _path_summary(downloads_dir, source=runner_paths.downloads_dir_source, kind="dir"),
+                "mail_root": _path_summary(mail_root, source=runner_paths.mail_root_source, kind="dir"),
                 "exports_dir": _path_summary(exports_dir, source="output_root", kind="dir"),
             },
             "mail_sync": {
@@ -507,14 +705,7 @@ def run_task_upload_to_keep_list_pipeline(
                 "folder_overrides": dict(folder_overrides or {}),
             },
         },
-        "preflight": {
-            "canonical_boundary": "keep-list",
-            "downloads_dir_ready": True,
-            "mail_root_ready": True,
-            "exports_dir_ready": True,
-            "ready": False,
-            "errors": [],
-        },
+        "preflight": preflight,
         "contract": {
             "contract_version": CONTRACT_VERSION,
             "scope": "task-upload-to-keep-list",
@@ -522,6 +713,12 @@ def run_task_upload_to_keep_list_pipeline(
             "canonical_boundary": "keep-list",
             "canonical_resume_point": "keep_list",
             "downstream_runner": "scripts/run_keep_list_screening_pipeline.py",
+        },
+        "setup": {
+            "scope": "task-upload-to-keep-list",
+            "completed": False,
+            "skipped": not preflight["ready"],
+            "errors": [],
         },
         "resume_context": {
             "reuse_requested": bool(reuse_existing),
@@ -538,12 +735,40 @@ def run_task_upload_to_keep_list_pipeline(
         "canonical_artifacts": {},
         "downstream_handoff": {},
     }
-    _write_summary(run_summary_path, summary)
+    attach_run_contract(summary)
+    task_spec = build_keep_list_upstream_task_spec(
+        generated_at=summary["started_at"],
+        runner_paths=runner_paths,
+        env_snapshot=resolved_config["env_snapshot"],
+        env_file_raw=str(env_file),
+        resolved_config_sources=resolved_config_sources,
+        task_name=normalized_task_name,
+        task_upload_url=resolved_config["task_upload_url"].value,
+        employee_info_url=resolved_config["employee_info_url"].value,
+        matching_strategy=normalized_matching_strategy,
+        brand_keyword=resolved_brand_keyword,
+        brand_match_include_from=bool(brand_match_include_from),
+        stop_after=normalized_stop_after,
+        reuse_existing=bool(reuse_existing),
+        reset_state=bool(reset_state),
+        mail_limit=int(max(0, int(mail_limit))),
+        mail_workers=int(max(1, int(mail_workers))),
+        sent_since=str(sent_since or "").strip(),
+        task_download_dir=str(task_download_dir or "").strip(),
+        mail_data_dir=str(mail_data_dir or "").strip(),
+        folder_prefixes=list(folder_prefixes or ["其他文件夹"]),
+        owner_email_overrides=dict(owner_email_overrides or {}),
+        folder_overrides=dict(folder_overrides or {}),
+    )
 
     def finalize(status: str, **extra: Any) -> dict[str, Any]:
         summary["status"] = status
         summary["finished_at"] = iso_now()
         summary.update(extra)
+        failure = extra.get("failure")
+        if isinstance(failure, dict):
+            attach_failure_to_summary(summary, failure)
+        attach_run_contract(summary)
         _write_summary(run_summary_path, summary)
         return summary
 
@@ -552,6 +777,94 @@ def run_task_upload_to_keep_list_pipeline(
             f"stopped_after_{step_name}",
             stopped_after=step_name,
         )
+
+    if not preflight["ready"]:
+        failure = preflight["errors"][0]
+        return finalize(
+            "failed",
+            failure={**failure, "failure_layer": "preflight"},
+        )
+
+    setup = materialize_setup(
+        scope="task-upload-to-keep-list",
+        directories=[
+            {
+                "label": "run_root",
+                "path": runner_paths.run_root,
+                "error_code": "RUN_ROOT_UNAVAILABLE",
+                "message": "run_root 无法创建: {path}",
+                "remediation": "检查路径权限或显式传入可写目录后重试。",
+            },
+            {
+                "label": "downloads_dir",
+                "path": downloads_dir,
+                "error_code": "DOWNLOADS_DIR_UNAVAILABLE",
+                "message": "downloads_dir 无法创建: {path}",
+                "remediation": "检查路径权限或显式传入可写目录后重试。",
+            },
+            {
+                "label": "mail_root",
+                "path": mail_root,
+                "error_code": "MAIL_ROOT_UNAVAILABLE",
+                "message": "mail_root 无法创建: {path}",
+                "remediation": "检查路径权限或显式传入可写目录后重试。",
+            },
+            {
+                "label": "exports_dir",
+                "path": exports_dir,
+                "error_code": "EXPORTS_DIR_UNAVAILABLE",
+                "message": "exports_dir 无法创建: {path}",
+                "remediation": "检查路径权限或显式传入可写目录后重试。",
+            },
+        ],
+        files=[
+            {
+                "label": "task_spec",
+                "path": runner_paths.task_spec_json,
+                "writer": lambda path: write_task_spec(path, task_spec),
+                "error_code": "TASK_SPEC_WRITE_FAILED",
+                "message": "task_spec 无法写入: {path}",
+                "remediation": "检查 run root 权限或 task spec 序列化逻辑后重试。",
+            }
+        ],
+    )
+    summary["setup"] = {**setup, "skipped": False}
+    if not setup["completed"]:
+        failure = setup["errors"][0]
+        return finalize(
+            "failed",
+            failure=failure,
+        )
+    summary["resolved_inputs"]["paths"] = {
+        "downloads_dir": _path_summary(downloads_dir, source=runner_paths.downloads_dir_source, kind="dir"),
+        "mail_root": _path_summary(mail_root, source=runner_paths.mail_root_source, kind="dir"),
+        "exports_dir": _path_summary(exports_dir, source="output_root", kind="dir"),
+    }
+    _write_summary(run_summary_path, summary)
+
+    try:
+        runtime = _load_runtime_dependencies()
+        resolve_sync_sent_since = runtime["resolve_sync_sent_since"]
+        download_task_upload_screening_assets = runtime["download_task_upload_screening_assets"]
+        sync_task_upload_mailboxes = runtime["sync_task_upload_mailboxes"]
+        Database = runtime["Database"]
+        match_brand_keyword = runtime["match_brand_keyword"]
+        resolve_shared_email_candidates = runtime["resolve_shared_email_candidates"]
+        run_shared_email_final_review = runtime["run_shared_email_final_review"]
+        enrich_creator_workbook = runtime["enrich_creator_workbook"]
+        prepare_llm_review_candidates = runtime["prepare_llm_review_candidates"]
+        run_and_apply_llm_review = runtime["run_and_apply_llm_review"]
+        resolved_sent_since = resolve_sync_sent_since(sent_since or None).isoformat()
+        summary["resolved_inputs"]["mail_sync"]["sent_since"] = resolved_sent_since
+    except Exception as exc:  # noqa: BLE001
+        failure = _build_failure_payload(
+            stage="runtime_import",
+            error_code="KEEP_LIST_RUNTIME_IMPORT_FAILED",
+            message=f"上游 runtime 加载失败: {exc}",
+            remediation="检查邮件同步、飞书桥接和 review 相关本地依赖后重试。",
+            details={"exception_type": exc.__class__.__name__},
+        )
+        return finalize("failed", failure=failure)
 
     try:
         client, env_values, feishu_resolution = _build_feishu_client(
@@ -615,8 +928,6 @@ def run_task_upload_to_keep_list_pipeline(
         else:
             credential_mode = "employee_directory"
 
-        downloads_dir.mkdir(parents=True, exist_ok=True)
-        mail_root.mkdir(parents=True, exist_ok=True)
         summary["resolved_urls"] = {
             "task_upload_url": resolved_task_upload_url,
             "employee_info_url": resolved_employee_info_url,
@@ -1260,8 +1571,6 @@ def run_task_upload_to_keep_list_pipeline(
         return finalize(
             "failed",
             failed_step=failed_step,
-            error=failure["message"],
-            error_code=failure["error_code"],
             failure=failure,
         )
 

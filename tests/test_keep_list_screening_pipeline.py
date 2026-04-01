@@ -4,7 +4,9 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from typing import Any
 
+from harness.contract import RUN_CONTRACT_VERSION
 import scripts.run_keep_list_screening_pipeline as keep_list_runner
 
 
@@ -65,6 +67,7 @@ class FakeClient:
 class FakeFlaskApp:
     def __init__(self, client):
         self._client = client
+        self.config = {}
 
     def test_client(self):
         return self._client
@@ -78,6 +81,19 @@ class FakeBackendApp:
         self._metadata = json.loads(json.dumps(metadata or {"instagram": {"alpha": {"handle": "alpha"}}}))
         self._client = FakeClient(preflight=preflight)
         self.app = FakeFlaskApp(self._client)
+        self.DATA_DIR = "/original/data"
+        self.CONFIG_DIR = "/original/config"
+        self.TEMP_DIR = "/original/temp"
+        self.UPLOAD_FOLDER = "/original/data/uploads"
+        self.ACTIVE_RULESPEC_PATH = "/original/config/active_rulespec.json"
+        self.ACTIVE_VISUAL_PROMPTS_PATH = "/original/config/active_visual_prompts.json"
+        self.FIELD_MATCH_REPORT_PATH = "/original/config/field_match_report.json"
+        self.MISSING_CAPABILITIES_PATH = "/original/config/missing_capabilities.json"
+        self.REVIEW_NOTES_PATH = "/original/config/review_notes.md"
+        self.APIFY_TOKEN_POOL_STATE_FILE = "/original/data/apify_token_pool_state.json"
+        self.APIFY_BALANCE_CACHE_FILE = "/original/data/apify_balance_cache.json"
+        self.APIFY_RUN_GUARDS_FILE = "/original/data/apify_run_guards.json"
+        self.app.config["UPLOAD_FOLDER"] = self.UPLOAD_FOLDER
         self._routing_strategy = str(routing_strategy or "")
         self._channel_race = json.loads(json.dumps(channel_race or {}))
 
@@ -125,14 +141,21 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
     def tearDown(self) -> None:
         keep_list_runner._load_runtime_dependencies = self.original_loader
 
+    def _write_env_file(self, root: Path) -> Path:
+        env_path = root / ".env"
+        env_path.write_text("TEST_ONLY=1\n", encoding="utf-8")
+        return env_path
+
     def test_runner_fails_early_when_keep_workbook_is_missing(self) -> None:
         keep_list_runner._load_runtime_dependencies = lambda: (_ for _ in ()).throw(AssertionError("runtime should not load"))
 
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
             summary_path = temp_root / "run" / "summary.json"
+            env_path = self._write_env_file(temp_root)
             summary = keep_list_runner.run_keep_list_screening_pipeline(
                 keep_workbook=temp_root / "missing_keep.xlsx",
+                env_file=env_path,
                 output_root=temp_root / "run",
                 summary_json=summary_path,
                 platform_filters=["instagram"],
@@ -141,11 +164,73 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             persisted_summary = json.loads(summary_path.read_text(encoding="utf-8"))
 
         self.assertEqual(summary["status"], "failed")
+        self.assertEqual(summary["contract_version"], RUN_CONTRACT_VERSION)
+        self.assertEqual(summary["verdict"]["outcome"], "failed")
         self.assertEqual(summary["error_code"], "KEEP_WORKBOOK_MISSING")
         self.assertEqual(summary["failure"]["stage"], "preflight")
+        self.assertEqual(summary["failure_layer"], "preflight")
+        self.assertEqual(summary["failure_decision"]["category"], "input")
+        self.assertEqual(summary["failure_decision"]["resolution_mode"], "manual_fix")
+        self.assertTrue(summary["failure_decision"]["requires_manual_intervention"])
+        self.assertFalse(summary["failure_decision"]["retryable"])
         self.assertFalse(summary["preflight"]["ready"])
+        self.assertTrue(summary["setup"]["skipped"])
+        self.assertFalse(summary["setup"]["completed"])
         self.assertEqual(summary["preflight"]["errors"][0]["error_code"], "KEEP_WORKBOOK_MISSING")
+        self.assertFalse(Path(summary["task_spec_json"]).exists())
         self.assertEqual(persisted_summary["failure"]["error_code"], "KEEP_WORKBOOK_MISSING")
+
+    def test_runner_allows_missing_env_file_for_local_keep_and_template_inputs(self) -> None:
+        backend_app = FakeBackendApp(
+            {
+                "status": "configured",
+                "error_code": "",
+                "message": "视觉模型已就绪：openai",
+                "configured_provider_names": ["openai"],
+                "runnable_provider_names": ["openai"],
+                "providers": [{"name": "openai", "runnable": True}],
+            }
+        )
+
+        def fake_prepare_screening_inputs(**kwargs):
+            return {
+                "prepared_at": "2026-03-28T01:02:03Z",
+                "upload": {"stats": {"Instagram": 1}},
+            }
+
+        keep_list_runner._load_runtime_dependencies = lambda: {
+            "backend_app": backend_app,
+            "prepare_screening_inputs": fake_prepare_screening_inputs,
+            "count_passed_profiles": lambda scrape_job: 0,
+            "export_platform_artifacts": lambda client, platform, export_dir: {},
+            "poll_job": lambda client, job_id, label, interval: {},
+            "require_success": lambda response, label: response.get_json(),
+            "reset_backend_runtime_state": lambda: None,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            missing_env = temp_root / "missing.env"
+            keep_path = temp_root / "keep.xlsx"
+            template_path = temp_root / "template.xlsx"
+            keep_path.touch()
+            template_path.touch()
+            summary = keep_list_runner.run_keep_list_screening_pipeline(
+                keep_workbook=keep_path,
+                template_workbook=template_path,
+                env_file=missing_env,
+                output_root=temp_root / "run",
+                platform_filters=["instagram"],
+                skip_scrape=True,
+            )
+
+        self.assertEqual(summary["status"], "staged_only")
+        self.assertEqual(summary["contract_version"], RUN_CONTRACT_VERSION)
+        self.assertEqual(summary["verdict"]["outcome"], "completed")
+        self.assertTrue(summary["preflight"]["ready"])
+        self.assertTrue(summary["setup"]["completed"])
+        self.assertFalse(summary["preflight"]["env_file_exists"])
+        self.assertEqual(summary["env_file"], str(missing_env.resolve()))
 
     def test_runner_records_runtime_import_failure_before_staging(self) -> None:
         keep_list_runner._load_runtime_dependencies = lambda: (_ for _ in ()).throw(ModuleNotFoundError("backend.app"))
@@ -154,17 +239,27 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             temp_root = Path(temp_dir)
             keep_path = temp_root / "keep.xlsx"
             keep_path.touch()
+            env_path = self._write_env_file(temp_root)
             summary = keep_list_runner.run_keep_list_screening_pipeline(
                 keep_workbook=keep_path,
+                env_file=env_path,
                 output_root=temp_root / "run",
                 platform_filters=["instagram"],
                 skip_scrape=True,
             )
 
         self.assertEqual(summary["status"], "failed")
+        self.assertEqual(summary["verdict"]["outcome"], "failed")
         self.assertEqual(summary["error_code"], "SCREENING_RUNTIME_IMPORT_FAILED")
         self.assertEqual(summary["failure"]["stage"], "runtime_import")
-        self.assertFalse(summary["preflight"]["ready"])
+        self.assertEqual(summary["failure_layer"], "runtime")
+        self.assertEqual(summary["failure_decision"]["category"], "dependency")
+        self.assertEqual(summary["failure_decision"]["resolution_mode"], "manual_fix")
+        self.assertTrue(summary["failure_decision"]["requires_manual_intervention"])
+        self.assertFalse(summary["failure_decision"]["retryable"])
+        self.assertTrue(summary["preflight"]["ready"])
+        self.assertEqual(summary["preflight"]["errors"], [])
+        self.assertTrue(summary["setup"]["completed"])
 
     def test_summary_includes_vision_preflight_for_staging_only_run(self) -> None:
         preflight = {
@@ -199,16 +294,31 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             template_path = temp_root / "template.xlsx"
             keep_path.touch()
             template_path.touch()
+            env_path = self._write_env_file(temp_root)
 
             summary = keep_list_runner.run_keep_list_screening_pipeline(
                 keep_workbook=keep_path,
                 template_workbook=template_path,
+                env_file=env_path,
                 output_root=temp_root / "run",
                 platform_filters=["instagram"],
                 skip_scrape=True,
             )
+            task_spec = json.loads(Path(summary["task_spec_json"]).read_text(encoding="utf-8"))
 
         self.assertEqual(summary["vision_preflight"]["status"], "configured")
+        self.assertTrue(summary["run_id"])
+        self.assertEqual(summary["run_root"], str((temp_root / "run").resolve()))
+        self.assertEqual(summary["env_file_raw"], str(env_path))
+        self.assertEqual(summary["env_file"], str(env_path.resolve()))
+        self.assertEqual(summary["resolved_inputs"]["env_file"]["path"], str(env_path.resolve()))
+        self.assertEqual(summary["resolved_config_sources"]["env_file"], "cli")
+        self.assertTrue(summary["setup"]["completed"])
+        self.assertEqual(task_spec["scope"], "keep-list-screening")
+        self.assertEqual(task_spec["canonical_boundary"], "screening")
+        self.assertEqual(task_spec["intent"]["keep_workbook"], str(keep_path.resolve()))
+        self.assertEqual(task_spec["intent"]["requested_platforms"], ["instagram"])
+        self.assertTrue(task_spec["paths"]["staging_summary_json"].endswith("/staging_summary.json"))
         self.assertTrue(summary["resolved_inputs"]["keep_workbook"]["exists"])
         self.assertEqual(summary["resolved_inputs"]["keep_workbook"]["source"], "cli_or_default")
         self.assertEqual(summary["preflight"]["template_input_mode"], "template_workbook")
@@ -217,8 +327,276 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             summary["platforms"]["instagram"]["visual_gate"]["preflight_status"],
             "configured",
         )
-        self.assertEqual(summary["vision_probe"]["success"], True)
-        self.assertEqual(summary["vision_probe"]["provider"], "openai")
+        self.assertEqual(summary["vision_probe"]["status"], "skipped")
+        self.assertEqual(summary["vision_probe"]["reason"], "skip_scrape flag set")
+        self.assertEqual(backend_app._client.probe_calls, [])
+
+    def test_skip_scrape_does_not_fail_when_vision_preflight_is_unconfigured(self) -> None:
+        preflight = {
+            "status": "unconfigured",
+            "error_code": "MISSING_VISION_CONFIG",
+            "message": "缺少视觉模型配置。",
+            "configured_provider_names": [],
+            "runnable_provider_names": [],
+            "providers": [],
+        }
+        backend_app = FakeBackendApp(preflight)
+
+        def fake_prepare_screening_inputs(**kwargs):
+            return {
+                "prepared_at": "2026-03-28T01:02:03Z",
+                "upload": {"stats": {"Instagram": 1}},
+            }
+
+        keep_list_runner._load_runtime_dependencies = lambda: {
+            "backend_app": backend_app,
+            "prepare_screening_inputs": fake_prepare_screening_inputs,
+            "count_passed_profiles": lambda scrape_job: 0,
+            "export_platform_artifacts": lambda client, platform, export_dir: {},
+            "poll_job": lambda client, job_id, label, interval: {},
+            "require_success": lambda response, label: response.get_json(),
+            "reset_backend_runtime_state": lambda: None,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            keep_path = temp_root / "keep.xlsx"
+            template_path = temp_root / "template.xlsx"
+            keep_path.touch()
+            template_path.touch()
+            env_path = self._write_env_file(temp_root)
+
+            summary = keep_list_runner.run_keep_list_screening_pipeline(
+                keep_workbook=keep_path,
+                template_workbook=template_path,
+                env_file=env_path,
+                output_root=temp_root / "run",
+                platform_filters=["instagram"],
+                skip_scrape=True,
+            )
+
+        self.assertEqual(summary["status"], "staged_only")
+        self.assertEqual(summary["verdict"]["outcome"], "completed")
+        self.assertEqual(summary["vision_preflight"]["status"], "unconfigured")
+        self.assertEqual(summary["vision_probe"]["status"], "skipped")
+        self.assertEqual(summary["vision_probe"]["reason"], "skip_scrape flag set")
+        self.assertNotIn("failure", summary)
+        self.assertNotIn("failure_decision", summary)
+        self.assertEqual(summary["platforms"]["instagram"]["status"], "staged_only")
+        self.assertEqual(summary["platforms"]["instagram"]["visual_gate"]["preflight_status"], "unconfigured")
+        self.assertEqual(backend_app._client.probe_calls, [])
+
+    def test_runner_defaults_to_run_local_download_and_template_output_dirs(self) -> None:
+        backend_app = FakeBackendApp(
+            {
+                "status": "configured",
+                "error_code": "",
+                "message": "视觉模型已就绪：openai",
+                "configured_provider_names": ["openai"],
+                "runnable_provider_names": ["openai"],
+                "providers": [{"name": "openai", "runnable": True}],
+            }
+        )
+        observed: dict[str, Any] = {}
+
+        def fake_prepare_screening_inputs(**kwargs):
+            observed.update(kwargs)
+            return {
+                "prepared_at": "2026-03-28T01:02:03Z",
+                "upload": {"stats": {"Instagram": 1}},
+            }
+
+        keep_list_runner._load_runtime_dependencies = lambda: {
+            "backend_app": backend_app,
+            "prepare_screening_inputs": fake_prepare_screening_inputs,
+            "count_passed_profiles": lambda scrape_job: 0,
+            "export_platform_artifacts": lambda client, platform, export_dir: {},
+            "poll_job": lambda client, job_id, label, interval: {},
+            "require_success": lambda response, label: response.get_json(),
+            "reset_backend_runtime_state": lambda: None,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            keep_path = temp_root / "keep.xlsx"
+            template_path = temp_root / "template.xlsx"
+            keep_path.touch()
+            template_path.touch()
+            env_path = self._write_env_file(temp_root)
+
+            summary = keep_list_runner.run_keep_list_screening_pipeline(
+                keep_workbook=keep_path,
+                template_workbook=template_path,
+                env_file=env_path,
+                task_name="MINISO",
+                platform_filters=["instagram"],
+                skip_scrape=True,
+            )
+
+        self.assertIn("/temp/runs/keep_list_screening/", summary["run_root"])
+        self.assertEqual(summary["output_root"], summary["run_root"])
+        self.assertTrue(summary["setup"]["completed"])
+        self.assertTrue(str(observed["task_download_dir"]).startswith(summary["run_root"]))
+        self.assertTrue(str(observed["template_output_dir"]).startswith(summary["run_root"]))
+        self.assertNotEqual(
+            str(observed["template_output_dir"]),
+            str(keep_list_runner.REPO_ROOT / "downloads" / "task_upload_attachments" / "parsed_outputs"),
+        )
+
+    def test_runner_restores_backend_runtime_dirs_between_runs(self) -> None:
+        backend_app = FakeBackendApp(
+            {
+                "status": "configured",
+                "error_code": "",
+                "message": "视觉模型已就绪：openai",
+                "configured_provider_names": ["openai"],
+                "runnable_provider_names": ["openai"],
+                "providers": [{"name": "openai", "runnable": True}],
+            }
+        )
+        observed_snapshots: list[tuple[str, str, str]] = []
+
+        def fake_snapshot_backend_runtime_state():
+            observed_snapshots.append((backend_app.DATA_DIR, backend_app.CONFIG_DIR, backend_app.TEMP_DIR))
+            return {
+                "DATA_DIR": backend_app.DATA_DIR,
+                "CONFIG_DIR": backend_app.CONFIG_DIR,
+                "TEMP_DIR": backend_app.TEMP_DIR,
+                "UPLOAD_FOLDER": backend_app.UPLOAD_FOLDER,
+                "ACTIVE_RULESPEC_PATH": backend_app.ACTIVE_RULESPEC_PATH,
+                "ACTIVE_VISUAL_PROMPTS_PATH": backend_app.ACTIVE_VISUAL_PROMPTS_PATH,
+                "FIELD_MATCH_REPORT_PATH": backend_app.FIELD_MATCH_REPORT_PATH,
+                "MISSING_CAPABILITIES_PATH": backend_app.MISSING_CAPABILITIES_PATH,
+                "REVIEW_NOTES_PATH": backend_app.REVIEW_NOTES_PATH,
+                "APIFY_TOKEN_POOL_STATE_FILE": backend_app.APIFY_TOKEN_POOL_STATE_FILE,
+                "APIFY_BALANCE_CACHE_FILE": backend_app.APIFY_BALANCE_CACHE_FILE,
+                "APIFY_RUN_GUARDS_FILE": backend_app.APIFY_RUN_GUARDS_FILE,
+                "app_upload_folder": backend_app.app.config["UPLOAD_FOLDER"],
+            }
+
+        def fake_restore_backend_runtime_state(snapshot):
+            backend_app.DATA_DIR = snapshot["DATA_DIR"]
+            backend_app.CONFIG_DIR = snapshot["CONFIG_DIR"]
+            backend_app.TEMP_DIR = snapshot["TEMP_DIR"]
+            backend_app.UPLOAD_FOLDER = snapshot["UPLOAD_FOLDER"]
+            backend_app.ACTIVE_RULESPEC_PATH = snapshot["ACTIVE_RULESPEC_PATH"]
+            backend_app.ACTIVE_VISUAL_PROMPTS_PATH = snapshot["ACTIVE_VISUAL_PROMPTS_PATH"]
+            backend_app.FIELD_MATCH_REPORT_PATH = snapshot["FIELD_MATCH_REPORT_PATH"]
+            backend_app.MISSING_CAPABILITIES_PATH = snapshot["MISSING_CAPABILITIES_PATH"]
+            backend_app.REVIEW_NOTES_PATH = snapshot["REVIEW_NOTES_PATH"]
+            backend_app.APIFY_TOKEN_POOL_STATE_FILE = snapshot["APIFY_TOKEN_POOL_STATE_FILE"]
+            backend_app.APIFY_BALANCE_CACHE_FILE = snapshot["APIFY_BALANCE_CACHE_FILE"]
+            backend_app.APIFY_RUN_GUARDS_FILE = snapshot["APIFY_RUN_GUARDS_FILE"]
+            backend_app.app.config["UPLOAD_FOLDER"] = snapshot["app_upload_folder"]
+
+        def fake_prepare_screening_inputs(**kwargs):
+            backend_app.DATA_DIR = str(kwargs["screening_data_dir"])
+            backend_app.CONFIG_DIR = str(kwargs["config_dir"])
+            backend_app.TEMP_DIR = str(kwargs["temp_dir"])
+            backend_app.UPLOAD_FOLDER = str(Path(backend_app.DATA_DIR) / "uploads")
+            backend_app.app.config["UPLOAD_FOLDER"] = backend_app.UPLOAD_FOLDER
+            return {
+                "prepared_at": "2026-03-28T01:02:03Z",
+                "upload": {"stats": {"Instagram": 1}},
+            }
+
+        keep_list_runner._load_runtime_dependencies = lambda: {
+            "backend_app": backend_app,
+            "prepare_screening_inputs": fake_prepare_screening_inputs,
+            "snapshot_backend_runtime_state": fake_snapshot_backend_runtime_state,
+            "restore_backend_runtime_state": fake_restore_backend_runtime_state,
+            "count_passed_profiles": lambda scrape_job: 0,
+            "export_platform_artifacts": lambda client, platform, export_dir: {},
+            "poll_job": lambda client, job_id, label, interval: {},
+            "require_success": lambda response, label: response.get_json(),
+            "reset_backend_runtime_state": lambda: None,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            env_path = self._write_env_file(temp_root)
+            keep_one = temp_root / "keep_one.xlsx"
+            template_one = temp_root / "template_one.xlsx"
+            keep_two = temp_root / "keep_two.xlsx"
+            template_two = temp_root / "template_two.xlsx"
+            for path in (keep_one, template_one, keep_two, template_two):
+                path.touch()
+
+            first = keep_list_runner.run_keep_list_screening_pipeline(
+                keep_workbook=keep_one,
+                template_workbook=template_one,
+                env_file=env_path,
+                output_root=temp_root / "run_one",
+                platform_filters=["instagram"],
+                skip_scrape=True,
+            )
+            second = keep_list_runner.run_keep_list_screening_pipeline(
+                keep_workbook=keep_two,
+                template_workbook=template_two,
+                env_file=env_path,
+                output_root=temp_root / "run_two",
+                platform_filters=["instagram"],
+                skip_scrape=True,
+            )
+
+        self.assertEqual(first["status"], "staged_only")
+        self.assertEqual(second["status"], "staged_only")
+        self.assertEqual(observed_snapshots, [
+            ("/original/data", "/original/config", "/original/temp"),
+            ("/original/data", "/original/config", "/original/temp"),
+        ])
+        self.assertEqual(backend_app.DATA_DIR, "/original/data")
+        self.assertEqual(backend_app.CONFIG_DIR, "/original/config")
+        self.assertEqual(backend_app.TEMP_DIR, "/original/temp")
+        self.assertEqual(backend_app.app.config["UPLOAD_FOLDER"], "/original/data/uploads")
+
+    def test_runner_records_task_upload_url_source_from_env_file(self) -> None:
+        backend_app = FakeBackendApp(
+            {
+                "status": "configured",
+                "error_code": "",
+                "message": "视觉模型已就绪：openai",
+                "configured_provider_names": ["openai"],
+                "runnable_provider_names": ["openai"],
+                "providers": [{"name": "openai", "runnable": True}],
+            }
+        )
+
+        def fake_prepare_screening_inputs(**kwargs):
+            return {
+                "prepared_at": "2026-03-28T01:02:03Z",
+                "upload": {"stats": {"Instagram": 1}},
+            }
+
+        keep_list_runner._load_runtime_dependencies = lambda: {
+            "backend_app": backend_app,
+            "prepare_screening_inputs": fake_prepare_screening_inputs,
+            "count_passed_profiles": lambda scrape_job: 0,
+            "export_platform_artifacts": lambda client, platform, export_dir: {},
+            "poll_job": lambda client, job_id, label, interval: {},
+            "require_success": lambda response, label: response.get_json(),
+            "reset_backend_runtime_state": lambda: None,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            env_path = temp_root / ".env"
+            env_path.write_text("TASK_UPLOAD_URL=https://env.example/task\n", encoding="utf-8")
+            keep_path = temp_root / "keep.xlsx"
+            template_path = temp_root / "template.xlsx"
+            keep_path.touch()
+            template_path.touch()
+
+            summary = keep_list_runner.run_keep_list_screening_pipeline(
+                keep_workbook=keep_path,
+                template_workbook=template_path,
+                env_file=env_path,
+                output_root=temp_root / "run",
+                platform_filters=["instagram"],
+                skip_scrape=True,
+            )
+
+        self.assertEqual(summary["resolved_config_sources"]["task_upload_url"], "env_file:TASK_UPLOAD_URL")
 
     def test_probe_ranked_summary_uses_channel_race_when_no_explicit_provider_is_requested(self) -> None:
         preflight = {
@@ -270,10 +648,12 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             template_path = temp_root / "template.xlsx"
             keep_path.touch()
             template_path.touch()
+            env_path = self._write_env_file(temp_root)
 
             summary = keep_list_runner.run_keep_list_screening_pipeline(
                 keep_workbook=keep_path,
                 template_workbook=template_path,
+                env_file=env_path,
                 output_root=temp_root / "run",
                 platform_filters=["instagram"],
                 probe_vision_provider_only=True,
@@ -332,10 +712,12 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             keep_path.touch()
             template_path.touch()
             summary_path = temp_root / "run" / "summary.json"
+            env_path = self._write_env_file(temp_root)
 
             summary = keep_list_runner.run_keep_list_screening_pipeline(
                 keep_workbook=keep_path,
                 template_workbook=template_path,
+                env_file=env_path,
                 output_root=temp_root / "run",
                 summary_json=summary_path,
                 platform_filters=["instagram"],
@@ -345,8 +727,13 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             persisted_summary = json.loads(summary_path.read_text(encoding="utf-8"))
 
         self.assertEqual(summary["status"], "vision_probe_failed")
+        self.assertEqual(summary["verdict"]["outcome"], "failed")
         self.assertEqual(summary["vision_probe"]["error_code"], "VISION_PROVIDER_PREFLIGHT_FAILED")
         self.assertEqual(summary["vision_probe"]["vision_preflight"]["status"], "degraded")
+        self.assertEqual(summary["failure"]["error_code"], "VISION_PROVIDER_PREFLIGHT_FAILED")
+        self.assertEqual(summary["failure_decision"]["category"], "configuration")
+        self.assertEqual(summary["failure_decision"]["resolution_mode"], "manual_fix")
+        self.assertTrue(summary["failure_decision"]["requires_manual_intervention"])
         self.assertEqual(persisted_summary["vision_preflight"]["status"], "degraded")
 
     def test_runner_can_probe_and_target_specific_provider(self) -> None:
@@ -398,9 +785,11 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             template_path = temp_root / "template.xlsx"
             keep_path.touch()
             template_path.touch()
+            env_path = self._write_env_file(temp_root)
             summary = keep_list_runner.run_keep_list_screening_pipeline(
                 keep_workbook=keep_path,
                 template_workbook=template_path,
+                env_file=env_path,
                 output_root=temp_root / "run",
                 platform_filters=["instagram"],
                 vision_provider="openai",
@@ -409,6 +798,7 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         self.assertEqual(summary["requested_vision_provider"], "openai")
         self.assertEqual(summary["vision_probe"]["success"], True)
         self.assertTrue(summary["resolved_inputs"]["output_dirs"]["output_root"]["exists"])
+        self.assertTrue(summary["setup"]["completed"])
         self.assertEqual(summary["preflight"]["requested_platforms"], ["instagram"])
         self.assertEqual(summary["platforms"]["instagram"]["requested_vision_provider"], "openai")
         self.assertEqual(
@@ -464,10 +854,12 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             template_path = temp_root / "template.xlsx"
             keep_path.touch()
             template_path.touch()
+            env_path = self._write_env_file(temp_root)
 
             summary = keep_list_runner.run_keep_list_screening_pipeline(
                 keep_workbook=keep_path,
                 template_workbook=template_path,
+                env_file=env_path,
                 output_root=temp_root / "run",
                 platform_filters=["tiktok"],
                 skip_visual=True,
@@ -533,10 +925,12 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             template_path = temp_root / "template.xlsx"
             keep_path.touch()
             template_path.touch()
+            env_path = self._write_env_file(temp_root)
 
             summary = keep_list_runner.run_keep_list_screening_pipeline(
                 keep_workbook=keep_path,
                 template_workbook=template_path,
+                env_file=env_path,
                 output_root=temp_root / "run",
                 platform_filters=["instagram"],
                 vision_provider="openai",
@@ -544,6 +938,10 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
 
         platform_summary = summary["platforms"]["instagram"]
         self.assertEqual(summary["status"], "missing_profiles_blocked")
+        self.assertEqual(summary["verdict"]["outcome"], "blocked")
+        self.assertEqual(summary["failure"]["error_code"], "MISSING_PROFILES_BLOCKED")
+        self.assertEqual(summary["failure_decision"]["category"], "input")
+        self.assertTrue(summary["failure_decision"]["requires_manual_intervention"])
         self.assertEqual(platform_summary["status"], "missing_profiles_blocked")
         self.assertEqual(platform_summary["missing_profile_count"], 1)
         self.assertEqual(platform_summary["missing_profiles"][0]["identifier"], "ghost")
@@ -600,10 +998,12 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             keep_path.touch()
             template_path.touch()
             summary_path = temp_root / "run" / "summary.json"
+            env_path = self._write_env_file(temp_root)
 
             summary = keep_list_runner.run_keep_list_screening_pipeline(
                 keep_workbook=keep_path,
                 template_workbook=template_path,
+                env_file=env_path,
                 output_root=temp_root / "run",
                 summary_json=summary_path,
                 platform_filters=["instagram"],
@@ -680,10 +1080,12 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             template_path = temp_root / "template.xlsx"
             keep_path.touch()
             template_path.touch()
+            env_path = self._write_env_file(temp_root)
 
             summary = keep_list_runner.run_keep_list_screening_pipeline(
                 keep_workbook=keep_path,
                 template_workbook=template_path,
+                env_file=env_path,
                 output_root=temp_root / "run",
                 summary_json=temp_root / "run" / "summary.json",
                 platform_filters=["instagram"],
@@ -747,10 +1149,12 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             template_path = temp_root / "template.xlsx"
             keep_path.touch()
             template_path.touch()
+            env_path = self._write_env_file(temp_root)
 
             summary = keep_list_runner.run_keep_list_screening_pipeline(
                 keep_workbook=keep_path,
                 template_workbook=template_path,
+                env_file=env_path,
                 output_root=temp_root / "run",
                 platform_filters=["instagram"],
                 vision_provider="openai",
@@ -803,10 +1207,12 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             template_path = temp_root / "template.xlsx"
             keep_path.touch()
             template_path.touch()
+            env_path = self._write_env_file(temp_root)
 
             summary = keep_list_runner.run_keep_list_screening_pipeline(
                 keep_workbook=keep_path,
                 template_workbook=template_path,
+                env_file=env_path,
                 output_root=temp_root / "run",
                 platform_filters=["instagram"],
                 skip_positioning_card_analysis=True,
@@ -861,10 +1267,12 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             template_path = temp_root / "template.xlsx"
             keep_path.touch()
             template_path.touch()
+            env_path = self._write_env_file(temp_root)
 
             summary = keep_list_runner.run_keep_list_screening_pipeline(
                 keep_workbook=keep_path,
                 template_workbook=template_path,
+                env_file=env_path,
                 output_root=temp_root / "run",
                 platform_filters=["instagram"],
             )
@@ -916,16 +1324,24 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             template_path = temp_root / "template.xlsx"
             keep_path.touch()
             template_path.touch()
+            env_path = self._write_env_file(temp_root)
             summary = keep_list_runner.run_keep_list_screening_pipeline(
                 keep_workbook=keep_path,
                 template_workbook=template_path,
+                env_file=env_path,
                 output_root=temp_root / "run",
                 platform_filters=["instagram"],
                 vision_provider="openai",
             )
 
         self.assertEqual(summary["status"], "scrape_failed")
+        self.assertEqual(summary["verdict"]["outcome"], "failed")
+        self.assertEqual(summary["verdict"]["resolution_mode"], "auto_retry")
         self.assertEqual(summary["platforms"]["instagram"]["status"], "scrape_failed")
+        self.assertEqual(summary["failure"]["error_code"], "SCRAPE_FAILED")
+        self.assertEqual(summary["failure_decision"]["category"], "external_runtime")
+        self.assertEqual(summary["failure_decision"]["resolution_mode"], "auto_retry")
+        self.assertTrue(summary["failure_decision"]["retryable"])
 
 
 if __name__ == "__main__":

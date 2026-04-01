@@ -1,0 +1,168 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "harness/run-summary.schema.json",
+  "title": "Harness Run Summary",
+  "type": "object",
+  "required": [
+    "contract_version",
+    "failure_schema_version",
+    "status",
+    "started_at",
+    "contract",
+    "verdict"
+  ],
+  "properties": {
+    "contract_version": {
+      "type": "string",
+      "const": "harness.run-summary.v1-draft"
+    },
+    "failure_schema_version": {
+      "type": "string",
+      "const": "harness.failure.v1-draft"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "run_root": {
+      "type": "string"
+    },
+    "output_root": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string"
+    },
+    "started_at": {
+      "type": "string"
+    },
+    "finished_at": {
+      "type": "string"
+    },
+    "env_file_raw": {
+      "type": "string"
+    },
+    "env_file": {
+      "type": "string"
+    },
+    "resolved_config_sources": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "contract": {
+      "type": "object",
+      "required": [
+        "scope"
+      ],
+      "properties": {
+        "scope": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "preflight": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "setup": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "failure": {
+      "$ref": "./failure.schema.json"
+    },
+    "failure_decision": {
+      "$ref": "#/$defs/failureDecision"
+    },
+    "verdict": {
+      "$ref": "#/$defs/verdict"
+    }
+  },
+  "$defs": {
+    "failureDecision": {
+      "type": "object",
+      "required": [
+        "category",
+        "resolution_mode",
+        "retryable",
+        "requires_manual_intervention",
+        "recommended_action",
+        "conclusion"
+      ],
+      "properties": {
+        "category": {
+          "type": "string"
+        },
+        "resolution_mode": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "requires_manual_intervention": {
+          "type": "boolean"
+        },
+        "recommended_action": {
+          "type": "string"
+        },
+        "conclusion": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "verdict": {
+      "type": "object",
+      "required": [
+        "outcome",
+        "status",
+        "failure_layer",
+        "category",
+        "resolution_mode",
+        "retryable",
+        "requires_manual_intervention",
+        "recommended_action",
+        "conclusion"
+      ],
+      "properties": {
+        "outcome": {
+          "type": "string",
+          "enum": [
+            "completed",
+            "stopped",
+            "failed",
+            "blocked",
+            "running",
+            "unknown"
+          ]
+        },
+        "status": {
+          "type": "string"
+        },
+        "failure_layer": {
+          "type": "string"
+        },
+        "category": {
+          "type": "string"
+        },
+        "resolution_mode": {
+          "type": "string"
+        },
+        "retryable": {
+          "type": "boolean"
+        },
+        "requires_manual_intervention": {
+          "type": "boolean"
+        },
+        "recommended_action": {
+          "type": "string"
+        },
+        "conclusion": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

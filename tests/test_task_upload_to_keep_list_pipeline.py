@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from harness.contract import RUN_CONTRACT_VERSION
 import scripts.run_task_upload_to_keep_list_pipeline as task_runner
 
 
@@ -14,6 +15,22 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         task_runner._load_runtime_dependencies = self.original_loader
+
+    def _write_env_file(self, root: Path, **overrides: str) -> Path:
+        values = {
+            "FEISHU_APP_ID": "app-id",
+            "FEISHU_APP_SECRET": "app-secret",
+            "TASK_UPLOAD_URL": "https://env.example/task",
+            "EMPLOYEE_INFO_URL": "https://env.example/employee",
+            "TIMEOUT_SECONDS": "30",
+        }
+        values.update({key: value for key, value in overrides.items() if value is not None})
+        env_path = root / ".env"
+        env_path.write_text(
+            "\n".join(f"{key}={value}" for key, value in values.items()) + "\n",
+            encoding="utf-8",
+        )
+        return env_path
 
     def test_parser_keeps_single_entry_options(self) -> None:
         parser = task_runner.build_parser()
@@ -90,20 +107,114 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
             summary_path = temp_root / "run" / "summary.json"
+            env_path = self._write_env_file(
+                temp_root,
+                FEISHU_APP_ID="",
+                FEISHU_APP_SECRET="",
+            )
             summary = task_runner.run_task_upload_to_keep_list_pipeline(
                 task_name="MINISO",
-                env_file=".env",
+                env_file=env_path,
                 output_root=temp_root / "run",
                 summary_json=summary_path,
             )
             persisted = json.loads(summary_path.read_text(encoding="utf-8"))
 
         self.assertEqual(summary["status"], "failed")
+        self.assertEqual(summary["contract_version"], RUN_CONTRACT_VERSION)
+        self.assertEqual(summary["verdict"]["outcome"], "failed")
         self.assertEqual(summary["error_code"], "FEISHU_APP_ID_MISSING")
         self.assertEqual(summary["failure"]["stage"], "preflight")
+        self.assertEqual(summary["failure_layer"], "preflight")
+        self.assertEqual(summary["failure_decision"]["category"], "configuration")
+        self.assertEqual(summary["failure_decision"]["resolution_mode"], "manual_fix")
+        self.assertTrue(summary["failure_decision"]["requires_manual_intervention"])
+        self.assertFalse(summary["failure_decision"]["retryable"])
         self.assertFalse(summary["preflight"]["ready"])
+        self.assertTrue(summary["setup"]["skipped"])
+        self.assertFalse(summary["setup"]["completed"])
         self.assertEqual(summary["preflight"]["errors"][0]["error_code"], "FEISHU_APP_ID_MISSING")
+        self.assertFalse(Path(summary["task_spec_json"]).exists())
         self.assertEqual(persisted["failure"]["error_code"], "FEISHU_APP_ID_MISSING")
+
+    def test_runner_defaults_to_run_local_paths_when_output_root_is_omitted(self) -> None:
+        task_runner._load_runtime_dependencies = lambda: (_ for _ in ()).throw(AssertionError("runtime should not load"))
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            env_path = self._write_env_file(
+                temp_root,
+                FEISHU_APP_ID="",
+                FEISHU_APP_SECRET="",
+            )
+            summary = task_runner.run_task_upload_to_keep_list_pipeline(
+                task_name="MINISO",
+                env_file=env_path,
+            )
+
+        self.assertEqual(summary["status"], "failed")
+        self.assertIn("/temp/runs/task_upload_to_keep_list/", summary["run_root"])
+        self.assertEqual(summary["output_root"], summary["run_root"])
+        self.assertTrue(summary["resolved_inputs"]["paths"]["downloads_dir"]["path"].startswith(summary["run_root"]))
+        self.assertTrue(summary["resolved_inputs"]["paths"]["mail_root"]["path"].startswith(summary["run_root"]))
+        self.assertEqual(summary["resolved_config_sources"]["env_file"], "cli")
+
+    def test_runner_allows_missing_env_file_when_required_config_is_provided_explicitly(self) -> None:
+        def fake_download_task_upload_screening_assets(**kwargs):
+            download_dir = Path(kwargs["download_dir"])
+            template_path = download_dir / "miniso_template.xlsx"
+            sending_list_path = download_dir / "miniso_sending_list.xlsx"
+            template_path.parent.mkdir(parents=True, exist_ok=True)
+            template_path.touch()
+            sending_list_path.touch()
+            return {
+                "recordId": "rec123",
+                "taskName": "MINISO",
+                "linkedBitableUrl": "https://bitable.example/miniso",
+                "templateDownloadedPath": str(template_path),
+                "sendingListDownloadedPath": str(sending_list_path),
+            }
+
+        task_runner._load_runtime_dependencies = lambda: {
+            "Settings": object,
+            "Database": object,
+            "FeishuOpenClient": lambda **kwargs: object(),
+            "DEFAULT_FEISHU_BASE_URL": "https://open.feishu.cn",
+            "download_task_upload_screening_assets": fake_download_task_upload_screening_assets,
+            "sync_task_upload_mailboxes": lambda **kwargs: {},
+            "match_brand_keyword": lambda **kwargs: {},
+            "resolve_shared_email_candidates": lambda **kwargs: {},
+            "run_shared_email_final_review": lambda **kwargs: {},
+            "enrich_creator_workbook": lambda **kwargs: {},
+            "prepare_llm_review_candidates": lambda **kwargs: {},
+            "run_and_apply_llm_review": lambda **kwargs: {},
+            "resolve_sync_sent_since": lambda value: __import__("datetime").date(2025, 12, 27),
+            "load_local_env": lambda env_file: {},
+            "get_preferred_value": lambda cli_value, env_values, env_key, default="": str(cli_value or "").strip() or str(env_values.get(env_key, default) or "").strip(),
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            missing_env = temp_root / "missing.env"
+            summary = task_runner.run_task_upload_to_keep_list_pipeline(
+                task_name="MINISO",
+                env_file=missing_env,
+                output_root=temp_root / "run",
+                stop_after="task-assets",
+                task_upload_url="https://example.com/task",
+                employee_info_url="https://example.com/employee",
+                feishu_app_id="app-id",
+                feishu_app_secret="app-secret",
+            )
+
+        self.assertEqual(summary["status"], "stopped_after_task-assets")
+        self.assertEqual(summary["contract_version"], RUN_CONTRACT_VERSION)
+        self.assertEqual(summary["verdict"]["outcome"], "stopped")
+        self.assertEqual(summary["verdict"]["recommended_action"], "resume_run")
+        self.assertTrue(summary["preflight"]["ready"])
+        self.assertFalse(summary["preflight"]["env_file_exists"])
+        self.assertEqual(summary["env_file"], str(missing_env.resolve()))
+        self.assertEqual(summary["resolved_config_sources"]["task_upload_url"], "cli")
 
     def test_runner_records_single_entry_summary_and_handoff(self) -> None:
         class FakeClient:
@@ -242,16 +353,20 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
             summary_path = temp_root / "run" / "summary.json"
+            env_path = self._write_env_file(temp_root)
             summary = task_runner.run_task_upload_to_keep_list_pipeline(
                 task_name="MINISO",
-                env_file=".env",
+                env_file=env_path,
                 output_root=temp_root / "run",
                 summary_json=summary_path,
                 stop_after="keep-list",
             )
             persisted = json.loads(summary_path.read_text(encoding="utf-8"))
+            task_spec = json.loads(Path(summary["task_spec_json"]).read_text(encoding="utf-8"))
 
         self.assertEqual(summary["status"], "stopped_after_keep-list")
+        self.assertEqual(summary["contract_version"], RUN_CONTRACT_VERSION)
+        self.assertEqual(summary["verdict"]["outcome"], "stopped")
         self.assertEqual(summary["steps"]["task_assets"]["status"], "completed")
         self.assertEqual(summary["steps"]["mail_sync"]["status"], "completed")
         self.assertEqual(summary["steps"]["enrichment"]["status"], "completed")
@@ -259,14 +374,37 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
         self.assertEqual(summary["steps"]["llm_review"]["status"], "completed")
         self.assertEqual(summary["contract"]["contract_version"], "phase16.keep-list.v2")
         self.assertEqual(summary["contract"]["canonical_boundary"], "keep-list")
+        self.assertTrue(summary["run_id"])
+        self.assertEqual(summary["run_root"], str((temp_root / "run").resolve()))
+        self.assertEqual(summary["env_file_raw"], str(env_path))
+        self.assertEqual(summary["env_file"], str(env_path.resolve()))
+        self.assertEqual(summary["resolved_inputs"]["env_file"]["path"], str(env_path.resolve()))
+        self.assertEqual(summary["resolved_config_sources"]["task_upload_url"], "env_file:TASK_UPLOAD_URL")
+        self.assertEqual(summary["resolved_config_sources"]["employee_info_url"], "env_file:EMPLOYEE_INFO_URL")
+        self.assertEqual(
+            summary["resolved_config_sources"]["feishu_app_id"],
+            {"present": True, "source": "env_file:FEISHU_APP_ID"},
+        )
+        self.assertEqual(
+            summary["resolved_config_sources"]["feishu_app_secret"],
+            {"present": True, "source": "env_file:FEISHU_APP_SECRET"},
+        )
+        self.assertNotIn("app-secret", json.dumps(summary["resolved_config_sources"], ensure_ascii=False))
         self.assertFalse(summary["resume_context"]["existing_summary_accepted"])
         self.assertEqual(summary["resume_context"]["reset_reason"], "no_existing_summary")
         self.assertIn("exists", summary["resolved_inputs"]["env_file"])
-        self.assertTrue(summary["resolved_inputs"]["env_file"]["path"].endswith(".env"))
+        self.assertEqual(summary["resolved_inputs"]["env_file"]["path"], str(env_path.resolve()))
         self.assertEqual(summary["resolved_inputs"]["feishu"]["task_upload_url_source"], "env_file")
         self.assertEqual(summary["resolved_inputs"]["mail_sync"]["sent_since_source"], "default_recent_3_calendar_months")
+        self.assertEqual(task_spec["scope"], "task-upload-to-keep-list")
+        self.assertEqual(task_spec["canonical_boundary"], "keep-list")
+        self.assertEqual(task_spec["intent"]["task_name"], "MINISO")
+        self.assertEqual(task_spec["intent"]["task_upload_url"], "https://env.example/task")
+        self.assertEqual(task_spec["intent"]["stop_after"], "keep-list")
+        self.assertEqual(task_spec["controls"]["owner_email_overrides"], {})
         self.assertEqual(summary["resolved_inputs"]["paths"]["downloads_dir"]["source"], "output_root_default")
-        self.assertTrue(summary["preflight"]["downloads_dir_ready"])
+        self.assertTrue(summary["setup"]["completed"])
+        self.assertTrue(summary["setup"]["downloads_dir_ready"])
         self.assertEqual(summary["steps"]["mail_sync"]["resume_policy"]["stage_policy"], "always_rerun_incremental")
         self.assertEqual(summary["steps"]["llm_review"]["resume_policy"]["resume_point_key"], "keep_list")
         self.assertTrue(summary["artifacts"]["keep_workbook"].endswith("_llm_reviewed_keep.xlsx"))
@@ -424,9 +562,10 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
+            env_path = self._write_env_file(temp_root)
             summary = task_runner.run_task_upload_to_keep_list_pipeline(
                 task_name="MINISO",
-                env_file=".env",
+                env_file=env_path,
                 output_root=temp_root / "run",
                 owner_email_overrides={"MINISO": "eden@amagency.biz"},
                 stop_after="keep-list",
@@ -579,9 +718,14 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
+            env_path = self._write_env_file(
+                temp_root,
+                EMAIL_ACCOUNT="partnerships@amagency.biz",
+                EMAIL_AUTH_CODE="xYeGKyNmK5jFN7Y2",
+            )
             summary = task_runner.run_task_upload_to_keep_list_pipeline(
                 task_name="MINISO",
-                env_file=".env",
+                env_file=env_path,
                 output_root=temp_root / "run",
                 stop_after="keep-list",
             )
@@ -684,6 +828,7 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
+            env_path = self._write_env_file(temp_root)
             downloads = temp_root / "run" / "downloads"
             exports = temp_root / "run" / "exports"
             downloads.mkdir(parents=True, exist_ok=True)
@@ -754,7 +899,7 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
 
             summary = task_runner.run_task_upload_to_keep_list_pipeline(
                 task_name="MINISO",
-                env_file=".env",
+                env_file=env_path,
                 output_root=temp_root / "run",
                 summary_json=summary_path,
                 stop_after="keep-list",
@@ -906,6 +1051,7 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
+            env_path = self._write_env_file(temp_root)
             downloads = temp_root / "run" / "downloads"
             exports = temp_root / "run" / "exports"
             downloads.mkdir(parents=True, exist_ok=True)
@@ -976,7 +1122,7 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
 
             summary = task_runner.run_task_upload_to_keep_list_pipeline(
                 task_name="MINISO",
-                env_file=".env",
+                env_file=env_path,
                 output_root=temp_root / "run",
                 summary_json=summary_path,
                 stop_after="keep-list",
@@ -1182,9 +1328,10 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
             summary_path = temp_root / "run" / "summary.json"
+            env_path = self._write_env_file(temp_root)
             summary = task_runner.run_task_upload_to_keep_list_pipeline(
                 task_name="MINISO",
-                env_file=".env",
+                env_file=env_path,
                 output_root=temp_root / "run",
                 summary_json=summary_path,
                 matching_strategy="brand-keyword-fast-path",

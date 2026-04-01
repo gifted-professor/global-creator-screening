@@ -12,6 +12,18 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from harness.contract import attach_run_contract
+from harness.config import resolve_keep_list_downstream_config
+from harness.failures import attach_failure_to_summary, build_failure_payload as build_harness_failure_payload
+from harness.paths import resolve_keep_list_downstream_paths
+from harness.preflight import (
+    build_preflight_error,
+    build_preflight_payload,
+    inspect_directory_materialization_target,
+)
+from harness.setup import materialize_setup
+from harness.spec import build_keep_list_downstream_task_spec, write_task_spec
+
 
 DEFAULT_KEEP_WORKBOOK = (
     REPO_ROOT / "exports" / "测试达人库_MINISO_匹配结果_高置信_按我们去重_llm_reviewed_keep.xlsx"
@@ -30,7 +42,11 @@ DEFAULT_PLATFORM_ORDER = ("tiktok", "instagram", "youtube")
 def _load_runtime_dependencies():
     import backend.app as backend_app
     from backend.final_export_merge import build_all_platforms_final_review_artifacts, collect_final_exports
-    from scripts.prepare_screening_inputs import prepare_screening_inputs
+    from scripts.prepare_screening_inputs import (
+        prepare_screening_inputs,
+        restore_backend_runtime_state,
+        snapshot_backend_runtime_state,
+    )
     from scripts.run_screening_smoke import (
         count_passed_profiles,
         export_platform_artifacts,
@@ -44,6 +60,8 @@ def _load_runtime_dependencies():
         "build_all_platforms_final_review_artifacts": build_all_platforms_final_review_artifacts,
         "collect_final_exports": collect_final_exports,
         "prepare_screening_inputs": prepare_screening_inputs,
+        "restore_backend_runtime_state": restore_backend_runtime_state,
+        "snapshot_backend_runtime_state": snapshot_backend_runtime_state,
         "count_passed_profiles": count_passed_profiles,
         "export_platform_artifacts": export_platform_artifacts,
         "poll_job": poll_job,
@@ -53,8 +71,7 @@ def _load_runtime_dependencies():
 
 
 def default_output_root() -> Path:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return REPO_ROOT / "temp" / f"keep_list_screening_{timestamp}"
+    return resolve_keep_list_downstream_paths(task_name="task").run_root
 
 
 def iso_now() -> str:
@@ -89,15 +106,17 @@ def _build_failure_payload(
     error_code: str,
     message: str,
     remediation: str,
+    failure_layer: str = "runtime",
     details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
-        "stage": stage,
-        "error_code": error_code,
-        "message": message,
-        "remediation": remediation,
-        "details": details or {},
-    }
+    return build_harness_failure_payload(
+        stage=stage,
+        error_code=error_code,
+        message=message,
+        remediation=remediation,
+        failure_layer=failure_layer,
+        details=details,
+    )
 
 
 def normalize_platforms(values: list[str] | None) -> list[str]:
@@ -308,6 +327,127 @@ def _build_positioning_stage_payload(status: str, reason: str = "", **extra: Any
     return payload
 
 
+def _build_resolved_config_sources(
+    *,
+    env_file: str | Path,
+    keep_workbook: Path,
+    template_workbook: Path | None,
+    task_name: str,
+    task_upload_url: str,
+    platform_filters: list[str] | None,
+    vision_provider: str,
+    max_identifiers_per_platform: int,
+    poll_interval: float,
+    probe_vision_provider_only: bool,
+    skip_scrape: bool,
+    skip_visual: bool,
+    skip_positioning_card_analysis: bool,
+    output_root_source: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    return resolve_keep_list_downstream_config(
+        env_file=env_file,
+        keep_workbook=keep_workbook,
+        template_workbook=template_workbook,
+        task_name=task_name,
+        task_upload_url=task_upload_url,
+        platform_filters=platform_filters,
+        vision_provider=vision_provider,
+        max_identifiers_per_platform=max_identifiers_per_platform,
+        poll_interval=poll_interval,
+        probe_vision_provider_only=probe_vision_provider_only,
+        skip_scrape=skip_scrape,
+        skip_visual=skip_visual,
+        skip_positioning_card_analysis=skip_positioning_card_analysis,
+        output_root_source=output_root_source,
+    )
+
+
+def _build_downstream_preflight(
+    *,
+    keep_workbook: Path,
+    template_workbook: Path | None,
+    env_snapshot: Any,
+    run_root: Path,
+    screening_data_dir: Path,
+    config_dir: Path,
+    temp_dir: Path,
+    exports_dir: Path,
+    downloads_dir: Path,
+    requested_platforms: list[str],
+    skip_scrape: bool,
+    skip_visual: bool,
+    skip_positioning_card_analysis: bool,
+    probe_vision_provider_only: bool,
+) -> dict[str, Any]:
+    errors: list[dict[str, Any]] = []
+    run_root_target = inspect_directory_materialization_target(run_root)
+    screening_data_dir_target = inspect_directory_materialization_target(screening_data_dir)
+    config_dir_target = inspect_directory_materialization_target(config_dir)
+    temp_dir_target = inspect_directory_materialization_target(temp_dir)
+    exports_dir_target = inspect_directory_materialization_target(exports_dir)
+    downloads_dir_target = inspect_directory_materialization_target(downloads_dir)
+    if not keep_workbook.exists():
+        errors.append(
+            build_preflight_error(
+                error_code="KEEP_WORKBOOK_MISSING",
+                message=f"keep workbook 不存在: {keep_workbook.resolve()}",
+                remediation="先确认上游 keep-list 已生成，或通过 `--keep-workbook` 指向真实存在的 `*_keep.xlsx` 文件。",
+                details={"path": str(keep_workbook.resolve())},
+            )
+        )
+    if template_workbook is not None and not template_workbook.exists():
+        errors.append(
+            build_preflight_error(
+                error_code="TEMPLATE_WORKBOOK_MISSING",
+                message=f"template workbook 不存在: {template_workbook.resolve()}",
+                remediation="通过 `--template-workbook` 指向真实模板文件，或改为传 `--task-name` 让 staging 走任务上传模板下载。",
+                details={"path": str(template_workbook.resolve())},
+            )
+        )
+    for error_code, path_value, label, inspection in (
+        ("RUN_ROOT_UNAVAILABLE", run_root, "run_root", run_root_target),
+        ("SCREENING_DATA_DIR_UNAVAILABLE", screening_data_dir, "screening_data_dir", screening_data_dir_target),
+        ("CONFIG_DIR_UNAVAILABLE", config_dir, "config_dir", config_dir_target),
+        ("TEMP_DIR_UNAVAILABLE", temp_dir, "temp_dir", temp_dir_target),
+        ("EXPORTS_DIR_UNAVAILABLE", exports_dir, "exports_dir", exports_dir_target),
+        ("DOWNLOADS_DIR_UNAVAILABLE", downloads_dir, "downloads_dir", downloads_dir_target),
+    ):
+        if not bool(inspection["materializable"]):
+            errors.append(
+                build_preflight_error(
+                    error_code=error_code,
+                    message=f"{label} 无法创建: {path_value}",
+                    remediation="检查输出路径权限，或显式传入可写目录后重试。",
+                    details={
+                        "path": str(path_value),
+                        "nearest_existing_parent": str(inspection["nearest_existing_parent"]),
+                    },
+                )
+            )
+    return build_preflight_payload(
+        checks={
+            "scope": "keep-list-screening",
+            "lightweight_only": True,
+            "env_file_exists": bool(getattr(env_snapshot, "exists", False)),
+            "keep_workbook_exists": keep_workbook.exists(),
+            "template_input_mode": "template_workbook" if template_workbook else "task_upload_or_none",
+            "template_workbook_exists": template_workbook.exists() if template_workbook else False,
+            "requested_platforms": requested_platforms,
+            "skip_scrape": bool(skip_scrape),
+            "skip_visual": bool(skip_visual),
+            "skip_positioning_card_analysis": bool(skip_positioning_card_analysis),
+            "probe_vision_provider_only": bool(probe_vision_provider_only),
+            "run_root_materializable": bool(run_root_target["materializable"]),
+            "screening_data_dir_materializable": bool(screening_data_dir_target["materializable"]),
+            "config_dir_materializable": bool(config_dir_target["materializable"]),
+            "temp_dir_materializable": bool(temp_dir_target["materializable"]),
+            "exports_dir_materializable": bool(exports_dir_target["materializable"]),
+            "downloads_dir_materializable": bool(downloads_dir_target["materializable"]),
+        },
+        errors=errors,
+    )
+
+
 def run_keep_list_screening_pipeline(
     *,
     keep_workbook: Path,
@@ -332,35 +472,76 @@ def run_keep_list_screening_pipeline(
     task_owner_owner_name: str = "",
     linked_bitable_url: str = "",
 ) -> dict[str, Any]:
-    resolved_output_root = (output_root or default_output_root()).expanduser().resolve()
-    resolved_output_root.mkdir(parents=True, exist_ok=True)
-
-    run_summary_path = (summary_json.expanduser().resolve() if summary_json else resolved_output_root / "summary.json")
-    staging_summary_path = resolved_output_root / "staging_summary.json"
-    screening_data_dir = resolved_output_root / "data"
-    config_dir = resolved_output_root / "config"
-    temp_dir = resolved_output_root / "temp"
-    exports_dir = resolved_output_root / "exports"
+    normalized_task_name = str(task_name or "").strip()
+    runner_paths = resolve_keep_list_downstream_paths(
+        task_name=normalized_task_name or "task",
+        output_root=output_root,
+        summary_json=summary_json,
+    )
+    resolved_output_root = runner_paths.output_root
+    run_summary_path = runner_paths.summary_json
+    staging_summary_path = runner_paths.staging_summary_json
+    screening_data_dir = runner_paths.screening_data_dir
+    config_dir = runner_paths.config_dir
+    temp_dir = runner_paths.temp_dir
+    exports_dir = runner_paths.exports_dir
+    downloads_dir = runner_paths.downloads_dir
     requested_platforms = normalize_platforms(platform_filters)
-    env_path = Path(env_file).expanduser()
+    resolved_config_sources, resolved_config = _build_resolved_config_sources(
+        env_file=env_file,
+        keep_workbook=keep_workbook,
+        template_workbook=template_workbook,
+        task_name=normalized_task_name,
+        task_upload_url=task_upload_url,
+        platform_filters=platform_filters,
+        vision_provider=vision_provider,
+        max_identifiers_per_platform=max_identifiers_per_platform,
+        poll_interval=poll_interval,
+        probe_vision_provider_only=probe_vision_provider_only,
+        skip_scrape=skip_scrape,
+        skip_visual=skip_visual,
+        skip_positioning_card_analysis=skip_positioning_card_analysis,
+        output_root_source=runner_paths.output_root_source,
+    )
     resolved_keep_workbook = keep_workbook.expanduser()
     resolved_template_workbook = template_workbook.expanduser() if template_workbook else None
+    preflight = _build_downstream_preflight(
+        keep_workbook=resolved_keep_workbook,
+        template_workbook=resolved_template_workbook,
+        env_snapshot=resolved_config["env_snapshot"],
+        run_root=runner_paths.run_root,
+        screening_data_dir=screening_data_dir,
+        config_dir=config_dir,
+        temp_dir=temp_dir,
+        exports_dir=exports_dir,
+        downloads_dir=downloads_dir,
+        requested_platforms=requested_platforms,
+        skip_scrape=skip_scrape,
+        skip_visual=skip_visual,
+        skip_positioning_card_analysis=skip_positioning_card_analysis,
+        probe_vision_provider_only=probe_vision_provider_only,
+    )
 
     summary: dict[str, Any] = {
         "started_at": iso_now(),
+        "run_id": runner_paths.run_id,
+        "run_root": str(runner_paths.run_root),
         "keep_workbook": str(resolved_keep_workbook.resolve()),
         "template_workbook": str(resolved_template_workbook.resolve()) if resolved_template_workbook else "",
-        "task_name": str(task_name or "").strip(),
+        "task_name": normalized_task_name,
         "task_upload_url": str(task_upload_url or "").strip(),
-        "env_file": str(env_file),
+        "env_file_raw": str(env_file),
+        "env_file": str(resolved_config["env_snapshot"].path),
         "output_root": str(resolved_output_root),
         "summary_json": str(run_summary_path),
+        "task_spec_json": str(runner_paths.task_spec_json),
         "staging_summary_json": str(staging_summary_path),
+        "resolved_config_sources": resolved_config_sources,
         "resolved_inputs": {
             "env_file": {
-                "path": str(env_path.resolve()),
-                "exists": env_path.exists(),
-                "source": "cli_or_default",
+                "path": str(resolved_config["env_snapshot"].path),
+                "exists": resolved_config["env_snapshot"].exists,
+                "source": resolved_config["env_snapshot"].source,
             },
             "keep_workbook": _path_summary(resolved_keep_workbook, source="cli_or_default", kind="file"),
             "template_workbook": _path_summary(
@@ -369,25 +550,15 @@ def run_keep_list_screening_pipeline(
                 kind="file",
             ),
             "output_dirs": {
-                "output_root": _path_summary(resolved_output_root, source="cli_or_default", kind="dir"),
-                "screening_data_dir": _path_summary(screening_data_dir, source="output_root", kind="dir"),
-                "config_dir": _path_summary(config_dir, source="output_root", kind="dir"),
-                "temp_dir": _path_summary(temp_dir, source="output_root", kind="dir"),
-                "exports_dir": _path_summary(exports_dir, source="output_root", kind="dir"),
+                "output_root": _path_summary(resolved_output_root, source=runner_paths.output_root_source, kind="dir"),
+                "screening_data_dir": _path_summary(screening_data_dir, source="output_root_default", kind="dir"),
+                "config_dir": _path_summary(config_dir, source="output_root_default", kind="dir"),
+                "temp_dir": _path_summary(temp_dir, source="output_root_default", kind="dir"),
+                "exports_dir": _path_summary(exports_dir, source="output_root_default", kind="dir"),
+                "downloads_dir": _path_summary(downloads_dir, source="output_root_default", kind="dir"),
             },
         },
-        "preflight": {
-            "keep_workbook_exists": resolved_keep_workbook.exists(),
-            "template_input_mode": "template_workbook" if resolved_template_workbook else ("task_upload" if str(task_name or "").strip() else "none"),
-            "template_workbook_exists": resolved_template_workbook.exists() if resolved_template_workbook else False,
-            "requested_platforms": requested_platforms,
-            "skip_scrape": bool(skip_scrape),
-            "skip_visual": bool(skip_visual),
-            "skip_positioning_card_analysis": bool(skip_positioning_card_analysis),
-            "probe_vision_provider_only": bool(probe_vision_provider_only),
-            "ready": False,
-            "errors": [],
-        },
+        "preflight": preflight,
         "requested_platforms": requested_platforms,
         "requested_vision_provider": str(vision_provider or "").strip().lower(),
         "max_identifiers_per_platform": int(max_identifiers_per_platform),
@@ -406,38 +577,141 @@ def run_keep_list_screening_pipeline(
             "all_platforms_upload_payload_json": "",
             "final_exports": {},
         },
+        "setup": {
+            "scope": "keep-list-screening",
+            "completed": False,
+            "skipped": not preflight["ready"],
+            "errors": [],
+        },
     }
+    attach_run_contract(summary)
+    task_spec = build_keep_list_downstream_task_spec(
+        generated_at=summary["started_at"],
+        runner_paths=runner_paths,
+        env_snapshot=resolved_config["env_snapshot"],
+        env_file_raw=str(env_file),
+        resolved_config_sources=resolved_config_sources,
+        keep_workbook=resolved_keep_workbook.resolve(),
+        template_workbook=resolved_template_workbook.resolve() if resolved_template_workbook else None,
+        task_name=normalized_task_name,
+        task_upload_url=resolved_config["task_upload_url"].value,
+        requested_platforms=requested_platforms,
+        vision_provider=str(vision_provider or "").strip().lower(),
+        max_identifiers_per_platform=int(max_identifiers_per_platform),
+        poll_interval=float(poll_interval),
+        probe_vision_provider_only=bool(probe_vision_provider_only),
+        skip_scrape=bool(skip_scrape),
+        skip_visual=bool(skip_visual),
+        skip_positioning_card_analysis=bool(skip_positioning_card_analysis),
+        task_owner_name=str(task_owner_name or "").strip(),
+        task_owner_employee_id=str(task_owner_employee_id or "").strip(),
+        task_owner_employee_record_id=str(task_owner_employee_record_id or "").strip(),
+        task_owner_employee_email=str(task_owner_employee_email or "").strip(),
+        task_owner_owner_name=str(task_owner_owner_name or "").strip(),
+        linked_bitable_url=str(linked_bitable_url or "").strip(),
+    )
 
-    preflight_errors: list[dict[str, Any]] = []
-    if not resolved_keep_workbook.exists():
-        preflight_errors.append(
-            _build_failure_payload(
-                stage="preflight",
-                error_code="KEEP_WORKBOOK_MISSING",
-                message=f"keep workbook 不存在: {resolved_keep_workbook.resolve()}",
-                remediation="先确认上游 keep-list 已生成，或通过 `--keep-workbook` 指向真实存在的 `*_keep.xlsx` 文件。",
-                details={"path": str(resolved_keep_workbook.resolve())},
-            )
-        )
-    if resolved_template_workbook is not None and not resolved_template_workbook.exists():
-        preflight_errors.append(
-            _build_failure_payload(
-                stage="preflight",
-                error_code="TEMPLATE_WORKBOOK_MISSING",
-                message=f"template workbook 不存在: {resolved_template_workbook.resolve()}",
-                remediation="通过 `--template-workbook` 指向真实模板文件，或改为传 `--task-name` 让 staging 走任务上传模板下载。",
-                details={"path": str(resolved_template_workbook.resolve())},
-            )
-        )
-    if preflight_errors:
-        summary["status"] = "failed"
-        summary["finished_at"] = iso_now()
-        summary["error"] = preflight_errors[0]["message"]
-        summary["error_code"] = preflight_errors[0]["error_code"]
-        summary["failure"] = preflight_errors[0]
-        summary["preflight"]["errors"] = preflight_errors
+    def _finalize_failure(
+        *,
+        failure: dict[str, Any],
+        finished_at: str,
+        status: str = "failed",
+        expose_top_level: bool = True,
+    ) -> dict[str, Any]:
+        summary["status"] = status
+        summary["finished_at"] = finished_at
+        attach_failure_to_summary(summary, failure, expose_top_level=expose_top_level)
+        attach_run_contract(summary)
         _write_summary(run_summary_path, summary)
         return summary
+
+    if not preflight["ready"]:
+        failure = preflight["errors"][0]
+        return _finalize_failure(
+            failure={**failure, "failure_layer": "preflight"},
+            finished_at=iso_now(),
+        )
+
+    setup = materialize_setup(
+        scope="keep-list-screening",
+        directories=[
+            {
+                "label": "run_root",
+                "path": runner_paths.run_root,
+                "error_code": "RUN_ROOT_UNAVAILABLE",
+                "message": "run_root 无法创建: {path}",
+                "remediation": "检查输出路径权限，或显式传入可写目录后重试。",
+            },
+            {
+                "label": "screening_data_dir",
+                "path": screening_data_dir,
+                "error_code": "SCREENING_DATA_DIR_UNAVAILABLE",
+                "message": "screening_data_dir 无法创建: {path}",
+                "remediation": "检查输出路径权限后重试。",
+            },
+            {
+                "label": "config_dir",
+                "path": config_dir,
+                "error_code": "CONFIG_DIR_UNAVAILABLE",
+                "message": "config_dir 无法创建: {path}",
+                "remediation": "检查输出路径权限后重试。",
+            },
+            {
+                "label": "temp_dir",
+                "path": temp_dir,
+                "error_code": "TEMP_DIR_UNAVAILABLE",
+                "message": "temp_dir 无法创建: {path}",
+                "remediation": "检查输出路径权限后重试。",
+            },
+            {
+                "label": "exports_dir",
+                "path": exports_dir,
+                "error_code": "EXPORTS_DIR_UNAVAILABLE",
+                "message": "exports_dir 无法创建: {path}",
+                "remediation": "检查输出路径权限后重试。",
+            },
+            {
+                "label": "downloads_dir",
+                "path": downloads_dir,
+                "error_code": "DOWNLOADS_DIR_UNAVAILABLE",
+                "message": "downloads_dir 无法创建: {path}",
+                "remediation": "检查输出路径权限后重试。",
+            },
+            {
+                "label": "template_output_dir",
+                "path": runner_paths.template_output_dir,
+                "error_code": "TEMPLATE_OUTPUT_DIR_UNAVAILABLE",
+                "message": "template_output_dir 无法创建: {path}",
+                "remediation": "检查输出路径权限后重试。",
+            },
+        ],
+        files=[
+            {
+                "label": "task_spec",
+                "path": runner_paths.task_spec_json,
+                "writer": lambda path: write_task_spec(path, task_spec),
+                "error_code": "TASK_SPEC_WRITE_FAILED",
+                "message": "task_spec 无法写入: {path}",
+                "remediation": "检查 run root 权限或 task spec 序列化逻辑后重试。",
+            }
+        ],
+    )
+    summary["setup"] = {**setup, "skipped": False}
+    if not setup["completed"]:
+        failure = setup["errors"][0]
+        return _finalize_failure(
+            failure=failure,
+            finished_at=iso_now(),
+        )
+
+    summary["resolved_inputs"]["output_dirs"] = {
+        "output_root": _path_summary(resolved_output_root, source=runner_paths.output_root_source, kind="dir"),
+        "screening_data_dir": _path_summary(screening_data_dir, source="output_root_default", kind="dir"),
+        "config_dir": _path_summary(config_dir, source="output_root_default", kind="dir"),
+        "temp_dir": _path_summary(temp_dir, source="output_root_default", kind="dir"),
+        "exports_dir": _path_summary(exports_dir, source="output_root_default", kind="dir"),
+        "downloads_dir": _path_summary(downloads_dir, source="output_root_default", kind="dir"),
+    }
 
     try:
         runtime = _load_runtime_dependencies()
@@ -449,14 +723,10 @@ def run_keep_list_screening_pipeline(
             remediation="先补齐 `backend` 与筛号相关本地依赖，再重试 keep-list downstream run。",
             details={"exception_type": exc.__class__.__name__},
         )
-        summary["status"] = "failed"
-        summary["finished_at"] = iso_now()
-        summary["error"] = failure["message"]
-        summary["error_code"] = failure["error_code"]
-        summary["failure"] = failure
-        summary["preflight"]["errors"] = [failure]
-        _write_summary(run_summary_path, summary)
-        return summary
+        return _finalize_failure(
+            failure=failure,
+            finished_at=iso_now(),
+        )
 
     backend_app = runtime["backend_app"]
     if "build_all_platforms_final_review_artifacts" in runtime and "collect_final_exports" in runtime:
@@ -466,442 +736,484 @@ def run_keep_list_screening_pipeline(
         from backend.final_export_merge import build_all_platforms_final_review_artifacts, collect_final_exports
 
     prepare_screening_inputs = runtime["prepare_screening_inputs"]
+    snapshot_backend_runtime_state = runtime.get("snapshot_backend_runtime_state", lambda: {})
+    restore_backend_runtime_state = runtime.get("restore_backend_runtime_state", lambda snapshot: None)
     count_passed_profiles = runtime["count_passed_profiles"]
     export_platform_artifacts = runtime["export_platform_artifacts"]
     poll_job = runtime["poll_job"]
     require_success = runtime["require_success"]
     reset_backend_runtime_state = runtime["reset_backend_runtime_state"]
+    runtime_snapshot = snapshot_backend_runtime_state()
 
     try:
-        reset_backend_runtime_state()
-        staging_summary = prepare_screening_inputs(
-            creator_workbook=resolved_keep_workbook.resolve(),
-            template_workbook=resolved_template_workbook.resolve() if resolved_template_workbook else None,
-            task_name=str(task_name or "").strip(),
-            task_upload_url=str(task_upload_url or "").strip(),
-            env_file=env_file,
-            screening_data_dir=screening_data_dir,
-            config_dir=config_dir,
-            temp_dir=temp_dir,
-            summary_json=staging_summary_path,
-        )
-    except Exception as exc:  # noqa: BLE001
-        failure = _build_failure_payload(
-            stage="staging",
-            error_code="SCREENING_STAGING_FAILED",
-            message=str(exc) or exc.__class__.__name__,
-            remediation="检查 keep workbook、模板输入、任务上传相关 env，以及 staging summary 的 resolved_inputs 后重试。",
-            details={"exception_type": exc.__class__.__name__},
-        )
-        summary["status"] = "failed"
-        summary["finished_at"] = backend_app.iso_now()
-        summary["error"] = failure["message"]
-        summary["error_code"] = failure["error_code"]
-        summary["failure"] = failure
-        summary["preflight"]["errors"] = [failure]
+        try:
+            reset_backend_runtime_state()
+            staging_summary = prepare_screening_inputs(
+                creator_workbook=resolved_keep_workbook.resolve(),
+                template_workbook=resolved_template_workbook.resolve() if resolved_template_workbook else None,
+                task_name=normalized_task_name,
+                task_upload_url=str(task_upload_url or "").strip(),
+                env_file=env_file,
+                task_download_dir=downloads_dir,
+                template_output_dir=runner_paths.template_output_dir,
+                screening_data_dir=screening_data_dir,
+                config_dir=config_dir,
+                temp_dir=temp_dir,
+                summary_json=staging_summary_path,
+            )
+        except Exception as exc:  # noqa: BLE001
+            failure = _build_failure_payload(
+                stage="staging",
+                error_code="SCREENING_STAGING_FAILED",
+                message=str(exc) or exc.__class__.__name__,
+                remediation="检查 keep workbook、模板输入、任务上传相关 env，以及 staging summary 的 resolved_inputs 后重试。",
+                details={"exception_type": exc.__class__.__name__},
+            )
+            return _finalize_failure(
+                failure=failure,
+                finished_at=backend_app.iso_now(),
+            )
+
+        summary["started_at"] = backend_app.iso_now()
+        summary["staging"] = staging_summary
+        summary["vision_providers"] = backend_app.get_available_vision_provider_names()
+        summary["vision_preflight"] = backend_app.build_vision_preflight(vision_provider)
+        if skip_scrape and not probe_vision_provider_only:
+            summary["vision_probe"] = {
+                "status": "skipped",
+                "reason": "skip_scrape flag set",
+            }
+        summary["preflight"]["ready"] = True
+        summary["preflight"]["errors"] = []
         _write_summary(run_summary_path, summary)
-        return summary
 
-    summary["started_at"] = backend_app.iso_now()
-    summary["staging"] = staging_summary
-    summary["vision_providers"] = backend_app.get_available_vision_provider_names()
-    summary["vision_preflight"] = backend_app.build_vision_preflight(vision_provider)
-    summary["preflight"]["ready"] = True
-    summary["preflight"]["errors"] = []
-    _write_summary(run_summary_path, summary)
-
-    try:
-        client = backend_app.app.test_client()
-        resolve_routing_strategy = getattr(backend_app, "resolve_visual_review_routing_strategy", None)
-        active_routing_strategy = ""
-        if callable(resolve_routing_strategy):
-            active_routing_strategy = str(resolve_routing_strategy({}) or "").strip().lower()
-        if not skip_visual or probe_vision_provider_only:
-            if (
-                not str(vision_provider or "").strip()
-                and active_routing_strategy == "probe_ranked"
-                and hasattr(backend_app, "run_probe_ranked_visual_provider_race")
-            ):
-                race_payload = backend_app.run_probe_ranked_visual_provider_race(
-                    platform=requested_platforms[0] if requested_platforms else "instagram"
-                )
-                probe_payload = {
-                    "success": bool(race_payload.get("success")),
-                    "provider": race_payload.get("selected_provider") or "",
-                    "probe": {
+        try:
+            client = backend_app.app.test_client()
+            resolve_routing_strategy = getattr(backend_app, "resolve_visual_review_routing_strategy", None)
+            active_routing_strategy = ""
+            if callable(resolve_routing_strategy):
+                active_routing_strategy = str(resolve_routing_strategy({}) or "").strip().lower()
+            if (not skip_scrape and not skip_visual) or probe_vision_provider_only:
+                if (
+                    not str(vision_provider or "").strip()
+                    and active_routing_strategy == "probe_ranked"
+                    and hasattr(backend_app, "run_probe_ranked_visual_provider_race")
+                ):
+                    race_payload = backend_app.run_probe_ranked_visual_provider_race(
+                        platform=requested_platforms[0] if requested_platforms else "instagram"
+                    )
+                    probe_payload = {
                         "success": bool(race_payload.get("success")),
                         "provider": race_payload.get("selected_provider") or "",
-                        "model": race_payload.get("selected_model") or "",
-                        "checked_at": race_payload.get("checked_at") or "",
-                    },
-                    "channel_race": race_payload,
-                    "vision_preflight": summary["vision_preflight"],
-                }
-                probe_status_code = 200 if probe_payload.get("success") else 400
-                if not probe_payload.get("success"):
-                    probe_payload["error_code"] = "VISION_CHANNEL_RACE_FAILED"
-                    probe_payload["error"] = "视觉通道赛马失败：当前优先链路都不可用。"
-            else:
-                probe_response = client.post("/api/vision/providers/probe", json={"provider": vision_provider or ""})
-                probe_payload = probe_response.get_json(silent=True) or {
-                    "success": False,
-                    "error": f"unexpected HTTP {probe_response.status_code}",
-                }
-                probe_status_code = probe_response.status_code
-            summary["vision_probe"] = probe_payload
-            summary["vision_preflight"] = probe_payload.get("vision_preflight") or summary["vision_preflight"]
-            if probe_status_code >= 400 or probe_payload.get("success") is False:
-                summary["status"] = "vision_probe_failed"
+                        "probe": {
+                            "success": bool(race_payload.get("success")),
+                            "provider": race_payload.get("selected_provider") or "",
+                            "model": race_payload.get("selected_model") or "",
+                            "checked_at": race_payload.get("checked_at") or "",
+                        },
+                        "channel_race": race_payload,
+                        "vision_preflight": summary["vision_preflight"],
+                    }
+                    probe_status_code = 200 if probe_payload.get("success") else 400
+                    if not probe_payload.get("success"):
+                        probe_payload["error_code"] = "VISION_CHANNEL_RACE_FAILED"
+                        probe_payload["error"] = "视觉通道赛马失败：当前优先链路都不可用。"
+                else:
+                    probe_response = client.post("/api/vision/providers/probe", json={"provider": vision_provider or ""})
+                    probe_payload = probe_response.get_json(silent=True) or {
+                        "success": False,
+                        "error": f"unexpected HTTP {probe_response.status_code}",
+                    }
+                    probe_status_code = probe_response.status_code
+                summary["vision_probe"] = probe_payload
+                summary["vision_preflight"] = probe_payload.get("vision_preflight") or summary["vision_preflight"]
+                if probe_status_code >= 400 or probe_payload.get("success") is False:
+                    failure = _build_failure_payload(
+                        stage="vision_probe",
+                        error_code=str(
+                            probe_payload.get("error_code")
+                            or (probe_payload.get("vision_preflight") or {}).get("error_code")
+                            or "VISION_PROVIDER_PROBE_FAILED"
+                        ),
+                        message=str(probe_payload.get("error") or "视觉 provider probe 失败"),
+                        remediation="检查 vision preflight、provider 配置和可运行通道后重试。",
+                    )
+                    return _finalize_failure(
+                        failure=failure,
+                        finished_at=backend_app.iso_now(),
+                        status="vision_probe_failed",
+                        expose_top_level=False,
+                    )
+            if probe_vision_provider_only:
+                summary["status"] = "vision_probe_only"
                 summary["finished_at"] = backend_app.iso_now()
+                attach_run_contract(summary)
                 _write_summary(run_summary_path, summary)
                 return summary
-        if probe_vision_provider_only:
-            summary["status"] = "vision_probe_only"
-            summary["finished_at"] = backend_app.iso_now()
-            _write_summary(run_summary_path, summary)
-            return summary
 
-        for platform in requested_platforms:
-            requested_identifiers = select_platform_identifiers(platform, max(0, int(max_identifiers_per_platform)))
-            platform_summary: dict[str, Any] = {
-                "staged_identifier_count": len(backend_app.load_upload_metadata(platform)),
-                "requested_identifier_count": len(requested_identifiers),
-                "requested_identifier_preview": requested_identifiers[:10],
-                "requested_vision_provider": str(vision_provider or "").strip().lower(),
-                "vision_preflight": backend_app.build_vision_preflight(vision_provider),
-                "status": "running",
-                "current_stage": "platform_preparing",
-            }
-            _persist_platform_summary(
-                summary=summary,
-                run_summary_path=run_summary_path,
-                backend_app=backend_app,
-                platform=platform,
-                platform_summary=platform_summary,
-            )
-
-            if not requested_identifiers:
-                platform_summary["status"] = "skipped"
-                platform_summary["reason"] = "no staged identifiers for platform"
-                _persist_platform_summary(
-                    summary=summary,
-                    run_summary_path=run_summary_path,
-                    backend_app=backend_app,
-                    platform=platform,
-                    platform_summary=platform_summary,
-                    current_stage="platform_skipped",
-                )
-                continue
-
-            if skip_scrape:
-                platform_summary["status"] = "staged_only"
-                platform_summary["scrape_job"] = {"status": "skipped", "reason": "skip_scrape flag set"}
-                platform_summary["visual_gate"] = {
-                    "executed": False,
-                    "reason": "scrape skipped before visual review",
-                    "preflight_status": platform_summary["vision_preflight"]["status"],
-                    "runnable_provider_names": platform_summary["vision_preflight"]["runnable_provider_names"],
-                    "selected_provider": platform_summary["vision_preflight"].get("preferred_provider") or "",
+            for platform in requested_platforms:
+                requested_identifiers = select_platform_identifiers(platform, max(0, int(max_identifiers_per_platform)))
+                platform_summary: dict[str, Any] = {
+                    "staged_identifier_count": len(backend_app.load_upload_metadata(platform)),
+                    "requested_identifier_count": len(requested_identifiers),
+                    "requested_identifier_preview": requested_identifiers[:10],
+                    "requested_vision_provider": str(vision_provider or "").strip().lower(),
+                    "vision_preflight": backend_app.build_vision_preflight(vision_provider),
+                    "status": "running",
+                    "current_stage": "platform_preparing",
                 }
-                platform_summary["positioning_card_analysis"] = _build_positioning_stage_payload(
-                    "skipped",
-                    "scrape skipped before positioning analysis",
-                )
                 _persist_platform_summary(
                     summary=summary,
                     run_summary_path=run_summary_path,
                     backend_app=backend_app,
                     platform=platform,
                     platform_summary=platform_summary,
-                    current_stage="scrape_skipped",
                 )
-                continue
 
-            _persist_platform_summary(
-                summary=summary,
-                run_summary_path=run_summary_path,
-                backend_app=backend_app,
-                platform=platform,
-                platform_summary=platform_summary,
-                current_stage="scrape_starting",
-            )
-            scrape_payload_body = build_scrape_payload(platform, requested_identifiers)
-            scrape_payload = require_success(
-                client.post("/api/jobs/scrape", json={"platform": platform, "payload": scrape_payload_body}),
-                f"{platform} scrape start",
-            )
-            platform_summary["scrape_job"] = dict(scrape_payload.get("job") or {})
-            _persist_platform_summary(
-                summary=summary,
-                run_summary_path=run_summary_path,
-                backend_app=backend_app,
-                platform=platform,
-                platform_summary=platform_summary,
-                current_stage="scrape_running",
-            )
-            scrape_job = poll_job(client, scrape_payload["job"]["id"], f"{platform} scrape poll", max(1.0, float(poll_interval)))
-            platform_summary["scrape_job"] = scrape_job
-            scrape_apify = _extract_scrape_apify_metadata(scrape_job)
-            if scrape_apify:
-                platform_summary["scrape_job"]["failure_stage"] = _extract_scrape_failure_stage(scrape_job)
-                platform_summary["scrape_job"]["apify_run_id"] = scrape_apify.get("apify_run_id") or ""
-                platform_summary["scrape_job"]["apify_dataset_id"] = scrape_apify.get("apify_dataset_id") or ""
-                platform_summary["scrape_job"]["reused_guard"] = bool(scrape_apify.get("reused_guard"))
-                platform_summary["scrape_job"]["guard_key"] = scrape_apify.get("guard_key") or ""
-            scrape_partial_result = _extract_scrape_partial_result(scrape_job)
-            if scrape_partial_result:
-                platform_summary["scrape_job"]["partial_result"] = scrape_partial_result
-            _persist_platform_summary(
-                summary=summary,
-                run_summary_path=run_summary_path,
-                backend_app=backend_app,
-                platform=platform,
-                platform_summary=platform_summary,
-                current_stage="scrape_completed" if scrape_job["status"] == "completed" else "scrape_poll_finished",
-            )
-            scrape_was_salvaged = False
-            if scrape_job["status"] != "completed":
-                if _scrape_has_partial_result(scrape_job):
-                    scrape_was_salvaged = True
-                    platform_summary["scrape_job"]["salvaged"] = True
+                if not requested_identifiers:
+                    platform_summary["status"] = "skipped"
+                    platform_summary["reason"] = "no staged identifiers for platform"
                     _persist_platform_summary(
                         summary=summary,
                         run_summary_path=run_summary_path,
                         backend_app=backend_app,
                         platform=platform,
                         platform_summary=platform_summary,
-                        current_stage="scrape_partial_ready",
-                    )
-                else:
-                    platform_summary["status"] = "scrape_failed"
-                    _persist_platform_summary(
-                        summary=summary,
-                        run_summary_path=run_summary_path,
-                        backend_app=backend_app,
-                        platform=platform,
-                        platform_summary=platform_summary,
-                        current_stage="scrape_failed",
+                        current_stage="platform_skipped",
                     )
                     continue
 
-            scrape_profile_reviews = _extract_scrape_profile_reviews(scrape_job)
-            pass_count = _resolve_scrape_pass_count(scrape_job, count_passed_profiles)
-            missing_reviews = _extract_missing_profile_reviews(scrape_job)
-            missing_profiles = _build_missing_profile_summary(missing_reviews)
-            platform_summary["profile_review_count"] = len(scrape_profile_reviews)
-            platform_summary["prescreen_pass_count"] = pass_count
-            platform_summary["missing_profile_count"] = len(missing_profiles)
-            if missing_profiles:
-                platform_summary["missing_profiles"] = missing_profiles
-            platform_summary["visual_gate"] = {
-                "executed": False,
-                "skip_visual_flag": bool(skip_visual),
-                "preflight_status": platform_summary["vision_preflight"]["status"],
-                "runnable_provider_names": platform_summary["vision_preflight"]["runnable_provider_names"],
-                "configured_provider_names": platform_summary["vision_preflight"]["configured_provider_names"],
-                "selected_provider": platform_summary["vision_preflight"].get("preferred_provider") or "",
-            }
-            if missing_profiles:
-                platform_summary["visual_gate"]["blocked"] = True
-                platform_summary["visual_gate"]["reason"] = "prescreen contains Missing targets"
-                platform_summary["visual_job"] = {
-                    "status": "skipped",
-                    "reason": "名单账号未在本次抓取结果中返回，已阻断视觉复核和最终导出",
+                if skip_scrape:
+                    platform_summary["status"] = "staged_only"
+                    platform_summary["scrape_job"] = {"status": "skipped", "reason": "skip_scrape flag set"}
+                    platform_summary["visual_gate"] = {
+                        "executed": False,
+                        "reason": "scrape skipped before visual review",
+                        "preflight_status": platform_summary["vision_preflight"]["status"],
+                        "runnable_provider_names": platform_summary["vision_preflight"]["runnable_provider_names"],
+                        "selected_provider": platform_summary["vision_preflight"].get("preferred_provider") or "",
+                    }
+                    platform_summary["positioning_card_analysis"] = _build_positioning_stage_payload(
+                        "skipped",
+                        "scrape skipped before positioning analysis",
+                    )
+                    _persist_platform_summary(
+                        summary=summary,
+                        run_summary_path=run_summary_path,
+                        backend_app=backend_app,
+                        platform=platform,
+                        platform_summary=platform_summary,
+                        current_stage="scrape_skipped",
+                    )
+                    continue
+
+                _persist_platform_summary(
+                    summary=summary,
+                    run_summary_path=run_summary_path,
+                    backend_app=backend_app,
+                    platform=platform,
+                    platform_summary=platform_summary,
+                    current_stage="scrape_starting",
+                )
+                scrape_payload_body = build_scrape_payload(platform, requested_identifiers)
+                scrape_payload = require_success(
+                    client.post("/api/jobs/scrape", json={"platform": platform, "payload": scrape_payload_body}),
+                    f"{platform} scrape start",
+                )
+                platform_summary["scrape_job"] = dict(scrape_payload.get("job") or {})
+                _persist_platform_summary(
+                    summary=summary,
+                    run_summary_path=run_summary_path,
+                    backend_app=backend_app,
+                    platform=platform,
+                    platform_summary=platform_summary,
+                    current_stage="scrape_running",
+                )
+                scrape_job = poll_job(client, scrape_payload["job"]["id"], f"{platform} scrape poll", max(1.0, float(poll_interval)))
+                platform_summary["scrape_job"] = scrape_job
+                scrape_apify = _extract_scrape_apify_metadata(scrape_job)
+                if scrape_apify:
+                    platform_summary["scrape_job"]["failure_stage"] = _extract_scrape_failure_stage(scrape_job)
+                    platform_summary["scrape_job"]["apify_run_id"] = scrape_apify.get("apify_run_id") or ""
+                    platform_summary["scrape_job"]["apify_dataset_id"] = scrape_apify.get("apify_dataset_id") or ""
+                    platform_summary["scrape_job"]["reused_guard"] = bool(scrape_apify.get("reused_guard"))
+                    platform_summary["scrape_job"]["guard_key"] = scrape_apify.get("guard_key") or ""
+                scrape_partial_result = _extract_scrape_partial_result(scrape_job)
+                if scrape_partial_result:
+                    platform_summary["scrape_job"]["partial_result"] = scrape_partial_result
+                _persist_platform_summary(
+                    summary=summary,
+                    run_summary_path=run_summary_path,
+                    backend_app=backend_app,
+                    platform=platform,
+                    platform_summary=platform_summary,
+                    current_stage="scrape_completed" if scrape_job["status"] == "completed" else "scrape_poll_finished",
+                )
+                scrape_was_salvaged = False
+                if scrape_job["status"] != "completed":
+                    if _scrape_has_partial_result(scrape_job):
+                        scrape_was_salvaged = True
+                        platform_summary["scrape_job"]["salvaged"] = True
+                        _persist_platform_summary(
+                            summary=summary,
+                            run_summary_path=run_summary_path,
+                            backend_app=backend_app,
+                            platform=platform,
+                            platform_summary=platform_summary,
+                            current_stage="scrape_partial_ready",
+                        )
+                    else:
+                        platform_summary["status"] = "scrape_failed"
+                        _persist_platform_summary(
+                            summary=summary,
+                            run_summary_path=run_summary_path,
+                            backend_app=backend_app,
+                            platform=platform,
+                            platform_summary=platform_summary,
+                            current_stage="scrape_failed",
+                        )
+                        continue
+
+                scrape_profile_reviews = _extract_scrape_profile_reviews(scrape_job)
+                pass_count = _resolve_scrape_pass_count(scrape_job, count_passed_profiles)
+                missing_reviews = _extract_missing_profile_reviews(scrape_job)
+                missing_profiles = _build_missing_profile_summary(missing_reviews)
+                platform_summary["profile_review_count"] = len(scrape_profile_reviews)
+                platform_summary["prescreen_pass_count"] = pass_count
+                platform_summary["missing_profile_count"] = len(missing_profiles)
+                if missing_profiles:
+                    platform_summary["missing_profiles"] = missing_profiles
+                platform_summary["visual_gate"] = {
+                    "executed": False,
+                    "skip_visual_flag": bool(skip_visual),
+                    "preflight_status": platform_summary["vision_preflight"]["status"],
+                    "runnable_provider_names": platform_summary["vision_preflight"]["runnable_provider_names"],
+                    "configured_provider_names": platform_summary["vision_preflight"]["configured_provider_names"],
+                    "selected_provider": platform_summary["vision_preflight"].get("preferred_provider") or "",
                 }
-                platform_summary["positioning_card_analysis"] = _build_positioning_stage_payload(
-                    "skipped",
-                    "missing profiles blocked downstream stages",
+                if missing_profiles:
+                    platform_summary["visual_gate"]["blocked"] = True
+                    platform_summary["visual_gate"]["reason"] = "prescreen contains Missing targets"
+                    platform_summary["visual_job"] = {
+                        "status": "skipped",
+                        "reason": "名单账号未在本次抓取结果中返回，已阻断视觉复核和最终导出",
+                    }
+                    platform_summary["positioning_card_analysis"] = _build_positioning_stage_payload(
+                        "skipped",
+                        "missing profiles blocked downstream stages",
+                    )
+                    platform_summary["artifact_status"] = require_success(
+                        client.get(f"/api/artifacts/{platform}/status"),
+                        f"{platform} artifact status",
+                    )
+                    platform_summary["exports"] = {}
+                    platform_summary["status"] = "missing_profiles_blocked"
+                    _persist_platform_summary(
+                        summary=summary,
+                        run_summary_path=run_summary_path,
+                        backend_app=backend_app,
+                        platform=platform,
+                        platform_summary=platform_summary,
+                        current_stage="missing_profiles_blocked",
+                    )
+                    continue
+                if skip_visual:
+                    platform_summary["visual_job"] = {"status": "skipped", "reason": "skip_visual flag set"}
+                elif pass_count <= 0:
+                    platform_summary["visual_job"] = {"status": "skipped", "reason": "no Prescreen=Pass targets"}
+                elif backend_app.get_available_vision_provider_names(vision_provider):
+                    visual_payload_body = build_visual_payload(platform, requested_identifiers)
+                    if vision_provider:
+                        visual_payload_body["provider"] = str(vision_provider).strip().lower()
+                    _persist_platform_summary(
+                        summary=summary,
+                        run_summary_path=run_summary_path,
+                        backend_app=backend_app,
+                        platform=platform,
+                        platform_summary=platform_summary,
+                        current_stage="visual_starting",
+                    )
+                    visual_payload = require_success(
+                        client.post("/api/jobs/visual-review", json={"platform": platform, "payload": visual_payload_body}),
+                        f"{platform} visual start",
+                    )
+                    platform_summary["visual_job"] = dict(visual_payload.get("job") or {})
+                    _persist_platform_summary(
+                        summary=summary,
+                        run_summary_path=run_summary_path,
+                        backend_app=backend_app,
+                        platform=platform,
+                        platform_summary=platform_summary,
+                        current_stage="visual_running",
+                    )
+                    platform_summary["visual_job"] = poll_job(
+                        client,
+                        visual_payload["job"]["id"],
+                        f"{platform} visual poll",
+                        max(1.0, float(poll_interval)),
+                    )
+                    platform_summary["visual_gate"]["executed"] = True
+                else:
+                    platform_summary["visual_job"] = {
+                        "status": "skipped",
+                        "reason": platform_summary["vision_preflight"]["message"],
+                        "error_code": platform_summary["vision_preflight"]["error_code"],
+                        "vision_preflight": platform_summary["vision_preflight"],
+                    }
+
+                if skip_positioning_card_analysis:
+                    platform_summary["positioning_card_analysis"] = _build_positioning_stage_payload(
+                        "skipped",
+                        "skip_positioning_card_analysis flag set",
+                    )
+                elif skip_visual:
+                    platform_summary["positioning_card_analysis"] = _build_positioning_stage_payload(
+                        "skipped",
+                        "visual review skipped",
+                    )
+                else:
+                    resolve_targets = getattr(backend_app, "resolve_positioning_card_analysis_targets", None)
+                    eligible_targets = []
+                    if callable(resolve_targets):
+                        eligible_targets = list(resolve_targets(platform, build_visual_payload(platform, requested_identifiers)))
+                    if not eligible_targets:
+                        platform_summary["positioning_card_analysis"] = _build_positioning_stage_payload(
+                            "skipped",
+                            "no Visual=Pass targets",
+                        )
+                    else:
+                        positioning_payload_body = build_visual_payload(platform, requested_identifiers)
+                        if vision_provider:
+                            positioning_payload_body["provider"] = str(vision_provider).strip().lower()
+                        try:
+                            _persist_platform_summary(
+                                summary=summary,
+                                run_summary_path=run_summary_path,
+                                backend_app=backend_app,
+                                platform=platform,
+                                platform_summary=platform_summary,
+                                current_stage="positioning_card_analysis_starting",
+                            )
+                            positioning_payload = require_success(
+                                client.post(
+                                    "/api/jobs/positioning-card-analysis",
+                                    json={"platform": platform, "payload": positioning_payload_body},
+                                ),
+                                f"{platform} positioning card start",
+                            )
+                            platform_summary["positioning_card_analysis"] = dict(positioning_payload.get("job") or {})
+                            _persist_platform_summary(
+                                summary=summary,
+                                run_summary_path=run_summary_path,
+                                backend_app=backend_app,
+                                platform=platform,
+                                platform_summary=platform_summary,
+                                current_stage="positioning_card_analysis_running",
+                            )
+                            platform_summary["positioning_card_analysis"] = poll_job(
+                                client,
+                                positioning_payload["job"]["id"],
+                                f"{platform} positioning card poll",
+                                max(1.0, float(poll_interval)),
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            platform_summary["positioning_card_analysis"] = _build_positioning_stage_payload(
+                                "failed",
+                                str(exc) or exc.__class__.__name__,
+                                error_code="POSITIONING_CARD_ANALYSIS_FAILED",
+                                non_blocking=True,
+                            )
+
+                _persist_platform_summary(
+                    summary=summary,
+                    run_summary_path=run_summary_path,
+                    backend_app=backend_app,
+                    platform=platform,
+                    platform_summary=platform_summary,
+                    current_stage="exporting_artifacts",
                 )
                 platform_summary["artifact_status"] = require_success(
                     client.get(f"/api/artifacts/{platform}/status"),
                     f"{platform} artifact status",
                 )
-                platform_summary["exports"] = {}
-                platform_summary["status"] = "missing_profiles_blocked"
+                platform_summary["exports"] = export_platform_artifacts(client, platform, exports_dir / platform)
+                platform_summary["status"] = "completed_with_partial_scrape" if scrape_was_salvaged else "completed"
                 _persist_platform_summary(
                     summary=summary,
                     run_summary_path=run_summary_path,
                     backend_app=backend_app,
                     platform=platform,
                     platform_summary=platform_summary,
-                    current_stage="missing_profiles_blocked",
+                    current_stage="completed",
                 )
-                continue
-            if skip_visual:
-                platform_summary["visual_job"] = {"status": "skipped", "reason": "skip_visual flag set"}
-            elif pass_count <= 0:
-                platform_summary["visual_job"] = {"status": "skipped", "reason": "no Prescreen=Pass targets"}
-            elif backend_app.get_available_vision_provider_names(vision_provider):
-                visual_payload_body = build_visual_payload(platform, requested_identifiers)
-                if vision_provider:
-                    visual_payload_body["provider"] = str(vision_provider).strip().lower()
-                _persist_platform_summary(
-                    summary=summary,
-                    run_summary_path=run_summary_path,
-                    backend_app=backend_app,
-                    platform=platform,
-                    platform_summary=platform_summary,
-                    current_stage="visual_starting",
-                )
-                visual_payload = require_success(
-                    client.post("/api/jobs/visual-review", json={"platform": platform, "payload": visual_payload_body}),
-                    f"{platform} visual start",
-                )
-                platform_summary["visual_job"] = dict(visual_payload.get("job") or {})
-                _persist_platform_summary(
-                    summary=summary,
-                    run_summary_path=run_summary_path,
-                    backend_app=backend_app,
-                    platform=platform,
-                    platform_summary=platform_summary,
-                    current_stage="visual_running",
-                )
-                platform_summary["visual_job"] = poll_job(
-                    client,
-                    visual_payload["job"]["id"],
-                    f"{platform} visual poll",
-                    max(1.0, float(poll_interval)),
-                )
-                platform_summary["visual_gate"]["executed"] = True
-            else:
-                platform_summary["visual_job"] = {
-                    "status": "skipped",
-                    "reason": platform_summary["vision_preflight"]["message"],
-                    "error_code": platform_summary["vision_preflight"]["error_code"],
-                    "vision_preflight": platform_summary["vision_preflight"],
-                }
+        except Exception as exc:  # noqa: BLE001
+            failure = _build_failure_payload(
+                stage="downstream",
+                error_code="KEEP_LIST_SCREENING_RUNTIME_FAILED",
+                message=str(exc) or exc.__class__.__name__,
+                remediation="检查 staging 产物、vision preflight、backend runtime 和对应平台 job 日志后重试。",
+                details={"exception_type": exc.__class__.__name__},
+            )
+            return _finalize_failure(
+                failure=failure,
+                finished_at=backend_app.iso_now(),
+            )
 
-            if skip_positioning_card_analysis:
-                platform_summary["positioning_card_analysis"] = _build_positioning_stage_payload(
-                    "skipped",
-                    "skip_positioning_card_analysis flag set",
-                )
-            elif skip_visual:
-                platform_summary["positioning_card_analysis"] = _build_positioning_stage_payload(
-                    "skipped",
-                    "visual review skipped",
-                )
-            else:
-                resolve_targets = getattr(backend_app, "resolve_positioning_card_analysis_targets", None)
-                eligible_targets = []
-                if callable(resolve_targets):
-                    eligible_targets = list(resolve_targets(platform, build_visual_payload(platform, requested_identifiers)))
-                if not eligible_targets:
-                    platform_summary["positioning_card_analysis"] = _build_positioning_stage_payload(
-                        "skipped",
-                        "no Visual=Pass targets",
-                    )
-                else:
-                    positioning_payload_body = build_visual_payload(platform, requested_identifiers)
-                    if vision_provider:
-                        positioning_payload_body["provider"] = str(vision_provider).strip().lower()
-                    try:
-                        _persist_platform_summary(
-                            summary=summary,
-                            run_summary_path=run_summary_path,
-                            backend_app=backend_app,
-                            platform=platform,
-                            platform_summary=platform_summary,
-                            current_stage="positioning_card_analysis_starting",
-                        )
-                        positioning_payload = require_success(
-                            client.post(
-                                "/api/jobs/positioning-card-analysis",
-                                json={"platform": platform, "payload": positioning_payload_body},
-                            ),
-                            f"{platform} positioning card start",
-                        )
-                        platform_summary["positioning_card_analysis"] = dict(positioning_payload.get("job") or {})
-                        _persist_platform_summary(
-                            summary=summary,
-                            run_summary_path=run_summary_path,
-                            backend_app=backend_app,
-                            platform=platform,
-                            platform_summary=platform_summary,
-                            current_stage="positioning_card_analysis_running",
-                        )
-                        platform_summary["positioning_card_analysis"] = poll_job(
-                            client,
-                            positioning_payload["job"]["id"],
-                            f"{platform} positioning card poll",
-                            max(1.0, float(poll_interval)),
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        platform_summary["positioning_card_analysis"] = _build_positioning_stage_payload(
-                            "failed",
-                            str(exc) or exc.__class__.__name__,
-                            error_code="POSITIONING_CARD_ANALYSIS_FAILED",
-                            non_blocking=True,
-                        )
-
-            _persist_platform_summary(
-                summary=summary,
-                run_summary_path=run_summary_path,
-                backend_app=backend_app,
-                platform=platform,
-                platform_summary=platform_summary,
-                current_stage="exporting_artifacts",
-            )
-            platform_summary["artifact_status"] = require_success(
-                client.get(f"/api/artifacts/{platform}/status"),
-                f"{platform} artifact status",
-            )
-            platform_summary["exports"] = export_platform_artifacts(client, platform, exports_dir / platform)
-            platform_summary["status"] = "completed_with_partial_scrape" if scrape_was_salvaged else "completed"
-            _persist_platform_summary(
-                summary=summary,
-                run_summary_path=run_summary_path,
-                backend_app=backend_app,
-                platform=platform,
-                platform_summary=platform_summary,
-                current_stage="completed",
-            )
-    except Exception as exc:  # noqa: BLE001
-        failure = _build_failure_payload(
-            stage="downstream",
-            error_code="KEEP_LIST_SCREENING_RUNTIME_FAILED",
-            message=str(exc) or exc.__class__.__name__,
-            remediation="检查 staging 产物、vision preflight、backend runtime 和对应平台 job 日志后重试。",
-            details={"exception_type": exc.__class__.__name__},
+        combined_exports = collect_final_exports(summary.get("platforms"))
+        combined_artifacts = build_all_platforms_final_review_artifacts(
+            output_path=exports_dir / "all_platforms_final_review.xlsx",
+            payload_json_path=exports_dir / "all_platforms_final_review_payload.json",
+            final_exports=combined_exports,
+            keep_workbook=resolved_keep_workbook,
+            task_owner={
+                "responsible_name": str(task_owner_name or "").strip(),
+                "employee_name": str(task_owner_name or "").strip(),
+                "employee_id": str(task_owner_employee_id or "").strip(),
+                "employee_record_id": str(task_owner_employee_record_id or "").strip(),
+                "employee_email": str(task_owner_employee_email or "").strip(),
+                "owner_name": str(task_owner_owner_name or "").strip(),
+                "linked_bitable_url": str(linked_bitable_url or "").strip(),
+                "task_name": str(task_name or "").strip(),
+            },
         )
-        summary["status"] = "failed"
+        summary["artifacts"]["final_exports"] = combined_exports
+        summary["artifacts"]["all_platforms_final_review"] = combined_artifacts["all_platforms_final_review"]
+        summary["artifacts"]["all_platforms_upload_payload_json"] = combined_artifacts["all_platforms_upload_payload_json"]
+        summary["artifacts"]["all_platforms_upload_local_archive_dir"] = combined_artifacts["all_platforms_upload_local_archive_dir"]
+        summary["artifacts"]["all_platforms_upload_skipped_archive_json"] = combined_artifacts["all_platforms_upload_skipped_archive_json"]
+        summary["artifacts"]["all_platforms_upload_skipped_archive_xlsx"] = combined_artifacts["all_platforms_upload_skipped_archive_xlsx"]
+        summary["artifacts"]["all_platforms_upload_row_count"] = combined_artifacts["row_count"]
+        summary["artifacts"]["all_platforms_upload_source_row_count"] = combined_artifacts["source_row_count"]
+        summary["artifacts"]["all_platforms_upload_skipped_row_count"] = combined_artifacts["skipped_row_count"]
+        summary["status"] = summarize_platform_statuses(summary["platforms"])
         summary["finished_at"] = backend_app.iso_now()
-        summary["error"] = failure["message"]
-        summary["error_code"] = failure["error_code"]
-        summary["failure"] = failure
+        if summary["status"] == "scrape_failed":
+            attach_failure_to_summary(
+                summary,
+                _build_failure_payload(
+                    stage="platform_scrape",
+                    error_code="SCRAPE_FAILED",
+                    message="至少一个平台 scrape 未完成。",
+                    remediation="检查对应平台的 scrape job 状态；若确认为临时失败，可直接重试当前 run。",
+                ),
+                expose_top_level=False,
+            )
+        elif summary["status"] == "missing_profiles_blocked":
+            attach_failure_to_summary(
+                summary,
+                _build_failure_payload(
+                    stage="platform_gate",
+                    error_code="MISSING_PROFILES_BLOCKED",
+                    message="名单账号未在抓取结果中返回，当前 run 已被阻断。",
+                    remediation="检查 keep workbook、上传名单和抓取结果的一致性后重试。",
+                ),
+                expose_top_level=False,
+            )
+        attach_run_contract(summary)
         _write_summary(run_summary_path, summary)
         return summary
-
-    combined_exports = collect_final_exports(summary.get("platforms"))
-    combined_artifacts = build_all_platforms_final_review_artifacts(
-        output_path=exports_dir / "all_platforms_final_review.xlsx",
-        payload_json_path=exports_dir / "all_platforms_final_review_payload.json",
-        final_exports=combined_exports,
-        keep_workbook=resolved_keep_workbook,
-        task_owner={
-            "responsible_name": str(task_owner_name or "").strip(),
-            "employee_name": str(task_owner_name or "").strip(),
-            "employee_id": str(task_owner_employee_id or "").strip(),
-            "employee_record_id": str(task_owner_employee_record_id or "").strip(),
-            "employee_email": str(task_owner_employee_email or "").strip(),
-            "owner_name": str(task_owner_owner_name or "").strip(),
-            "linked_bitable_url": str(linked_bitable_url or "").strip(),
-            "task_name": str(task_name or "").strip(),
-        },
-    )
-    summary["artifacts"]["final_exports"] = combined_exports
-    summary["artifacts"]["all_platforms_final_review"] = combined_artifacts["all_platforms_final_review"]
-    summary["artifacts"]["all_platforms_upload_payload_json"] = combined_artifacts["all_platforms_upload_payload_json"]
-    summary["artifacts"]["all_platforms_upload_local_archive_dir"] = combined_artifacts["all_platforms_upload_local_archive_dir"]
-    summary["artifacts"]["all_platforms_upload_skipped_archive_json"] = combined_artifacts["all_platforms_upload_skipped_archive_json"]
-    summary["artifacts"]["all_platforms_upload_skipped_archive_xlsx"] = combined_artifacts["all_platforms_upload_skipped_archive_xlsx"]
-    summary["artifacts"]["all_platforms_upload_row_count"] = combined_artifacts["row_count"]
-    summary["artifacts"]["all_platforms_upload_source_row_count"] = combined_artifacts["source_row_count"]
-    summary["artifacts"]["all_platforms_upload_skipped_row_count"] = combined_artifacts["skipped_row_count"]
-    summary["status"] = summarize_platform_statuses(summary["platforms"])
-    summary["finished_at"] = backend_app.iso_now()
-    _write_summary(run_summary_path, summary)
-    return summary
+    finally:
+        restore_backend_runtime_state(runtime_snapshot)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -920,7 +1232,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-identifiers-per-platform", type=int, default=0, help="每个平台最多跑多少个账号；0 表示不截断。")
     parser.add_argument("--poll-interval", type=float, default=5.0, help="轮询 job 状态的秒数。")
     parser.add_argument("--probe-vision-provider-only", action="store_true", help="只做视觉 provider live probe，不继续 scrape/visual/export。")
-    parser.add_argument("--skip-scrape", action="store_true", help="只做 staging，不触发 scrape/visual/export。")
+    parser.add_argument(
+        "--skip-scrape",
+        action="store_true",
+        help="staging-only / local observation run；不触发 scrape/visual/export，且跳过 vision probe。",
+    )
     parser.add_argument("--skip-visual", action="store_true", help="跑 scrape 和导出，但跳过视觉复核。")
     parser.add_argument("--skip-positioning-card-analysis", action="store_true", help="跳过 visual-pass 后的定位卡分析。")
     parser.add_argument("--task-owner-name", default="", help="任务负责人展示名，用于总表 `达人对接人`。")
