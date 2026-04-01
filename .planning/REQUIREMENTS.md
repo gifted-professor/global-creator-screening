@@ -49,6 +49,12 @@
 - [ ] **OPS-UI-02**: operator 可以从本地页面启动现有 canonical `task upload -> final export` runner，并在页面上轮询查看 stage、错误、summary 路径和关键 artifact
 - [ ] **OPS-UI-03**: operator 可以在 run 完成后从页面直接拿到最终导出 Excel 与 summary 路径；v1 保持 local-only，不要求飞书写回
 
+### Shared Mailbox Post-Sync Operator Mainline
+
+- [ ] **SMB-01**: operator 可以从本地页面直接启动共享邮箱 post-sync 正式主线，输入预同步 shared mailbox `email_sync.db` / raw dir，而不在 operator 路径里重新抓 IMAP
+- [ ] **SMB-02**: operator-facing summary / UI 必须显式暴露共享邮箱主线的 top-level 与 per-task 增量结果，包括 `task_results`、`new_creator_count`、`existing_screened_count`、`existing_unscreened_count`、`full_screening_count`、`mail_only_update_count`、以及 aggregate local archive / task-level payload / upload result 路径
+- [ ] **SMB-03**: local operator launch contract 必须把 dry-run 与 live writeback intent、owner ambiguity / duplicate guards、以及“已筛号达人只更新邮件字段不覆盖 AI 字段”的边界暴露清楚，避免页面入口误触发不可解释的写回
+
 ## Out of Scope
 
 | Feature | Reason |
@@ -79,13 +85,16 @@
 | OPS-UI-01 | Phase 29 | Pending |
 | OPS-UI-02 | Phase 29 | Pending |
 | OPS-UI-03 | Phase 29 | Pending |
+| SMB-01 | Phase 30 | Pending |
+| SMB-02 | Phase 30 | Pending |
+| SMB-03 | Phase 30 | Pending |
 
 **Coverage:**
 - v1 requirements: 6 total
-- Follow-up requirements: 14 total
-- Mapped to phases: 18
+- Follow-up requirements: 17 total
+- Mapped to phases: 21
 - Unmapped follow-ups: 2 (`QTE-01`, `REL-01`)
 
 ---
 *Requirements defined: 2026-03-29*
-*Last updated: 2026-03-31 after milestone audit gap-closure planning*
+*Last updated: 2026-04-01 after Phase 30 planning*

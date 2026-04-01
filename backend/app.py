@@ -6233,6 +6233,7 @@ def perform_scrape(platform, payload, progress_callback=None, cancel_check=None)
     requested_lookup = build_requested_identifier_lookup(platform, identifiers)
     max_missing_retry_attempts = resolve_scrape_missing_retry_attempts(payload)
     retry_history = []
+    batch_failures = []
 
     if progress_callback:
         progress_callback("preparing", "正在准备抓取任务", done=0, total=len(batches), **build_target_preview(identifiers))
@@ -6240,13 +6241,47 @@ def perform_scrape(platform, payload, progress_callback=None, cancel_check=None)
     for index, batch in enumerate(batches, start=1):
         if cancel_check and cancel_check():
             return build_cancelled_result()
-        batch_result = run_apify_batch(
-            platform,
-            batch,
-            payload,
-            progress_callback=progress_callback,
-            cancel_check=cancel_check,
-        )
+        try:
+            batch_result = run_apify_batch(
+                platform,
+                batch,
+                payload,
+                progress_callback=progress_callback,
+                cancel_check=cancel_check,
+            )
+        except Exception as exc:
+            failure_record = {
+                "batch_index": index,
+                "batch_total": len(batches),
+                "targets": list(batch),
+                "target_preview": list(batch)[:10],
+                "error": str(exc),
+                "exception_type": exc.__class__.__name__,
+            }
+            if isinstance(exc, ApifyRuntimeError):
+                failure_record["failure_stage"] = exc.failure_stage
+                failure_record["retryable"] = bool(exc.retryable)
+                if exc.apify:
+                    failure_record["apify"] = dict(exc.apify)
+            batch_failures.append(failure_record)
+            partial_result = build_partial_scrape_result(
+                platform,
+                aggregated_items,
+                identifiers[: index * PLATFORM_BATCH_SIZES.get(platform, 20)],
+            )
+            if progress_callback:
+                progress_callback(
+                    "batch_failed",
+                    f"第 {index}/{len(batches)} 批抓取失败：{exc}",
+                    done=index,
+                    total=len(batches),
+                    partial_result=partial_result,
+                    batch_index=index,
+                    batch_total=len(batches),
+                    error=str(exc),
+                    **build_target_preview(batch),
+                )
+            continue
         if batch_result.get("cancelled"):
             return batch_result
         aggregated_items = merge_scrape_items(platform, aggregated_items, batch_result.get("raw_items") or [])
@@ -6403,6 +6438,8 @@ def perform_scrape(platform, payload, progress_callback=None, cancel_check=None)
         },
         "retry_summary": {
             "enabled": bool(max_missing_retry_attempts > 0),
+            "initial_batch_failure_count": len(batch_failures),
+            "initial_batch_failures": batch_failures,
             "max_attempts": max_missing_retry_attempts,
             "attempt_count": len(retry_history),
             "retried_identifier_count": retried_identifier_count,

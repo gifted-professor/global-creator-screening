@@ -89,6 +89,7 @@ def upload_final_review_payload_to_bitable(
     result_xlsx_path: str | Path | None = None,
     dry_run: bool = False,
     limit: int = 0,
+    suppress_ai_labels: bool = False,
 ) -> dict[str, Any]:
     payload_path = Path(str(payload_json_path)).expanduser().resolve()
     payload = json.loads(payload_path.read_text(encoding="utf-8"))
@@ -221,6 +222,7 @@ def upload_final_review_payload_to_bitable(
             "target_view_name": resolved_view.view_name,
             "source_row_count": int(payload.get("row_count") or len(payload.get("rows") or [])),
             "selected_row_count": len(rows),
+            "suppress_ai_labels": bool(suppress_ai_labels),
             "created_count": 0,
             "updated_count": 0,
             "skipped_existing_count": 0,
@@ -280,9 +282,17 @@ def upload_final_review_payload_to_bitable(
 
         try:
             if update_mode == _UPDATE_MODE_MAIL_ONLY:
-                fields = _build_mail_only_feishu_fields(row, field_schemas)
+                fields = _build_mail_only_feishu_fields(
+                    row,
+                    field_schemas,
+                    suppress_ai_labels=bool(suppress_ai_labels),
+                )
             else:
-                fields = _build_feishu_fields(row, field_schemas)
+                fields = _build_feishu_fields(
+                    row,
+                    field_schemas,
+                    suppress_ai_labels=bool(suppress_ai_labels),
+                )
             _attach_local_files_to_fields(
                 client,
                 row=row,
@@ -415,6 +425,7 @@ def upload_final_review_payload_to_bitable(
         "target_view_name": resolved_view.view_name,
         "source_row_count": int(payload.get("row_count") or len(payload.get("rows") or [])),
         "selected_row_count": len(rows),
+        "suppress_ai_labels": bool(suppress_ai_labels),
         "created_count": len(created_rows),
         "updated_count": len(updated_rows),
         "skipped_existing_count": len(skipped_existing_rows),
@@ -871,13 +882,20 @@ def _lookup_field_schema(field_schemas: dict[str, FieldSchema], desired_name: st
     return None
 
 
-def _build_feishu_fields(row: dict[str, Any], field_schemas: dict[str, FieldSchema]) -> dict[str, Any]:
+def _build_feishu_fields(
+    row: dict[str, Any],
+    field_schemas: dict[str, FieldSchema],
+    *,
+    suppress_ai_labels: bool = False,
+) -> dict[str, Any]:
     fields: dict[str, Any] = {}
     for payload_name, raw_value in row.items():
         if payload_name in _INTERNAL_PAYLOAD_KEYS or str(payload_name).startswith("__"):
             continue
         schema = _lookup_field_schema(field_schemas, payload_name)
         if schema is None:
+            continue
+        if bool(suppress_ai_labels) and schema.field_name == "标签（ai）":
             continue
         converted, include = _convert_field_value(schema, raw_value, row=row)
         if include:
@@ -891,11 +909,18 @@ def _build_feishu_fields(row: dict[str, Any], field_schemas: dict[str, FieldSche
     return fields
 
 
-def _build_mail_only_feishu_fields(row: dict[str, Any], field_schemas: dict[str, FieldSchema]) -> dict[str, Any]:
+def _build_mail_only_feishu_fields(
+    row: dict[str, Any],
+    field_schemas: dict[str, FieldSchema],
+    *,
+    suppress_ai_labels: bool = False,
+) -> dict[str, Any]:
     fields: dict[str, Any] = {}
     for payload_name in _MAIL_ONLY_FIELD_NAMES:
         schema = _lookup_field_schema(field_schemas, payload_name)
         if schema is None:
+            continue
+        if bool(suppress_ai_labels) and schema.field_name == "标签（ai）":
             continue
         converted, include = _convert_field_value(schema, row.get(payload_name), row=row)
         if include:

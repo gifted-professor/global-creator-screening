@@ -161,6 +161,91 @@ class FinalExportMergeTests(unittest.TestCase):
             self.assertEqual(payload["__feishu_shared_attachment_local_paths"], [str(output_path.resolve())])
             self.assertEqual(artifacts["all_platforms_upload_shared_attachment_local_paths"], [str(output_path.resolve())])
 
+    def test_keep_workbook_row_owner_fields_override_task_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            exports_dir = root / "exports"
+            tiktok_export = exports_dir / "tiktok" / "tiktok_final_review.xlsx"
+            tiktok_export.parent.mkdir(parents=True, exist_ok=True)
+
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "alpha",
+                        "username": "alpha",
+                        "profile_url": "https://www.tiktok.com/@alpha",
+                        "upload_handle": "alpha",
+                        "final_status": "Pass",
+                        "final_reason": "内容契合",
+                    }
+                ]
+            ).to_excel(tiktok_export, index=False)
+
+            keep_workbook = root / "upstream" / "exports" / "keep.xlsx"
+            keep_workbook.parent.mkdir(parents=True, exist_ok=True)
+            positioning_review = exports_dir / "tiktok" / "tiktok_positioning_card_review.xlsx"
+            pd.DataFrame(
+                [
+                    {
+                        "Platform": "TikTok",
+                        "@username": "alpha",
+                        "URL": "https://www.tiktok.com/@alpha",
+                        "brand_message_sent_at": "2026-03-30T21:55:31+00:00",
+                        "brand_message_snippet": "Hi Lilith, rate is $300 per video.",
+                        "达人对接人": "Sherry97",
+                        "达人对接人_employee_id": "ou_lilith",
+                        "达人对接人_employee_record_id": "rec_lilith",
+                        "达人对接人_employee_email": "lilith@amagency.biz",
+                        "达人对接人_owner_name": "lilith@amagency.biz",
+                        "任务名": "SKG",
+                        "linked_bitable_url": "https://bitable.example/skg",
+                    }
+                ]
+            ).to_excel(keep_workbook, index=False)
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "alpha",
+                        "username": "alpha",
+                        "profile_url": "https://www.tiktok.com/@alpha",
+                        "upload_handle": "alpha",
+                        "positioning_stage_status": "Completed",
+                        "positioning_labels": "家庭用品和家电-家庭博主",
+                        "fit_summary": "适合家庭类合作",
+                    }
+                ]
+            ).to_excel(positioning_review, index=False)
+
+            output_path = exports_dir / "all_platforms_final_review.xlsx"
+            payload_path = exports_dir / "all_platforms_final_review_payload.json"
+            build_all_platforms_final_review_artifacts(
+                output_path=output_path,
+                payload_json_path=payload_path,
+                final_exports={
+                    "tiktok": {
+                        "final_review": str(tiktok_export),
+                        "positioning_card_review": str(positioning_review),
+                    }
+                },
+                keep_workbook=keep_workbook,
+                task_owner={
+                    "responsible_name": "唐瑞霞",
+                    "employee_id": "ou_rhea",
+                    "employee_record_id": "rec_rhea",
+                    "employee_email": "rhea@amagency.biz",
+                    "owner_name": "rhea@amagency.biz",
+                    "task_name": "SKG",
+                    "linked_bitable_url": "https://bitable.example/skg",
+                },
+            )
+
+            workbook = pd.read_excel(output_path)
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+            self.assertEqual(workbook.loc[0, "达人对接人"], "Sherry97")
+            self.assertEqual(payload["rows"][0]["达人对接人"], "Sherry97")
+            self.assertEqual(payload["rows"][0]["达人对接人_employee_id"], "ou_lilith")
+            self.assertEqual(payload["rows"][0]["linked_bitable_url"], "https://bitable.example/skg")
+
     def test_payload_skips_processing_failures_and_preserves_uploadable_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)

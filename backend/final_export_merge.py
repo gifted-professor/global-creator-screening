@@ -538,6 +538,28 @@ def extract_task_owner_context(upstream_summary: dict[str, Any] | None) -> dict[
     }
 
 
+def _extract_row_owner_context(keep_row: dict[str, Any], task_owner: dict[str, Any] | None) -> dict[str, str]:
+    owner_context = dict(task_owner or {})
+    display_name = _clean_text(keep_row.get("达人对接人"))
+    return {
+        "responsible_name": display_name
+        or _clean_text(owner_context.get("responsible_name"))
+        or _clean_text(owner_context.get("employee_name"))
+        or _clean_text(owner_context.get("owner_name")),
+        "employee_name": display_name or _clean_text(owner_context.get("employee_name")),
+        "employee_id": _normalize_employee_id(keep_row.get("达人对接人_employee_id") or owner_context.get("employee_id")),
+        "employee_record_id": _clean_text(keep_row.get("达人对接人_employee_record_id"))
+        or _clean_text(owner_context.get("employee_record_id")),
+        "employee_email": _clean_text(keep_row.get("达人对接人_employee_email"))
+        or _clean_text(owner_context.get("employee_email")),
+        "owner_name": _clean_text(keep_row.get("达人对接人_owner_name"))
+        or _clean_text(owner_context.get("owner_name")),
+        "linked_bitable_url": _clean_text(keep_row.get("linked_bitable_url"))
+        or _clean_text(owner_context.get("linked_bitable_url")),
+        "task_name": _clean_text(keep_row.get("任务名")) or _clean_text(owner_context.get("task_name")),
+    }
+
+
 def collect_final_exports(platforms: dict[str, Any] | None) -> dict[str, dict[str, str]]:
     final_exports: dict[str, dict[str, str]] = {}
     for platform, platform_summary in (platforms or {}).items():
@@ -601,6 +623,7 @@ def build_all_platforms_final_review_artifacts(
             profile_url = _clean_text(_first_non_blank(record.get("profile_url"), ""))
             normalized_url = _normalize_url(profile_url)
             keep_row = keep_handle_lookup.get((platform, handle)) or keep_url_lookup.get((platform, normalized_url)) or {}
+            row_owner_context = _extract_row_owner_context(keep_row, owner_context)
             positioning_row = positioning_handle_lookup.get(handle) or positioning_url_lookup.get(normalized_url) or {}
             apify_row = apify_metrics.get(handle) or {}
             last_mail_raw_path = _clean_text(
@@ -707,7 +730,9 @@ def build_all_platforms_final_review_artifacts(
                         keep_row.get("brand_message_snippet"),
                     )
                 ),
-                "达人对接人": owner_display_name,
+                "达人对接人": _clean_text(row_owner_context.get("responsible_name"))
+                or _clean_text(row_owner_context.get("employee_name"))
+                or owner_display_name,
                 "ai是否通过": ai_pass_value,
                 "ai筛号反馈理由": screening_reason,
                 "标签(ai)": _clean_text(positioning_row.get("positioning_labels")) or positioning_label_note,
@@ -718,12 +743,12 @@ def build_all_platforms_final_review_artifacts(
             payload_row = dict(display_row)
             payload_row.update(
                 {
-                    "达人对接人_employee_id": _normalize_employee_id(owner_context.get("employee_id")),
-                    "达人对接人_employee_record_id": _clean_text(owner_context.get("employee_record_id")),
-                    "达人对接人_employee_email": _clean_text(owner_context.get("employee_email")),
-                    "达人对接人_owner_name": _clean_text(owner_context.get("owner_name")),
-                    "linked_bitable_url": _clean_text(owner_context.get("linked_bitable_url")),
-                    "任务名": _clean_text(owner_context.get("task_name")),
+                    "达人对接人_employee_id": _normalize_employee_id(row_owner_context.get("employee_id")),
+                    "达人对接人_employee_record_id": _clean_text(row_owner_context.get("employee_record_id")),
+                    "达人对接人_employee_email": _clean_text(row_owner_context.get("employee_email")),
+                    "达人对接人_owner_name": _clean_text(row_owner_context.get("owner_name")),
+                    "linked_bitable_url": _clean_text(row_owner_context.get("linked_bitable_url")),
+                    "任务名": _clean_text(row_owner_context.get("task_name")),
                     _LAST_MAIL_RAW_PATH_KEY: last_mail_raw_path,
                     _ROW_ATTACHMENT_PATHS_KEY: row_attachment_paths,
                 }

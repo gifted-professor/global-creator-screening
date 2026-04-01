@@ -3,8 +3,8 @@ gsd_state_version: 1.0
 milestone: v1.3.0
 milestone_name: External Email Dependency Decoupling
 status: ready_for_phase_planning
-stopped_at: Gap-closure phases 26-29 were added on 2026-03-31 to close milestone audit evidence gaps; next workflow step is `$gsd-plan-phase 26`
-last_updated: "2026-03-31T16:25:00+08:00"
+stopped_at: Gap-closure phases 26-29 remain the next milestone route; quick tasks `260401-el2`, `260401-f93`, `260401-hic`, and the expanded `260401-jgj` runbook/retro docs all landed on 2026-04-01; next roadmap step is still `$gsd-plan-phase 26`, while shared-mailbox task-name runs now have fresh `SKG` evidence for `455 -> 455` scrape closure and successful chunked live writeback
+last_updated: "2026-04-01T15:18:00+08:00"
 progress:
   total_phases: 10
   completed_phases: 6
@@ -171,6 +171,7 @@ Recent decisions affecting current work:
 - Phase 27 added: Reconstruct runtime safety proof and fallback certification for Phase 22
 - Phase 28 added: Reconstruct visual runtime and positioning evidence chain for Phases 23-24
 - Phase 29 added: Reconstruct operator UI evidence bundle and milestone closeout consistency
+- Phase 30 added: Stabilize operator UI on shared mailbox post-sync mainline
 
 ### Pending Todos
 
@@ -180,7 +181,7 @@ Recent decisions affecting current work:
 - Phase 28 planning: 补建 Phase 23 artifact bundle，并为 Phase 24 增加正式 verification 和 `23 -> 24` integration 证据
 - Phase 29 planning: 补建 Phase 25 operator UI artifact bundle，并收口 roadmap/state/audit closeout 口径
 - Milestone closeout: gap phases 完成后重新执行 `v1.3.0` audit / closeout，再确认 deferred follow-ups 边界
-- Next milestone intake: `v1.4.0 / Phase 30` 已登记为共享邮箱 post-sync routing + 飞书增量更新主线，详见 `.planning/v1.4.0-PHASE-30-INTAKE.md`
+- Phase 30 planning bundle: 共享邮箱 post-sync + operator UI stabilization context/plans 归档在 `.planning/phases/30-stabilize-operator-ui-on-shared-mailbox-post-sync-mainline/`；执行仍排在 `v1.3.0` closeout 之后
 - Deferred debt intake: `backend/app.py` 模块化 + app factory、shared settings loader、`pipeline_runtime.py` 抽取、SQLite WAL/FTS、upload/job hardening、LLM config consolidation、`pyproject.toml`/lint/typecheck、以及 workbook handle cleanup
 
 ### Blockers/Concerns
@@ -217,6 +218,10 @@ Recent decisions affecting current work:
 - 2026-03-27: Complete Phase 12 12-02 by generating real `llm_review / reviewed / keep` outputs; live validation succeeded with the legacy DeepSeek provider after the current 998Code endpoint proved unstable
 - 2026-03-28: Complete Phase 13 13-01 by accepting reviewed keep workbooks as staging input, adding `scripts/run_keep_list_screening_pipeline.py`, and validating real MINISO staged counts (`TikTok 122 / Instagram 146 / YouTube 15`)
 - 2026-03-28: Complete Phase 13 13-02 by running a bounded real MINISO keep-list downstream validation (`instagram` 1 identifier), reaching scrape, prescreen, visual-review invocation, and export download under `temp/keep_list_bounded_live_validation_escalated`
+- 2026-04-01: Complete quick task `260401-el2` so shared-mailbox post-sync collapses identical `SKG-1/2` task rows into one logical `SKG` run and routes `达人对接人` row-by-row from mail content via employee English names (`Rhea` / `Lilith`)
+- 2026-04-01: Complete quick task `260401-f93` so shared-mailbox post-sync keeps local `标签(ai)` diagnostics but suppresses `标签（ai）` during Feishu writeback, clearing the task-name route for dry-run-first execution
+- 2026-04-01: Complete quick task `260401-hic` so shared-mailbox post-sync brand-keyword matching now defaults to include `from`, fixing reply-side sender cases like `chanel@arsagendi.com` without changing the old task-driven default
+- 2026-04-01: Complete quick task `260401-jgj` by adding and then expanding the root-level shared-mailbox post-sync docs so they now cover the current `SKG` mainline, `SKG-1/2 -> SKG` grouping, `from`-side matching, owner routing, scrape / `Missing` / retry / export-block semantics, customer-side field reality, and the full `SKG` live writeback retro including filtered chunked resume to `455/455` keys in Feishu
 - 2026-03-28: Complete Phase 14 14-01 by adding backend vision provider snapshot/preflight diagnostics, exposing them through `/api/health`, and returning structured preflight errors on visual-review start
 - 2026-03-28: Complete Phase 14 14-02 by wiring backend `vision_preflight` into keep-list/smoke summaries, updating README operator docs, and leaving a fresh diagnostic artifact under `temp/keep_list_visual_diagnostic_phase14`
 - 2026-03-28: Complete Phase 15 15-01 by adding explicit visual provider selection, a lightweight live provider probe endpoint, and runner support for `--vision-provider` / `--probe-vision-provider-only`

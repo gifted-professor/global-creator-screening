@@ -22,6 +22,7 @@ from backend.final_export_merge import (
     _extract_handle,
     _format_date,
     _normalize_platform,
+    _normalize_url,
     _resolve_existing_local_paths,
 )
 
@@ -36,6 +37,14 @@ _TASK_GROUP_DEFAULT_BRAND_KEYWORDS = {
     "skg": "SKG",
 }
 _TASK_GROUP_SUFFIX_PATTERN = re.compile(r"(?:[-_\s]*\d+)$")
+_KEEP_OWNER_DISPLAY_FIELD = "达人对接人"
+_KEEP_OWNER_ENGLISH_NAME_FIELD = "达人对接人_英文名"
+_KEEP_OWNER_EMPLOYEE_ID_FIELD = "达人对接人_employee_id"
+_KEEP_OWNER_EMPLOYEE_RECORD_ID_FIELD = "达人对接人_employee_record_id"
+_KEEP_OWNER_EMPLOYEE_EMAIL_FIELD = "达人对接人_employee_email"
+_KEEP_OWNER_OWNER_NAME_FIELD = "达人对接人_owner_name"
+_KEEP_OWNER_STATUS_FIELD = "__owner_resolution_status"
+_KEEP_OWNER_ALIAS_FIELD = "__owner_resolution_aliases"
 
 
 def _load_runtime_dependencies() -> dict[str, Any]:
@@ -195,6 +204,19 @@ def _extract_ai_status(fields: dict[str, Any]) -> str:
 
 def _build_owner_context_from_upstream(upstream_summary: dict[str, Any], fallback_item: dict[str, Any]) -> dict[str, str]:
     task_owner = (((upstream_summary.get("downstream_handoff") or {}).get("task_owner")) or {})
+    if bool(fallback_item.get("rowLevelOwnerRouting")):
+        return {
+            "task_name": _clean_text(fallback_item.get("taskName")) or _clean_text(task_owner.get("task_name")),
+            "linked_bitable_url": _clean_text(fallback_item.get("linkedBitableUrl"))
+            or _clean_text(task_owner.get("linked_bitable_url")),
+            "responsible_name": "",
+            "employee_name": "",
+            "employee_english_name": "",
+            "employee_id": "",
+            "employee_record_id": "",
+            "employee_email": "",
+            "owner_name": "",
+        }
     responsible_name = (
         _clean_text(task_owner.get("responsible_name"))
         or _clean_text(task_owner.get("employee_name"))
@@ -206,6 +228,8 @@ def _build_owner_context_from_upstream(upstream_summary: dict[str, Any], fallbac
         or _clean_text(fallback_item.get("linkedBitableUrl")),
         "responsible_name": responsible_name,
         "employee_name": _clean_text(task_owner.get("employee_name")) or _clean_text(fallback_item.get("employeeName")),
+        "employee_english_name": _clean_text(task_owner.get("employee_english_name"))
+        or _clean_text(fallback_item.get("employeeEnglishName")),
         "employee_id": _clean_text(task_owner.get("employee_id")) or _clean_text(fallback_item.get("employeeId")),
         "employee_record_id": _clean_text(task_owner.get("employee_record_id"))
         or _clean_text(fallback_item.get("employeeRecordId")),
@@ -287,7 +311,7 @@ def _build_mail_only_rows(
     payload_row = dict(display_row)
     payload_row.update(
         {
-            "达人对接人_employee_id": _clean_text(owner_context.get("employee_id")).split(",")[0].strip(),
+            "达人对接人_employee_id": _normalize_employee_id(owner_context.get("employee_id")).split(",")[0].strip(),
             "达人对接人_employee_record_id": _clean_text(owner_context.get("employee_record_id")),
             "达人对接人_employee_email": _clean_text(owner_context.get("employee_email")),
             "达人对接人_owner_name": _clean_text(owner_context.get("owner_name")),
@@ -503,6 +527,496 @@ def _resolve_group_brand_keyword(
     return _derive_default_brand_keyword(task_name)
 
 
+def _normalize_employee_id(value: Any) -> str:
+    parts: list[str] = []
+    seen: set[str] = set()
+    for raw in re.split(r"[,\n|；;]+", _clean_text(value)):
+        candidate = raw.strip()
+        if not candidate or candidate in seen:
+            continue
+        seen.add(candidate)
+        parts.append(candidate)
+    return ",".join(parts)
+
+
+def _all_items_share_non_blank_value(items: Sequence[dict[str, Any]], field_name: str) -> bool:
+    if not items:
+        return False
+    values = [_clean_text(item.get(field_name)) for item in items]
+    return bool(values) and all(values) and len(set(values)) == 1
+
+
+def _resolve_group_display_name(group_key: str, members: Sequence[dict[str, Any]]) -> str:
+    if group_key in _TASK_GROUP_DEFAULT_BRAND_KEYWORDS:
+        return _TASK_GROUP_DEFAULT_BRAND_KEYWORDS[group_key]
+    first_name = _clean_text(next((item.get("taskName") for item in members if _clean_text(item.get("taskName"))), ""))
+    return _derive_default_brand_keyword(first_name) or first_name
+
+
+def _build_group_member_employee_match(member: dict[str, Any]) -> dict[str, str]:
+    return {
+        "employeeRecordId": _clean_text(member.get("employeeRecordId")),
+        "employeeId": _clean_text(member.get("employeeId")),
+        "employeeName": _clean_text(member.get("employeeName")),
+        "employeeEnglishName": _clean_text(member.get("employeeEnglishName")),
+        "employeeEmail": _clean_text(member.get("employeeEmail")),
+        "imapCode": _clean_text(member.get("imapCode")),
+        "matchedBy": "group_member",
+        "matchedValue": _clean_text(member.get("taskName")),
+    }
+
+
+def _dedupe_employee_matches(entries: Sequence[dict[str, Any]]) -> list[dict[str, str]]:
+    deduped: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        normalized = {
+            "employeeRecordId": _clean_text(entry.get("employeeRecordId")),
+            "employeeId": _clean_text(entry.get("employeeId")),
+            "employeeName": _clean_text(entry.get("employeeName")),
+            "employeeEnglishName": _clean_text(entry.get("employeeEnglishName")),
+            "employeeEmail": _clean_text(entry.get("employeeEmail")),
+            "imapCode": _clean_text(entry.get("imapCode")),
+            "matchedBy": _clean_text(entry.get("matchedBy")),
+            "matchedValue": _clean_text(entry.get("matchedValue")),
+        }
+        key = (
+            normalized["employeeRecordId"]
+            or normalized["employeeId"]
+            or normalized["employeeEmail"].casefold()
+            or normalized["employeeName"].casefold()
+        )
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(normalized)
+    return deduped
+
+
+def _should_collapse_task_group(
+    *,
+    group_key: str,
+    members: Sequence[dict[str, Any]],
+    requested_filters: set[str],
+) -> bool:
+    if group_key not in _TASK_GROUP_ALIASES or len(members) < 2:
+        return False
+    if not (
+        _all_items_share_non_blank_value(members, "linkedBitableUrl")
+        and _all_items_share_non_blank_value(members, "sendingListFileToken")
+        and _all_items_share_non_blank_value(members, "templateFileToken")
+    ):
+        return False
+    if not requested_filters:
+        return True
+    member_names = {_clean_text(item.get("taskName")).casefold() for item in members if _clean_text(item.get("taskName"))}
+    if group_key in requested_filters:
+        return True
+    return not bool(requested_filters & member_names)
+
+
+def _collapse_grouped_inspection_items(
+    inspection_items: Sequence[dict[str, Any]],
+    requested_filters: set[str],
+) -> list[dict[str, Any]]:
+    collapsed: list[dict[str, Any]] = []
+    consumed_task_names: set[str] = set()
+    normalized_items = [dict(item) for item in inspection_items]
+    for item in normalized_items:
+        task_name = _clean_text(item.get("taskName"))
+        normalized_task_name = task_name.casefold()
+        if not task_name or normalized_task_name in consumed_task_names:
+            continue
+        group_key = _derive_task_group_key(task_name)
+        alias_values = _TASK_GROUP_ALIASES.get(group_key)
+        if not alias_values:
+            collapsed.append(item)
+            consumed_task_names.add(normalized_task_name)
+            continue
+        members = [
+            dict(candidate)
+            for candidate in normalized_items
+            if _clean_text(candidate.get("taskName")).casefold() in alias_values
+        ]
+        if not _should_collapse_task_group(group_key=group_key, members=members, requested_filters=requested_filters):
+            collapsed.append(item)
+            consumed_task_names.add(normalized_task_name)
+            continue
+        representative = dict(members[0])
+        grouped_employee_matches = _dedupe_employee_matches(
+            [
+                *(dict(entry) for member in members for entry in (member.get("employeeMatches") or []) if isinstance(entry, dict)),
+                *(_build_group_member_employee_match(member) for member in members),
+            ]
+        )
+        member_task_names = [_clean_text(member.get("taskName")) for member in members if _clean_text(member.get("taskName"))]
+        grouped_item = dict(representative)
+        grouped_item.update(
+            {
+                "taskName": _resolve_group_display_name(group_key, members),
+                "groupKey": group_key,
+                "groupedTaskNames": member_task_names,
+                "groupedRecordIds": [_clean_text(member.get("recordId")) for member in members if _clean_text(member.get("recordId"))],
+                "representativeTaskName": _clean_text(representative.get("taskName")),
+                "rowLevelOwnerRouting": True,
+                "employeeMatched": bool(grouped_employee_matches),
+                "employeeMatches": grouped_employee_matches,
+                "ownerMatchCount": len(grouped_employee_matches),
+                "ownerMatchAmbiguous": len(grouped_employee_matches) > 1,
+                "employeeId": "",
+                "employeeRecordId": "",
+                "employeeName": "",
+                "employeeEnglishName": "",
+                "employeeEmail": "",
+                "responsibleName": "",
+                "ownerName": "",
+                "ownerEmail": "",
+                "ownerEmailCandidates": [],
+                "preferredOwnerEmail": "",
+            }
+        )
+        collapsed.append(grouped_item)
+        consumed_task_names.update(
+            _clean_text(member.get("taskName")).casefold()
+            for member in members
+            if _clean_text(member.get("taskName"))
+        )
+    return collapsed
+
+
+def _build_empty_owner_context(task_owner_context: dict[str, str]) -> dict[str, str]:
+    return {
+        "task_name": _clean_text(task_owner_context.get("task_name")),
+        "linked_bitable_url": _clean_text(task_owner_context.get("linked_bitable_url")),
+        "responsible_name": "",
+        "employee_name": "",
+        "employee_english_name": "",
+        "employee_id": "",
+        "employee_record_id": "",
+        "employee_email": "",
+        "owner_name": "",
+    }
+
+
+def _build_owner_context_from_candidate(candidate: dict[str, Any], task_owner_context: dict[str, str]) -> dict[str, str]:
+    employee_name = _clean_text(candidate.get("employeeName"))
+    employee_english_name = _clean_text(candidate.get("employeeEnglishName"))
+    employee_email = _clean_text(candidate.get("employeeEmail"))
+    display_name = employee_name or employee_english_name or employee_email
+    return {
+        "task_name": _clean_text(task_owner_context.get("task_name")),
+        "linked_bitable_url": _clean_text(task_owner_context.get("linked_bitable_url")),
+        "responsible_name": display_name,
+        "employee_name": employee_name or display_name,
+        "employee_english_name": employee_english_name,
+        "employee_id": _normalize_employee_id(candidate.get("employeeId")),
+        "employee_record_id": _clean_text(candidate.get("employeeRecordId")),
+        "employee_email": employee_email,
+        "owner_name": employee_email or display_name,
+    }
+
+
+def _build_owner_candidate_aliases(candidate: dict[str, Any]) -> list[str]:
+    aliases: list[str] = []
+    seen: set[str] = set()
+    for raw in (
+        candidate.get("employeeEnglishName"),
+        _clean_text(candidate.get("employeeEmail")).split("@", 1)[0].strip(),
+        candidate.get("employeeName"),
+    ):
+        alias = _clean_text(raw)
+        if not alias or len(alias) < 2:
+            continue
+        normalized = alias.casefold()
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        aliases.append(alias)
+    return aliases
+
+
+def _read_mail_text_excerpt(paths: Sequence[str]) -> str:
+    for raw_path in paths:
+        path = Path(str(raw_path or "")).expanduser()
+        if not path.exists() or not path.is_file():
+            continue
+        try:
+            return path.read_bytes()[:65536].decode("utf-8", errors="ignore")
+        except Exception:  # noqa: BLE001
+            continue
+    return ""
+
+
+def _build_owner_search_text(
+    keep_row: dict[str, Any],
+    *,
+    shared_mail_db_path: Path,
+    shared_mail_raw_dir: Path | None,
+    shared_mail_data_dir: Path | None,
+    keep_workbook: Path,
+) -> str:
+    attachment_paths = _build_mail_attachment_paths(
+        keep_row,
+        shared_mail_db_path=shared_mail_db_path,
+        shared_mail_raw_dir=shared_mail_raw_dir,
+        shared_mail_data_dir=shared_mail_data_dir,
+        keep_workbook=keep_workbook,
+    )
+    excerpt = _read_mail_text_excerpt(attachment_paths)
+    parts = [
+        _clean_text(keep_row.get("brand_message_subject")),
+        _clean_text(keep_row.get("brand_message_snippet")),
+        _clean_text(keep_row.get("last_mail_snippet")),
+        _clean_text(keep_row.get("matched_email")),
+        _clean_text(keep_row.get("brand_message_folder")),
+        excerpt,
+    ]
+    return "\n".join(part for part in parts if part)
+
+
+def _match_owner_aliases(search_text: str, candidate: dict[str, Any]) -> list[str]:
+    matched_aliases: list[str] = []
+    for alias in _build_owner_candidate_aliases(candidate):
+        pattern = re.compile(rf"(?<![A-Za-z0-9]){re.escape(alias)}(?![A-Za-z0-9])", re.IGNORECASE)
+        if pattern.search(search_text):
+            matched_aliases.append(alias)
+    return matched_aliases
+
+
+def _resolve_group_row_owner_context(
+    keep_row: dict[str, Any],
+    *,
+    task_owner_context: dict[str, str],
+    owner_candidates: Sequence[dict[str, Any]],
+    shared_mail_db_path: Path,
+    shared_mail_raw_dir: Path | None,
+    shared_mail_data_dir: Path | None,
+    keep_workbook: Path,
+) -> tuple[dict[str, str], dict[str, Any]]:
+    search_text = _build_owner_search_text(
+        keep_row,
+        shared_mail_db_path=shared_mail_db_path,
+        shared_mail_raw_dir=shared_mail_raw_dir,
+        shared_mail_data_dir=shared_mail_data_dir,
+        keep_workbook=keep_workbook,
+    )
+    matches: list[tuple[dict[str, Any], list[str]]] = []
+    for candidate in owner_candidates:
+        aliases = _match_owner_aliases(search_text, candidate)
+        if aliases:
+            matches.append((candidate, aliases))
+    if len(matches) == 1:
+        candidate, aliases = matches[0]
+        return _build_owner_context_from_candidate(candidate, task_owner_context), {
+            "status": "resolved_from_mail_content",
+            "aliases": aliases,
+        }
+    if len(matches) > 1:
+        aliases = [alias for _, matched_aliases in matches for alias in matched_aliases]
+        return _build_empty_owner_context(task_owner_context), {
+            "status": "ambiguous_mail_owner",
+            "aliases": aliases,
+        }
+    return _build_empty_owner_context(task_owner_context), {
+        "status": "unresolved_mail_owner",
+        "aliases": [],
+    }
+
+
+def _annotate_keep_frame_owner_context(
+    keep_frame: pd.DataFrame,
+    *,
+    task_owner_context: dict[str, str],
+    enable_row_level_owner_routing: bool,
+    owner_candidates: Sequence[dict[str, Any]],
+    shared_mail_db_path: Path,
+    shared_mail_raw_dir: Path | None,
+    shared_mail_data_dir: Path | None,
+    keep_workbook: Path,
+) -> pd.DataFrame:
+    records: list[dict[str, Any]] = []
+    for keep_row in keep_frame.to_dict(orient="records"):
+        if enable_row_level_owner_routing:
+            row_owner_context, resolution = _resolve_group_row_owner_context(
+                keep_row,
+                task_owner_context=task_owner_context,
+                owner_candidates=owner_candidates,
+                shared_mail_db_path=shared_mail_db_path,
+                shared_mail_raw_dir=shared_mail_raw_dir,
+                shared_mail_data_dir=shared_mail_data_dir,
+                keep_workbook=keep_workbook,
+            )
+        else:
+            row_owner_context = dict(task_owner_context)
+            resolution = {"status": "task_owner_default", "aliases": []}
+        annotated = dict(keep_row)
+        annotated.update(
+            {
+                _KEEP_OWNER_DISPLAY_FIELD: _clean_text(row_owner_context.get("responsible_name"))
+                or _clean_text(row_owner_context.get("employee_name")),
+                _KEEP_OWNER_ENGLISH_NAME_FIELD: _clean_text(row_owner_context.get("employee_english_name")),
+                _KEEP_OWNER_EMPLOYEE_ID_FIELD: _normalize_employee_id(row_owner_context.get("employee_id")),
+                _KEEP_OWNER_EMPLOYEE_RECORD_ID_FIELD: _clean_text(row_owner_context.get("employee_record_id")),
+                _KEEP_OWNER_EMPLOYEE_EMAIL_FIELD: _clean_text(row_owner_context.get("employee_email")),
+                _KEEP_OWNER_OWNER_NAME_FIELD: _clean_text(row_owner_context.get("owner_name")),
+                "任务名": _clean_text(row_owner_context.get("task_name")),
+                "linked_bitable_url": _clean_text(row_owner_context.get("linked_bitable_url")),
+                _KEEP_OWNER_STATUS_FIELD: _clean_text(resolution.get("status")),
+                _KEEP_OWNER_ALIAS_FIELD: "；".join(_clean_text(alias) for alias in (resolution.get("aliases") or []) if _clean_text(alias)),
+            }
+        )
+        records.append(annotated)
+    columns = list(keep_frame.columns)
+    for extra_column in (
+        _KEEP_OWNER_DISPLAY_FIELD,
+        _KEEP_OWNER_ENGLISH_NAME_FIELD,
+        _KEEP_OWNER_EMPLOYEE_ID_FIELD,
+        _KEEP_OWNER_EMPLOYEE_RECORD_ID_FIELD,
+        _KEEP_OWNER_EMPLOYEE_EMAIL_FIELD,
+        _KEEP_OWNER_OWNER_NAME_FIELD,
+        "任务名",
+        "linked_bitable_url",
+        _KEEP_OWNER_STATUS_FIELD,
+        _KEEP_OWNER_ALIAS_FIELD,
+    ):
+        if extra_column not in columns:
+            columns.append(extra_column)
+    return pd.DataFrame(records, columns=columns)
+
+
+def _build_owner_context_from_keep_row(keep_row: dict[str, Any], fallback_owner_context: dict[str, str]) -> dict[str, str]:
+    display_name = _clean_text(keep_row.get(_KEEP_OWNER_DISPLAY_FIELD))
+    return {
+        "task_name": _clean_text(keep_row.get("任务名")) or _clean_text(fallback_owner_context.get("task_name")),
+        "linked_bitable_url": _clean_text(keep_row.get("linked_bitable_url"))
+        or _clean_text(fallback_owner_context.get("linked_bitable_url")),
+        "responsible_name": display_name
+        or _clean_text(fallback_owner_context.get("responsible_name"))
+        or _clean_text(fallback_owner_context.get("employee_name")),
+        "employee_name": display_name or _clean_text(fallback_owner_context.get("employee_name")),
+        "employee_english_name": _clean_text(keep_row.get(_KEEP_OWNER_ENGLISH_NAME_FIELD))
+        or _clean_text(fallback_owner_context.get("employee_english_name")),
+        "employee_id": _normalize_employee_id(keep_row.get(_KEEP_OWNER_EMPLOYEE_ID_FIELD) or fallback_owner_context.get("employee_id")),
+        "employee_record_id": _clean_text(keep_row.get(_KEEP_OWNER_EMPLOYEE_RECORD_ID_FIELD))
+        or _clean_text(fallback_owner_context.get("employee_record_id")),
+        "employee_email": _clean_text(keep_row.get(_KEEP_OWNER_EMPLOYEE_EMAIL_FIELD))
+        or _clean_text(fallback_owner_context.get("employee_email")),
+        "owner_name": _clean_text(keep_row.get(_KEEP_OWNER_OWNER_NAME_FIELD))
+        or _clean_text(fallback_owner_context.get("owner_name")),
+    }
+
+
+def _build_keep_row_owner_lookup(
+    keep_frame: pd.DataFrame,
+) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[tuple[str, str], dict[str, Any]]]:
+    handle_lookup: dict[tuple[str, str], dict[str, Any]] = {}
+    url_lookup: dict[tuple[str, str], dict[str, Any]] = {}
+    for keep_row in keep_frame.to_dict(orient="records"):
+        platform = _extract_platform(keep_row)
+        if not platform:
+            continue
+        creator_id = _extract_creator_id(keep_row)
+        if creator_id:
+            handle_lookup.setdefault((platform, creator_id.casefold()), dict(keep_row))
+        normalized_url = _normalize_url(keep_row.get("URL"))
+        if normalized_url:
+            url_lookup.setdefault((platform, normalized_url), dict(keep_row))
+    return handle_lookup, url_lookup
+
+
+def _apply_row_owner_overrides(
+    rows: list[dict[str, Any]],
+    *,
+    keep_frame: pd.DataFrame,
+    fallback_owner_context: dict[str, str],
+    shared_mail_db_path: Path,
+    shared_mail_raw_dir: Path | None,
+    shared_mail_data_dir: Path | None,
+    keep_workbook: Path,
+) -> list[dict[str, Any]]:
+    if not rows:
+        return []
+    handle_lookup, url_lookup = _build_keep_row_owner_lookup(keep_frame)
+    overridden_rows: list[dict[str, Any]] = []
+    for row in rows:
+        platform = _normalize_platform(row.get("平台") or row.get("Platform"))
+        creator_id = (
+            _extract_handle(row.get("达人ID"))
+            or _extract_handle(row.get("主页链接") or row.get("URL"))
+        )
+        normalized_url = _normalize_url(row.get("主页链接") or row.get("URL"))
+        keep_row = handle_lookup.get((platform, creator_id.casefold())) or url_lookup.get((platform, normalized_url)) or {}
+        row_owner_context = _build_owner_context_from_keep_row(keep_row, fallback_owner_context)
+        updated = dict(row)
+        display_name = _clean_text(row_owner_context.get("responsible_name")) or _clean_text(row_owner_context.get("employee_name"))
+        if display_name:
+            updated["达人对接人"] = display_name
+        if keep_row:
+            attachment_paths = _build_mail_attachment_paths(
+                keep_row,
+                shared_mail_db_path=shared_mail_db_path,
+                shared_mail_raw_dir=shared_mail_raw_dir,
+                shared_mail_data_dir=shared_mail_data_dir,
+                keep_workbook=keep_workbook,
+            )
+            updated[_KEEP_OWNER_EMPLOYEE_ID_FIELD] = _clean_text(row_owner_context.get("employee_id")).split(",")[0].strip()
+            updated[_KEEP_OWNER_EMPLOYEE_RECORD_ID_FIELD] = _clean_text(row_owner_context.get("employee_record_id"))
+            updated[_KEEP_OWNER_EMPLOYEE_EMAIL_FIELD] = _clean_text(row_owner_context.get("employee_email"))
+            updated[_KEEP_OWNER_OWNER_NAME_FIELD] = _clean_text(row_owner_context.get("owner_name"))
+            updated["linked_bitable_url"] = _clean_text(row_owner_context.get("linked_bitable_url"))
+            updated["任务名"] = _clean_text(row_owner_context.get("task_name"))
+            updated.setdefault(
+                "__last_mail_raw_path",
+                _clean_text(keep_row.get("brand_message_raw_path") or keep_row.get("last_mail_raw_path")),
+            )
+            updated.setdefault("__feishu_attachment_local_paths", attachment_paths)
+        overridden_rows.append(updated)
+    return overridden_rows
+
+
+def _build_skipped_row_from_keep_record(
+    keep_row: dict[str, Any],
+    *,
+    owner_context: dict[str, str],
+    reason: str,
+    shared_mail_db_path: Path,
+    shared_mail_raw_dir: Path | None,
+    shared_mail_data_dir: Path | None,
+    keep_workbook: Path,
+) -> dict[str, Any]:
+    attachment_paths = _build_mail_attachment_paths(
+        keep_row,
+        shared_mail_db_path=shared_mail_db_path,
+        shared_mail_raw_dir=shared_mail_raw_dir,
+        shared_mail_data_dir=shared_mail_data_dir,
+        keep_workbook=keep_workbook,
+    )
+    display_name = _clean_text(owner_context.get("responsible_name")) or _clean_text(owner_context.get("employee_name"))
+    return {
+        "达人ID": _extract_creator_id(keep_row),
+        "平台": _extract_platform(keep_row),
+        "主页链接": _clean_text(keep_row.get("URL") or keep_row.get("主页链接")),
+        "当前网红报价": _build_quote_text(keep_row),
+        "达人最后一次回复邮件时间": _format_date(keep_row.get("brand_message_sent_at")),
+        "达人回复的最后一封邮件内容": _clean_text(keep_row.get("brand_message_snippet")),
+        "达人对接人": display_name,
+        "达人对接人_employee_id": _clean_text(owner_context.get("employee_id")).split(",")[0].strip(),
+        "达人对接人_employee_record_id": _clean_text(owner_context.get("employee_record_id")),
+        "达人对接人_employee_email": _clean_text(owner_context.get("employee_email")),
+        "达人对接人_owner_name": _clean_text(owner_context.get("owner_name")),
+        "linked_bitable_url": _clean_text(owner_context.get("linked_bitable_url")),
+        "任务名": _clean_text(owner_context.get("task_name")),
+        "ai是否通过": "",
+        "ai筛号反馈理由": reason,
+        "标签(ai)": "",
+        "ai评价": "",
+        "__last_mail_raw_path": _clean_text(keep_row.get("brand_message_raw_path") or keep_row.get("last_mail_raw_path")),
+        "__feishu_attachment_local_paths": attachment_paths,
+    }
+
+
 def _build_feishu_client(
     *,
     env_file: str,
@@ -566,7 +1080,7 @@ def run_shared_mailbox_post_sync_pipeline(
     folder_prefixes: list[str] | None = None,
     matching_strategy: str = "brand-keyword-fast-path",
     brand_keyword: str = "",
-    brand_match_include_from: bool = False,
+    brand_match_include_from: bool = True,
     platform_filters: list[str] | None = None,
     vision_provider: str = "",
     max_identifiers_per_platform: int = 0,
@@ -664,6 +1178,7 @@ def run_shared_mailbox_post_sync_pipeline(
             for item in inspection_items
             if _clean_text(item.get("taskName")).casefold() in resolved_task_names
         ]
+    inspection_items = _collapse_grouped_inspection_items(inspection_items, requested_task_filters)
 
     summary["task_count"] = len(inspection_items)
     summary["task_names"] = [_clean_text(item.get("taskName")) for item in inspection_items]
@@ -687,6 +1202,8 @@ def run_shared_mailbox_post_sync_pipeline(
         task_summary_path = task_root / "summary.json"
         task_result: dict[str, Any] = {
             "task_name": task_name,
+            "source_task_names": list(item.get("groupedTaskNames") or ([task_name] if task_name else [])),
+            "representative_task_name": _clean_text(item.get("representativeTaskName")) or task_name,
             "linked_bitable_url": _clean_text(item.get("linkedBitableUrl")),
             "matched_mail_count": 0,
             "full_screening_count": 0,
@@ -704,10 +1221,48 @@ def run_shared_mailbox_post_sync_pipeline(
             "downstream_summary_json": "",
         }
         try:
+            if bool(item.get("ownerMatchAmbiguous")) and not bool(item.get("rowLevelOwnerRouting")):
+                matched_entries = [
+                    dict(entry)
+                    for entry in (item.get("employeeMatches") or [])
+                    if isinstance(entry, dict)
+                ]
+                failure = _build_failure_payload(
+                    stage="inspection",
+                    error_code="TASK_OWNER_MATCH_AMBIGUOUS",
+                    message=f"{task_name} 命中多个负责人，当前无法安全判定唯一负责人。",
+                    remediation="请通过 owner_email_override 显式指定该任务负责人后再继续共享邮箱正式主线。",
+                    details={
+                        "task_name": task_name,
+                        "owner_email_candidates": list(item.get("ownerEmailCandidates") or []),
+                        "matched_employees": matched_entries,
+                    },
+                )
+                task_result["status"] = "inspection_failed"
+                task_result["failed_count"] = 1
+                task_result["failure"] = failure
+                aggregate_failed_rows.append(
+                    {
+                        "task_name": task_name,
+                        "stage": "inspection",
+                        "error_code": "TASK_OWNER_MATCH_AMBIGUOUS",
+                        "message": failure["message"],
+                        "remediation": failure["remediation"],
+                        "details": failure["details"],
+                    }
+                )
+                any_task_failed = True
+                summary["failed_record_count"] = int(summary.get("failed_record_count") or 0) + 1
+                summary["task_results"].append(task_result)
+                _write_json(task_summary_path, task_result)
+                _write_json(run_summary_path, summary)
+                continue
+
+            upstream_task_name = _clean_text(item.get("representativeTaskName")) or task_name
             upstream_output_root = task_root / "upstream"
             upstream_summary_path = upstream_output_root / "summary.json"
             upstream_summary = run_task_upload_to_keep_list_pipeline(
-                task_name=task_name,
+                task_name=upstream_task_name,
                 env_file=env_file,
                 task_upload_url=resolved_task_upload_url,
                 employee_info_url=resolved_employee_info_url,
@@ -773,6 +1328,23 @@ def run_shared_mailbox_post_sync_pipeline(
             keep_frame = pd.read_excel(keep_workbook)
             owner_context = _build_owner_context_from_upstream(upstream_summary, item)
             linked_bitable_url = _clean_text(owner_context.get("linked_bitable_url")) or _clean_text(item.get("linkedBitableUrl"))
+            owner_context["linked_bitable_url"] = linked_bitable_url
+            owner_context["task_name"] = _clean_text(owner_context.get("task_name")) or task_name
+            owner_candidates = [
+                dict(entry)
+                for entry in (item.get("employeeMatches") or [])
+                if isinstance(entry, dict)
+            ]
+            keep_frame = _annotate_keep_frame_owner_context(
+                keep_frame,
+                task_owner_context=owner_context,
+                enable_row_level_owner_routing=bool(item.get("rowLevelOwnerRouting")),
+                owner_candidates=owner_candidates,
+                shared_mail_db_path=resolved_mail_db_path,
+                shared_mail_raw_dir=resolved_mail_raw_dir,
+                shared_mail_data_dir=resolved_mail_data_dir,
+                keep_workbook=keep_workbook,
+            )
             _, existing_analysis = fetch_existing_bitable_record_analysis(
                 client,
                 linked_bitable_url=linked_bitable_url,
@@ -810,31 +1382,55 @@ def run_shared_mailbox_post_sync_pipeline(
                 continue
             existing_index = existing_analysis.index
             owner_scope_enabled = bool(_clean_text(getattr(existing_analysis, "owner_scope_field_name", "")))
-            owner_scope_value = _clean_text(owner_context.get("employee_id")) or _clean_text(
-                owner_context.get("responsible_name")
-            )
 
             matched_mail_count = _extract_matched_mail_count(upstream_summary, keep_frame)
             mail_only_display_rows: list[dict[str, Any]] = []
             mail_only_payload_rows: list[dict[str, Any]] = []
-            full_screening_keys: set[str] = set()
+            combined_skipped_rows: list[dict[str, Any]] = []
+            full_screening_rows: list[dict[str, Any]] = []
             existing_screened_count = 0
             existing_unscreened_count = 0
             new_creator_count = 0
 
             for keep_row in keep_frame.to_dict(orient="records"):
+                row_owner_context = _build_owner_context_from_keep_row(keep_row, owner_context)
+                row_owner_scope_value = _clean_text(row_owner_context.get("employee_id")) or _clean_text(
+                    row_owner_context.get("responsible_name")
+                )
+                if bool(item.get("rowLevelOwnerRouting")) and not row_owner_scope_value:
+                    owner_status = _clean_text(keep_row.get(_KEEP_OWNER_STATUS_FIELD))
+                    alias_text = _clean_text(keep_row.get(_KEEP_OWNER_ALIAS_FIELD))
+                    reason = "无法根据邮件内容匹配唯一负责人，已跳过写回。"
+                    if owner_status == "ambiguous_mail_owner" and alias_text:
+                        reason = f"邮件内容同时命中多个负责人别名（{alias_text}），已跳过写回。"
+                    elif owner_status == "unresolved_mail_owner":
+                        reason = "邮件内容未命中任何负责人英文名或邮箱别名，已跳过写回。"
+                    combined_skipped_rows.append(
+                        {
+                            "skip_reasons": [reason],
+                            "row": _build_skipped_row_from_keep_record(
+                                keep_row,
+                                owner_context=row_owner_context,
+                                reason=reason,
+                                shared_mail_db_path=resolved_mail_db_path,
+                                shared_mail_raw_dir=resolved_mail_raw_dir,
+                                shared_mail_data_dir=resolved_mail_data_dir,
+                                keep_workbook=keep_workbook,
+                            ),
+                        }
+                    )
+                    continue
                 creator_id = _extract_creator_id(keep_row)
                 platform = _extract_platform(keep_row)
                 record_key = (
-                    _build_record_key(owner_scope_value, creator_id, platform)
+                    _build_record_key(row_owner_scope_value, creator_id, platform)
                     if owner_scope_enabled
                     else _build_record_key(creator_id, platform)
                 )
                 existing_record = existing_index.get(record_key) if record_key else None
                 if existing_record is None:
                     new_creator_count += 1
-                    if record_key:
-                        full_screening_keys.add(record_key)
+                    full_screening_rows.append(dict(keep_row))
                     continue
                 ai_status = _extract_ai_status(existing_record.get("fields") or {})
                 if ai_status:
@@ -842,7 +1438,7 @@ def run_shared_mailbox_post_sync_pipeline(
                     display_row, payload_row = _build_mail_only_rows(
                         keep_row=keep_row,
                         existing_fields=dict(existing_record.get("fields") or {}),
-                        owner_context=owner_context,
+                        owner_context=row_owner_context,
                         linked_bitable_url=linked_bitable_url,
                         shared_mail_db_path=resolved_mail_db_path,
                         shared_mail_raw_dir=resolved_mail_raw_dir,
@@ -853,18 +1449,11 @@ def run_shared_mailbox_post_sync_pipeline(
                     mail_only_payload_rows.append(payload_row)
                     continue
                 existing_unscreened_count += 1
-                if record_key:
-                    full_screening_keys.add(record_key)
+                full_screening_rows.append(dict(keep_row))
 
-            full_screening_frame = _filter_keep_frame_for_full_screening(
-                keep_frame,
-                full_screening_keys,
-                owner_scope_value=owner_scope_value,
-                owner_scope_enabled=owner_scope_enabled,
-            )
+            full_screening_frame = pd.DataFrame(full_screening_rows, columns=list(keep_frame.columns))
             full_screening_display_rows: list[dict[str, Any]] = []
             full_screening_payload_rows: list[dict[str, Any]] = []
-            combined_skipped_rows: list[dict[str, Any]] = []
             downstream_summary_json = ""
             if len(full_screening_frame.index) > 0:
                 filtered_keep_workbook = task_root / "partition" / f"{task_slug}_full_screening_keep.xlsx"
@@ -904,10 +1493,27 @@ def run_shared_mailbox_post_sync_pipeline(
                         str((downstream_summary.get("artifacts") or {}).get("all_platforms_upload_payload_json") or "")
                     ).expanduser()
                     if final_review_path.exists():
-                        full_screening_display_rows = pd.read_excel(final_review_path).to_dict(orient="records")
+                        full_screening_display_rows = _apply_row_owner_overrides(
+                            pd.read_excel(final_review_path).to_dict(orient="records"),
+                            keep_frame=full_screening_frame,
+                            fallback_owner_context=owner_context,
+                            shared_mail_db_path=resolved_mail_db_path,
+                            shared_mail_raw_dir=resolved_mail_raw_dir,
+                            shared_mail_data_dir=resolved_mail_data_dir,
+                            keep_workbook=filtered_keep_workbook,
+                        )
                     if payload_path.exists():
                         downstream_payload = json.loads(payload_path.read_text(encoding="utf-8"))
-                        for row in list(downstream_payload.get("rows") or []):
+                        overridden_payload_rows = _apply_row_owner_overrides(
+                            [dict(row) for row in list(downstream_payload.get("rows") or []) if isinstance(row, dict)],
+                            keep_frame=full_screening_frame,
+                            fallback_owner_context=owner_context,
+                            shared_mail_db_path=resolved_mail_db_path,
+                            shared_mail_raw_dir=resolved_mail_raw_dir,
+                            shared_mail_data_dir=resolved_mail_data_dir,
+                            keep_workbook=filtered_keep_workbook,
+                        )
+                        for row in overridden_payload_rows:
                             if isinstance(row, dict):
                                 annotated_row = dict(row)
                                 annotated_row["__feishu_update_mode"] = CREATE_OR_UPDATE_MODE
@@ -919,22 +1525,19 @@ def run_shared_mailbox_post_sync_pipeline(
                         or f"{task_name} 下游 full-screening 失败，状态为 {downstream_status or 'unknown'}"
                     )
                     for record in full_screening_frame.to_dict(orient="records"):
+                        row_owner_context = _build_owner_context_from_keep_row(record, owner_context)
                         combined_skipped_rows.append(
                             {
                                 "skip_reasons": [failure_reason],
-                                "row": {
-                                    "达人ID": _extract_creator_id(record),
-                                    "平台": _extract_platform(record),
-                                    "主页链接": _clean_text(record.get("URL") or record.get("主页链接")),
-                                    "当前网红报价": _build_quote_text(record),
-                                    "达人最后一次回复邮件时间": _format_date(record.get("brand_message_sent_at")),
-                                    "达人回复的最后一封邮件内容": _clean_text(record.get("brand_message_snippet")),
-                                    "达人对接人": _clean_text(owner_context.get("responsible_name")),
-                                    "ai是否通过": "",
-                                    "ai筛号反馈理由": failure_reason,
-                                    "标签(ai)": "",
-                                    "ai评价": "",
-                                },
+                                "row": _build_skipped_row_from_keep_record(
+                                    record,
+                                    owner_context=row_owner_context,
+                                    reason=failure_reason,
+                                    shared_mail_db_path=resolved_mail_db_path,
+                                    shared_mail_raw_dir=resolved_mail_raw_dir,
+                                    shared_mail_data_dir=resolved_mail_data_dir,
+                                    keep_workbook=filtered_keep_workbook,
+                                ),
                             }
                         )
                     any_task_failed = True
@@ -957,6 +1560,7 @@ def run_shared_mailbox_post_sync_pipeline(
                 payload_json_path=combined_payload_artifacts["payload_json_path"],
                 linked_bitable_url=linked_bitable_url,
                 dry_run=bool(upload_dry_run),
+                suppress_ai_labels=True,
             )
 
             task_failed_count = int(combined_payload_artifacts["payload"]["skipped_row_count"]) + int(
@@ -1128,7 +1732,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="上游匹配策略。",
     )
     parser.add_argument("--brand-keyword", default="", help="fast path 品牌关键词；默认复用 task-name。")
-    parser.add_argument("--brand-match-include-from", action="store_true", help="品牌匹配时把发件人地址纳入候选。")
+    parser.add_argument(
+        "--brand-match-include-from",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="品牌匹配时是否把发件人地址纳入候选；shared-mailbox 主线默认开启。",
+    )
     parser.add_argument("--platform", action="append", help="只跑指定平台，可重复传入：tiktok / instagram / youtube。")
     parser.add_argument("--vision-provider", default="", help="指定视觉 provider。")
     parser.add_argument("--max-identifiers-per-platform", type=int, default=0, help="每个平台最多跑多少个账号；0 表示不截断。")
@@ -1177,7 +1786,7 @@ def main(argv: list[str] | None = None) -> int:
         folder_prefixes=list(args.folder_prefix or []),
         matching_strategy=args.matching_strategy,
         brand_keyword=args.brand_keyword or "",
-        brand_match_include_from=bool(args.brand_match_include_from),
+        brand_match_include_from=True if args.brand_match_include_from is None else bool(args.brand_match_include_from),
         platform_filters=args.platform,
         vision_provider=args.vision_provider or "",
         max_identifiers_per_platform=max(0, int(args.max_identifiers_per_platform)),

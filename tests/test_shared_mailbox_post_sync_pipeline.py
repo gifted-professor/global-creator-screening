@@ -20,7 +20,7 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
         pipeline._load_runtime_dependencies = self.original_loader
         pipeline._build_feishu_client = self.original_build_client
 
-    def test_task_group_alias_skg_expands_to_skg_1_and_skg_2_with_shared_brand_keyword(self) -> None:
+    def test_task_group_alias_skg_collapses_to_single_group_run(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             shared_root = root / "shared_mailbox"
@@ -32,6 +32,7 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
             (shared_raw_dir / "alpha.eml").write_text("Subject: alpha\n\nbody", encoding="utf-8")
 
             upstream_calls: list[dict[str, object]] = []
+            upload_calls: list[dict[str, object]] = []
 
             class FakeClient:
                 pass
@@ -41,6 +42,7 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
                     {
                         "task_name": kwargs["task_name"],
                         "brand_keyword": kwargs["brand_keyword"],
+                        "brand_match_include_from": kwargs["brand_match_include_from"],
                     }
                 )
                 output_root = Path(kwargs["output_root"])
@@ -55,7 +57,7 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
                             "@username": "alpha",
                             "URL": "https://www.tiktok.com/@alpha",
                             "brand_message_sent_at": "2026-03-31T10:00:00+08:00",
-                            "brand_message_snippet": "Latest alpha reply $100",
+                            "brand_message_snippet": "Hi Rhea, rate is $100",
                             "brand_message_raw_path": "raw/alpha.eml",
                         }
                     ]
@@ -156,6 +158,7 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
                 return summary
 
             def fake_upload_final_review_payload_to_bitable(client, **kwargs):
+                upload_calls.append(dict(kwargs))
                 archive_dir = Path(kwargs["payload_json_path"]).parent / "feishu_upload_local_archive"
                 archive_dir.mkdir(parents=True, exist_ok=True)
                 result_json = archive_dir / "feishu_bitable_upload_result.json"
@@ -196,10 +199,13 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
                         {
                             "recordId": "rec_skg_1",
                             "taskName": "SKG-1",
-                            "linkedBitableUrl": "https://bitable.example/skg-1",
+                            "linkedBitableUrl": "https://bitable.example/skg",
+                            "templateFileToken": "boxcn-skg-template",
+                            "sendingListFileToken": "boxcn-skg-list",
                             "employeeId": "ou_rhea",
                             "employeeRecordId": "rec_rhea",
                             "employeeName": "唐瑞霞",
+                            "employeeEnglishName": "Rhea",
                             "employeeEmail": "rhea@amagency.biz",
                             "responsibleName": "唐瑞霞",
                             "ownerName": "rhea@amagency.biz",
@@ -207,13 +213,16 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
                         {
                             "recordId": "rec_skg_2",
                             "taskName": "SKG-2",
-                            "linkedBitableUrl": "https://bitable.example/skg-2",
-                            "employeeId": "ou_rhea",
-                            "employeeRecordId": "rec_rhea",
-                            "employeeName": "唐瑞霞",
-                            "employeeEmail": "rhea@amagency.biz",
-                            "responsibleName": "唐瑞霞",
-                            "ownerName": "rhea@amagency.biz",
+                            "linkedBitableUrl": "https://bitable.example/skg",
+                            "templateFileToken": "boxcn-skg-template",
+                            "sendingListFileToken": "boxcn-skg-list",
+                            "employeeId": "ou_lilith",
+                            "employeeRecordId": "rec_lilith",
+                            "employeeName": "Sherry97",
+                            "employeeEnglishName": "Lilith",
+                            "employeeEmail": "lilith@amagency.biz",
+                            "responsibleName": "Sherry97",
+                            "ownerName": "lilith@amagency.biz",
                         },
                     ]
                 },
@@ -232,11 +241,29 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
             )
 
             self.assertEqual(summary["status"], "completed")
-            self.assertEqual(summary["task_names"], ["SKG-1", "SKG-2"])
+            self.assertEqual(summary["task_names"], ["SKG"])
             self.assertEqual(
-                [(item["task_name"], item["brand_keyword"]) for item in upstream_calls],
-                [("SKG-1", "SKG"), ("SKG-2", "SKG")],
+                [(item["task_name"], item["brand_keyword"], item["brand_match_include_from"]) for item in upstream_calls],
+                [("SKG-1", "SKG", True)],
             )
+            self.assertEqual(len(upload_calls), 1)
+            self.assertTrue(upload_calls[0]["suppress_ai_labels"])
+
+    def test_parser_defaults_brand_match_include_from_to_true_for_shared_mailbox(self) -> None:
+        parser = pipeline.build_parser()
+
+        default_args = parser.parse_args(["--shared-mail-db-path", "data/shared_mailbox/email_sync.db"])
+        self.assertIsNone(default_args.brand_match_include_from)
+
+        enabled_args = parser.parse_args(
+            ["--shared-mail-db-path", "data/shared_mailbox/email_sync.db", "--brand-match-include-from"]
+        )
+        self.assertTrue(enabled_args.brand_match_include_from)
+
+        disabled_args = parser.parse_args(
+            ["--shared-mail-db-path", "data/shared_mailbox/email_sync.db", "--no-brand-match-include-from"]
+        )
+        self.assertFalse(disabled_args.brand_match_include_from)
 
     def test_concrete_skg_2_filter_does_not_expand_back_to_skg_1(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -398,10 +425,13 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
                         {
                             "recordId": "rec_skg_1",
                             "taskName": "SKG-1",
-                            "linkedBitableUrl": "https://bitable.example/skg-1",
+                            "linkedBitableUrl": "https://bitable.example/skg",
+                            "templateFileToken": "boxcn-skg-template",
+                            "sendingListFileToken": "boxcn-skg-list",
                             "employeeId": "ou_rhea",
                             "employeeRecordId": "rec_rhea",
                             "employeeName": "唐瑞霞",
+                            "employeeEnglishName": "Rhea",
                             "employeeEmail": "rhea@amagency.biz",
                             "responsibleName": "唐瑞霞",
                             "ownerName": "rhea@amagency.biz",
@@ -409,13 +439,16 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
                         {
                             "recordId": "rec_skg_2",
                             "taskName": "SKG-2",
-                            "linkedBitableUrl": "https://bitable.example/skg-2",
-                            "employeeId": "ou_rhea",
-                            "employeeRecordId": "rec_rhea",
-                            "employeeName": "唐瑞霞",
-                            "employeeEmail": "rhea@amagency.biz",
-                            "responsibleName": "唐瑞霞",
-                            "ownerName": "rhea@amagency.biz",
+                            "linkedBitableUrl": "https://bitable.example/skg",
+                            "templateFileToken": "boxcn-skg-template",
+                            "sendingListFileToken": "boxcn-skg-list",
+                            "employeeId": "ou_lilith",
+                            "employeeRecordId": "rec_lilith",
+                            "employeeName": "Sherry97",
+                            "employeeEnglishName": "Lilith",
+                            "employeeEmail": "lilith@amagency.biz",
+                            "responsibleName": "Sherry97",
+                            "ownerName": "lilith@amagency.biz",
                         },
                     ]
                 },
@@ -440,6 +473,242 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
                 [(item["task_name"], item["brand_keyword"]) for item in upstream_calls],
                 [("SKG-2", "SKG")],
             )
+
+    def test_grouped_skg_routes_row_owner_from_mail_content(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            shared_root = root / "shared_mailbox"
+            shared_db_path = shared_root / "email_sync.db"
+            shared_raw_dir = shared_root / "raw"
+            shared_db_path.parent.mkdir(parents=True, exist_ok=True)
+            shared_db_path.touch()
+            shared_raw_dir.mkdir(parents=True, exist_ok=True)
+            (shared_raw_dir / "alpha.eml").write_text("Subject: alpha\n\nHi Rhea, rate is $100", encoding="utf-8")
+            (shared_raw_dir / "beta.eml").write_text("Subject: beta\n\nHi Lilith, rate is $200", encoding="utf-8")
+
+            uploaded_payloads: list[dict[str, object]] = []
+
+            class FakeClient:
+                pass
+
+            def fake_run_task_upload_to_keep_list_pipeline(**kwargs):
+                output_root = Path(kwargs["output_root"])
+                output_root.mkdir(parents=True, exist_ok=True)
+                keep_workbook = output_root / "skg_keep.xlsx"
+                template_workbook = output_root / "skg_template.xlsx"
+                template_workbook.touch()
+                pd.DataFrame(
+                    [
+                        {
+                            "Platform": "TikTok",
+                            "@username": "alpha",
+                            "URL": "https://www.tiktok.com/@alpha",
+                            "brand_message_subject": "SKG alpha outreach",
+                            "brand_message_sent_at": "2026-03-31T10:00:00+08:00",
+                            "brand_message_snippet": "Hi Rhea, rate is $100",
+                            "brand_message_raw_path": "raw/alpha.eml",
+                        },
+                        {
+                            "Platform": "TikTok",
+                            "@username": "beta",
+                            "URL": "https://www.tiktok.com/@beta",
+                            "brand_message_subject": "SKG beta outreach",
+                            "brand_message_sent_at": "2026-03-31T11:00:00+08:00",
+                            "brand_message_snippet": "Hi Lilith, rate is $200",
+                            "brand_message_raw_path": "raw/beta.eml",
+                        },
+                    ]
+                ).to_excel(keep_workbook, index=False)
+                summary = {
+                    "status": "stopped_after_keep-list",
+                    "resume_points": {
+                        "keep_list": {
+                            "keep_workbook": str(keep_workbook),
+                            "template_workbook": str(template_workbook),
+                        }
+                    },
+                    "artifacts": {
+                        "keep_workbook": str(keep_workbook),
+                        "template_workbook": str(template_workbook),
+                    },
+                    "steps": {"brand_match": {"stats": {"message_hit_count": 2}}},
+                    "downstream_handoff": {
+                        "task_owner": {
+                            "task_name": kwargs["task_name"],
+                            "linked_bitable_url": "https://bitable.example/skg",
+                            "responsible_name": "唐瑞霞",
+                            "employee_name": "唐瑞霞",
+                            "employee_id": "ou_rhea",
+                            "employee_record_id": "rec_rhea",
+                            "employee_email": "rhea@amagency.biz",
+                            "owner_name": "rhea@amagency.biz",
+                        }
+                    },
+                }
+                Path(kwargs["summary_json"]).write_text(json.dumps(summary, ensure_ascii=False), encoding="utf-8")
+                return summary
+
+            def fake_run_keep_list_screening_pipeline(**kwargs):
+                keep_rows = pd.read_excel(Path(kwargs["keep_workbook"])).to_dict(orient="records")
+                output_root = Path(kwargs["output_root"])
+                output_root.mkdir(parents=True, exist_ok=True)
+                exports_dir = output_root / "exports"
+                exports_dir.mkdir(parents=True, exist_ok=True)
+                display_rows: list[dict[str, object]] = []
+                payload_rows: list[dict[str, object]] = []
+                for keep_row in keep_rows:
+                    creator_id = keep_row["@username"]
+                    display_row = {
+                        "达人ID": creator_id,
+                        "平台": "tiktok",
+                        "主页链接": keep_row["URL"],
+                        "# Followers(K)#": 200,
+                        "Average Views (K)": 50,
+                        "互动率": "10.0%",
+                        "当前网红报价": "$100",
+                        "达人最后一次回复邮件时间": "2026/03/31",
+                        "达人回复的最后一封邮件内容": keep_row["brand_message_snippet"],
+                        "达人对接人": kwargs["task_owner_name"],
+                        "ai是否通过": "是",
+                        "ai筛号反馈理由": "screened",
+                        "标签(ai)": "",
+                        "ai评价": "good fit",
+                    }
+                    payload_row = dict(display_row)
+                    payload_row.update(
+                        {
+                            "达人对接人_employee_id": kwargs["task_owner_employee_id"],
+                            "达人对接人_employee_record_id": kwargs["task_owner_employee_record_id"],
+                            "达人对接人_employee_email": kwargs["task_owner_employee_email"],
+                            "达人对接人_owner_name": kwargs["task_owner_owner_name"],
+                            "linked_bitable_url": kwargs["linked_bitable_url"],
+                            "任务名": kwargs["task_name"],
+                        }
+                    )
+                    display_rows.append(display_row)
+                    payload_rows.append(payload_row)
+                final_review_path = exports_dir / "all_platforms_final_review.xlsx"
+                payload_path = exports_dir / "all_platforms_final_review_payload.json"
+                pd.DataFrame(display_rows).to_excel(final_review_path, index=False)
+                payload = {
+                    "task_owner": {"task_name": kwargs["task_name"]},
+                    "columns": list(display_rows[0].keys()),
+                    "source_row_count": len(display_rows),
+                    "row_count": len(payload_rows),
+                    "skipped_row_count": 0,
+                    "rows": payload_rows,
+                    "skipped_rows": [],
+                }
+                payload_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+                summary = {
+                    "status": "completed",
+                    "artifacts": {
+                        "all_platforms_final_review": str(final_review_path),
+                        "all_platforms_upload_payload_json": str(payload_path),
+                    },
+                }
+                Path(kwargs["summary_json"]).write_text(json.dumps(summary, ensure_ascii=False), encoding="utf-8")
+                return summary
+
+            def fake_upload_final_review_payload_to_bitable(client, **kwargs):
+                payload = json.loads(Path(kwargs["payload_json_path"]).read_text(encoding="utf-8"))
+                uploaded_payloads.append(payload)
+                archive_dir = Path(kwargs["payload_json_path"]).parent / "feishu_upload_local_archive"
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                result_json = archive_dir / "feishu_bitable_upload_result.json"
+                result_xlsx = archive_dir / "feishu_bitable_upload_result.xlsx"
+                result_json.write_text(json.dumps({"ok": True}, ensure_ascii=False), encoding="utf-8")
+                pd.DataFrame([{"status": "ok"}]).to_excel(result_xlsx, index=False)
+                return {
+                    "ok": True,
+                    "payload_json_path": kwargs["payload_json_path"],
+                    "result_json_path": str(result_json),
+                    "result_xlsx_path": str(result_xlsx),
+                    "created_count": len(payload.get("rows") or []),
+                    "updated_count": 0,
+                    "failed_count": 0,
+                    "skipped_existing_count": 0,
+                    "failed_rows": [],
+                    "skipped_existing_rows": [],
+                }
+
+            pipeline._build_feishu_client = lambda **kwargs: (
+                FakeClient(),
+                {
+                    "TASK_UPLOAD_URL": "https://task-upload.example.com",
+                    "EMPLOYEE_INFO_URL": "https://employee.example.com",
+                },
+                {"feishu_base_url": "https://open.feishu.cn", "timeout_seconds": 30.0},
+            )
+            pipeline._load_runtime_dependencies = lambda: {
+                "DEFAULT_FEISHU_BASE_URL": "https://open.feishu.cn",
+                "FeishuOpenClient": FakeClient,
+                "fetch_existing_bitable_record_analysis": lambda client, *, linked_bitable_url: (
+                    object(),
+                    SimpleNamespace(index={}, duplicate_groups=[]),
+                ),
+                "fetch_existing_bitable_record_index": lambda client, *, linked_bitable_url: (object(), {}),
+                "inspect_task_upload_assignments": lambda **kwargs: {
+                    "items": [
+                        {
+                            "recordId": "rec_skg_1",
+                            "taskName": "SKG-1",
+                            "linkedBitableUrl": "https://bitable.example/skg",
+                            "templateFileToken": "boxcn-skg-template",
+                            "sendingListFileToken": "boxcn-skg-list",
+                            "employeeId": "ou_rhea",
+                            "employeeRecordId": "rec_rhea",
+                            "employeeName": "唐瑞霞",
+                            "employeeEnglishName": "Rhea",
+                            "employeeEmail": "rhea@amagency.biz",
+                            "responsibleName": "唐瑞霞",
+                            "ownerName": "rhea@amagency.biz",
+                        },
+                        {
+                            "recordId": "rec_skg_2",
+                            "taskName": "SKG-2",
+                            "linkedBitableUrl": "https://bitable.example/skg",
+                            "templateFileToken": "boxcn-skg-template",
+                            "sendingListFileToken": "boxcn-skg-list",
+                            "employeeId": "ou_lilith",
+                            "employeeRecordId": "rec_lilith",
+                            "employeeName": "Sherry97",
+                            "employeeEnglishName": "Lilith",
+                            "employeeEmail": "lilith@amagency.biz",
+                            "responsibleName": "Sherry97",
+                            "ownerName": "lilith@amagency.biz",
+                        },
+                    ]
+                },
+                "load_local_env": lambda env_file: {},
+                "run_keep_list_screening_pipeline": fake_run_keep_list_screening_pipeline,
+                "run_task_upload_to_keep_list_pipeline": fake_run_task_upload_to_keep_list_pipeline,
+                "upload_final_review_payload_to_bitable": fake_upload_final_review_payload_to_bitable,
+            }
+
+            summary = pipeline.run_shared_mailbox_post_sync_pipeline(
+                shared_mail_db_path=shared_db_path,
+                shared_mail_raw_dir=shared_raw_dir,
+                shared_mail_data_dir=shared_root,
+                task_name_filters=["SKG"],
+                output_root=root / "run",
+            )
+
+            self.assertEqual(summary["status"], "completed")
+            self.assertEqual(summary["task_names"], ["SKG"])
+            self.assertEqual(len(uploaded_payloads), 1)
+            payload_rows = {row["达人ID"]: row for row in uploaded_payloads[0]["rows"]}
+            self.assertEqual(payload_rows["alpha"]["达人对接人"], "唐瑞霞")
+            self.assertEqual(payload_rows["alpha"]["达人对接人_employee_id"], "ou_rhea")
+            self.assertEqual(payload_rows["beta"]["达人对接人"], "Sherry97")
+            self.assertEqual(payload_rows["beta"]["达人对接人_employee_id"], "ou_lilith")
+            task_result = summary["task_results"][0]
+            workbook_rows = pd.read_excel(task_result["all_platforms_final_review"]).fillna("")
+            owner_map = {
+                row["达人ID"]: row["达人对接人"]
+                for row in workbook_rows.to_dict(orient="records")
+            }
+            self.assertEqual(owner_map, {"alpha": "唐瑞霞", "beta": "Sherry97"})
 
     def test_pipeline_routes_mail_only_updates_and_full_screening_rows(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -657,7 +926,7 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
                 Path(kwargs["summary_json"]).write_text(json.dumps(summary, ensure_ascii=False), encoding="utf-8")
                 return summary
 
-            def fake_upload_final_review_payload_to_bitable(client, *, payload_json_path, linked_bitable_url="", task_name="", task_upload_url="", result_json_path=None, result_xlsx_path=None, dry_run=False, limit=0):
+            def fake_upload_final_review_payload_to_bitable(client, *, payload_json_path, linked_bitable_url="", task_name="", task_upload_url="", result_json_path=None, result_xlsx_path=None, dry_run=False, limit=0, suppress_ai_labels=False):
                 payload_path = Path(payload_json_path)
                 payload = json.loads(payload_path.read_text(encoding="utf-8"))
                 upload_payloads[linked_bitable_url] = payload
@@ -967,6 +1236,101 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
             [(item["task_name"], item["brand_keyword"], item["matching_strategy"]) for item in upstream_calls],
             [("Duet1", "Duet", "brand-keyword-fast-path"), ("Duet2", "Duet", "brand-keyword-fast-path")],
         )
+
+    def test_pipeline_blocks_ambiguous_task_owner_before_upstream(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            shared_root = root / "shared_mailbox"
+            shared_db_path = shared_root / "email_sync.db"
+            shared_raw_dir = shared_root / "raw"
+            shared_db_path.parent.mkdir(parents=True, exist_ok=True)
+            shared_db_path.touch()
+            shared_raw_dir.mkdir(parents=True, exist_ok=True)
+
+            upstream_called = False
+
+            class FakeClient:
+                pass
+
+            def fake_run_task_upload_to_keep_list_pipeline(**kwargs):
+                nonlocal upstream_called
+                upstream_called = True
+                raise AssertionError("ambiguous owner task should be blocked before upstream")
+
+            pipeline._build_feishu_client = lambda **kwargs: (
+                FakeClient(),
+                {
+                    "TASK_UPLOAD_URL": "https://task-upload.example.com",
+                    "EMPLOYEE_INFO_URL": "https://employee.example.com",
+                },
+                {"feishu_base_url": "https://open.feishu.cn", "timeout_seconds": 30.0},
+            )
+            pipeline._load_runtime_dependencies = lambda: {
+                "DEFAULT_FEISHU_BASE_URL": "https://open.feishu.cn",
+                "FeishuOpenClient": FakeClient,
+                "fetch_existing_bitable_record_analysis": lambda client, *, linked_bitable_url: (
+                    object(),
+                    SimpleNamespace(index={}, duplicate_groups=[]),
+                ),
+                "fetch_existing_bitable_record_index": lambda client, *, linked_bitable_url: (object(), {}),
+                "inspect_task_upload_assignments": lambda **kwargs: {
+                    "items": [
+                        {
+                            "recordId": "rec_miniso",
+                            "taskName": "MINISO",
+                            "linkedBitableUrl": "https://bitable.example/miniso",
+                            "employeeId": "ou_primary",
+                            "employeeRecordId": "rec_primary",
+                            "employeeName": "陈俊仁",
+                            "employeeEmail": "chenjunren@amagency.biz",
+                            "responsibleName": "陈俊仁",
+                            "ownerName": "chenjunren@amagency.biz,eden@amagency.biz",
+                            "ownerEmailCandidates": ["chenjunren@amagency.biz", "eden@amagency.biz"],
+                            "ownerMatchAmbiguous": True,
+                            "employeeMatches": [
+                                {
+                                    "employeeRecordId": "rec_primary",
+                                    "employeeId": "ou_primary",
+                                    "employeeName": "陈俊仁",
+                                    "employeeEmail": "chenjunren@amagency.biz",
+                                    "imapCode": "imap-chen-123",
+                                    "matchedBy": "owner_email",
+                                    "matchedValue": "chenjunren@amagency.biz",
+                                },
+                                {
+                                    "employeeRecordId": "rec_eden",
+                                    "employeeId": "ou_eden",
+                                    "employeeName": "Eden",
+                                    "employeeEmail": "eden@amagency.biz",
+                                    "imapCode": "imap-eden-456",
+                                    "matchedBy": "owner_email",
+                                    "matchedValue": "eden@amagency.biz",
+                                },
+                            ],
+                        }
+                    ]
+                },
+                "load_local_env": lambda env_file: {},
+                "run_keep_list_screening_pipeline": lambda **kwargs: {},
+                "run_task_upload_to_keep_list_pipeline": fake_run_task_upload_to_keep_list_pipeline,
+                "upload_final_review_payload_to_bitable": lambda client, **kwargs: {},
+            }
+
+            summary = pipeline.run_shared_mailbox_post_sync_pipeline(
+                shared_mail_db_path=shared_db_path,
+                shared_mail_raw_dir=shared_raw_dir,
+                shared_mail_data_dir=shared_root,
+                env_file=".env",
+                output_root=root / "run",
+            )
+
+        self.assertFalse(upstream_called)
+        self.assertEqual(summary["status"], "completed_with_failures")
+        self.assertEqual(summary["failed_record_count"], 1)
+        self.assertEqual(summary["task_names"], ["MINISO"])
+        task_result = summary["task_results"][0]
+        self.assertEqual(task_result["status"], "inspection_failed")
+        self.assertEqual(task_result["failure"]["error_code"], "TASK_OWNER_MATCH_AMBIGUOUS")
 
     def test_skipped_existing_rows_do_not_count_as_failures(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

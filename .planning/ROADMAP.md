@@ -13,6 +13,8 @@
 
 `Phase 23` 和 `Phase 24` 是在 decoupling proof 之后补录的 repo-local follow-up：前者把模板编译出的品牌视觉 prompt / feature contract 真正接回 runtime，后者把 visual-pass 之后的定位卡分析接入 downstream / final-wrapper 可观察 contract。2026-03-30 用户又把原本 deferred 的“本地薄 operator UI”提前拉进当前 roadmap，作为 local-only follow-up，不改写主 runner，只在现有 Flask/backend 和 single-entry pipeline 之上补一个控制页。
 
+2026-04-01 又登记了 next-milestone candidate `Phase 30`：共享邮箱 post-sync CLI / summary / regression surface 已经存在，但 `/operator` 仍默认指向旧的 task-driven wrapper。这个 phase 的重点不是重新发明 shared-mailbox mainline，而是把 operator UX、summary contract 和 dry-run/live guardrails 对齐到这条正式主线。
+
 ## Phases
 
 - [x] **Phase 20: Baseline legacy dependency surfaces and lock repo-local replacement contract** - 盘点 workbook / dashboard / project-home 的外部依赖触点并定义统一替换规则
@@ -25,6 +27,7 @@
 - [ ] **Phase 27: Reconstruct runtime safety proof and fallback certification for Phase 22** - 把 decoupled bounded regression 与 fallback contract 整理成正式的 Phase 22 planning / verification bundle
 - [ ] **Phase 28: Reconstruct visual runtime and positioning evidence chain for Phases 23-24** - 为 visual prompt contract 与 positioning-card analysis 补建缺失 phase artifacts，并补齐跨阶段验证链
 - [ ] **Phase 29: Reconstruct operator UI evidence bundle and milestone closeout consistency** - 为 operator UI 补建 Phase 25 planning bundle，并把 roadmap / state / audit closeout 口径收口一致
+- [ ] **Phase 30: Stabilize operator UI on shared mailbox post-sync mainline** - 让 `/operator` 默认切到共享邮箱 post-sync 正式主线，并暴露增量写回与本地归档 contract
 
 ## Progress
 
@@ -40,6 +43,7 @@
 | 27. Reconstruct runtime safety proof and fallback certification for Phase 22 | 0/2 | Planned | Pending |
 | 28. Reconstruct visual runtime and positioning evidence chain for Phases 23-24 | 0/3 | Planned | Pending |
 | 29. Reconstruct operator UI evidence bundle and milestone closeout consistency | 0/2 | Planned | Pending |
+| 30. Stabilize operator UI on shared mailbox post-sync mainline | 0/3 | Planned | Pending |
 
 ### Phase 20: Baseline legacy dependency surfaces and lock repo-local replacement contract
 
@@ -220,3 +224,19 @@ Plans:
 Plans:
 - [ ] 29-01: Recreate the missing Phase 25 planning bundle for the local operator UI
 - [ ] 29-02: Add operator verification coverage and align milestone closeout docs for re-audit
+
+### Phase 30: Stabilize operator UI on shared mailbox post-sync mainline
+
+**Goal**: 让 `/operator` 默认对齐共享邮箱 post-sync 正式主线，在不重跑 IMAP 的前提下消费预同步共享邮箱邮件库，按 task-upload 做增量分流，并把 per-task 筛号/邮件更新/飞书写回结果作为 operator-first contract 暴露出来。
+**Requirements**: [SMB-01, SMB-02, SMB-03]
+**Depends on:** Phase 29
+**Success Criteria** (what must be TRUE):
+  1. `/operator` / `api/operator/*` 默认启动 `scripts/run_shared_mailbox_post_sync_pipeline.py`，要求显式 shared mailbox db/raw/data 输入，并且不会在 operator 路径里重新触发 IMAP 抓信
+  2. operator 页面与 API 会直接暴露 shared-mailbox mainline 的 top-level 与 per-task 增量计数/产物，包括 `task_results`、mail-only/full-screening split、aggregate local archive，以及上传 payload/result 路径
+  3. 文档与回归覆盖留下 dry-run-first 的官方验证路径，并把 live writeback guardrails、owner ambiguity / duplicate guards、以及 mail-only update 边界说明清楚
+**Plans:** 3 plans
+
+Plans:
+- [ ] 30-01: Re-anchor operator backend launch and summary serialization to the shared-mailbox post-sync runner
+- [ ] 30-02: Update the operator console to drive shared-mailbox inputs and render per-task incremental outcomes
+- [ ] 30-03: Document and verify the shared-mailbox operator contract with dry-run-first guardrails

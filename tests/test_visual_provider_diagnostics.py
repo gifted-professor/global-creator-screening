@@ -377,6 +377,85 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
             ["Pass", "Pass"],
         )
 
+    def test_perform_scrape_retries_missing_profiles_after_main_batch_failure(self) -> None:
+        batch_calls = []
+
+        def fake_run_apify_batch(platform, batch, payload, progress_callback=None, cancel_check=None):
+            batch_calls.append(list(batch))
+            if batch == ["alpha"]:
+                if batch_calls.count(["alpha"]) == 1:
+                    raise backend_app.ApifyRuntimeError(
+                        "poll",
+                        "查询 Apify run 失败：HTTP 502 Bad Gateway",
+                        retryable=True,
+                        apify={"apify_run_id": "run-alpha-1", "apify_dataset_id": "dataset-alpha-1"},
+                    )
+                return {
+                    "success": True,
+                    "raw_items": [
+                        {
+                            "url": "https://instagram.com/alpha",
+                            "username": "alpha",
+                            "biography": "NYC creator",
+                            "latestPosts": [{"timestamp": "2026-03-29T00:00:00+00:00", "displayUrl": "https://example.com/a.jpg"}],
+                        }
+                    ],
+                    "apify": {"usage_total_usd": 0.05},
+                }
+            if batch == ["beta"]:
+                return {
+                    "success": True,
+                    "raw_items": [
+                        {
+                            "url": "https://instagram.com/beta",
+                            "username": "beta",
+                            "biography": "LA CA lifestyle",
+                            "latestPosts": [{"timestamp": "2026-03-29T00:00:00+00:00", "displayUrl": "https://example.com/b.jpg"}],
+                        }
+                    ],
+                    "apify": {"usage_total_usd": 0.04},
+                }
+            raise AssertionError(f"unexpected batch: {batch}")
+
+        with mock.patch.dict(backend_app.PLATFORM_BATCH_SIZES, {"instagram": 1}, clear=False), mock.patch.object(
+            backend_app,
+            "run_apify_batch",
+            side_effect=fake_run_apify_batch,
+        ), mock.patch.object(
+            backend_app,
+            "load_upload_metadata",
+            return_value={
+                "alpha": {"handle": "alpha", "region": "US"},
+                "beta": {"handle": "beta", "region": "US"},
+            },
+        ), mock.patch.object(
+            backend_app,
+            "load_active_rulespec",
+            return_value={},
+        ), mock.patch.object(
+            backend_app,
+            "write_json_file",
+        ), mock.patch.object(
+            backend_app,
+            "save_profile_reviews",
+        ):
+            result = backend_app.perform_scrape(
+                "instagram",
+                {"usernames": ["alpha", "beta"]},
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(batch_calls, [["alpha"], ["beta"], ["alpha"]])
+        self.assertEqual(result["retry_summary"]["initial_batch_failure_count"], 1)
+        self.assertEqual(result["retry_summary"]["attempt_count"], 1)
+        self.assertEqual(result["retry_summary"]["retried_identifier_count"], 1)
+        self.assertEqual(result["retry_summary"]["remaining_missing_count"], 0)
+        self.assertEqual(sorted(result["successful_identifiers"]), ["alpha", "beta"])
+        self.assertEqual(
+            [item["status"] for item in result["profile_reviews"]],
+            ["Pass", "Pass"],
+        )
+
     def test_probe_endpoint_returns_success_payload_for_selected_provider(self) -> None:
         os.environ["OPENAI_API_KEY"] = "sk-live-12345678"
 

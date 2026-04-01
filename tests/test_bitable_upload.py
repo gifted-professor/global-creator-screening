@@ -341,6 +341,62 @@ class BitableUploadTests(unittest.TestCase):
         self.assertEqual(gamma_update["fields"]["ai 是否通过"], "是")
         self.assertEqual(client.created_records[0]["fields"]["达人ID"], "delta")
 
+    def test_upload_payload_can_suppress_ai_labels(self) -> None:
+        client = _FakeBitableUploadClient()
+        resolved_view = ResolvedBitableView(
+            source_url="https://example.com/base/app?table=tbl&view=vew",
+            source_kind="base",
+            source_token="app_token",
+            app_token="app_token",
+            table_id="tbl",
+            view_id="vew",
+            table_name="达人管理",
+            view_name="总视图",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            payload_path = root / "payload.json"
+            payload_path.write_text(
+                json.dumps(
+                    {
+                        "rows": [
+                            {
+                                "达人ID": "alpha",
+                                "平台": "instagram",
+                                "主页链接": "https://www.instagram.com/alpha",
+                                "达人对接人": "陈俊仁",
+                                "达人对接人_employee_id": "ou_alpha",
+                                "ai是否通过": "是",
+                                "标签(ai)": "家庭用品和家电-家庭博主；美食",
+                                "ai评价": "nice",
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            with patch(
+                "feishu_screening_bridge.bitable_upload.resolve_bitable_view_from_url",
+                return_value=resolved_view,
+            ):
+                result = upload_final_review_payload_to_bitable(
+                    client,
+                    payload_json_path=payload_path,
+                    linked_bitable_url="https://example.com/base/app?table=tbl&view=vew",
+                    suppress_ai_labels=True,
+                )
+
+        self.assertTrue(result["suppress_ai_labels"])
+        self.assertEqual(result["created_count"], 1)
+        created_fields = client.created_records[0]["fields"]
+        self.assertEqual(created_fields["达人ID"], "alpha")
+        self.assertEqual(created_fields["ai 是否通过"], "是")
+        self.assertEqual(created_fields["ai 评价"], "nice")
+        self.assertNotIn("标签（ai）", created_fields)
+
     def test_upload_payload_matches_existing_records_when_feishu_returns_rich_text_lists(self) -> None:
         client = _FakeBitableUploadClient()
         client.search_items = [
