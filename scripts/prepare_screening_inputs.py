@@ -566,6 +566,173 @@ def clear_active_visual_prompts() -> None:
         active_path.unlink()
 
 
+def _append_prompt_platform(platforms: list[str], seen: set[str], candidate: Any) -> None:
+    normalized = backend_app.normalize_visual_prompt_lookup_key(candidate)
+    if normalized not in backend_app.PLATFORM_ACTORS or normalized in seen:
+        return
+    seen.add(normalized)
+    platforms.append(normalized)
+
+
+def resolve_runtime_prompt_platforms(
+    *,
+    active_rulespec: dict[str, Any] | None,
+    active_visual_prompts: dict[str, Any] | None,
+) -> list[str]:
+    platforms: list[str] = []
+    seen: set[str] = set()
+    prompt_payload = active_visual_prompts if isinstance(active_visual_prompts, dict) else {}
+    rulespec_payload = active_rulespec if isinstance(active_rulespec, dict) else {}
+
+    for container_key in ("platform_prompts", "platforms"):
+        container = prompt_payload.get(container_key)
+        if not isinstance(container, dict):
+            continue
+        for candidate_key, candidate_value in container.items():
+            if isinstance(candidate_value, dict):
+                _append_prompt_platform(platforms, seen, candidate_key)
+
+    for candidate_key, candidate_value in prompt_payload.items():
+        if candidate_key in {"platform_prompts", "platforms"}:
+            continue
+        if isinstance(candidate_value, dict):
+            _append_prompt_platform(platforms, seen, candidate_key)
+
+    overrides = rulespec_payload.get("platform_overrides")
+    if isinstance(overrides, dict):
+        for candidate_key in overrides.keys():
+            _append_prompt_platform(platforms, seen, candidate_key)
+
+    if not platforms:
+        platforms.extend(list(backend_app.PLATFORM_ACTORS.keys()))
+    return platforms
+
+
+def resolve_runtime_prompt_provider(provider_name: str = "") -> dict[str, Any]:
+    preflight = backend_app.build_vision_preflight(provider_name)
+    provider_snapshots = {
+        backend_app.normalize_vision_provider_name(item.get("name")): dict(item)
+        for item in (preflight.get("providers") or [])
+        if isinstance(item, dict)
+    }
+    requested_provider = backend_app.normalize_vision_provider_name(preflight.get("requested_provider") or provider_name)
+    preferred_provider = backend_app.normalize_vision_provider_name(preflight.get("preferred_provider"))
+    selected_provider = preferred_provider or requested_provider or "openai"
+    provider_source = (
+        "preferred_provider"
+        if preferred_provider
+        else ("requested_provider" if requested_provider else "default_openai")
+    )
+    selected_snapshot = provider_snapshots.get(selected_provider) or {}
+    selected_model = str(selected_snapshot.get("model") or "").strip()
+    if not selected_model:
+        for provider in backend_app.VISION_PROVIDER_CONFIGS:
+            if backend_app.normalize_vision_provider_name(provider.get("name")) != selected_provider:
+                continue
+            selected_model = str(backend_app.resolve_vision_provider_model(provider) or "").strip()
+            break
+    if not selected_model:
+        selected_model = str(getattr(backend_app, "DEFAULT_VISION_MODEL", "gpt-5.4") or "gpt-5.4").strip()
+    return {
+        "requested_provider": requested_provider,
+        "preferred_provider": preferred_provider,
+        "selected_provider": selected_provider,
+        "provider_source": provider_source,
+        "selected_model": selected_model,
+        "preflight_status": str(preflight.get("status") or "").strip(),
+        "preflight_message": str(preflight.get("message") or "").strip(),
+        "configured_provider_names": list(preflight.get("configured_provider_names") or []),
+        "runnable_provider_names": list(preflight.get("runnable_provider_names") or []),
+        "provider_snapshot": selected_snapshot,
+    }
+
+
+def build_runtime_prompt_artifacts(
+    *,
+    active_rulespec: dict[str, Any] | None,
+    active_visual_prompts: dict[str, Any] | None,
+    provider_name: str = "",
+) -> dict[str, Any]:
+    resolved_rulespec = active_rulespec if isinstance(active_rulespec, dict) else {}
+    resolved_visual_prompts = active_visual_prompts if isinstance(active_visual_prompts, dict) else {}
+    provider_resolution = resolve_runtime_prompt_provider(provider_name)
+    selected_provider = str(provider_resolution.get("selected_provider") or "").strip()
+    selected_model = str(provider_resolution.get("selected_model") or "").strip()
+    platforms = resolve_runtime_prompt_platforms(
+        active_rulespec=resolved_rulespec,
+        active_visual_prompts=resolved_visual_prompts,
+    )
+
+    platform_payloads: dict[str, Any] = {}
+    for platform in platforms:
+        visual_selection = backend_app.resolve_visual_review_prompt_selection(
+            selected_provider,
+            platform,
+            model_name=selected_model,
+            active_visual_prompts=resolved_visual_prompts,
+            active_rulespec=resolved_rulespec,
+        )
+        positioning_selection = backend_app.resolve_positioning_card_prompt_selection(
+            selected_provider,
+            platform,
+            model_name=selected_model,
+            active_rulespec=resolved_rulespec,
+        )
+        platform_payloads[platform] = {
+            "platform_label": backend_app.UPLOAD_PLATFORM_RESPONSE_LABELS.get(platform, platform),
+            "visual_review": {
+                "prompt_source": str(visual_selection.get("source") or "").strip(),
+                "visual_contract_source": str(visual_selection.get("visual_contract_source") or "").strip(),
+                "resolved_cover_limit": int(visual_selection.get("resolved_cover_limit") or 0),
+                "prompt": str(visual_selection.get("prompt") or ""),
+                "preview_prompt": backend_app.build_visual_review_prompt(
+                    selected_provider,
+                    platform,
+                    "{{username}}",
+                    model_name=selected_model,
+                ),
+            },
+            "positioning_card_analysis": {
+                "prompt_source": str(positioning_selection.get("source") or "").strip(),
+                "visual_contract_source": str(positioning_selection.get("visual_contract_source") or "").strip(),
+                "resolved_cover_limit": int(positioning_selection.get("resolved_cover_limit") or 0),
+                "prompt": str(positioning_selection.get("prompt") or ""),
+                "preview_prompt": backend_app.build_positioning_card_prompt(
+                    selected_provider,
+                    platform,
+                    "{{username}}",
+                    model_name=selected_model,
+                ),
+            },
+        }
+
+    return {
+        "generated_at": backend_app.iso_now(),
+        "provider": provider_resolution,
+        "platform_count": len(platform_payloads),
+        "platforms": platform_payloads,
+    }
+
+
+def write_runtime_prompt_artifacts(
+    *,
+    output_dir: Path,
+    active_rulespec: dict[str, Any] | None,
+    active_visual_prompts: dict[str, Any] | None,
+    provider_name: str = "",
+) -> tuple[dict[str, Any], Path]:
+    resolved_output_dir = output_dir.expanduser().resolve()
+    resolved_output_dir.mkdir(parents=True, exist_ok=True)
+    payload = build_runtime_prompt_artifacts(
+        active_rulespec=active_rulespec,
+        active_visual_prompts=active_visual_prompts,
+        provider_name=provider_name,
+    )
+    output_path = resolved_output_dir / "runtime_prompt_artifacts.json"
+    backend_app.write_json_file(str(output_path), payload)
+    return payload, output_path
+
+
 def prepare_upload_metadata(source_path: Path) -> dict[str, Any]:
     frames = load_upload_frames(source_path)
     if not frames:
@@ -678,6 +845,7 @@ def prepare_screening_inputs(
         "resolved_inputs": {},
         "preflight": {},
         "rulespec": {},
+        "prompts": {},
         "upload": {},
         "taskSource": {},
     }
@@ -760,10 +928,16 @@ def prepare_screening_inputs(
         rulespec_path = Path(report["artifacts"]["rulespec_json"])
         visual_prompts_path = Path(report["artifacts"]["visual_prompts_json"]) if report.get("artifacts", {}).get("visual_prompts_json") else None
         payload = persist_active_rulespec(rulespec_path)
+        active_visual_prompts_payload: dict[str, Any] = {}
         if visual_prompts_path is not None:
-            persist_active_visual_prompts(visual_prompts_path)
+            active_visual_prompts_payload = persist_active_visual_prompts(visual_prompts_path)
         else:
             clear_active_visual_prompts()
+        prompt_artifacts_payload, prompt_artifacts_path = write_runtime_prompt_artifacts(
+            output_dir=Path(report["output_dir"]),
+            active_rulespec=payload,
+            active_visual_prompts=active_visual_prompts_payload,
+        )
         summary["rulespec"] = {
             "source": "task_upload_template" if should_resolve_task_upload and template_workbook is None else "template_workbook",
             "template_workbook": str(resolved_template_workbook),
@@ -771,17 +945,39 @@ def prepare_screening_inputs(
             "compile_report_path": str(Path(report["output_dir"]) / "compile_report.json"),
             "rulespec_json_path": str(rulespec_path),
             "visual_prompts_json_path": str(visual_prompts_path) if visual_prompts_path is not None else "",
+            "runtime_prompt_artifacts_json_path": str(prompt_artifacts_path),
             "warning_count": len(report.get("warnings") or []),
             "rule_count": len(payload.get("rules") or []),
+            "runtime_prompt_platform_count": int(prompt_artifacts_payload.get("platform_count") or 0),
+        }
+        summary["prompts"] = {
+            "runtime_prompt_artifacts_json_path": str(prompt_artifacts_path),
+            "selected_provider": str((prompt_artifacts_payload.get("provider") or {}).get("selected_provider") or ""),
+            "selected_model": str((prompt_artifacts_payload.get("provider") or {}).get("selected_model") or ""),
+            "platform_count": int(prompt_artifacts_payload.get("platform_count") or 0),
         }
     elif rulespec_json is not None:
         payload = persist_active_rulespec(rulespec_json)
         clear_active_visual_prompts()
+        prompt_output_dir = Path(backend_app.TEMP_DIR) / "runtime_prompt_artifacts" / rulespec_json.stem
+        prompt_artifacts_payload, prompt_artifacts_path = write_runtime_prompt_artifacts(
+            output_dir=prompt_output_dir,
+            active_rulespec=payload,
+            active_visual_prompts={},
+        )
         summary["rulespec"] = {
             "source": "rulespec_json",
             "rulespec_json_path": str(rulespec_json),
             "visual_prompts_json_path": "",
             "rule_count": len(payload.get("rules") or []),
+            "runtime_prompt_artifacts_json_path": str(prompt_artifacts_path),
+            "runtime_prompt_platform_count": int(prompt_artifacts_payload.get("platform_count") or 0),
+        }
+        summary["prompts"] = {
+            "runtime_prompt_artifacts_json_path": str(prompt_artifacts_path),
+            "selected_provider": str((prompt_artifacts_payload.get("provider") or {}).get("selected_provider") or ""),
+            "selected_model": str((prompt_artifacts_payload.get("provider") or {}).get("selected_model") or ""),
+            "platform_count": int(prompt_artifacts_payload.get("platform_count") or 0),
         }
 
     if resolved_creator_workbook is not None:

@@ -79,6 +79,7 @@ class EmployeeDirectoryEntry:
     record_id: str
     employee_id: str
     employee_name: str
+    employee_english_name: str
     email: str
     imap_code: str
 
@@ -90,6 +91,19 @@ class TaskMailboxSelection:
     resolved_folder: str
     resolved_folders: list[str]
     fallback_reason: str
+
+
+def _serialize_employee_directory_entry(employee: EmployeeDirectoryEntry, *, matched_by: str, matched_value: str = "") -> dict[str, str]:
+    return {
+        "employeeRecordId": employee.record_id,
+        "employeeId": employee.employee_id,
+        "employeeName": employee.employee_name,
+        "employeeEnglishName": employee.employee_english_name,
+        "employeeEmail": employee.email,
+        "imapCode": employee.imap_code,
+        "matchedBy": matched_by,
+        "matchedValue": matched_value,
+    }
 
 
 def resolve_task_upload_entry(
@@ -223,12 +237,30 @@ def inspect_task_upload_assignments(
     for entry in entries:
         matched_by = ""
         employee: EmployeeDirectoryEntry | None = None
+        matched_employee_entries: list[dict[str, str]] = []
+        matched_employee_keys: set[str] = set()
         employee_id_key = _normalize_lookup_key(entry.employee_id)
-        owner_email_key = _normalize_lookup_key(entry.owner_email)
         task_key = _normalize_lookup_key(entry.task_name)
         preferred_owner_email = normalized_owner_email_overrides.get(task_key, "")
         preferred_owner_email_key = _normalize_lookup_key(preferred_owner_email)
         owner_email_candidates = list(entry.owner_email_candidates or ((entry.owner_email,) if entry.owner_email else ()))
+
+        def _append_match(candidate_employee: EmployeeDirectoryEntry | None, *, candidate_matched_by: str, candidate_value: str = "") -> None:
+            if candidate_employee is None:
+                return
+            candidate_key = _normalize_lookup_key(candidate_employee.record_id) or _normalize_lookup_key(candidate_employee.employee_id) or _normalize_lookup_key(candidate_employee.email)
+            if candidate_key and candidate_key in matched_employee_keys:
+                return
+            if candidate_key:
+                matched_employee_keys.add(candidate_key)
+            matched_employee_entries.append(
+                _serialize_employee_directory_entry(
+                    candidate_employee,
+                    matched_by=candidate_matched_by,
+                    matched_value=candidate_value,
+                )
+            )
+
         if preferred_owner_email_key:
             owner_email_candidates = [
                 candidate
@@ -240,20 +272,35 @@ def inspect_task_upload_assignments(
                 if _normalize_lookup_key(candidate) != preferred_owner_email_key
             ]
             for candidate in owner_email_candidates:
-                employee = employees_by_email.get(_normalize_lookup_key(candidate))
-                if employee is not None:
+                candidate_employee = employees_by_email.get(_normalize_lookup_key(candidate))
+                _append_match(candidate_employee, candidate_matched_by="owner_email_override", candidate_value=candidate)
+                if candidate_employee is not None:
+                    employee = candidate_employee
                     matched_by = "owner_email_override"
                     break
         if employee is None and employee_id_key:
-            employee = employees_by_id.get(employee_id_key)
-            if employee is not None:
+            candidate_employee = employees_by_id.get(employee_id_key)
+            _append_match(candidate_employee, candidate_matched_by="employee_id", candidate_value=entry.employee_id)
+            employee = candidate_employee
+            if candidate_employee is not None:
                 matched_by = "employee_id"
         if employee is None:
             for candidate in owner_email_candidates:
-                employee = employees_by_email.get(_normalize_lookup_key(candidate))
-                if employee is not None:
+                candidate_employee = employees_by_email.get(_normalize_lookup_key(candidate))
+                _append_match(candidate_employee, candidate_matched_by="owner_email", candidate_value=candidate)
+                if candidate_employee is not None:
+                    employee = candidate_employee
                     matched_by = "owner_email"
                     break
+        elif not preferred_owner_email_key:
+            for candidate in owner_email_candidates:
+                _append_match(
+                    employees_by_email.get(_normalize_lookup_key(candidate)),
+                    candidate_matched_by="owner_email",
+                    candidate_value=candidate,
+                )
+
+        owner_match_ambiguous = len(matched_employee_entries) > 1 and not preferred_owner_email_key
 
         saved_template_path = ""
         parse_requested = False
@@ -305,9 +352,13 @@ def inspect_task_upload_assignments(
             "sendingListFileName": entry.sending_list_file_name,
             "templateParseRequested": parse_requested,
             "employeeMatched": employee is not None,
+            "employeeMatches": matched_employee_entries,
+            "ownerMatchCount": len(matched_employee_entries),
+            "ownerMatchAmbiguous": owner_match_ambiguous,
             "matchedBy": matched_by,
             "employeeRecordId": employee.record_id if employee is not None else "",
             "employeeName": employee.employee_name if employee is not None else "",
+            "employeeEnglishName": employee.employee_english_name if employee is not None else "",
             "employeeEmail": employee.email if employee is not None else "",
             "imapCode": employee.imap_code if employee is not None else "",
         }
@@ -441,14 +492,14 @@ def sync_task_upload_mailboxes(
             employee_email = str(inspected.get("employeeEmail") or "").strip()
             imap_code = str(inspected.get("imapCode") or "").strip()
             has_employee_credentials = bool(employee_email and imap_code)
-            if has_employee_credentials:
-                resolved_account_email = employee_email
-                resolved_auth_code = imap_code
-                credential_source = "employee_directory"
-            elif default_credentials_requested:
+            if default_credentials_requested:
                 resolved_account_email = normalized_default_account_email
                 resolved_auth_code = normalized_default_auth_code
                 credential_source = "default_account"
+            elif has_employee_credentials:
+                resolved_account_email = employee_email
+                resolved_auth_code = imap_code
+                credential_source = "employee_directory"
             else:
                 resolved_account_email = employee_email
                 resolved_auth_code = imap_code
@@ -487,6 +538,7 @@ def sync_task_upload_mailboxes(
                 task_name=inspected["taskName"],
                 explicit_folder=requested_folder,
                 folder_prefixes=normalized_folder_prefixes,
+                prefer_shared_backup_folder=(credential_source == "default_account"),
             )
 
             db = Database(settings.db_path)
@@ -563,7 +615,7 @@ def sync_task_upload_mailboxes(
         "imapHost": str(imap_host or "imap.qq.com").strip() or "imap.qq.com",
         "imapPort": int(imap_port),
         "defaultCredentialMode": (
-            "employee_directory_preferred_with_default_fallback"
+            "default_account_preferred_with_employee_fallback"
             if default_credentials_requested
             else "employee_directory"
         ),
@@ -593,8 +645,18 @@ def sync_task_upload_view_to_email_project(
 
         entries = _fetch_task_upload_entries(client, task_upload_url)
         imported_items: list[dict[str, Any]] = []
+        skipped_items: list[dict[str, str]] = []
         latest_project_code = ""
         for entry in entries:
+            if not entry.workbook_file_token:
+                skipped_items.append(
+                    {
+                        "recordId": entry.record_id,
+                        "taskName": entry.task_name,
+                        "reason": "缺少 `需求上传（excel 格式）` 附件，已跳过。",
+                    }
+                )
+                continue
             saved_path = _download_task_upload_workbook(client, entry, download_root)
             project_code = _build_project_code(entry.task_name, prefix=project_code_prefix)
             primary_category = _resolve_primary_category(
@@ -653,6 +715,8 @@ def sync_task_upload_view_to_email_project(
             "projectStatePath": str(aggregate_project_state_path),
             "recordCount": len(entries),
             "importedCount": len(imported_items),
+            "skippedCount": len(skipped_items),
+            "skippedItems": skipped_items,
             "latestProjectCode": latest_project_code,
             "items": imported_items,
         }
@@ -702,8 +766,18 @@ def sync_task_upload_view_to_email_project(
 
     entries = _fetch_task_upload_entries(client, task_upload_url)
     imported_items: list[dict[str, Any]] = []
+    skipped_items: list[dict[str, str]] = []
     latest_project_code = ""
     for entry in entries:
+        if not entry.workbook_file_token:
+            skipped_items.append(
+                {
+                    "recordId": entry.record_id,
+                    "taskName": entry.task_name,
+                    "reason": "缺少 `需求上传（excel 格式）` 附件，已跳过。",
+                }
+            )
+            continue
         saved_path = _download_task_upload_workbook(client, entry, download_root)
         project_code = _build_project_code(entry.task_name, prefix=project_code_prefix)
         primary_category = _resolve_primary_category(
@@ -755,6 +829,8 @@ def sync_task_upload_view_to_email_project(
         "dashboardOutput": str(output_path),
         "recordCount": len(entries),
         "importedCount": len(imported_items),
+        "skippedCount": len(skipped_items),
+        "skippedItems": skipped_items,
         "items": imported_items,
     }
 
@@ -771,8 +847,6 @@ def _fetch_task_upload_entries(client: FeishuOpenClient, task_upload_url: str) -
             continue
         fields = item.get("fields") or {}
         workbook = _extract_attachment_with_file_token(fields.get("需求上传（excel 格式）"))
-        if not isinstance(workbook, dict):
-            continue
         sending_list = _extract_attachment_with_file_token(fields.get("发信名单"))
         task_name = _extract_text_like(fields.get("任务名")) or str(item.get("record_id") or "")
         owner_email_candidates = _extract_email_values(fields.get("负责人邮箱"))
@@ -790,8 +864,8 @@ def _fetch_task_upload_entries(client: FeishuOpenClient, task_upload_url: str) -
                 owner_email_candidates=owner_email_candidates,
                 responsible_name=responsible_name,
                 linked_bitable_url=linked_bitable_url,
-                workbook_file_token=str(workbook.get("file_token") or "").strip(),
-                workbook_file_name=str(workbook.get("name") or "").strip() or "screening.xlsx",
+                workbook_file_token=str((workbook or {}).get("file_token") or "").strip(),
+                workbook_file_name=str((workbook or {}).get("name") or "").strip() or "screening.xlsx",
                 sending_list_file_token=str((sending_list or {}).get("file_token") or "").strip(),
                 sending_list_file_name=str((sending_list or {}).get("name") or "").strip() or "creator-source.xlsx",
             )
@@ -817,6 +891,11 @@ def _fetch_employee_directory_entries(client: FeishuOpenClient, employee_info_ur
                 employee_name=_first_non_empty(
                     _extract_person_name(fields.get("员工名")),
                     _extract_text_like(fields.get("员工名")),
+                ),
+                employee_english_name=_first_non_empty(
+                    _extract_text_like(fields.get("英文名")),
+                    _extract_text_like(fields.get("英文名字")),
+                    _extract_person_english_name(fields.get("员工名")),
                 ),
                 email=_first_non_empty(
                     _extract_email_value(fields.get("邮箱")),
@@ -964,6 +1043,7 @@ def _resolve_task_mailbox_selection(
     task_name: str,
     explicit_folder: str = "",
     folder_prefixes: list[str] | tuple[str, ...] | None = None,
+    prefer_shared_backup_folder: bool = False,
 ) -> TaskMailboxSelection:
     selectable = resolve_mailboxes(discovered_mailboxes, None)
     try:
@@ -983,6 +1063,16 @@ def _resolve_task_mailbox_selection(
     except ValueError as exc:
         if not selectable:
             raise
+        if prefer_shared_backup_folder:
+            backup_folder = _find_shared_backup_mailbox(selectable)
+            if backup_folder:
+                return TaskMailboxSelection(
+                    strategy="shared_backup_folder",
+                    requested_folders=[backup_folder],
+                    resolved_folder=backup_folder,
+                    resolved_folders=[backup_folder],
+                    fallback_reason=str(exc),
+                )
         return TaskMailboxSelection(
             strategy="all_selectable_fallback",
             requested_folders=None,
@@ -990,6 +1080,25 @@ def _resolve_task_mailbox_selection(
             resolved_folders=[mailbox.display_name for mailbox in selectable],
             fallback_reason=str(exc),
         )
+
+
+def _find_shared_backup_mailbox(selectable: list[MailboxInfo]) -> str:
+    preferred_names = (
+        "其他文件夹/邮件备份",
+        "邮件备份",
+    )
+    normalized_preferred = {_normalize_lookup_key(name) for name in preferred_names}
+    for mailbox in selectable:
+        display_name = str(mailbox.display_name or "").strip()
+        normalized = _normalize_lookup_key(display_name)
+        if normalized in normalized_preferred:
+            return display_name
+    for mailbox in selectable:
+        display_name = str(mailbox.display_name or "").strip()
+        normalized = _normalize_lookup_key(display_name)
+        if normalized.endswith("/邮件备份") or normalized.endswith("邮件备份"):
+            return display_name
+    return ""
 
 
 def _parse_task_upload_workbook(*, workbook_path: Path, output_root: Path) -> dict[str, Any]:
@@ -1262,6 +1371,22 @@ def _extract_person_name(value: Any) -> str:
     return _extract_text_like(value)
 
 
+def _extract_person_english_name(value: Any) -> str:
+    if isinstance(value, list):
+        person = value[0] if value else None
+        if isinstance(person, dict):
+            candidate = _normalize_text(person.get("en_name"))
+            if candidate:
+                return candidate
+            fallback = _normalize_text(person.get("name"))
+            if _looks_like_english_name(fallback):
+                return fallback
+    fallback = _extract_text_like(value)
+    if _looks_like_english_name(fallback):
+        return fallback
+    return ""
+
+
 def _extract_mention_link(value: Any) -> str:
     if isinstance(value, dict):
         return _normalize_text(value.get("link") or value.get("url"))
@@ -1362,6 +1487,15 @@ def _normalize_blank(value: str) -> str:
     if normalized in {"", "/", "／", "无", "None", "none"}:
         return ""
     return normalized
+
+
+def _looks_like_english_name(value: str) -> bool:
+    candidate = _normalize_text(value)
+    if not candidate:
+        return False
+    if re.search(r"[\u4e00-\u9fff]", candidate):
+        return False
+    return bool(re.search(r"[A-Za-z]", candidate))
 
 
 def _normalize_lookup_key(value: str) -> str:

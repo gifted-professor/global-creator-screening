@@ -126,6 +126,64 @@ class SyncWorkersTests(unittest.TestCase):
         raw_files = sorted(path.name for path in self.settings.raw_dir.rglob("*.eml"))
         self.assertEqual(raw_files, ["1001_1.eml", "1001_2.eml", "1001_3.eml"])
 
+    def test_shared_backup_retry_reconnects_and_resumes_from_last_checkpoint(self) -> None:
+        shared_backup = MailboxInfo(
+            display_name="其他文件夹/邮件备份",
+            imap_name="其他文件夹/邮件备份",
+            delimiter="/",
+            flags=["\\HasNoChildren"],
+        )
+        search_calls: list[int] = []
+        fetch_calls: list[int] = []
+
+        def fake_search(client, last_seen_uid, sent_since=None):
+            search_calls.append(last_seen_uid)
+            return [uid for uid in (1, 2, 3) if uid > last_seen_uid]
+
+        def fake_fetch_raw_message(client, uid):
+            fetch_calls.append(uid)
+            if uid == 2 and fetch_calls.count(2) == 1:
+                raise RuntimeError("command: UID => socket error: EOF")
+            return {
+                "uid": uid,
+                "flags": ["\\Seen"],
+                "internal_date_raw": "31-Mar-2026 09:00:00 +0800",
+                "size_bytes": 100 + uid,
+                "raw_bytes": f"raw-{uid}".encode("utf-8"),
+            }
+
+        def fake_build_fetched_message(settings, mailbox, uidvalidity, payload):
+            uid = int(payload["uid"])
+            return FetchedMessage(parsed=_make_parsed(uid), raw_bytes=payload["raw_bytes"])
+
+        with patch("email_sync.imap_sync.connect", side_effect=lambda settings: _FakeImapClient()):
+            with patch("email_sync.imap_sync.discover_mailboxes", return_value=[shared_backup]):
+                with patch("email_sync.imap_sync._search_uids", side_effect=fake_search):
+                    with patch("email_sync.imap_sync._fetch_raw_message", side_effect=fake_fetch_raw_message):
+                        with patch("email_sync.imap_sync._build_fetched_message", side_effect=fake_build_fetched_message):
+                            results = sync_mailboxes(self.settings, self.db, requested_folders=[shared_backup.display_name], workers=1)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].fetched, 3)
+        self.assertEqual(results[0].last_seen_uid, 3)
+        self.assertEqual(search_calls, [0, 1])
+        self.assertEqual(fetch_calls, [1, 2, 2, 3])
+
+        state = self.db.get_sync_state("demo@qq.com", shared_backup.display_name)
+        self.assertIsNotNone(state)
+        assert state is not None
+        self.assertEqual(state["last_seen_uid"], 3)
+        self.assertEqual(state["last_run_synced"], 3)
+
+        retry_errors = list(
+            self.db.conn.execute(
+                "SELECT stage, error_message FROM sync_errors WHERE folder_name = ? ORDER BY id",
+                (shared_backup.display_name,),
+            ).fetchall()
+        )
+        self.assertEqual(len(retry_errors), 1)
+        self.assertEqual(retry_errors[0]["stage"], "folder_retry")
+
 
 if __name__ == "__main__":
     unittest.main()

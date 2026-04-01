@@ -2,13 +2,13 @@
 gsd_state_version: 1.0
 milestone: v1.3.0
 milestone_name: External Email Dependency Decoupling
-status: ready_for_milestone_audit
-stopped_at: Phase 25 completed on 2026-03-30; next workflow step is `$gsd-audit-milestone`
-last_updated: "2026-03-30T15:07:01+08:00"
+status: ready_for_phase_planning
+stopped_at: Gap-closure phases 26-29 remain the next milestone route; quick tasks `260401-el2`, `260401-f93`, `260401-hic`, and the expanded `260401-jgj` runbook/retro docs all landed on 2026-04-01; next roadmap step is still `$gsd-plan-phase 26`, while shared-mailbox task-name runs now have fresh `SKG` evidence for `455 -> 455` scrape closure and successful chunked live writeback
+last_updated: "2026-04-01T15:18:00+08:00"
 progress:
-  total_phases: 6
+  total_phases: 10
   completed_phases: 6
-  total_plans: 13
+  total_plans: 22
   completed_plans: 13
 ---
 
@@ -19,12 +19,12 @@ progress:
 See: .planning/PROJECT.md (updated 2026-03-30)
 
 **Core value:** 在不打断现有本地工作流的前提下，把飞书内容获取、筛选导入和相关配置集中到一个可持续维护的仓库里。
-**Current focus:** Milestone closeout after Phase 25 local operator UI delivery
+**Current focus:** Plan and execute gap-closure phases 26-29 so `v1.3.0` can pass re-audit
 
 ## Current Position
 
-Phase: 25 (Build local thin operator UI for task-driven screening runs) — COMPLETED
-Plan: 2 of 2 completed
+Gap-closure planning ready: `v1.3.0` phases `26-29`
+Current route: plan Phase 26, then close remaining audit evidence gaps before re-audit
 
 ## Performance Metrics
 
@@ -60,6 +60,10 @@ Plan: 2 of 2 completed
 | 23 | 3 | n/a | n/a |
 | 24 | 2 | n/a | n/a |
 | 25 | 2 | n/a | n/a |
+| 26 | 2 | n/a | n/a |
+| 27 | 2 | n/a | n/a |
+| 28 | 3 | n/a | n/a |
+| 29 | 2 | n/a | n/a |
 
 **Recent Trend:**
 
@@ -162,15 +166,27 @@ Recent decisions affecting current work:
 - Phase 23 added: Wire template-compiled visual prompts into runtime and define visual feature-group contract
 - Phase 24 added: Add post-visual-review positioning-card analysis step for approved creators
 - Phase 25 added: Build local thin operator UI for task-driven screening runs
+- Phase 25.1 inserted after Phase 25: Fix MINISO LLM auth failures, redact summary secrets, surface missing duet sending-list diagnostics, and clarify LLM stage observability (URGENT)
+- Phase 26 added: Backfill decoupling verification bundle for Phases 20-21
+- Phase 27 added: Reconstruct runtime safety proof and fallback certification for Phase 22
+- Phase 28 added: Reconstruct visual runtime and positioning evidence chain for Phases 23-24
+- Phase 29 added: Reconstruct operator UI evidence bundle and milestone closeout consistency
+- Phase 30 added: Stabilize operator UI on shared mailbox post-sync mainline
 
 ### Pending Todos
 
-- Milestone audit / closeout: 执行 `v1.3.0` closeout，确认 Phases 20-25 与 deferred follow-ups 的边界
-- Milestone closeout: `v1.3.0` 的 audit / closeout 顺延到 Phase 25 完成之后，再一起确认 Phases 20-25 与 deferred follow-ups 的边界
+- Phase 25.1 execution: 收口 upstream summary 脱敏、`发信名单` 缺件诊断、以及 LLM review auth / stage observability
+- Phase 26 planning: 为 Phases 20-21 补齐 verification bundle、summary frontmatter 与 DEP traceability 收口
+- Phase 27 planning: 重建 Phase 22 planning/sumary/verification artifact，并把 bounded proof 与 fallback contract 固化到正式 phase 文档
+- Phase 28 planning: 补建 Phase 23 artifact bundle，并为 Phase 24 增加正式 verification 和 `23 -> 24` integration 证据
+- Phase 29 planning: 补建 Phase 25 operator UI artifact bundle，并收口 roadmap/state/audit closeout 口径
+- Milestone closeout: gap phases 完成后重新执行 `v1.3.0` audit / closeout，再确认 deferred follow-ups 边界
+- Phase 30 planning bundle: 共享邮箱 post-sync + operator UI stabilization context/plans 归档在 `.planning/phases/30-stabilize-operator-ui-on-shared-mailbox-post-sync-mainline/`；执行仍排在 `v1.3.0` closeout 之后
 - Deferred debt intake: `backend/app.py` 模块化 + app factory、shared settings loader、`pipeline_runtime.py` 抽取、SQLite WAL/FTS、upload/job hardening、LLM config consolidation、`pyproject.toml`/lint/typecheck、以及 workbook handle cleanup
 
 ### Blockers/Concerns
 
+- Phase 25.1 当前是基于用户提供的 `temp/miniso_step1_keep_list_20260331_1611` 与 `temp/duet_full_rerun_20260331_1606` 结论来 planning；这两个 run root 目前不在工作区里，执行时应优先保住 fixture/regression 覆盖，并在拿到真实 artifact 后再补 live 证据
 - 当前仓库仍要兼容 lite `active_rulespec.json`；后续优化不能假设所有入口都会先产出 full `rules`
 - 外部 qwen benchmark 仍在 sibling docs；后续 prompt 调优应继续走 override / benchmark route，而不是把 sibling benchmark 文件迁入变成阻塞项
 - UI v1 不能假设统一邮箱 `partnerships@amagency.biz` 已经通过 IMAP 暴露 `邮件备份(30316)` 或项目专属目录；默认执行路径要继续沿用已验证的老邮箱 route
@@ -202,6 +218,10 @@ Recent decisions affecting current work:
 - 2026-03-27: Complete Phase 12 12-02 by generating real `llm_review / reviewed / keep` outputs; live validation succeeded with the legacy DeepSeek provider after the current 998Code endpoint proved unstable
 - 2026-03-28: Complete Phase 13 13-01 by accepting reviewed keep workbooks as staging input, adding `scripts/run_keep_list_screening_pipeline.py`, and validating real MINISO staged counts (`TikTok 122 / Instagram 146 / YouTube 15`)
 - 2026-03-28: Complete Phase 13 13-02 by running a bounded real MINISO keep-list downstream validation (`instagram` 1 identifier), reaching scrape, prescreen, visual-review invocation, and export download under `temp/keep_list_bounded_live_validation_escalated`
+- 2026-04-01: Complete quick task `260401-el2` so shared-mailbox post-sync collapses identical `SKG-1/2` task rows into one logical `SKG` run and routes `达人对接人` row-by-row from mail content via employee English names (`Rhea` / `Lilith`)
+- 2026-04-01: Complete quick task `260401-f93` so shared-mailbox post-sync keeps local `标签(ai)` diagnostics but suppresses `标签（ai）` during Feishu writeback, clearing the task-name route for dry-run-first execution
+- 2026-04-01: Complete quick task `260401-hic` so shared-mailbox post-sync brand-keyword matching now defaults to include `from`, fixing reply-side sender cases like `chanel@arsagendi.com` without changing the old task-driven default
+- 2026-04-01: Complete quick task `260401-jgj` by adding and then expanding the root-level shared-mailbox post-sync docs so they now cover the current `SKG` mainline, `SKG-1/2 -> SKG` grouping, `from`-side matching, owner routing, scrape / `Missing` / retry / export-block semantics, customer-side field reality, and the full `SKG` live writeback retro including filtered chunked resume to `455/455` keys in Feishu
 - 2026-03-28: Complete Phase 14 14-01 by adding backend vision provider snapshot/preflight diagnostics, exposing them through `/api/health`, and returning structured preflight errors on visual-review start
 - 2026-03-28: Complete Phase 14 14-02 by wiring backend `vision_preflight` into keep-list/smoke summaries, updating README operator docs, and leaving a fresh diagnostic artifact under `temp/keep_list_visual_diagnostic_phase14`
 - 2026-03-28: Complete Phase 15 15-01 by adding explicit visual provider selection, a lightweight live provider probe endpoint, and runner support for `--vision-provider` / `--probe-vision-provider-only`
@@ -223,6 +243,14 @@ Recent decisions affecting current work:
 - 2026-03-29: Complete Phase 19 19-03 by tightening visual preferred-pool retry behavior, normalizing model diagnostics, preserving `completed_with_partial_scrape` in the final wrapper, and aligning README/operator docs
 - 2026-03-30: Quick Task `260330-bsm` — add one automatic Missing re-scrape pass before final export, keep blocking remaining Missing from downstream export, and record artifacts under `.planning/quick/260330-bsm-missing-missing-300-250-missing-final-ex/`
 - 2026-03-30: Quick Task `260330-gqs` — default task-upload mail sync to `partnerships@amagency.biz`, surface credential source in keep-list summary, and verify with targeted tests plus one bounded live `MINISO` mail-sync probe under `.planning/quick/260330-gqs-partnerships-amagency-biz-xyegkynmk5jfn7/`
+- 2026-03-31: Quick Task `260331-gn2` — validate local `CLIProxyAPI -> gpt-5.4` text/image HTTP paths and confirm the existing `openai` vision provider is wire-compatible with `OPENAI_BASE_URL=http://127.0.0.1:8317/v1`
+- 2026-03-31: Quick Task `260331-gru` — switch this machine's default `openai` vision provider in `.env.local` to local `CLIProxyAPI -> gpt-5.4` and verify both `/chat/completions` and `/responses` succeed with the new config
+- 2026-03-31: Quick Task `260331-h43` — keep the local `CLIProxyAPI openai` provider guard in code, revert this machine's default visual concurrency back to `6`, and re-verify `6`-way project-code visual review runs
+- 2026-03-31: Quick Task `260331-hf8` — verify shared mailbox `partnerships@amagency.biz` on enterprise IMAP, confirm `MINISO` mail lives under `其他文件夹/邮件备份`, and prove retrieval with a repo-local recent-mail sample under `.planning/quick/260331-hf8-partnerships-amagency-biz-imap-miniso/`
+- 2026-03-31: Quick Task `260331-jq7` — bind final-review payloads to carry row-level raw `.eml` attachment candidates plus shared workbook candidates, and teach the Feishu bitable uploader to populate attachment fields from local files
+- 2026-03-31: Quick Task `260331-k2m` — switch default mail sync routing to shared mailbox first, default sent-since to today, and prefer `其他文件夹/邮件备份` when the shared mailbox lacks a task-specific folder
+- 2026-03-31: Quick Task `260331-m9r` — add shared-backup IMAP retry/reconnect/resume semantics so `其他文件夹/邮件备份` can continue from the latest synced UID after retryable `EOF` failures
+- 2026-03-31: Quick Task `260331-m9z` — export resolved runtime LLM prompt artifacts after task-upload template download, surface them through `prepare_screening_inputs` / upstream keep-list summary / final-export wrapper, and verify with targeted prompt-artifact tests
 - 2026-03-31: Remove remaining `.planning` absolute workstation paths so the repo can move under a new parent directory without stale local path references
 - 2026-03-29: Clarify in README/PROJECT that the Phase 18 bounded proof only proves the repo-local single-entry mainline, not full-batch or multi-platform stability, full legacy-entry decoupling, or non-`openai` provider readiness
 - 2026-03-29: Intake external qwen prompt benchmark into local context: future visual tuning should prefer dual-prompt routing (`gpt-5.4` original + `qwen-vl-max` v2) with fixed benchmark harness instead of more blind prompt chasing
@@ -234,6 +262,6 @@ Recent decisions affecting current work:
 
 ## Session Continuity
 
-Last session: 2026-03-30 15:07
-Stopped at: Phase 25 completed on 2026-03-30; next workflow step is `$gsd-audit-milestone`
+Last session: 2026-03-31 11:35
+Stopped at: Gap-closure phases 26-29 created; next workflow step is `$gsd-plan-phase 26`
 Resume file: None

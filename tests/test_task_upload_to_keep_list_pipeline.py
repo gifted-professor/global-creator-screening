@@ -9,6 +9,10 @@ from harness.contract import RUN_CONTRACT_VERSION
 import scripts.run_task_upload_to_keep_list_pipeline as task_runner
 
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+FIXTURE_TEMPLATE = REPO_ROOT / "tests" / "fixtures" / "template_parser" / "11.xlsx"
+
+
 class TaskUploadToKeepListPipelineTests(unittest.TestCase):
     def setUp(self) -> None:
         self.original_loader = task_runner._load_runtime_dependencies
@@ -84,6 +88,24 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
         self.assertEqual(args.brand_keyword, "MINISO")
         self.assertTrue(args.brand_match_include_from)
         self.assertEqual(args.stop_after, "shared-resolution")
+
+    def test_parser_accepts_existing_mail_db_options(self) -> None:
+        parser = task_runner.build_parser()
+        args = parser.parse_args(
+            [
+                "--task-name",
+                "MINISO",
+                "--existing-mail-db-path",
+                "/tmp/shared/email_sync.db",
+                "--existing-mail-raw-dir",
+                "/tmp/shared/raw",
+                "--existing-mail-data-dir",
+                "/tmp/shared",
+            ]
+        )
+        self.assertEqual(args.existing_mail_db_path, "/tmp/shared/email_sync.db")
+        self.assertEqual(args.existing_mail_raw_dir, "/tmp/shared/raw")
+        self.assertEqual(args.existing_mail_data_dir, "/tmp/shared")
 
     def test_runner_records_structured_preflight_failure_when_feishu_credentials_missing(self) -> None:
         task_runner._load_runtime_dependencies = lambda: {
@@ -395,7 +417,7 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
         self.assertIn("exists", summary["resolved_inputs"]["env_file"])
         self.assertEqual(summary["resolved_inputs"]["env_file"]["path"], str(env_path.resolve()))
         self.assertEqual(summary["resolved_inputs"]["feishu"]["task_upload_url_source"], "env_file")
-        self.assertEqual(summary["resolved_inputs"]["mail_sync"]["sent_since_source"], "default_recent_3_calendar_months")
+        self.assertEqual(summary["resolved_inputs"]["mail_sync"]["sent_since_source"], "default_today_only")
         self.assertEqual(task_spec["scope"], "task-upload-to-keep-list")
         self.assertEqual(task_spec["canonical_boundary"], "keep-list")
         self.assertEqual(task_spec["intent"]["task_name"], "MINISO")
@@ -422,6 +444,71 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
             persisted["resume_points"]["llm_candidates"]["llm_review_input_prefix"],
             summary["artifacts"]["llm_review_input_prefix"],
         )
+
+    def test_runner_keeps_task_assets_boundary_pure_when_stopped_early(self) -> None:
+        class FakeClient:
+            pass
+
+        def fake_load_local_env(env_file):
+            return {
+                "FEISHU_APP_ID": "app-id",
+                "FEISHU_APP_SECRET": "app-secret",
+                "TASK_UPLOAD_URL": "https://env.example/task",
+                "EMPLOYEE_INFO_URL": "https://env.example/employee",
+            }
+
+        def fake_get_preferred_value(cli_value, env_values, env_key, default=""):
+            return str(cli_value or "").strip() or str(env_values.get(env_key, default) or "").strip()
+
+        def fake_download_task_upload_screening_assets(**kwargs):
+            download_dir = Path(kwargs["download_dir"])
+            sending_list_path = download_dir / "miniso_sending_list.xlsx"
+            download_dir.mkdir(parents=True, exist_ok=True)
+            sending_list_path.touch()
+            return {
+                "recordId": "rec123",
+                "taskName": "MINISO",
+                "linkedBitableUrl": "https://bitable.example/miniso",
+                "templateDownloadedPath": str(FIXTURE_TEMPLATE),
+                "sendingListDownloadedPath": str(sending_list_path),
+            }
+
+        task_runner._load_runtime_dependencies = lambda: {
+            "Settings": object,
+            "Database": object,
+            "FeishuOpenClient": lambda **kwargs: FakeClient(),
+            "DEFAULT_FEISHU_BASE_URL": "https://open.feishu.cn",
+            "download_task_upload_screening_assets": fake_download_task_upload_screening_assets,
+            "sync_task_upload_mailboxes": lambda **kwargs: (_ for _ in ()).throw(AssertionError("mail sync should not run")),
+            "match_brand_keyword": lambda **kwargs: (_ for _ in ()).throw(AssertionError("fast path should not run")),
+            "resolve_shared_email_candidates": lambda **kwargs: (_ for _ in ()).throw(AssertionError("shared resolution should not run")),
+            "run_shared_email_final_review": lambda **kwargs: (_ for _ in ()).throw(AssertionError("shared final review should not run")),
+            "enrich_creator_workbook": lambda **kwargs: (_ for _ in ()).throw(AssertionError("enrichment should not run")),
+            "prepare_llm_review_candidates": lambda **kwargs: (_ for _ in ()).throw(AssertionError("llm candidates should not run")),
+            "run_and_apply_llm_review": lambda **kwargs: (_ for _ in ()).throw(AssertionError("llm review should not run")),
+            "resolve_sync_sent_since": lambda value: __import__("datetime").date(2025, 12, 27),
+            "load_local_env": fake_load_local_env,
+            "get_preferred_value": fake_get_preferred_value,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            summary = task_runner.run_task_upload_to_keep_list_pipeline(
+                task_name="MINISO",
+                env_file=".env",
+                output_root=temp_root / "run",
+                task_upload_url="https://cli.example/task",
+                employee_info_url="https://cli.example/employee",
+                feishu_app_id="app-id",
+                feishu_app_secret="app-secret",
+                stop_after="task-assets",
+            )
+
+        self.assertEqual(summary["status"], "stopped_after_task-assets")
+        self.assertEqual(summary["steps"]["task_assets"]["status"], "completed")
+        self.assertEqual(summary["artifacts"].get("template_prepare_summary_json", ""), "")
+        self.assertEqual(summary["artifacts"].get("template_runtime_prompt_artifacts_json", ""), "")
+        self.assertNotIn("template_prompt_artifacts", summary["steps"]["task_assets"])
 
     def test_runner_passes_owner_email_overrides_to_mail_sync(self) -> None:
         observed: dict[str, object] = {}
@@ -573,6 +660,176 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
 
         self.assertEqual(observed["owner_email_overrides"], {"MINISO": "eden@amagency.biz"})
         self.assertEqual(summary["resolved_inputs"]["mail_sync"]["owner_email_overrides"], {"MINISO": "eden@amagency.biz"})
+
+    def test_runner_can_reuse_existing_shared_mail_db_without_running_imap_sync(self) -> None:
+        class FakeClient:
+            pass
+
+        class FakeDb:
+            def __init__(self, db_path):
+                self.db_path = Path(db_path)
+
+            def close(self):
+                return None
+
+        def fake_load_local_env(env_file):
+            return {
+                "FEISHU_APP_ID": "app-id",
+                "FEISHU_APP_SECRET": "app-secret",
+                "TASK_UPLOAD_URL": "https://env.example/task",
+                "EMPLOYEE_INFO_URL": "https://env.example/employee",
+                "TIMEOUT_SECONDS": "30",
+                "EMAIL_ACCOUNT": "partnerships@amagency.biz",
+                "EMAIL_AUTH_CODE": "secret",
+            }
+
+        def fake_get_preferred_value(cli_value, env_values, env_key, default=""):
+            return str(cli_value or "").strip() or str(env_values.get(env_key, default) or "").strip()
+
+        def fake_download_task_upload_screening_assets(**kwargs):
+            download_dir = Path(kwargs["download_dir"])
+            template_path = download_dir / "miniso_template.xlsx"
+            sending_list_path = download_dir / "miniso_sending_list.xlsx"
+            template_path.parent.mkdir(parents=True, exist_ok=True)
+            template_path.touch()
+            sending_list_path.touch()
+            return {
+                "recordId": "rec123",
+                "taskName": "MINISO",
+                "linkedBitableUrl": "https://bitable.example/miniso",
+                "templateDownloadedPath": str(template_path),
+                "sendingListDownloadedPath": str(sending_list_path),
+            }
+
+        def fake_inspect_task_upload_assignments(**kwargs):
+            return {
+                "items": [
+                    {
+                        "recordId": "rec123",
+                        "taskName": "MINISO",
+                        "employeeId": "ou_alpha",
+                        "employeeRecordId": "rec_emp",
+                        "employeeName": "陈俊仁",
+                        "employeeEmail": "chenjunren@amagency.biz",
+                        "responsibleName": "陈俊仁",
+                        "ownerName": "陈俊仁",
+                        "linkedBitableUrl": "https://bitable.example/miniso",
+                    }
+                ]
+            }
+
+        def fail_sync_task_upload_mailboxes(**kwargs):
+            raise AssertionError("should not call IMAP sync when existing_mail_db_path is provided")
+
+        def fake_match_brand_keyword(*, db, input_path, output_prefix, keyword, include_from):
+            all_xlsx = output_prefix.with_suffix(".xlsx")
+            deduped_xlsx = output_prefix.with_name(f"{output_prefix.name}_去重").with_suffix(".xlsx")
+            unique_xlsx = output_prefix.with_name(f"{output_prefix.name}_唯一邮箱").with_suffix(".xlsx")
+            shared_xlsx = output_prefix.with_name(f"{output_prefix.name}_共享邮箱").with_suffix(".xlsx")
+            for path in (all_xlsx, deduped_xlsx, unique_xlsx, shared_xlsx):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+            return {
+                "source_kind": "sending_list",
+                "message_hit_count": 1,
+                "matched_email_count": 1,
+                "email_direct_match_row_count": 1,
+                "profile_deduped_row_count": 1,
+                "unique_email_row_count": 1,
+                "shared_email_row_count": 0,
+                "shared_email_group_count": 0,
+                "xlsx_path": str(all_xlsx),
+                "deduped_xlsx_path": str(deduped_xlsx),
+                "unique_xlsx_path": str(unique_xlsx),
+                "shared_xlsx_path": str(shared_xlsx),
+            }
+
+        def fake_resolve_shared_email_candidates(*, db, input_path, output_prefix):
+            resolved_xlsx = output_prefix.with_suffix(".xlsx")
+            unresolved_xlsx = output_prefix.with_name(f"{output_prefix.name}_待复核").with_suffix(".xlsx")
+            jsonl_path = output_prefix.with_name(f"{output_prefix.name}_llm_candidates").with_suffix(".jsonl")
+            for path in (resolved_xlsx, unresolved_xlsx, jsonl_path):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+            return {
+                "resolved_group_count": 0,
+                "resolved_row_count": 0,
+                "unresolved_group_count": 0,
+                "unresolved_row_count": 0,
+                "llm_candidate_group_count": 0,
+                "resolved_xlsx_path": str(resolved_xlsx),
+                "unresolved_xlsx_path": str(unresolved_xlsx),
+                "llm_candidates_jsonl_path": str(jsonl_path),
+            }
+
+        def fake_run_shared_email_final_review(*, input_prefix, env_path, auto_keep_paths, base_url, api_key, model, wire_api):
+            review_jsonl = input_prefix.with_name(f"{input_prefix.name}_llm_review").with_suffix(".jsonl")
+            resolved_xlsx = input_prefix.with_name(f"{input_prefix.name}_llm_resolved").with_suffix(".xlsx")
+            manual_tail_xlsx = input_prefix.with_name(f"{input_prefix.name}_manual_tail").with_suffix(".xlsx")
+            keep_xlsx = input_prefix.with_name(f"{input_prefix.name}_final_keep").with_suffix(".xlsx")
+            for path in (review_jsonl, resolved_xlsx, manual_tail_xlsx, keep_xlsx):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+            return {
+                "review_group_count": 0,
+                "llm_resolved_row_count": 0,
+                "manual_row_count": 0,
+                "final_keep_row_count": 0,
+                "retryable_failure_count": 0,
+                "llm_review_jsonl_path": str(review_jsonl),
+                "llm_resolved_xlsx_path": str(resolved_xlsx),
+                "manual_tail_xlsx_path": str(manual_tail_xlsx),
+                "final_keep_xlsx_path": str(keep_xlsx),
+            }
+
+        task_runner._load_runtime_dependencies = lambda: {
+            "Settings": object,
+            "Database": FakeDb,
+            "FeishuOpenClient": lambda **kwargs: FakeClient(),
+            "DEFAULT_FEISHU_BASE_URL": "https://open.feishu.cn",
+            "download_task_upload_screening_assets": fake_download_task_upload_screening_assets,
+            "inspect_task_upload_assignments": fake_inspect_task_upload_assignments,
+            "sync_task_upload_mailboxes": fail_sync_task_upload_mailboxes,
+            "match_brand_keyword": fake_match_brand_keyword,
+            "resolve_shared_email_candidates": fake_resolve_shared_email_candidates,
+            "run_shared_email_final_review": fake_run_shared_email_final_review,
+            "enrich_creator_workbook": lambda **kwargs: (_ for _ in ()).throw(AssertionError("legacy enrichment should not run")),
+            "prepare_llm_review_candidates": lambda **kwargs: (_ for _ in ()).throw(AssertionError("llm candidates should not run")),
+            "run_and_apply_llm_review": lambda **kwargs: (_ for _ in ()).throw(AssertionError("llm review should not run")),
+            "resolve_sync_sent_since": lambda value: __import__("datetime").date(2026, 3, 31),
+            "load_local_env": fake_load_local_env,
+            "get_preferred_value": fake_get_preferred_value,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            existing_db = root / "shared" / "email_sync.db"
+            existing_raw = root / "shared" / "raw"
+            existing_db.parent.mkdir(parents=True, exist_ok=True)
+            existing_db.touch()
+            existing_raw.mkdir(parents=True, exist_ok=True)
+            summary = task_runner.run_task_upload_to_keep_list_pipeline(
+                task_name="MINISO",
+                env_file=".env",
+                output_root=root / "run",
+                summary_json=root / "run" / "summary.json",
+                matching_strategy="brand-keyword-fast-path",
+                stop_after="keep-list",
+                task_upload_url="https://cli.example/task",
+                employee_info_url="https://cli.example/employee",
+                feishu_app_id="app-id",
+                feishu_app_secret="app-secret",
+                existing_mail_db_path=existing_db,
+                existing_mail_raw_dir=existing_raw,
+                existing_mail_data_dir=existing_db.parent,
+            )
+
+        self.assertEqual(summary["status"], "stopped_after_keep-list")
+        self.assertEqual(summary["resolved_inputs"]["mail_sync"]["source_mode"], "pre_synced_mail_db")
+        self.assertEqual(summary["steps"]["mail_sync"]["task"]["credential_source"], "external_shared_mailbox_cache")
+        self.assertEqual(summary["steps"]["mail_sync"]["artifacts"]["mail_db_path"], str(existing_db.resolve()))
+        self.assertEqual(summary["steps"]["mail_sync"]["artifacts"]["mail_raw_dir"], str(existing_raw.resolve()))
+        self.assertEqual(summary["steps"]["mail_sync"]["resume_policy"]["stage_policy"], "reuse_external_shared_mail_db_reference")
 
     def test_runner_passes_default_mail_credentials_to_mail_sync(self) -> None:
         observed: dict[str, object] = {}
@@ -738,7 +995,7 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
         self.assertEqual(summary["resolved_inputs"]["mail_sync"]["default_auth_code_source"], "env_file:EMAIL_AUTH_CODE")
         self.assertEqual(
             summary["resolved_inputs"]["mail_sync"]["credential_mode"],
-            "employee_directory_preferred_with_default_fallback",
+            "default_account_preferred_with_employee_fallback",
         )
 
     def test_runner_can_reuse_existing_artifacts_from_prior_summary(self) -> None:

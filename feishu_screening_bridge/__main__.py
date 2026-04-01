@@ -150,7 +150,7 @@ def _build_parser() -> argparse.ArgumentParser:
     mail_sync_parser.add_argument("--limit", type=int, default=0, help="只抓最新 N 封用于测试，不推进增量游标")
     mail_sync_parser.add_argument("--workers", type=int, default=1, help="并发抓取 worker 数，默认 1")
     mail_sync_parser.add_argument("--reset-state", action="store_true", help="忽略本地游标，重新全量扫描")
-    mail_sync_parser.add_argument("--sent-since", default="", help="只抓这个日期及之后的邮件，格式 YYYY-MM-DD；默认最近 3 个月")
+    mail_sync_parser.add_argument("--sent-since", default="", help="只抓这个日期及之后的邮件，格式 YYYY-MM-DD；默认今天")
     mail_sync_parser.add_argument("--imap-host", default="", help="IMAP Host，默认 imap.qq.com")
     mail_sync_parser.add_argument("--imap-port", type=int, default=0, help="IMAP Port，默认 993")
     mail_sync_parser.add_argument("--feishu-app-id", default="", help="飞书自建应用 app_id")
@@ -631,7 +631,18 @@ def _cmd_upload_final_review_payload(args: argparse.Namespace) -> int:
     )
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 0
+        return 0 if bool(result.get("ok", True)) else 2
+
+    if not bool(result.get("ok", True)):
+        print(
+            "final review payload upload blocked: "
+            f"table={result['target_table_name'] or result['target_table_id']}  "
+            f"selected={result['selected_row_count']}  "
+            f"failed={result['failed_count']}  "
+            f"error={result.get('error') or 'unknown'}  "
+            f"result_json={result['result_json_path']}"
+        )
+        return 2
 
     print(
         "final review payload uploaded: "

@@ -160,6 +160,7 @@ class PrepareScreeningInputsTests(unittest.TestCase):
             self.assertTrue(active_rulespec_path.exists(), active_rulespec_path)
             self.assertTrue(active_visual_prompts_path.exists(), active_visual_prompts_path)
             self.assertTrue(Path(summary["rulespec"]["visual_prompts_json_path"]).exists(), summary)
+            self.assertTrue(Path(summary["rulespec"]["runtime_prompt_artifacts_json_path"]).exists(), summary)
 
             instagram_metadata_path = Path(summary["upload"]["upload_metadata_paths"]["instagram"])
             tiktok_metadata_path = Path(summary["upload"]["upload_metadata_paths"]["tiktok"])
@@ -170,6 +171,23 @@ class PrepareScreeningInputsTests(unittest.TestCase):
             tiktok_metadata = json.loads(tiktok_metadata_path.read_text(encoding="utf-8"))
             self.assertIn("creatoralpha", instagram_metadata, instagram_metadata)
             self.assertIn("creatorbeta", tiktok_metadata, tiktok_metadata)
+            prompt_artifacts = json.loads(Path(summary["rulespec"]["runtime_prompt_artifacts_json_path"]).read_text(encoding="utf-8"))
+            self.assertIn("instagram", prompt_artifacts["platforms"], prompt_artifacts)
+            self.assertEqual(
+                prompt_artifacts["platforms"]["instagram"]["visual_review"]["prompt_source"],
+                "platform_prompt",
+                prompt_artifacts,
+            )
+            self.assertIn(
+                "达人：{{username}}",
+                prompt_artifacts["platforms"]["instagram"]["visual_review"]["preview_prompt"],
+                prompt_artifacts,
+            )
+            self.assertEqual(
+                prompt_artifacts["platforms"]["instagram"]["positioning_card_analysis"]["prompt_source"],
+                "generic_brand_fit",
+                prompt_artifacts,
+            )
 
             self.assertTrue(summary_json.exists(), summary_json)
 
@@ -394,6 +412,7 @@ class PrepareScreeningInputsTests(unittest.TestCase):
             self.assertEqual(summary["rulespec"]["source"], "rulespec_json", summary)
             self.assertEqual(summary["rulespec"]["visual_prompts_json_path"], "", summary)
             self.assertFalse(Path(summary["active_visual_prompts_path"]).exists(), summary)
+            self.assertTrue(Path(summary["rulespec"]["runtime_prompt_artifacts_json_path"]).exists(), summary)
 
 
 if __name__ == "__main__":

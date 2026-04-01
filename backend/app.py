@@ -11,6 +11,7 @@ import uuid
 import base64
 import hashlib
 import random
+from contextlib import contextmanager
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
 from datetime import datetime
 from io import BytesIO
@@ -261,6 +262,7 @@ VISUAL_IMAGE_DOWNLOAD_MAX_RETRIES = max(1, int(os.getenv("VISUAL_IMAGE_DOWNLOAD_
 VISUAL_IMAGE_CACHE_ENABLED = parse_env_flag("VISUAL_IMAGE_CACHE_ENABLED", default=True)
 VISUAL_IMAGE_CACHE_DIR = str(os.getenv("VISUAL_IMAGE_CACHE_DIR", "") or "").strip()
 VISUAL_REVIEW_RETRYABLE_STATUS_CODES = {408, 429, 500, 502, 503, 504, 522}
+DEFAULT_LOCAL_OPENAI_MAX_INFLIGHT_REQUESTS = 8
 VISION_PROVIDER_CONFIGS = (
     {
         "name": "openai",
@@ -269,6 +271,7 @@ VISION_PROVIDER_CONFIGS = (
         "env_key": "OPENAI_API_KEY",
         "api_style": VISION_API_STYLE_RESPONSES,
         "model_env_key": "OPENAI_VISION_MODEL",
+        "max_inflight_env_key": "OPENAI_MAX_INFLIGHT_REQUESTS",
     },
     {
         "name": "reelx",
@@ -444,6 +447,8 @@ OPERATOR_RUNS_LOCK = threading.Lock()
 OPERATOR_RUNS: dict[str, dict[str, Any]] = {}
 OPERATOR_RUN_PROCESSES: dict[str, subprocess.Popen[Any]] = {}
 OPERATOR_RUN_LOG_HANDLES: dict[str, Any] = {}
+VISION_PROVIDER_REQUEST_GATES_LOCK = threading.Lock()
+VISION_PROVIDER_REQUEST_GATES: dict[tuple[str, str, int], threading.BoundedSemaphore] = {}
 OPERATOR_RUNS_ROOT = BASE_DIR / "temp" / "operator_runs"
 OPERATOR_RUN_TERMINAL_STATUSES = {"completed", "completed_with_partial_scrape", "failed", "cancelled"}
 
@@ -4121,6 +4126,67 @@ def compute_visual_retry_delay_seconds(attempt_index):
     return round(delay + jitter, 3)
 
 
+def is_local_cliproxyapi_base_url(base_url):
+    parsed = urlparse(str(base_url or "").strip())
+    hostname = str(parsed.hostname or "").strip().lower()
+    try:
+        port = int(parsed.port) if parsed.port is not None else None
+    except Exception:
+        port = None
+    return hostname in {"127.0.0.1", "localhost"} and port == 8317
+
+
+def resolve_vision_provider_max_inflight_requests(provider, base_url=""):
+    provider_name = normalize_vision_provider_name((provider or {}).get("name"))
+    env_key = str((provider or {}).get("max_inflight_env_key") or "").strip()
+    if env_key:
+        raw_value = os.getenv(env_key, "")
+        if str(raw_value or "").strip():
+            try:
+                return max(0, int(raw_value))
+            except (TypeError, ValueError):
+                return 0
+    if provider_name == "openai" and is_local_cliproxyapi_base_url(base_url or (provider or {}).get("base_url")):
+        return DEFAULT_LOCAL_OPENAI_MAX_INFLIGHT_REQUESTS
+    return 0
+
+
+def get_vision_provider_request_gate(provider_name, base_url, limit):
+    normalized_provider = normalize_vision_provider_name(provider_name)
+    normalized_base_url = str(base_url or "").strip().rstrip("/")
+    normalized_limit = max(0, int(limit or 0))
+    if normalized_limit <= 0:
+        return None
+    key = (normalized_provider, normalized_base_url, normalized_limit)
+    with VISION_PROVIDER_REQUEST_GATES_LOCK:
+        gate = VISION_PROVIDER_REQUEST_GATES.get(key)
+        if gate is None:
+            gate = threading.BoundedSemaphore(normalized_limit)
+            VISION_PROVIDER_REQUEST_GATES[key] = gate
+        return gate
+
+
+@contextmanager
+def acquire_vision_provider_request_slot(provider, base_url, request_timeout):
+    provider_name = normalize_vision_provider_name((provider or {}).get("name"))
+    limit = resolve_vision_provider_max_inflight_requests(provider, base_url=base_url)
+    gate = get_vision_provider_request_gate(provider_name, base_url, limit)
+    if gate is None:
+        yield
+        return
+    acquired = gate.acquire(timeout=max(float(request_timeout or 0), 30.0))
+    if not acquired:
+        raise VisionProviderError(
+            provider_name,
+            f"{provider_name} 并发闸门等待超时（limit={limit}）",
+            retryable=True,
+        )
+    try:
+        yield
+    finally:
+        gate.release()
+
+
 def is_qiandao_25p_visual_model(model_name):
     return str(model_name or "").strip() == QIANDAO_25P_VISION_MODEL
 
@@ -4266,7 +4332,8 @@ def call_vision_provider_with_json_contract(
                 }
 
             try:
-                response = requests.post(url, headers=headers, json=body, timeout=request_timeout)
+                with acquire_vision_provider_request_slot(provider, candidate_base_url, request_timeout):
+                    response = requests.post(url, headers=headers, json=body, timeout=request_timeout)
             except requests.exceptions.RequestException as exc:
                 last_error = VisionProviderError(
                     provider_name,
@@ -4420,12 +4487,14 @@ def probe_vision_provider(provider):
     for candidate_index, candidate_base_url in enumerate(base_urls):
         request_payload = build_vision_provider_probe_request({**provider, "base_url": candidate_base_url})
         try:
-            response = requests.post(
-                request_payload["url"],
-                headers=request_payload["headers"],
-                json=request_payload["body"],
-                timeout=min(VISION_REQUEST_TIMEOUT, 20),
-            )
+            probe_timeout = min(VISION_REQUEST_TIMEOUT, 20)
+            with acquire_vision_provider_request_slot(provider, candidate_base_url, probe_timeout):
+                response = requests.post(
+                    request_payload["url"],
+                    headers=request_payload["headers"],
+                    json=request_payload["body"],
+                    timeout=probe_timeout,
+                )
         except requests.exceptions.RequestException as exc:
             last_error = VisionProviderError(
                 request_payload["provider_name"],
@@ -5683,11 +5752,57 @@ def build_actor_input(platform, batch, payload):
 
 
 def apify_request(method, url, *, token, params=None, json_payload=None):
+    def _curl_get_fallback(prepared_url):
+        curl_result = subprocess.run(
+            [
+                "curl",
+                "--silent",
+                "--show-error",
+                "--location",
+                "--max-time",
+                str(APIFY_REQUEST_TIMEOUT),
+                "--request",
+                "GET",
+                prepared_url,
+                "--write-out",
+                "\n__CODEX_HTTP_STATUS__:%{http_code}\n",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=APIFY_REQUEST_TIMEOUT + 5,
+            check=False,
+        )
+        if curl_result.returncode != 0:
+            stderr = str(curl_result.stderr or "").strip()
+            raise RuntimeError(stderr or f"curl exited with code {curl_result.returncode}")
+        marker = "\n__CODEX_HTTP_STATUS__:"
+        marker_index = curl_result.stdout.rfind(marker)
+        if marker_index < 0:
+            raise RuntimeError("curl fallback missing status marker")
+        body = curl_result.stdout[:marker_index]
+        status_text = (
+            curl_result.stdout[marker_index + len(marker):].strip().splitlines()[0].strip()
+        )
+        status_code = int(status_text or "0")
+
+        class CurlResponse:
+            def __init__(self, status_code, text):
+                self.status_code = status_code
+                self.text = text
+                self.headers = {}
+                self.content = str(text or "").encode("utf-8")
+
+            def json(self):
+                return json.loads(self.text or "null")
+
+        return CurlResponse(status_code=status_code, text=body)
+
     request_params = dict(params or {})
     request_params["token"] = token
     normalized_method = str(method or "GET").strip().upper()
     max_attempts = APIFY_TRANSPORT_MAX_RETRIES if normalized_method == "GET" else 1
     last_error = None
+    prepared = requests.Request(normalized_method, url, params=request_params).prepare()
     for attempt in range(1, max_attempts + 1):
         try:
             return requests.request(
@@ -5699,8 +5814,15 @@ def apify_request(method, url, *, token, params=None, json_payload=None):
             )
         except requests.exceptions.RequestException as exc:
             last_error = exc
+            if normalized_method == "GET":
+                try:
+                    return _curl_get_fallback(prepared.url)
+                except Exception as curl_exc:
+                    last_error = RuntimeError(
+                        f"{exc}; curl fallback failed: {curl_exc}"
+                    )
             if attempt >= max_attempts:
-                raise
+                break
             time.sleep(APIFY_TRANSPORT_RETRY_BACKOFF_SECONDS * attempt)
     if last_error is not None:
         raise last_error
@@ -6246,6 +6368,7 @@ def perform_scrape(platform, payload, progress_callback=None, cancel_check=None)
     requested_lookup = build_requested_identifier_lookup(platform, identifiers)
     max_missing_retry_attempts = resolve_scrape_missing_retry_attempts(payload)
     retry_history = []
+    batch_failures = []
 
     if progress_callback:
         progress_callback("preparing", "正在准备抓取任务", done=0, total=len(batches), **build_target_preview(identifiers))
@@ -6253,13 +6376,47 @@ def perform_scrape(platform, payload, progress_callback=None, cancel_check=None)
     for index, batch in enumerate(batches, start=1):
         if cancel_check and cancel_check():
             return build_cancelled_result()
-        batch_result = run_apify_batch(
-            platform,
-            batch,
-            payload,
-            progress_callback=progress_callback,
-            cancel_check=cancel_check,
-        )
+        try:
+            batch_result = run_apify_batch(
+                platform,
+                batch,
+                payload,
+                progress_callback=progress_callback,
+                cancel_check=cancel_check,
+            )
+        except Exception as exc:
+            failure_record = {
+                "batch_index": index,
+                "batch_total": len(batches),
+                "targets": list(batch),
+                "target_preview": list(batch)[:10],
+                "error": str(exc),
+                "exception_type": exc.__class__.__name__,
+            }
+            if isinstance(exc, ApifyRuntimeError):
+                failure_record["failure_stage"] = exc.failure_stage
+                failure_record["retryable"] = bool(exc.retryable)
+                if exc.apify:
+                    failure_record["apify"] = dict(exc.apify)
+            batch_failures.append(failure_record)
+            partial_result = build_partial_scrape_result(
+                platform,
+                aggregated_items,
+                identifiers[: index * PLATFORM_BATCH_SIZES.get(platform, 20)],
+            )
+            if progress_callback:
+                progress_callback(
+                    "batch_failed",
+                    f"第 {index}/{len(batches)} 批抓取失败：{exc}",
+                    done=index,
+                    total=len(batches),
+                    partial_result=partial_result,
+                    batch_index=index,
+                    batch_total=len(batches),
+                    error=str(exc),
+                    **build_target_preview(batch),
+                )
+            continue
         if batch_result.get("cancelled"):
             return batch_result
         aggregated_items = merge_scrape_items(platform, aggregated_items, batch_result.get("raw_items") or [])
@@ -6416,6 +6573,8 @@ def perform_scrape(platform, payload, progress_callback=None, cancel_check=None)
         },
         "retry_summary": {
             "enabled": bool(max_missing_retry_attempts > 0),
+            "initial_batch_failure_count": len(batch_failures),
+            "initial_batch_failures": batch_failures,
             "max_attempts": max_missing_retry_attempts,
             "attempt_count": len(retry_history),
             "retried_identifier_count": retried_identifier_count,

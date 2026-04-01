@@ -41,6 +41,7 @@ def _load_runtime_dependencies():
     from feishu_screening_bridge.local_env import get_preferred_value, load_local_env
     from feishu_screening_bridge.task_upload_sync import (
         download_task_upload_screening_assets,
+        inspect_task_upload_assignments,
         sync_task_upload_mailboxes,
     )
 
@@ -50,6 +51,7 @@ def _load_runtime_dependencies():
         "FeishuOpenClient": FeishuOpenClient,
         "DEFAULT_FEISHU_BASE_URL": DEFAULT_FEISHU_BASE_URL,
         "download_task_upload_screening_assets": download_task_upload_screening_assets,
+        "inspect_task_upload_assignments": inspect_task_upload_assignments,
         "sync_task_upload_mailboxes": sync_task_upload_mailboxes,
         "match_brand_keyword": match_brand_keyword,
         "resolve_shared_email_candidates": resolve_shared_email_candidates,
@@ -478,6 +480,37 @@ def _resolve_downstream_reuse(
     return True, "upstream_inputs_unchanged"
 
 
+def _build_template_prompt_artifacts(
+    *,
+    template_workbook: Path,
+    output_root: Path,
+    env_file: str,
+) -> dict[str, Any]:
+    from scripts.prepare_screening_inputs import prepare_screening_inputs
+
+    runtime_root = output_root.expanduser().resolve()
+    summary_path = runtime_root / "summary.json"
+    prepared = prepare_screening_inputs(
+        template_workbook=template_workbook.expanduser().resolve(),
+        env_file=env_file,
+        template_output_dir=runtime_root / "parsed_outputs",
+        screening_data_dir=runtime_root / "screening_data",
+        config_dir=runtime_root / "config",
+        temp_dir=runtime_root / "temp",
+        summary_json=summary_path,
+    )
+    return {
+        "status": "completed",
+        "summary_json": str(summary_path),
+        "runtime_prompt_artifacts_json": str((prepared.get("prompts") or {}).get("runtime_prompt_artifacts_json_path") or ""),
+        "compile_report_json": str((prepared.get("rulespec") or {}).get("compile_report_path") or ""),
+        "compile_output_dir": str((prepared.get("rulespec") or {}).get("compile_output_dir") or ""),
+        "prompt_platform_count": int((prepared.get("prompts") or {}).get("platform_count") or 0),
+        "selected_provider": str((prepared.get("prompts") or {}).get("selected_provider") or ""),
+        "selected_model": str((prepared.get("prompts") or {}).get("selected_model") or ""),
+    }
+
+
 def _build_feishu_client(
     *,
     env_file: str,
@@ -546,6 +579,9 @@ def run_task_upload_to_keep_list_pipeline(
     folder_overrides: dict[str, str] | None = None,
     imap_host: str = "",
     imap_port: int = 0,
+    existing_mail_db_path: str | Path = "",
+    existing_mail_raw_dir: str | Path = "",
+    existing_mail_data_dir: str | Path = "",
     mail_limit: int = 0,
     mail_workers: int = 1,
     sent_since: str = "",
@@ -665,6 +701,9 @@ def run_task_upload_to_keep_list_pipeline(
             "employee_info_url": str(employee_info_url or "").strip(),
             "task_download_dir": str(task_download_dir or "").strip(),
             "mail_data_dir": str(mail_data_dir or "").strip(),
+            "existing_mail_db_path": str(existing_mail_db_path or "").strip(),
+            "existing_mail_raw_dir": str(existing_mail_raw_dir or "").strip(),
+            "existing_mail_data_dir": str(existing_mail_data_dir or "").strip(),
             "mail_limit": int(max(0, int(mail_limit))),
             "mail_workers": int(max(1, int(mail_workers))),
             "sent_since": str(sent_since or "").strip(),
@@ -697,7 +736,8 @@ def run_task_upload_to_keep_list_pipeline(
             },
             "mail_sync": {
                 "sent_since": resolved_sent_since,
-                "sent_since_source": "cli" if str(sent_since or "").strip() else "default_recent_3_calendar_months",
+                "sent_since_source": "cli" if str(sent_since or "").strip() else "default_today_only",
+                "source_mode": "pre_synced_mail_db" if str(existing_mail_db_path or "").strip() else "task_mail_sync",
                 "mail_limit": int(max(0, int(mail_limit))),
                 "mail_workers": int(max(1, int(mail_workers))),
                 "folder_prefixes": list(folder_prefixes or ["其他文件夹"]),
@@ -846,6 +886,7 @@ def run_task_upload_to_keep_list_pipeline(
         runtime = _load_runtime_dependencies()
         resolve_sync_sent_since = runtime["resolve_sync_sent_since"]
         download_task_upload_screening_assets = runtime["download_task_upload_screening_assets"]
+        inspect_task_upload_assignments = runtime.get("inspect_task_upload_assignments")
         sync_task_upload_mailboxes = runtime["sync_task_upload_mailboxes"]
         Database = runtime["Database"]
         match_brand_keyword = runtime["match_brand_keyword"]
@@ -922,7 +963,7 @@ def run_task_upload_to_keep_list_pipeline(
             ("TASK_UPLOAD_MAIL_AUTH_CODE", "EMAIL_AUTH_CODE"),
         )
         if resolved_default_account_email and resolved_default_auth_code:
-            credential_mode = "employee_directory_preferred_with_default_fallback"
+            credential_mode = "default_account_preferred_with_employee_fallback"
         elif resolved_default_account_email or resolved_default_auth_code:
             credential_mode = "incomplete_default_account"
         else:
@@ -1034,25 +1075,148 @@ def run_task_upload_to_keep_list_pipeline(
         if normalized_stop_after == "task-assets":
             return mark_stop("task-assets")
 
-        mail_sync_result = sync_task_upload_mailboxes(
-            client=client,
-            task_upload_url=resolved_task_upload_url,
-            employee_info_url=resolved_employee_info_url,
-            download_dir=downloads_dir,
-            mail_data_dir=mail_root,
-            task_names=[normalized_task_name],
-            owner_email_overrides=owner_email_overrides or {},
-            folder_overrides=folder_overrides or {},
-            folder_prefixes=folder_prefixes or ["其他文件夹"],
-            limit=int(mail_limit) if int(mail_limit) > 0 else None,
-            workers=max(1, int(mail_workers)),
-            reset_state=bool(reset_state),
-            sent_since=resolved_sent_since,
-            imap_host=resolved_imap_host,
-            imap_port=resolved_imap_port,
-            default_account_email=resolved_default_account_email,
-            default_auth_code=resolved_default_auth_code,
+        prompt_artifact_summary_json = str(task_assets["artifacts"].get("template_prepare_summary_json") or "").strip()
+        prompt_artifact_json = str(task_assets["artifacts"].get("template_runtime_prompt_artifacts_json") or "").strip()
+        prompt_artifacts_reused = bool(
+            task_assets_reused
+            and prompt_artifact_summary_json
+            and Path(prompt_artifact_summary_json).exists()
+            and prompt_artifact_json
+            and Path(prompt_artifact_json).exists()
         )
+        if prompt_artifacts_reused:
+            task_assets["template_prompt_artifacts"] = {
+                "status": "reused",
+                "summary_json": prompt_artifact_summary_json,
+                "runtime_prompt_artifacts_json": prompt_artifact_json,
+                "compile_report_json": str(task_assets["artifacts"].get("template_compile_report_json") or "").strip(),
+                "compile_output_dir": str(task_assets["artifacts"].get("template_compile_output_dir") or "").strip(),
+                "prompt_platform_count": int(task_assets["artifacts"].get("template_prompt_platform_count") or 0),
+                "selected_provider": str(task_assets["artifacts"].get("template_prompt_selected_provider") or "").strip(),
+                "selected_model": str(task_assets["artifacts"].get("template_prompt_selected_model") or "").strip(),
+            }
+        else:
+            try:
+                prompt_artifacts = _build_template_prompt_artifacts(
+                    template_workbook=Path(task_assets["artifacts"]["template_workbook"]),
+                    output_root=resolved_output_root / "task_assets_prompt_artifacts",
+                    env_file=env_file,
+                )
+                task_assets["artifacts"]["template_prepare_summary_json"] = prompt_artifacts["summary_json"]
+                task_assets["artifacts"]["template_runtime_prompt_artifacts_json"] = prompt_artifacts["runtime_prompt_artifacts_json"]
+                task_assets["artifacts"]["template_compile_report_json"] = prompt_artifacts["compile_report_json"]
+                task_assets["artifacts"]["template_compile_output_dir"] = prompt_artifacts["compile_output_dir"]
+                task_assets["artifacts"]["template_prompt_platform_count"] = prompt_artifacts["prompt_platform_count"]
+                task_assets["artifacts"]["template_prompt_selected_provider"] = prompt_artifacts["selected_provider"]
+                task_assets["artifacts"]["template_prompt_selected_model"] = prompt_artifacts["selected_model"]
+                task_assets["template_prompt_artifacts"] = dict(prompt_artifacts)
+            except Exception as exc:  # noqa: BLE001
+                task_assets["template_prompt_artifacts"] = {
+                    "status": "failed",
+                    "error": str(exc) or exc.__class__.__name__,
+                }
+
+        summary["steps"]["task_assets"] = task_assets
+        summary["artifacts"]["template_prepare_summary_json"] = str(
+            task_assets["artifacts"].get("template_prepare_summary_json") or ""
+        ).strip()
+        summary["artifacts"]["template_runtime_prompt_artifacts_json"] = str(
+            task_assets["artifacts"].get("template_runtime_prompt_artifacts_json") or ""
+        ).strip()
+        summary["resume_points"]["task_assets"]["template_prepare_summary_json"] = summary["artifacts"]["template_prepare_summary_json"]
+        summary["resume_points"]["task_assets"]["template_runtime_prompt_artifacts_json"] = summary["artifacts"]["template_runtime_prompt_artifacts_json"]
+        summary["canonical_artifacts"]["task_assets"] = _json_clone(summary["resume_points"]["task_assets"])
+        _write_summary(run_summary_path, summary)
+
+        normalized_existing_mail_db_path = str(existing_mail_db_path or "").strip()
+        if normalized_existing_mail_db_path:
+            if not callable(inspect_task_upload_assignments):
+                raise RuntimeError("existing_mail_db_path 模式缺少 inspect_task_upload_assignments runtime。")
+            existing_db_path = Path(normalized_existing_mail_db_path).expanduser().resolve()
+            if not existing_db_path.exists():
+                raise FileNotFoundError(f"existing_mail_db_path 不存在: {existing_db_path}")
+            existing_raw_dir_path = (
+                Path(str(existing_mail_raw_dir)).expanduser().resolve()
+                if str(existing_mail_raw_dir or "").strip()
+                else existing_db_path.parent / "raw"
+            )
+            existing_data_dir_path = (
+                Path(str(existing_mail_data_dir)).expanduser().resolve()
+                if str(existing_mail_data_dir or "").strip()
+                else existing_db_path.parent
+            )
+            inspection = inspect_task_upload_assignments(
+                client=client,
+                task_upload_url=resolved_task_upload_url,
+                employee_info_url=resolved_employee_info_url,
+                download_dir=downloads_dir,
+                download_templates=False,
+                parse_templates=False,
+                owner_email_overrides=owner_email_overrides or {},
+            )
+            mail_item = next(
+                (
+                    item
+                    for item in (inspection.get("items") or [])
+                    if str(item.get("taskName") or "").strip() == normalized_task_name
+                ),
+                {},
+            )
+            if not isinstance(mail_item, dict) or not mail_item:
+                raise RuntimeError(f"任务 {normalized_task_name!r} 在任务上传里找不到可用映射。")
+            mail_item = dict(mail_item)
+            mail_item.update(
+                {
+                    "mailSyncOk": True,
+                    "mailSyncError": "",
+                    "mailCredentialSource": "external_shared_mailbox_cache",
+                    "mailLoginEmail": resolved_default_account_email or str(mail_item.get("employeeEmail") or "").strip(),
+                    "mailSyncStrategy": "pre_synced_mail_db",
+                    "mailFallbackReason": "shared_mailbox_sync_managed_externally",
+                    "resolvedFolder": str((folder_prefixes or ["其他文件夹/邮件备份"])[0]),
+                    "resolvedFolders": list(folder_prefixes or ["其他文件夹/邮件备份"]),
+                    "mailScannedFolderCount": 1,
+                    "mailFetchedCount": 0,
+                    "mailServerTotalCount": None,
+                    "mailSyncDurationSeconds": 0.0,
+                    "mailDbPath": str(existing_db_path),
+                    "mailRawDir": str(existing_raw_dir_path),
+                    "mailDataDir": str(existing_data_dir_path),
+                }
+            )
+            mail_sync_result = {
+                "ok": True,
+                "selectedCount": 1,
+                "syncedCount": 1,
+                "failedCount": 0,
+                "mailDataDir": str(existing_data_dir_path),
+                "imapHost": resolved_imap_host,
+                "imapPort": resolved_imap_port,
+                "defaultCredentialMode": "external_pre_synced_mail_db",
+                "defaultAccountEmail": resolved_default_account_email,
+                "sentSince": resolved_sent_since,
+                "items": [mail_item],
+            }
+        else:
+            mail_sync_result = sync_task_upload_mailboxes(
+                client=client,
+                task_upload_url=resolved_task_upload_url,
+                employee_info_url=resolved_employee_info_url,
+                download_dir=downloads_dir,
+                mail_data_dir=mail_root,
+                task_names=[normalized_task_name],
+                owner_email_overrides=owner_email_overrides or {},
+                folder_overrides=folder_overrides or {},
+                folder_prefixes=folder_prefixes or ["其他文件夹"],
+                limit=int(mail_limit) if int(mail_limit) > 0 else None,
+                workers=max(1, int(mail_workers)),
+                reset_state=bool(reset_state),
+                sent_since=resolved_sent_since,
+                imap_host=resolved_imap_host,
+                imap_port=resolved_imap_port,
+                default_account_email=resolved_default_account_email,
+                default_auth_code=resolved_default_auth_code,
+            )
         mail_item = next(iter(mail_sync_result.get("items") or []), {})
         if not mail_item:
             raise RuntimeError(f"任务 {normalized_task_name!r} 没有产生 mail sync 结果。")
@@ -1091,9 +1255,13 @@ def run_task_upload_to_keep_list_pipeline(
             "raw": mail_sync_result,
         }
         mail_sync_mode, mail_sync_reason = _resolve_execution_details(
-            reused=False,
+            reused=bool(normalized_existing_mail_db_path and existing_summary_accepted and _step_artifacts_exist((existing_summary.get("steps", {}) or {}).get("mail_sync", {}), ("mail_db_path",))),
             existing_summary_accepted=existing_summary_accepted,
-            rerun_reason="mail_sync_is_incremental_and_owned_by_current_run",
+            rerun_reason=(
+                "mail_sync_is_owned_by_external_shared_db"
+                if normalized_existing_mail_db_path
+                else "mail_sync_is_incremental_and_owned_by_current_run"
+            ),
         )
         mail_sync_step = _annotate_step_payload(
             mail_sync_step,
@@ -1101,14 +1269,18 @@ def run_task_upload_to_keep_list_pipeline(
             execution_reason=mail_sync_reason,
             input_refs={
                 "sending_list_workbook": summary["artifacts"]["sending_list_workbook"],
-                "mail_data_dir": str(mail_root),
+                "mail_data_dir": str(mail_root if not normalized_existing_mail_db_path else existing_mail_data_dir or Path(normalized_existing_mail_db_path).expanduser().resolve().parent),
                 "sent_since": resolve_sync_sent_since(sent_since or None).isoformat(),
                 "reset_state": bool(reset_state),
             },
             owned_artifact_keys=("mail_db_path", "mail_raw_dir", "mail_data_dir"),
             resume_point_key="mail_sync",
-            reuse_supported=False,
-            stage_policy="always_rerun_incremental",
+            reuse_supported=bool(normalized_existing_mail_db_path),
+            stage_policy=(
+                "reuse_external_shared_mail_db_reference"
+                if normalized_existing_mail_db_path
+                else "always_rerun_incremental"
+            ),
         )
         if not mail_item.get("mailSyncOk"):
             raise RuntimeError(str(mail_item.get("mailSyncError") or "mail sync failed"))
@@ -1589,6 +1761,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--summary-json", default="", help="最终 summary.json 输出路径。")
     parser.add_argument("--task-download-dir", default="", help="任务附件下载目录；默认写到 output-root/downloads。")
     parser.add_argument("--mail-data-dir", default="", help="任务邮件数据目录；默认写到 output-root/mail_sync。")
+    parser.add_argument("--existing-mail-db-path", default="", help="已有共享邮箱 email_sync.db 路径；传入后跳过 IMAP 抓信。")
+    parser.add_argument("--existing-mail-raw-dir", default="", help="已有共享邮箱 raw 邮件目录；默认 <existing-mail-db-path>/../raw。")
+    parser.add_argument("--existing-mail-data-dir", default="", help="已有共享邮箱 mail data 根目录；默认 <existing-mail-db-path>/..。")
     parser.add_argument("--feishu-app-id", default="", help="飞书自建应用 app_id。")
     parser.add_argument("--feishu-app-secret", default="", help="飞书自建应用 app_secret。")
     parser.add_argument("--feishu-base-url", default="", help="飞书 OpenAPI Base URL。")
@@ -1601,7 +1776,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--mail-limit", type=int, default=0, help="mail sync 只抓最新 N 封；0 表示不截断。")
     parser.add_argument("--mail-workers", type=int, default=1, help="mail sync worker 数。")
-    parser.add_argument("--sent-since", default="", help="mail sync 起始日期 YYYY-MM-DD；默认最近 3 个月。")
+    parser.add_argument("--sent-since", default="", help="mail sync 起始日期 YYYY-MM-DD；默认今天。")
     parser.add_argument("--reset-state", action="store_true", help="mail sync 忽略本地游标，重新全量扫描。")
     parser.add_argument(
         "--matching-strategy",
@@ -1636,6 +1811,9 @@ def main(argv: list[str] | None = None) -> int:
         summary_json=Path(args.summary_json) if args.summary_json else None,
         task_download_dir=args.task_download_dir,
         mail_data_dir=args.mail_data_dir,
+        existing_mail_db_path=args.existing_mail_db_path,
+        existing_mail_raw_dir=args.existing_mail_raw_dir,
+        existing_mail_data_dir=args.existing_mail_data_dir,
         feishu_app_id=args.feishu_app_id,
         feishu_app_secret=args.feishu_app_secret,
         feishu_base_url=args.feishu_base_url,

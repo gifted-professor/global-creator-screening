@@ -555,6 +555,8 @@ def run_task_upload_to_final_export_pipeline(
             "downstream_summary_json": str(downstream_summary_path),
             "keep_workbook": "",
             "template_workbook": "",
+            "template_prepare_summary_json": "",
+            "template_runtime_prompt_artifacts_json": "",
             "all_platforms_final_review": "",
             "all_platforms_upload_payload_json": "",
             "final_exports": {},
@@ -703,10 +705,14 @@ def run_task_upload_to_final_export_pipeline(
         "canonical_boundary": ((upstream_summary.get("contract") or {}).get("canonical_boundary") or "keep-list"),
         "keep_workbook": keep_workbook,
         "template_workbook": template_workbook,
+        "template_prepare_summary_json": str((upstream_summary.get("artifacts") or {}).get("template_prepare_summary_json") or "").strip(),
+        "template_runtime_prompt_artifacts_json": str((upstream_summary.get("artifacts") or {}).get("template_runtime_prompt_artifacts_json") or "").strip(),
         "downstream_handoff": upstream_summary.get("downstream_handoff") or {},
     }
     summary["artifacts"]["keep_workbook"] = keep_workbook
     summary["artifacts"]["template_workbook"] = template_workbook
+    summary["artifacts"]["template_prepare_summary_json"] = summary["steps"]["upstream"]["template_prepare_summary_json"]
+    summary["artifacts"]["template_runtime_prompt_artifacts_json"] = summary["steps"]["upstream"]["template_runtime_prompt_artifacts_json"]
     task_owner_context = extract_task_owner_context(upstream_summary)
     summary["resume_points"]["keep_list"] = {
         "keep_workbook": keep_workbook,
@@ -896,7 +902,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model", default="", help="覆盖 duplicate review 的 LLM model。")
     parser.add_argument("--wire-api", default="", help="覆盖 duplicate review 的 wire API。")
     parser.add_argument("--platform", action="append", help="只跑指定平台，可重复传入：tiktok / instagram / youtube。")
-    parser.add_argument("--vision-provider", default="", help="指定视觉 provider，例如 openai / mimo / quan2go / lemonapi。")
+    parser.add_argument("--vision-provider", default="", help="指定视觉 provider，例如 openai / reelx。")
     parser.add_argument("--max-identifiers-per-platform", type=int, default=0, help="每个平台最多跑多少个账号；0 表示不截断。")
     parser.add_argument("--poll-interval", type=float, default=5.0, help="轮询 job 状态的秒数。")
     parser.add_argument("--probe-vision-provider-only", action="store_true", help="只做视觉 provider live probe，不继续 scrape/visual/export。")

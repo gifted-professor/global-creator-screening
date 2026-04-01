@@ -34,7 +34,7 @@ from .creator_enrichment import (
 from .db import Database
 
 
-HANDLE_COLUMN_ALIASES = ("@username", "username", "handle", "账号", "达人账号")
+HANDLE_COLUMN_ALIASES = ("@username", "username", "用户名", "博主用户名", "handle", "账号", "达人账号")
 PLATFORM_COLUMN_ALIASES = ("platform", "平台")
 PROFILE_COLUMN_ALIASES = tuple(SENDING_LIST_GENERIC_LINK_ALIASES) + tuple(
     alias for aliases in SENDING_LIST_PLATFORM_LINK_ALIASES.values() for alias in aliases

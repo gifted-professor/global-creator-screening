@@ -5,13 +5,15 @@
 - ✅ **v1.0.0 Consolidated Local Creator Screening Pipeline** — Phases 1-13 shipped 2026-03-28. Archive: `.planning/milestones/v1.0.0-ROADMAP.md`
 - ✅ **v1.1.0 Visual Provider Reliability and Downstream Hardening** — Phases 14-15 shipped 2026-03-28. Archive: `.planning/milestones/v1.1.0-ROADMAP.md`
 - ✅ **v1.2.0 End-to-End Single-Entry Pipeline Verification** — Phases 16-19 shipped 2026-03-29. Archive: `.planning/milestones/v1.2.0-ROADMAP.md`
-- 🚧 **v1.3.0 External Email Dependency Decoupling** — Phases 20-25 completed; milestone closeout pending
+- 🚧 **v1.3.0 External Email Dependency Decoupling** — Phases 20-25 implemented; gap-closure Phases 26-29 planned before milestone closeout
 
 ## Overview
 
 `v1.3.0` 先聚焦 `DEP-01`：把 workbook / dashboard / project-home 对 external full `email` 项目的剩余耦合从运行主线里拆掉，确保 operator 在当前仓库里就能完成关键入口流程。`QTE-01` 与 `REL-01` 保留为后续里程碑，避免本轮把 dependency removal、数据接入和大样本稳定性验证混成同一交付面。
 
 `Phase 23` 和 `Phase 24` 是在 decoupling proof 之后补录的 repo-local follow-up：前者把模板编译出的品牌视觉 prompt / feature contract 真正接回 runtime，后者把 visual-pass 之后的定位卡分析接入 downstream / final-wrapper 可观察 contract。2026-03-30 用户又把原本 deferred 的“本地薄 operator UI”提前拉进当前 roadmap，作为 local-only follow-up，不改写主 runner，只在现有 Flask/backend 和 single-entry pipeline 之上补一个控制页。
+
+2026-04-01 又登记了 next-milestone candidate `Phase 30`：共享邮箱 post-sync CLI / summary / regression surface 已经存在，但 `/operator` 仍默认指向旧的 task-driven wrapper。这个 phase 的重点不是重新发明 shared-mailbox mainline，而是把 operator UX、summary contract 和 dry-run/live guardrails 对齐到这条正式主线。
 
 ## Phases
 
@@ -20,7 +22,12 @@
 - [x] **Phase 22: Validate decoupled runtime stability and operator fallback contract** - 回归主链并收口兼容回退说明，确保迁移可安全落地
 - [x] **Phase 23: Wire template-compiled visual prompts into runtime and define visual feature-group contract** - 把模板编译出的品牌视觉 prompt 接回 runtime，并定义 `visual_feature_group` 的消费契约
 - [x] **Phase 24: Add post-visual-review positioning-card analysis step for approved creators** - 在 visual review 之后增加 repo-local 定位卡分析，并把结构化输出接入 downstream / final wrapper summary
-- [ ] **Phase 25: Build local thin operator UI for task-driven screening runs** - 提供本地可视化控制页，读取飞书任务、触发现有 task-driven runner，并展示 summary / 导出产物
+- [x] **Phase 25: Build local thin operator UI for task-driven screening runs** - 提供本地可视化控制页，读取飞书任务、触发现有 task-driven runner，并展示 summary / 导出产物
+- [ ] **Phase 26: Backfill decoupling verification bundle for Phases 20-21** - 把已实现的 repo-local decoupling 结果补齐成可审计的 SUMMARY / VERIFICATION / traceability 证据链
+- [ ] **Phase 27: Reconstruct runtime safety proof and fallback certification for Phase 22** - 把 decoupled bounded regression 与 fallback contract 整理成正式的 Phase 22 planning / verification bundle
+- [ ] **Phase 28: Reconstruct visual runtime and positioning evidence chain for Phases 23-24** - 为 visual prompt contract 与 positioning-card analysis 补建缺失 phase artifacts，并补齐跨阶段验证链
+- [ ] **Phase 29: Reconstruct operator UI evidence bundle and milestone closeout consistency** - 为 operator UI 补建 Phase 25 planning bundle，并把 roadmap / state / audit closeout 口径收口一致
+- [ ] **Phase 30: Stabilize operator UI on shared mailbox post-sync mainline** - 让 `/operator` 默认切到共享邮箱 post-sync 正式主线，并暴露增量写回与本地归档 contract
 
 ## Progress
 
@@ -32,6 +39,11 @@
 | 23. Wire template-compiled visual prompts into runtime and define visual feature-group contract | 3/3 | Completed | 2026-03-30 |
 | 24. Add post-visual-review positioning-card analysis step for approved creators | 2/2 | Completed | 2026-03-30 |
 | 25. Build local thin operator UI for task-driven screening runs | 2/2 | Completed | 2026-03-30 |
+| 26. Backfill decoupling verification bundle for Phases 20-21 | 0/2 | Planned | Pending |
+| 27. Reconstruct runtime safety proof and fallback certification for Phase 22 | 0/2 | Planned | Pending |
+| 28. Reconstruct visual runtime and positioning evidence chain for Phases 23-24 | 0/3 | Planned | Pending |
+| 29. Reconstruct operator UI evidence bundle and milestone closeout consistency | 0/2 | Planned | Pending |
+| 30. Stabilize operator UI on shared mailbox post-sync mainline | 0/3 | Planned | Pending |
 
 ### Phase 20: Baseline legacy dependency surfaces and lock repo-local replacement contract
 
@@ -132,3 +144,99 @@ Plans:
 
 **Details:**
 Phase 25 已完成。`25-01` 落下第一版 backend-served control plane：`/operator` 页面、`/api/operator/tasks`、`/api/operator/runs`、`/api/operator/runs/<id>`、`/api/operator/file` 已落地，并通过 `backend/.venv/bin/python -m unittest tests.test_visual_provider_diagnostics tests.test_task_upload_to_final_export_pipeline -v` 的 77 个 targeted tests。`25-02` 又用 operator API 真实发起了一轮 bounded `MINISO`，运行根目录留在 `temp/operator_runs/20260330_150053_MINISO_5a2afccf`，最终 top-level `summary.json` 与 `downstream/summary.json` 都为 `completed`，并产出 `instagram_final_review.xlsx` 与定位卡导出。
+
+### Phase 25.1: Fix MINISO LLM auth failures, redact summary secrets, surface missing duet sending-list diagnostics, and clarify LLM stage observability (INSERTED)
+
+**Goal**: 修复 `task upload -> keep-list` 上游链路里已经实跑暴露的紧急问题：让文本 LLM 调用的鉴权/路由可以被清晰归因、让 summary 不再落敏感字段、并把缺 `发信名单` 与 `llm_candidates`/`llm_review` 的失败边界拆清楚。
+**Requirements**: [OPS-REL-01, OPS-REL-02, OPS-REL-03]
+**Depends on:** Phase 25
+**Success Criteria** (what must be TRUE):
+  1. `task upload -> keep-list` 上游 summary 会显式暴露文本 LLM review 实际使用的 provider/base/model/wire_api，并且 `auth_not_found` 之类的失败归因到 `llm_review` 调用面，而不是模糊地挂到 `llm_candidates`
+  2. `summary.json` 不再直接持久化 `imapCode`、飞书 file token、未脱敏邮箱地址或整包 raw task/mail payload，同时 downstream 仍能通过最小 handoff contract 读取任务 owner 上下文
+  3. 缺 `发信名单`、任务上传重复命中、`llm_candidates_prepare`、`llm_review_call`、`llm_review_writeback` 都会成为独立、可机读的诊断块，排查时不需要靠聊天上下文还原失败位置
+**Plans:** 2 plans
+
+Plans:
+- [ ] 25.1-01: Redact upstream summary payloads and surface explicit task-assets diagnostics
+- [ ] 25.1-02: Add LLM review config diagnostics and split `llm_review` failure attribution
+
+### Phase 26: Backfill decoupling verification bundle for Phases 20-21
+
+**Goal**: 把 Phase 20-21 已经实现的 repo-local decoupling 结果补齐成可审计的 phase-local evidence bundle，并让 DEP requirements 的 traceability 从“历史完成”切回“待重新认证”。
+**Depends on:** Phase 25
+**Requirements**: [DEP-01, DEP-02, DEP-03, DEP-04]
+**Gap Closure:** Closes milestone audit gaps for missing verification on Phases 20-21
+**Success Criteria** (what must be TRUE):
+  1. Phase 20 与 Phase 21 都有正式 `VERIFICATION.md`，能把实现、测试和 repo-local contract 证据串起来
+  2. `SUMMARY.md` / frontmatter / `REQUIREMENTS.md` / `ROADMAP.md` 对 DEP requirements 的口径一致，不再出现“完成但无法审计”的状态分裂
+  3. re-audit 时，DEP requirements 不再因为 Phase 20-21 缺 verification 而被判为 partial
+**Plans:** 2 plans
+
+Plans:
+- [ ] 26-01: Backfill Phase 20-21 verification artifacts and normalize summary requirement frontmatter
+- [ ] 26-02: Reconcile decoupling traceability across roadmap, requirements, and repo-local operator docs
+
+### Phase 27: Reconstruct runtime safety proof and fallback certification for Phase 22
+
+**Goal**: 用现有 bounded regression proof 与 fallback artifact 重建正式的 Phase 22 planning / summary / verification bundle，完成 SAF requirements 的审计闭环。
+**Depends on:** Phase 26
+**Requirements**: [SAF-01, SAF-02]
+**Gap Closure:** Closes milestone audit gaps for missing Phase 22 artifact bundle
+**Success Criteria** (what must be TRUE):
+  1. Phase 22 目录补齐 context / summary / verification artifact，并明确引用 `temp/phase22_decoupled_bounded_validation` 等现有 proof
+  2. `task upload -> final export` bounded regression 与 fallback contract 的 operator 路径可以被 phase-local 文档和验证文件直接证明
+  3. re-audit 时，SAF requirements 不再因为 Phase 22 空目录而被判为 unsatisfied
+**Plans:** 2 plans
+
+Plans:
+- [ ] 27-01: Rebuild the Phase 22 planning bundle from existing bounded regression and fallback artifacts
+- [ ] 27-02: Add formal verification coverage for repo-local runtime safety and fallback recovery
+
+### Phase 28: Reconstruct visual runtime and positioning evidence chain for Phases 23-24
+
+**Goal**: 为 visual runtime contract 与 positioning-card analysis 补齐缺失的 phase artifacts、verification 和跨阶段证据链，使 VIS/POS requirements 可以重新通过 audit。
+**Depends on:** Phase 27
+**Requirements**: [VIS-01, VIS-02, VIS-03, POS-01, POS-02, POS-03]
+**Gap Closure:** Closes milestone audit gaps for missing Phase 23 artifacts and missing Phase 24 verification
+**Success Criteria** (what must be TRUE):
+  1. 缺失的 Phase 23 目录、plan/summary/verification artifacts 被补建，并能引用已有实现提交与回归测试
+  2. Phase 24 获得正式 `VERIFICATION.md`，且 `SUMMARY.md` frontmatter / contract note / requirements traceability 一致
+  3. re-audit 时，`23 -> 24` 的 visual-to-positioning integration chain 可被 phase-local artifacts 直接证明
+**Plans:** 3 plans
+
+Plans:
+- [ ] 28-01: Recreate the missing Phase 23 planning bundle for the visual runtime contract
+- [ ] 28-02: Backfill verification evidence linking Phase 23 visual runtime outputs into Phase 24 positioning behavior
+- [ ] 28-03: Normalize Phase 24 requirement traceability and verification coverage for POS requirements
+
+### Phase 29: Reconstruct operator UI evidence bundle and milestone closeout consistency
+
+**Goal**: 为 operator UI 补建 Phase 25 planning bundle，并把 roadmap checklist / state / audit closeout 口径收口，准备重新执行 milestone audit。
+**Depends on:** Phase 28
+**Requirements**: [OPS-UI-01, OPS-UI-02, OPS-UI-03]
+**Gap Closure:** Closes milestone audit gaps for missing Phase 25 artifacts and closeout inconsistencies
+**Success Criteria** (what must be TRUE):
+  1. Phase 25 对应的 planning / summary / verification artifacts 补齐，并引用现有 `/operator` proof 和 bounded run artifact
+  2. `ROADMAP.md` / `STATE.md` / audit prerequisites 对 operator UI 的状态一致，不再出现 checklist 与 progress table 冲突
+  3. re-audit 时，OPS-UI requirements 与 local operator flow 可以被正式认证，并直接衔接 milestone closeout
+**Plans:** 2 plans
+
+Plans:
+- [ ] 29-01: Recreate the missing Phase 25 planning bundle for the local operator UI
+- [ ] 29-02: Add operator verification coverage and align milestone closeout docs for re-audit
+
+### Phase 30: Stabilize operator UI on shared mailbox post-sync mainline
+
+**Goal**: 让 `/operator` 默认对齐共享邮箱 post-sync 正式主线，在不重跑 IMAP 的前提下消费预同步共享邮箱邮件库，按 task-upload 做增量分流，并把 per-task 筛号/邮件更新/飞书写回结果作为 operator-first contract 暴露出来。
+**Requirements**: [SMB-01, SMB-02, SMB-03]
+**Depends on:** Phase 29
+**Success Criteria** (what must be TRUE):
+  1. `/operator` / `api/operator/*` 默认启动 `scripts/run_shared_mailbox_post_sync_pipeline.py`，要求显式 shared mailbox db/raw/data 输入，并且不会在 operator 路径里重新触发 IMAP 抓信
+  2. operator 页面与 API 会直接暴露 shared-mailbox mainline 的 top-level 与 per-task 增量计数/产物，包括 `task_results`、mail-only/full-screening split、aggregate local archive，以及上传 payload/result 路径
+  3. 文档与回归覆盖留下 dry-run-first 的官方验证路径，并把 live writeback guardrails、owner ambiguity / duplicate guards、以及 mail-only update 边界说明清楚
+**Plans:** 3 plans
+
+Plans:
+- [ ] 30-01: Re-anchor operator backend launch and summary serialization to the shared-mailbox post-sync runner
+- [ ] 30-02: Update the operator console to drive shared-mailbox inputs and render per-task incremental outcomes
+- [ ] 30-03: Document and verify the shared-mailbox operator contract with dry-run-first guardrails

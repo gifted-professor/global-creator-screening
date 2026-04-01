@@ -277,7 +277,10 @@ class FeishuScreeningBridgeTests(unittest.TestCase):
         self.assertEqual(item["matchedBy"], "employee_id")
         self.assertEqual(item["ownerEmail"], "yvette@amagency.biz")
         self.assertEqual(item["employeeEmail"], "yvette@amagency.biz")
+        self.assertEqual(item["employeeEnglishName"], "Yvette")
         self.assertEqual(item["imapCode"], "imap-yvette-123")
+        self.assertEqual(item["ownerMatchCount"], 1)
+        self.assertEqual(item["employeeMatches"][0]["employeeEnglishName"], "Yvette")
         self.assertEqual(item["sendingListFileToken"], "boxcn-duet-sending-list")
         self.assertEqual(item["sendingListFileName"], "duet-发信名单.xlsx")
         self.assertTrue(Path(item["templateDownloadedPath"]).exists())
@@ -341,6 +344,55 @@ class FeishuScreeningBridgeTests(unittest.TestCase):
         self.assertEqual(result["sendingListFileName"], "duet-发信名单.xlsx")
         self.assertTrue(Path(result["templateDownloadedPath"]).exists(), result)
         self.assertTrue(Path(result["sendingListDownloadedPath"]).exists(), result)
+
+    def test_inspect_task_upload_keeps_rows_even_when_workbook_attachment_is_missing(self) -> None:
+        result = inspect_task_upload_assignments(
+            client=_FakeInspectionClientWithMissingWorkbook(self._build_new_template_workbook_bytes()),
+            task_upload_url="https://bcnorxdfy50v.feishu.cn/wiki/S0bbwTnlZiJlVMk1Q04ctPXBnje?table=tblYvtOYLoGWCRna&view=vewNwYvkQL",
+            employee_info_url="https://bcnorxdfy50v.feishu.cn/wiki/S0bbwTnlZiJlVMk1Q04ctPXBnje?table=tblQho4xE6SrOtmw&view=vewHoxVXaC",
+            download_dir=self.base_path / "downloads",
+            download_templates=False,
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["recordCount"], 2)
+        task_names = [item["taskName"] for item in result["items"]]
+        self.assertEqual(task_names, ["duet", "MINISO"])
+        miniso_item = next(item for item in result["items"] if item["taskName"] == "MINISO")
+        self.assertEqual(miniso_item["templateFileToken"], "")
+        self.assertEqual(miniso_item["sendingListFileToken"], "boxcn-miniso-sending-list")
+        self.assertTrue(miniso_item["employeeMatched"])
+        self.assertEqual(miniso_item["matchedBy"], "employee_id")
+
+    def test_download_task_upload_assets_reports_missing_workbook_instead_of_task_not_found(self) -> None:
+        with self.assertRaisesRegex(ValueError, "缺少 `需求上传（excel 格式）` 附件"):
+            download_task_upload_screening_assets(
+                client=_FakeInspectionClientWithMissingWorkbook(self._build_new_template_workbook_bytes()),
+                task_upload_url="https://bcnorxdfy50v.feishu.cn/wiki/S0bbwTnlZiJlVMk1Q04ctPXBnje?table=tblYvtOYLoGWCRna&view=vewNwYvkQL",
+                task_name="MINISO",
+                download_dir=self.base_path / "downloads",
+            )
+
+    def test_sync_task_upload_view_skips_tasks_with_missing_workbook(self) -> None:
+        result = sync_task_upload_view_to_email_project(
+            client=_FakeTaskUploadClientWithMissingWorkbook(self._build_new_template_workbook_bytes()),
+            task_upload_url="https://bcnorxdfy50v.feishu.cn/wiki/S0bbwTnlZiJlVMk1Q04ctPXBnje?table=tblYvtOYLoGWCRna&view=vewNwYvkQL",
+            email_project_root=None,
+            email_env_file=self.env_path,
+            download_dir=self.base_path / "downloads",
+            dashboard_output=self.base_path / "repo_local_dashboard.html",
+            project_code_prefix="P-FSH-",
+            default_primary_category="lifestyle",
+            category_overrides={"duet": "lifestyle"},
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["recordCount"], 2)
+        self.assertEqual(result["importedCount"], 1)
+        self.assertEqual(result["skippedCount"], 1)
+        self.assertEqual(result["items"][0]["taskName"], "duet")
+        self.assertEqual(result["skippedItems"][0]["taskName"], "MINISO")
+        self.assertIn("缺少 `需求上传（excel 格式）` 附件", result["skippedItems"][0]["reason"])
 
     def test_sync_task_upload_mailboxes_resolves_prefixed_folder_and_runs_sync(self) -> None:
         mail_data_dir = self.base_path / "task-mail-data"
@@ -459,7 +511,7 @@ class FeishuScreeningBridgeTests(unittest.TestCase):
             )
 
         self.assertTrue(result["ok"])
-        self.assertEqual(result["defaultCredentialMode"], "employee_directory_preferred_with_default_fallback")
+        self.assertEqual(result["defaultCredentialMode"], "default_account_preferred_with_employee_fallback")
         self.assertEqual(result["defaultAccountEmail"], "partnerships@amagency.biz")
         item = result["items"][0]
         self.assertFalse(item["employeeMatched"])
@@ -540,8 +592,59 @@ class FeishuScreeningBridgeTests(unittest.TestCase):
         self.assertIsNone(kwargs["requested_folders"])
         self.assertEqual(kwargs["sent_since"], date(2026, 3, 1))
 
-    def test_sync_task_upload_mailboxes_prefers_employee_credentials_before_default_account(self) -> None:
-        mail_data_dir = self.base_path / "task-mail-data-employee-priority"
+    def test_sync_task_upload_mailboxes_prefers_shared_backup_folder_for_default_account(self) -> None:
+        mail_data_dir = self.base_path / "task-mail-data-shared-backup"
+
+        class _FakeImapClient:
+            def close(self) -> None:
+                return None
+
+            def logout(self) -> None:
+                return None
+
+        with (
+            patch("feishu_screening_bridge.task_upload_sync.connect", return_value=_FakeImapClient()),
+            patch(
+                "feishu_screening_bridge.task_upload_sync.discover_mailboxes",
+                return_value=[
+                    MailboxInfo(display_name="INBOX", imap_name="INBOX", delimiter="/", flags=["\\HasNoChildren"]),
+                    MailboxInfo(display_name="其他文件夹/邮件备份", imap_name="其他文件夹/邮件备份", delimiter="/", flags=["\\HasNoChildren"]),
+                ],
+            ),
+            patch(
+                "feishu_screening_bridge.task_upload_sync.sync_mailboxes",
+                return_value=[
+                    SyncResult(
+                        folder_name="其他文件夹/邮件备份",
+                        fetched=8,
+                        skipped_state_advance=False,
+                        last_seen_uid=88,
+                        uidvalidity=9527,
+                        message_count_on_server=31195,
+                    )
+                ],
+            ) as sync_mock,
+        ):
+            result = sync_task_upload_mailboxes(
+                client=_FakeInspectionClient(self._build_new_template_workbook_bytes()),
+                task_upload_url="https://bcnorxdfy50v.feishu.cn/wiki/S0bbwTnlZiJlVMk1Q04ctPXBnje?table=tblYvtOYLoGWCRna&view=vewNwYvkQL",
+                employee_info_url="https://bcnorxdfy50v.feishu.cn/wiki/S0bbwTnlZiJlVMk1Q04ctPXBnje?table=tblQho4xE6SrOtmw&view=vewHoxVXaC",
+                download_dir=self.base_path / "downloads",
+                mail_data_dir=mail_data_dir,
+                default_account_email="partnerships@amagency.biz",
+                default_auth_code="xYeGKyNmK5jFN7Y2",
+            )
+
+        item = result["items"][0]
+        self.assertTrue(item["mailSyncOk"])
+        self.assertEqual(item["mailCredentialSource"], "default_account")
+        self.assertEqual(item["mailSyncStrategy"], "shared_backup_folder")
+        self.assertEqual(item["resolvedFolder"], "其他文件夹/邮件备份")
+        _, kwargs = sync_mock.call_args
+        self.assertEqual(kwargs["requested_folders"], ["其他文件夹/邮件备份"])
+
+    def test_sync_task_upload_mailboxes_prefers_default_account_before_employee_credentials(self) -> None:
+        mail_data_dir = self.base_path / "task-mail-data-default-priority"
 
         class _FakeImapClient:
             def close(self) -> None:
@@ -583,16 +686,16 @@ class FeishuScreeningBridgeTests(unittest.TestCase):
             )
 
         self.assertTrue(result["ok"])
-        self.assertEqual(result["defaultCredentialMode"], "employee_directory_preferred_with_default_fallback")
+        self.assertEqual(result["defaultCredentialMode"], "default_account_preferred_with_employee_fallback")
         item = result["items"][0]
         self.assertTrue(item["employeeMatched"])
-        self.assertEqual(item["mailCredentialSource"], "employee_directory")
-        self.assertEqual(item["mailLoginEmail"], "yvette@amagency.biz")
+        self.assertEqual(item["mailCredentialSource"], "default_account")
+        self.assertEqual(item["mailLoginEmail"], "partnerships@amagency.biz")
         settings = sync_mock.call_args.args[0]
-        self.assertEqual(settings.account_email, "yvette@amagency.biz")
-        self.assertEqual(settings.auth_code, "imap-yvette-123")
+        self.assertEqual(settings.account_email, "partnerships@amagency.biz")
+        self.assertEqual(settings.auth_code, "xYeGKyNmK5jFN7Y2")
 
-    def test_sync_task_upload_mail_cli_defaults_to_recent_three_months_when_omitted(self) -> None:
+    def test_sync_task_upload_mail_cli_defaults_to_today_when_omitted(self) -> None:
         mail_data_dir = self.base_path / "task-mail-data-default-window"
         env_path = self.base_path / "mail.env"
         env_path.write_text(
@@ -1120,4 +1223,84 @@ class _FakeInspectionClient(_FakeTaskUploadClient):
                     ],
                 },
             }
+        return super().post_api_json(url_path, body=body, headers=headers)
+
+
+class _FakeInspectionClientWithMissingWorkbook(_FakeInspectionClient):
+    def post_api_json(
+        self,
+        url_path: str,
+        *,
+        body: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        if url_path == "/bitable/v1/apps/WVxtbuOkdaoqbxscPfJcG3oEnMd/tables/tblYvtOYLoGWCRna/records/search":
+            payload = super().post_api_json(url_path, body=body, headers=headers)
+            items = list(((payload.get("data") or {}).get("items") or []))
+            items.append(
+                {
+                    "record_id": "rec-task-002",
+                    "fields": {
+                        "任务名": [{"text": "MINISO", "type": "text"}],
+                        "员工ID": {"type": 1, "value": [{"text": "ou_miniso_001", "type": "text"}]},
+                        "负责人邮箱": {
+                            "type": 1,
+                            "value": [{"link": "mailto:eden@amagency.biz", "text": "eden@amagency.biz", "type": "url"}],
+                        },
+                        "负责人": [{"name": "Eden"}],
+                        "发信名单": [{"file_token": "boxcn-miniso-sending-list", "name": "miniso-发信名单.xlsx"}],
+                        "达人管理表链接": {"link": "https://example.com/base/miniso", "type": "mention"},
+                    },
+                }
+            )
+            payload["data"]["items"] = items
+            return payload
+        if url_path == "/bitable/v1/apps/WVxtbuOkdaoqbxscPfJcG3oEnMd/tables/tblQho4xE6SrOtmw/records/search":
+            payload = super().post_api_json(url_path, body=body, headers=headers)
+            items = list(((payload.get("data") or {}).get("items") or []))
+            items.append(
+                {
+                    "record_id": "rec-employee-002",
+                    "fields": {
+                        "员工 ID": [{"text": "ou_miniso_001", "type": "text"}],
+                        "员工名": [{"name": "Eden"}],
+                        "邮箱": [{"text": "eden@amagency.biz", "type": "text"}],
+                        "imap 码": [{"text": "imap-eden-456", "type": "text"}],
+                    },
+                }
+            )
+            payload["data"]["items"] = items
+            return payload
+        return super().post_api_json(url_path, body=body, headers=headers)
+
+
+class _FakeTaskUploadClientWithMissingWorkbook(_FakeTaskUploadClient):
+    def post_api_json(
+        self,
+        url_path: str,
+        *,
+        body: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        if url_path == "/bitable/v1/apps/WVxtbuOkdaoqbxscPfJcG3oEnMd/tables/tblYvtOYLoGWCRna/records/search":
+            payload = super().post_api_json(url_path, body=body, headers=headers)
+            items = list(((payload.get("data") or {}).get("items") or []))
+            items.append(
+                {
+                    "record_id": "rec-task-002",
+                    "fields": {
+                        "任务名": [{"text": "MINISO", "type": "text"}],
+                        "负责人邮箱": {
+                            "type": 1,
+                            "value": [{"link": "mailto:eden@amagency.biz", "text": "eden@amagency.biz", "type": "url"}],
+                        },
+                        "负责人": [{"name": "Eden"}],
+                        "发信名单": [{"file_token": "boxcn-miniso-sending-list", "name": "miniso-发信名单.xlsx"}],
+                        "达人管理表链接": {"link": "https://example.com/base/miniso", "type": "mention"},
+                    },
+                }
+            )
+            payload["data"]["items"] = items
+            payload["data"]["total"] = len(items)
+            return payload
         return super().post_api_json(url_path, body=body, headers=headers)

@@ -7,14 +7,62 @@
 - `workbook_template_parser/`：需求模板解析
 - `backend/`：`筛号` 后端主链路
 
-## 当前主链路
+## 当前正式主链路
 
-1. 飞书任务上传 -> 员工邮箱 / IMAP 码
-2. 下载需求模板 -> 模板解析
-3. 按任务抓取邮箱文件夹邮件
-4. 建线程、匹配达人库、抽报价
-5. 把模板 rulespec + 达人匹配名单写入筛号当前输入状态
-6. Apify 抓取 -> 预筛 -> 视觉复核 -> 导出
+当前正式生产口径只认共享邮箱主线：
+
+1. 外部调度器先把共享邮箱 `partnerships@amagency.biz / 其他文件夹/邮件备份` 同步到本地 `email_sync.db`
+2. `scripts/run_shared_mailbox_post_sync_pipeline.py` 直接消费这份共享邮箱本地库
+3. 从飞书 `task-upload` 拉当前有效任务，并按项目名 / 任务名自动分堆
+4. 共享邮箱快路径默认走 `brand-keyword-fast-path`
+5. 对每个任务识别“新达人 / 已筛号达人 / 已存在邮件更新”
+6. 新达人继续走 `keep-list -> Apify -> visual -> positioning -> export -> upload`
+7. 已筛号达人只更新邮件字段和最新 `.eml`
+
+老的 task-driven runner 仍保留在仓库里做兼容和局部调试，但不再视为正式调度入口。
+
+## 共享邮箱后半段增量路由
+
+如果共享邮箱最新邮件已经由外部程序同步到本地 `email_sync.db`，正式项目入口就是这条 repo-local 后半段主线：
+
+```bash
+python3 scripts/run_shared_mailbox_post_sync_pipeline.py \
+  --shared-mail-db-path "/path/to/shared/email_sync.db" \
+  --task-upload-url "$TASK_UPLOAD_URL" \
+  --employee-info-url "$EMPLOYEE_INFO_URL" \
+  --env-file .env \
+  --upload-dry-run
+```
+
+这条入口不会重新抓 IMAP，而是直接消费已经同步好的共享邮箱本地库，然后：
+
+- 从飞书 `task-upload` 拉当前有效任务
+- 按项目名 / `task_name` 自动分堆；如果只给项目名，会优先命中对应任务组
+- 对每个任务识别“新达人”和“已筛号达人”
+- 新达人继续走完整 `keep-list -> Apify -> visual -> positioning -> total export`
+- 已筛号达人只更新邮件字段和最新 `.eml` 附件
+- 最终把每个任务写回各自的目标飞书表
+
+输出 contract 会额外给出：
+
+- top-level `summary.json`
+- 每个任务各自的 summary / total export / upload payload
+- 本地失败归档 `failed_or_skipped_records.json` / `.xlsx`
+
+同项目内的判定键现在是“负责人维度优先”的：
+
+- 默认按 `达人对接人 + 达人ID + 平台`
+- 也就是说，不同项目只要负责人不同，就允许同达人并存
+- 如果目标飞书表缺少 `达人对接人`，或存在未填写负责人的历史记录，上传会直接阻断，避免误判重复
+
+- 飞书里不存在该键：创建新记录并跑完整筛号
+- 飞书里存在该键且 `ai是否通过` 为空：补跑完整筛号并更新该记录
+- 飞书里存在该键且 `ai是否通过` 非空：只更新邮件相关字段，不再重跑下游筛号
+
+上传前还会再做两层保护：
+
+- 目标飞书表如果已经存在重复的“当前主键”记录，会直接阻断写入
+- 当前 payload 如果内部存在重复的“当前主键”记录，也会直接阻断写入
 
 ## 视觉复核后定位卡分析
 
@@ -70,8 +118,8 @@ repo-local 可观察面如下：
 
 如果要开始改代码，再打开这 4 个入口文件就够了：
 
-- `scripts/run_task_upload_to_final_export_pipeline.py`
-- `scripts/run_task_upload_to_keep_list_pipeline.py`
+- `scripts/run_shared_mailbox_sync.py`
+- `scripts/run_shared_mailbox_post_sync_pipeline.py`
 - `scripts/run_keep_list_screening_pipeline.py`
 - `backend/app.py`
 
@@ -113,7 +161,7 @@ python3 -m feishu_screening_bridge --help
 python3 -m email_sync --help
 ```
 
-邮件抓取如果不显式传 `--sent-since`，默认只抓最近 `3` 个自然月内的邮件；例如在 `2026-03-27` 运行时，默认等价于 `--sent-since 2025-12-27`。如果要改窗口，显式传 `--sent-since YYYY-MM-DD` 即可覆盖默认值。
+邮件抓取如果不显式传 `--sent-since`，默认从“今天”开始抓；当前共享邮箱主线默认优先走 `partnerships@amagency.biz` 的 `其他文件夹/邮件备份`。如果要改窗口，显式传 `--sent-since YYYY-MM-DD` 即可覆盖默认值。
 
 以后达人匹配默认应直接使用任务上传里的飞书 `发信名单`，而不是本地测试达人库 workbook。可以直接按任务名下载 `发信名单` 并做匹配：
 

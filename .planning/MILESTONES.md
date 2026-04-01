@@ -1,5 +1,25 @@
 # Milestones
 
+## Next Candidate: v1.4.0 Shared Mailbox Post-Sync Routing and Feishu Incremental Update
+
+**Status:** queued after current `v1.3.0` gap-closure / re-audit work
+
+**Planned first phase:** `Phase 30`
+
+**Intent:**
+
+- 以共享邮箱本地 `email_sync.db` 为统一输入
+- 按 `task-upload` 当前有效任务分堆
+- 同项目内按 `达人ID + 平台` 做增量判定
+- 已筛号达人只更新邮件字段和最新 `.eml`
+- 新达人继续走完整筛号链路并写回各自飞书表
+
+**Reference:**
+
+- `.planning/v1.4.0-PHASE-30-INTAKE.md`
+
+---
+
 ## v1.2.0 End-to-End Single-Entry Pipeline Verification (Shipped: 2026-03-29)
 
 **Phases completed:** 5 roadmap phases through Phase 19
