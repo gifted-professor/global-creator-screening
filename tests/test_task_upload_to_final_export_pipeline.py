@@ -327,6 +327,123 @@ class TaskUploadToFinalExportRunnerTests(unittest.TestCase):
             {"instagram": "completed_with_partial_scrape", "tiktok": "scrape_failed"},
         )
 
+    def test_runner_accepts_staged_only_as_successful_terminal_status(self) -> None:
+        def fake_upstream(**kwargs):
+            keep_path = Path(kwargs["output_root"]) / "exports" / "MINISO_final_keep.xlsx"
+            template_path = Path(kwargs["output_root"]) / "downloads" / "template.xlsx"
+            keep_path.parent.mkdir(parents=True, exist_ok=True)
+            keep_path.touch()
+            template_path.parent.mkdir(parents=True, exist_ok=True)
+            template_path.touch()
+            return {
+                "status": "stopped_after_keep-list",
+                "contract": {"canonical_boundary": "keep-list"},
+                "resume_points": {
+                    "keep_list": {
+                        "keep_workbook": str(keep_path),
+                        "template_workbook": str(template_path),
+                    }
+                },
+                "artifacts": {
+                    "keep_workbook": str(keep_path),
+                    "template_workbook": str(template_path),
+                },
+            }
+
+        def fake_downstream(**kwargs):
+            return {
+                "status": "staged_only",
+                "platforms": {
+                    "instagram": {
+                        "status": "staged_only",
+                    }
+                },
+                "artifacts": {},
+            }
+
+        final_runner._load_runtime_dependencies = lambda: {
+            "run_task_upload_to_keep_list_pipeline": fake_upstream,
+            "run_keep_list_screening_pipeline": fake_downstream,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            env_path = temp_root / ".env"
+            env_path.write_text("", encoding="utf-8")
+            summary = final_runner.run_task_upload_to_final_export_pipeline(
+                task_name="MINISO",
+                env_file=str(env_path),
+                output_root=temp_root / "run",
+                task_upload_url="https://example.com/task",
+                employee_info_url="https://example.com/employee",
+                feishu_app_id="app-id",
+                feishu_app_secret="app-secret",
+                platform_filters=["instagram"],
+                skip_scrape=True,
+            )
+
+        self.assertEqual(summary["status"], "staged_only")
+        self.assertEqual(summary["delivery_status"], "staged_only")
+        self.assertEqual(summary["verdict"]["outcome"], "completed")
+        self.assertNotIn("failure", summary)
+
+    def test_runner_accepts_vision_probe_only_as_successful_terminal_status(self) -> None:
+        def fake_upstream(**kwargs):
+            keep_path = Path(kwargs["output_root"]) / "exports" / "MINISO_final_keep.xlsx"
+            template_path = Path(kwargs["output_root"]) / "downloads" / "template.xlsx"
+            keep_path.parent.mkdir(parents=True, exist_ok=True)
+            keep_path.touch()
+            template_path.parent.mkdir(parents=True, exist_ok=True)
+            template_path.touch()
+            return {
+                "status": "stopped_after_keep-list",
+                "contract": {"canonical_boundary": "keep-list"},
+                "resume_points": {
+                    "keep_list": {
+                        "keep_workbook": str(keep_path),
+                        "template_workbook": str(template_path),
+                    }
+                },
+                "artifacts": {
+                    "keep_workbook": str(keep_path),
+                    "template_workbook": str(template_path),
+                },
+            }
+
+        def fake_downstream(**kwargs):
+            return {
+                "status": "vision_probe_only",
+                "platforms": {},
+                "artifacts": {},
+                "vision_probe": {"success": True, "provider": "openai"},
+            }
+
+        final_runner._load_runtime_dependencies = lambda: {
+            "run_task_upload_to_keep_list_pipeline": fake_upstream,
+            "run_keep_list_screening_pipeline": fake_downstream,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            env_path = temp_root / ".env"
+            env_path.write_text("", encoding="utf-8")
+            summary = final_runner.run_task_upload_to_final_export_pipeline(
+                task_name="MINISO",
+                env_file=str(env_path),
+                output_root=temp_root / "run",
+                task_upload_url="https://example.com/task",
+                employee_info_url="https://example.com/employee",
+                feishu_app_id="app-id",
+                feishu_app_secret="app-secret",
+                probe_vision_provider_only=True,
+            )
+
+        self.assertEqual(summary["status"], "vision_probe_only")
+        self.assertEqual(summary["delivery_status"], "vision_probe_only")
+        self.assertEqual(summary["verdict"]["outcome"], "completed")
+        self.assertEqual(summary["steps"]["downstream"]["vision_probe"]["provider"], "openai")
+        self.assertNotIn("failure", summary)
+
     def test_runner_surfaces_positioning_artifacts_and_stage_summaries_without_blocking_delivery(self) -> None:
         def fake_upstream(**kwargs):
             keep_path = Path(kwargs["output_root"]) / "exports" / "MINISO_final_keep.xlsx"

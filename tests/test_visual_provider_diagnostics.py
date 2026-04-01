@@ -2116,6 +2116,16 @@ class OperatorConsoleRoutesTests(unittest.TestCase):
             with backend_app.OPERATOR_RUNS_LOCK:
                 backend_app.OPERATOR_RUNS.pop(payload["id"], None)
 
+    def test_operator_default_env_file_is_anchored_to_repo_root(self) -> None:
+        original_cwd = Path.cwd()
+        try:
+            os.chdir(backend_app.BASE_DIR / "backend")
+            resolved_env_file = backend_app._resolve_operator_env_file()
+        finally:
+            os.chdir(original_cwd)
+
+        self.assertEqual(resolved_env_file, (backend_app.BASE_DIR / ".env").resolve())
+
     def test_operator_run_detail_serializes_summary_artifacts(self) -> None:
         refreshed_run = {
             "id": "run-2",

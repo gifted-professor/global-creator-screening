@@ -527,7 +527,14 @@ def _path_is_within_root(path: Path, root: Path) -> bool:
 
 
 def _resolve_operator_env_snapshot(env_file: str = ""):
-    return load_env_file_snapshot(env_file or ".env")
+    raw = str(env_file or ".env").strip() or ".env"
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        candidate = (BASE_DIR / candidate).resolve()
+    return load_env_file_snapshot(
+        str(candidate),
+        default_env_file=str((BASE_DIR / ".env").resolve()),
+    )
 
 
 def _resolve_operator_env_file(env_file: str = "") -> Path:
