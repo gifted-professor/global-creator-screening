@@ -574,13 +574,16 @@ backend/.venv/bin/python scripts/run_keep_list_screening_pipeline.py \
 
 - `--platform`：只跑指定平台，可重复传入
 - `--max-identifiers-per-platform`：每个平台最多跑多少个账号，适合 bounded validation
-- `--skip-scrape`：只做 staging，不触发 Apify / prescreen / export
+- `--skip-scrape`：staging-only / local observation run；跳过 scrape 和视觉执行，且跳过 vision probe；但 run 末尾仍可能生成汇总导出文件，不要用 export 文件是否存在来判断是否已经越过 staging
 - `--skip-visual`：跑 scrape 和导出，但跳过视觉复核
 - `--vision-provider`：显式指定视觉 provider，例如 `openai`
 - `--probe-vision-provider-only`：只做视觉 provider 轻量探活，不继续跑 scrape / visual
 
 summary 会明确记录：
 
+- `run_id`、`run_root`、`task_spec_json`
+- 顶层 `verdict`，用于先快速判断这轮 run 的最终结论
+- `failure_decision`，用于判断应该补配置、补输入、人工排查，还是直接重试
 - keep workbook 路径
 - 实际 staged 数量和分平台计数
 - 是否执行 scrape

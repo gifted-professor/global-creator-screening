@@ -7,6 +7,11 @@
 如果只想看正式链路说明，先看 `SHARED_MAILBOX_POST_SYNC_CHAIN.md`。  
 如果要回放“这次到底发生了什么”，看这份。
 
+注：
+
+- 这份文档记录的是 `2026-04-01` 当时那次 run 的事实，不会因为后续框架收口而重写当时过程。
+- 当前仓库后续已经接入单 run harness 基线；但 shared-mailbox 顶层 run 仍应先看 top-level `summary.json` 里的 `status`、计数和 `task_results`，再对具体 child canonical runs 使用 `verdict`、`failure_decision`、`task_spec.json` 和 `workflow_handoff.json`。
+
 ## 一句话结论
 
 这次 `SKG` 最终已经完整落表到飞书。
