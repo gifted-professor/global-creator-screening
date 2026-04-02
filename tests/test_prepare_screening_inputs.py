@@ -148,6 +148,9 @@ class PrepareScreeningInputsTests(unittest.TestCase):
             )
 
             self.assertEqual(summary["rulespec"]["source"], "template_workbook", summary)
+            self.assertEqual(summary["env_file_raw"], ".env", summary)
+            self.assertEqual(summary["env_file"], summary["resolved_inputs"]["env_file"]["path"], summary)
+            self.assertIn("resolved_config_sources", summary)
             self.assertEqual(summary["upload"]["metadata_count_by_platform"]["instagram"], 1, summary)
             self.assertEqual(summary["upload"]["metadata_count_by_platform"]["tiktok"], 1, summary)
             self.assertEqual(summary["upload"]["metadata_count_by_platform"]["youtube"], 0, summary)
@@ -313,9 +316,13 @@ class PrepareScreeningInputsTests(unittest.TestCase):
                 "scripts.prepare_screening_inputs.resolve_task_upload_source_files",
                 return_value=fake_task_source,
             ) as mocked_resolver:
+                task_download_dir = tmp_path / "downloads"
+                template_output_dir = tmp_path / "parsed_outputs"
                 summary = prepare_screening_inputs(
                     task_name="MINISO",
                     task_upload_url="https://example.com/wiki/task-upload",
+                    task_download_dir=task_download_dir,
+                    template_output_dir=template_output_dir,
                     screening_data_dir=screening_data_dir,
                     config_dir=config_dir,
                     temp_dir=temp_dir,
@@ -329,6 +336,10 @@ class PrepareScreeningInputsTests(unittest.TestCase):
             self.assertEqual(summary["upload"]["metadata_count_by_platform"]["instagram"], 2, summary)
             self.assertEqual(summary["upload"]["metadata_count_by_platform"]["tiktok"], 2, summary)
             self.assertEqual(summary["upload"]["metadata_count_by_platform"]["youtube"], 1, summary)
+            self.assertEqual(summary["resolved_inputs"]["task_download_dir"]["path"], str(task_download_dir.resolve()), summary)
+            self.assertEqual(summary["resolved_inputs"]["template_output_dir"]["path"], str(template_output_dir.resolve()), summary)
+            self.assertEqual(summary["resolved_config_sources"]["task_download_dir"], "cli", summary)
+            self.assertEqual(summary["resolved_config_sources"]["template_output_dir"], "cli", summary)
             self.assertTrue(summary_json.exists(), summary_json)
 
     def test_prepare_screening_inputs_skips_task_upload_resolution_when_local_inputs_are_complete(self) -> None:

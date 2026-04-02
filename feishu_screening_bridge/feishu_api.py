@@ -10,6 +10,7 @@ from urllib import error, parse, request
 
 
 DEFAULT_FEISHU_BASE_URL = "https://open.feishu.cn/open-apis"
+_TRUSTED_FEISHU_HOST_SUFFIXES = ("feishu.cn", "larksuite.com")
 
 _BOX_TOKEN_PATTERN = re.compile(r"(box[a-zA-Z0-9_-]+)")
 
@@ -71,9 +72,40 @@ class FeishuOpenClient:
         return token
 
     def download_file(self, file_token_or_url: str, *, desired_name: str | None = None) -> DownloadedFeishuFile:
-        file_token = extract_file_token(file_token_or_url)
+        raw = str(file_token_or_url or "").strip()
+        if not raw:
+            raise ValueError("file_token 或 file_url 不能为空。")
+        file_token = extract_file_token(raw)
         access_token = self.get_tenant_access_token()
         last_error: Exception | None = None
+
+        direct_download_url = _extract_drive_download_url(
+            raw,
+            trusted_hosts=_build_trusted_drive_download_hosts(self.base_url),
+        )
+        if direct_download_url:
+            try:
+                status, headers, body, resolved_url = self._request_bytes(
+                    "GET",
+                    direct_download_url,
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+            except FeishuApiError as exc:
+                last_error = exc
+            else:
+                if status == 200 and not _looks_like_json(headers.get("Content-Type", ""), body):
+                    file_name = _normalize_download_name(
+                        desired_name
+                        or _extract_filename_from_headers(headers)
+                        or f"{file_token}{_guess_extension(headers.get('Content-Type', ''))}"
+                    )
+                    return DownloadedFeishuFile(
+                        file_token=file_token,
+                        file_name=file_name,
+                        content_type=str(headers.get("Content-Type") or "application/octet-stream"),
+                        content=body,
+                        source_url=resolved_url,
+                    )
 
         for resource in ("files", "medias"):
             url_path = f"/drive/v1/{resource}/{parse.quote(file_token, safe='')}/download"
@@ -334,6 +366,10 @@ def extract_file_token(file_token_or_url: str) -> str:
     if query_token:
         return query_token
 
+    drive_match = re.search(r"/drive/v1/(?:files|medias)/([^/?#]+)/", parsed.path)
+    if drive_match:
+        return parse.unquote(drive_match.group(1))
+
     match = _BOX_TOKEN_PATTERN.search(raw)
     if match:
         return match.group(1)
@@ -387,9 +423,56 @@ def _guess_extension(content_type: str) -> str:
 
 
 def _join_url(base_url: str, url_path: str) -> str:
+    if "://" in str(url_path or ""):
+        return str(url_path)
     if not url_path.startswith("/"):
         url_path = "/" + url_path
     return base_url.rstrip("/") + url_path
+
+
+def _build_trusted_drive_download_hosts(base_url: str) -> tuple[str, ...]:
+    hosts: list[str] = []
+    for raw_url in (base_url, DEFAULT_FEISHU_BASE_URL):
+        parsed = parse.urlparse(str(raw_url or "").strip())
+        host = str(parsed.hostname or "").strip().lower().rstrip(".")
+        if host and host not in hosts:
+            hosts.append(host)
+    return tuple(hosts)
+
+
+def _is_trusted_drive_download_host(hostname: str, trusted_hosts: tuple[str, ...] | list[str] | set[str] | None = None) -> bool:
+    normalized = str(hostname or "").strip().lower().rstrip(".")
+    if not normalized:
+        return False
+    normalized_trusted_hosts = {
+        str(item or "").strip().lower().rstrip(".")
+        for item in (trusted_hosts or ())
+        if str(item or "").strip()
+    }
+    if normalized in normalized_trusted_hosts:
+        return True
+    return any(normalized == suffix or normalized.endswith(f".{suffix}") for suffix in _TRUSTED_FEISHU_HOST_SUFFIXES)
+
+
+def _extract_drive_download_url(
+    file_token_or_url: str,
+    *,
+    trusted_hosts: tuple[str, ...] | list[str] | set[str] | None = None,
+) -> str:
+    raw = str(file_token_or_url or "").strip()
+    if "://" not in raw:
+        return ""
+    parsed = parse.urlparse(raw)
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    if not _is_trusted_drive_download_host(str(parsed.hostname or ""), trusted_hosts):
+        return ""
+    normalized_path = parsed.path or ""
+    if "/drive/v1/" not in normalized_path or not normalized_path.endswith("/download"):
+        return ""
+    if "/files/" not in normalized_path and "/medias/" not in normalized_path:
+        return ""
+    return raw
 
 
 def _looks_like_json(content_type: str, body: bytes) -> bool:

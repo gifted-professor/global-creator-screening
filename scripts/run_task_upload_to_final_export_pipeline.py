@@ -13,10 +13,26 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from backend.final_export_merge import extract_task_owner_context
+from harness.contract import SUCCESSFUL_TERMINAL_STATUSES, attach_run_contract
+from harness.config import (
+    RequiredConfigSpec,
+    build_required_config_errors,
+    normalize_platform_filters,
+    resolve_final_runner_config,
+)
+from harness.failures import attach_failure_to_summary, build_failure_payload as build_harness_failure_payload
+from harness.paths import resolve_final_runner_paths
+from harness.preflight import (
+    build_preflight_error,
+    build_preflight_payload,
+    inspect_directory_materialization_target,
+)
+from harness.setup import materialize_setup
+from harness.spec import build_final_runner_task_spec, write_task_spec
 
 
 MATCHING_STRATEGIES = ("legacy-enrichment", "brand-keyword-fast-path")
-SUCCESSFUL_DOWNSTREAM_STATUSES = {"completed", "completed_with_partial_scrape"}
+SUCCESSFUL_DOWNSTREAM_STATUSES = SUCCESSFUL_TERMINAL_STATUSES
 
 
 def _load_runtime_dependencies():
@@ -30,8 +46,7 @@ def _load_runtime_dependencies():
 
 
 def default_output_root() -> Path:
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    return REPO_ROOT / "temp" / f"task_upload_to_final_export_{timestamp}"
+    return resolve_final_runner_paths(task_name="task").run_root
 
 
 def iso_now() -> str:
@@ -66,15 +81,17 @@ def _build_failure_payload(
     error_code: str,
     message: str,
     remediation: str,
+    failure_layer: str = "runtime",
     details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
-        "stage": stage,
-        "error_code": error_code,
-        "message": message,
-        "remediation": remediation,
-        "details": details or {},
-    }
+    return build_harness_failure_payload(
+        stage=stage,
+        error_code=error_code,
+        message=message,
+        remediation=remediation,
+        failure_layer=failure_layer,
+        details=details,
+    )
 
 
 def _build_keep_list_resume_command(
@@ -183,6 +200,153 @@ def _collect_downstream_artifact_path(downstream_summary: dict[str, Any], key: s
     return str(((downstream_summary.get("artifacts") or {}).get(key) or "")).strip()
 
 
+def _normalize_platform_filters(platform_filters: list[str] | None) -> list[str]:
+    return normalize_platform_filters(platform_filters)
+
+
+def _build_resolved_config_sources(
+    *,
+    env_file: str,
+    task_upload_url: str,
+    employee_info_url: str,
+    feishu_app_id: str,
+    feishu_app_secret: str,
+    feishu_base_url: str,
+    timeout_seconds: float,
+    matching_strategy: str,
+    brand_keyword: str,
+    task_name: str,
+    platform_filters: list[str] | None,
+    vision_provider: str,
+    max_identifiers_per_platform: int,
+    mail_limit: int,
+    mail_workers: int,
+    sent_since: str,
+    reset_state: bool,
+    reuse_existing: bool,
+    probe_vision_provider_only: bool,
+    skip_scrape: bool,
+    skip_visual: bool,
+    skip_positioning_card_analysis: bool,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    return resolve_final_runner_config(
+        env_file=env_file,
+        task_upload_url=task_upload_url,
+        employee_info_url=employee_info_url,
+        feishu_app_id=feishu_app_id,
+        feishu_app_secret=feishu_app_secret,
+        feishu_base_url=feishu_base_url,
+        timeout_seconds=timeout_seconds,
+        matching_strategy=matching_strategy,
+        brand_keyword=brand_keyword,
+        task_name=task_name,
+        platform_filters=platform_filters,
+        vision_provider=vision_provider,
+        max_identifiers_per_platform=max_identifiers_per_platform,
+        mail_limit=mail_limit,
+        mail_workers=mail_workers,
+        sent_since=sent_since,
+        reset_state=reset_state,
+        reuse_existing=reuse_existing,
+        probe_vision_provider_only=probe_vision_provider_only,
+        skip_scrape=skip_scrape,
+        skip_visual=skip_visual,
+        skip_positioning_card_analysis=skip_positioning_card_analysis,
+    )
+
+
+def _build_final_runner_preflight(
+    *,
+    task_name: str,
+    matching_strategy: str,
+    run_root: Path,
+    env_snapshot: Any,
+    resolved_task_upload_url: Any,
+    resolved_employee_info_url: Any,
+    resolved_feishu_app_id: Any,
+    resolved_feishu_app_secret: Any,
+    requested_platforms: list[str],
+) -> dict[str, Any]:
+    errors: list[dict[str, Any]] = []
+    run_root_target = inspect_directory_materialization_target(run_root)
+    if not str(task_name or "").strip():
+        errors.append(
+            build_preflight_error(
+                error_code="TASK_NAME_MISSING",
+                message="缺少 task_name。",
+                remediation="通过 `--task-name` 传入任务名后重试。",
+            )
+        )
+    if str(matching_strategy or "").strip().lower() not in MATCHING_STRATEGIES:
+        errors.append(
+            build_preflight_error(
+                error_code="MATCHING_STRATEGY_INVALID",
+                message=f"不支持的 matching_strategy: {matching_strategy}",
+                remediation=f"改用 {', '.join(MATCHING_STRATEGIES)} 之一后重试。",
+                details={"matching_strategy": str(matching_strategy or "")},
+            )
+        )
+    errors.extend(
+        build_required_config_errors(
+            [
+                RequiredConfigSpec(
+                    resolved=resolved_task_upload_url,
+                    error_code="TASK_UPLOAD_URL_MISSING",
+                    message="缺少 TASK_UPLOAD_URL。",
+                    remediation="在 `.env` 或 `--task-upload-url` 中提供 TASK_UPLOAD_URL 后重试。",
+                ),
+                RequiredConfigSpec(
+                    resolved=resolved_employee_info_url,
+                    error_code="EMPLOYEE_INFO_URL_MISSING",
+                    message="缺少 EMPLOYEE_INFO_URL。",
+                    remediation="在 `.env` 或 `--employee-info-url` 中提供 EMPLOYEE_INFO_URL 后重试。",
+                ),
+                RequiredConfigSpec(
+                    resolved=resolved_feishu_app_id,
+                    error_code="FEISHU_APP_ID_MISSING",
+                    message="缺少 FEISHU_APP_ID。",
+                    remediation="在 `.env` 或 `--feishu-app-id` 中提供 FEISHU_APP_ID 后重试。",
+                ),
+                RequiredConfigSpec(
+                    resolved=resolved_feishu_app_secret,
+                    error_code="FEISHU_APP_SECRET_MISSING",
+                    message="缺少 FEISHU_APP_SECRET。",
+                    remediation="在 `.env` 或 `--feishu-app-secret` 中提供 FEISHU_APP_SECRET 后重试。",
+                ),
+            ]
+        )
+    )
+    if not bool(run_root_target["materializable"]):
+        errors.append(
+            build_preflight_error(
+                error_code="RUN_ROOT_UNAVAILABLE",
+                message=f"run_root 无法创建: {run_root}",
+                remediation="检查输出目录权限或显式传入可写的 `--output-root` 后重试。",
+                details={
+                    "path": str(run_root),
+                    "nearest_existing_parent": str(run_root_target["nearest_existing_parent"]),
+                },
+            )
+        )
+    return build_preflight_payload(
+        checks={
+            "scope": "task-upload-to-final-export",
+            "lightweight_only": True,
+            "task_name_present": bool(str(task_name or "").strip()),
+            "matching_strategy": str(matching_strategy or "").strip().lower(),
+            "env_file_exists": bool(getattr(env_snapshot, "exists", False)),
+            "task_upload_url_present": bool(getattr(resolved_task_upload_url, "present", False)),
+            "employee_info_url_present": bool(getattr(resolved_employee_info_url, "present", False)),
+            "feishu_app_id_present": bool(getattr(resolved_feishu_app_id, "present", False)),
+            "feishu_app_secret_present": bool(getattr(resolved_feishu_app_secret, "present", False)),
+            "requested_platforms": list(requested_platforms),
+            "run_root_exists": run_root.exists(),
+            "run_root_materializable": bool(run_root_target["materializable"]),
+        },
+        errors=errors,
+    )
+
+
 def run_task_upload_to_final_export_pipeline(
     *,
     task_name: str,
@@ -222,35 +386,102 @@ def run_task_upload_to_final_export_pipeline(
     skip_visual: bool = False,
     skip_positioning_card_analysis: bool = False,
 ) -> dict[str, Any]:
-    runtime = _load_runtime_dependencies()
-    run_upstream = runtime["run_task_upload_to_keep_list_pipeline"]
-    run_downstream = runtime["run_keep_list_screening_pipeline"]
-
     normalized_task_name = str(task_name or "").strip()
-    if not normalized_task_name:
-        raise ValueError("缺少 task_name。")
     normalized_matching_strategy = str(matching_strategy or "").strip().lower() or MATCHING_STRATEGIES[0]
-    if normalized_matching_strategy not in MATCHING_STRATEGIES:
-        raise ValueError(f"不支持的 matching_strategy: {matching_strategy}")
     normalized_brand_keyword = str(brand_keyword or "").strip() or normalized_task_name
-    requested_platforms = [str(value).strip().lower() for value in (platform_filters or []) if str(value).strip()]
+    requested_platforms = _normalize_platform_filters(platform_filters)
+    runner_paths = resolve_final_runner_paths(
+        task_name=normalized_task_name or "task",
+        output_root=output_root,
+        summary_json=summary_json,
+    )
+    resolved_output_root = runner_paths.output_root
+    upstream_output_root = runner_paths.upstream_output_root
+    downstream_output_root = runner_paths.downstream_output_root
+    upstream_summary_path = runner_paths.upstream_summary_json
+    downstream_summary_path = runner_paths.downstream_summary_json
+    task_spec_path = runner_paths.task_spec_json
+    run_summary_path = runner_paths.summary_json
+    resolved_config_sources, resolved_config = _build_resolved_config_sources(
+        env_file=env_file,
+        task_upload_url=task_upload_url,
+        employee_info_url=employee_info_url,
+        feishu_app_id=feishu_app_id,
+        feishu_app_secret=feishu_app_secret,
+        feishu_base_url=feishu_base_url,
+        timeout_seconds=timeout_seconds,
+        matching_strategy=normalized_matching_strategy,
+        brand_keyword=brand_keyword,
+        task_name=normalized_task_name,
+        platform_filters=platform_filters,
+        vision_provider=vision_provider,
+        max_identifiers_per_platform=max_identifiers_per_platform,
+        mail_limit=mail_limit,
+        mail_workers=mail_workers,
+        sent_since=sent_since,
+        reset_state=reset_state,
+        reuse_existing=reuse_existing,
+        probe_vision_provider_only=probe_vision_provider_only,
+        skip_scrape=skip_scrape,
+        skip_visual=skip_visual,
+        skip_positioning_card_analysis=skip_positioning_card_analysis,
+    )
+    preflight = _build_final_runner_preflight(
+        task_name=normalized_task_name,
+        matching_strategy=normalized_matching_strategy,
+        run_root=runner_paths.run_root,
+        env_snapshot=resolved_config["env_snapshot"],
+        resolved_task_upload_url=resolved_config["task_upload_url"],
+        resolved_employee_info_url=resolved_config["employee_info_url"],
+        resolved_feishu_app_id=resolved_config["feishu_app_id"],
+        resolved_feishu_app_secret=resolved_config["feishu_app_secret"],
+        requested_platforms=requested_platforms,
+    )
 
-    resolved_output_root = (output_root or default_output_root()).expanduser().resolve()
-    resolved_output_root.mkdir(parents=True, exist_ok=True)
-    upstream_output_root = (resolved_output_root / "upstream").resolve()
-    downstream_output_root = (resolved_output_root / "downstream").resolve()
-    upstream_summary_path = upstream_output_root / "summary.json"
-    downstream_summary_path = downstream_output_root / "summary.json"
-    run_summary_path = summary_json.expanduser().resolve() if summary_json else resolved_output_root / "summary.json"
+    started_at = iso_now()
+    task_spec = build_final_runner_task_spec(
+        generated_at=started_at,
+        runner_paths=runner_paths,
+        env_snapshot=resolved_config["env_snapshot"],
+        env_file_raw=str(env_file),
+        resolved_config_sources=resolved_config_sources,
+        task_name=normalized_task_name,
+        task_upload_url=resolved_config["task_upload_url"].value,
+        employee_info_url=resolved_config["employee_info_url"].value,
+        task_download_dir=str(task_download_dir or "").strip(),
+        mail_data_dir=str(mail_data_dir or "").strip(),
+        owner_email_overrides=dict(owner_email_overrides or {}),
+        matching_strategy=normalized_matching_strategy,
+        brand_keyword=normalized_brand_keyword,
+        brand_match_include_from=bool(brand_match_include_from),
+        mail_limit=int(max(0, int(mail_limit))),
+        mail_workers=int(max(1, int(mail_workers))),
+        sent_since=str(sent_since or "").strip(),
+        reset_state=bool(reset_state),
+        reuse_existing=bool(reuse_existing),
+        requested_platforms=requested_platforms,
+        vision_provider=str(vision_provider or "").strip().lower(),
+        max_identifiers_per_platform=int(max(0, int(max_identifiers_per_platform))),
+        poll_interval=max(1.0, float(poll_interval)),
+        probe_vision_provider_only=bool(probe_vision_provider_only),
+        skip_scrape=bool(skip_scrape),
+        skip_visual=bool(skip_visual),
+        skip_positioning_card_analysis=bool(skip_positioning_card_analysis),
+    )
 
     summary: dict[str, Any] = {
-        "started_at": iso_now(),
+        "started_at": started_at,
         "finished_at": "",
-        "status": "running",
+        "status": "running" if preflight["ready"] else "failed",
+        "run_id": runner_paths.run_id,
+        "run_root": str(runner_paths.run_root),
         "task_name": normalized_task_name,
-        "env_file": str(env_file),
+        "env_file_raw": str(env_file),
+        "env_file": str(resolved_config["env_snapshot"].path),
         "output_root": str(resolved_output_root),
         "summary_json": str(run_summary_path),
+        "task_spec_json": str(task_spec_path),
+        "resolved_config_sources": resolved_config_sources,
         "matching_strategy": normalized_matching_strategy,
         "brand_keyword": normalized_brand_keyword,
         "inputs": {
@@ -266,8 +497,13 @@ def run_task_upload_to_final_export_pipeline(
             "reuse_existing": bool(reuse_existing),
         },
         "resolved_inputs": {
-            "env_file": _path_summary(Path(env_file), source="cli_or_default", kind="file"),
+            "env_file": {
+                "path": str(resolved_config["env_snapshot"].path),
+                "exists": resolved_config["env_snapshot"].exists,
+                "source": resolved_config["env_snapshot"].source,
+            },
         },
+        "preflight": preflight,
         "bounded_controls": {
             "upstream": {
                 "matching_strategy": normalized_matching_strategy,
@@ -290,11 +526,15 @@ def run_task_upload_to_final_export_pipeline(
             },
         },
         "resolved_paths": {
+            "run_root": str(runner_paths.run_root),
             "output_root": str(resolved_output_root),
+            "task_spec_json": str(task_spec_path),
             "upstream_output_root": str(upstream_output_root),
             "upstream_summary_json": str(upstream_summary_path),
+            "upstream_task_spec_json": str(runner_paths.upstream_task_spec_json),
             "downstream_output_root": str(downstream_output_root),
             "downstream_summary_json": str(downstream_summary_path),
+            "downstream_task_spec_json": str(runner_paths.downstream_task_spec_json),
         },
         "contract": {
             "scope": "task-upload-to-final-export",
@@ -302,6 +542,12 @@ def run_task_upload_to_final_export_pipeline(
             "downstream_runner": "scripts/run_keep_list_screening_pipeline.py",
             "canonical_internal_boundary": "keep-list",
             "canonical_resume_point": "keep_list",
+        },
+        "setup": {
+            "scope": "task-upload-to-final-export",
+            "completed": False,
+            "skipped": not preflight["ready"],
+            "errors": [],
         },
         "steps": {},
         "artifacts": {
@@ -318,14 +564,85 @@ def run_task_upload_to_final_export_pipeline(
         },
         "resume_points": {},
     }
-    _write_summary(run_summary_path, summary)
+    attach_run_contract(summary)
 
     def finalize(status: str, **extra: Any) -> dict[str, Any]:
         summary["status"] = status
         summary["finished_at"] = iso_now()
         summary.update(extra)
+        failure = extra.get("failure")
+        if isinstance(failure, dict):
+            attach_failure_to_summary(summary, failure)
+        attach_run_contract(summary)
         _write_summary(run_summary_path, summary)
         return summary
+
+    if not preflight["ready"]:
+        failure = preflight["errors"][0]
+        return finalize(
+            "failed",
+            failure={**failure, "failure_layer": "preflight"},
+        )
+
+    setup = materialize_setup(
+        scope="task-upload-to-final-export",
+        directories=[
+            {
+                "label": "run_root",
+                "path": runner_paths.run_root,
+                "error_code": "RUN_ROOT_UNAVAILABLE",
+                "message": "run_root 无法创建: {path}",
+                "remediation": "检查输出目录权限或显式传入可写的 `--output-root` 后重试。",
+            },
+            {
+                "label": "upstream_output_root",
+                "path": upstream_output_root,
+                "error_code": "UPSTREAM_OUTPUT_ROOT_UNAVAILABLE",
+                "message": "upstream_output_root 无法创建: {path}",
+                "remediation": "检查输出目录权限后重试。",
+            },
+            {
+                "label": "downstream_output_root",
+                "path": downstream_output_root,
+                "error_code": "DOWNSTREAM_OUTPUT_ROOT_UNAVAILABLE",
+                "message": "downstream_output_root 无法创建: {path}",
+                "remediation": "检查输出目录权限后重试。",
+            },
+        ],
+        files=[
+            {
+                "label": "task_spec",
+                "path": task_spec_path,
+                "writer": lambda path: write_task_spec(path, task_spec),
+                "error_code": "TASK_SPEC_WRITE_FAILED",
+                "message": "task_spec 无法写入: {path}",
+                "remediation": "检查 run root 权限或 task spec 序列化逻辑后重试。",
+            }
+        ],
+    )
+    summary["setup"] = {**setup, "skipped": False}
+    if not setup["completed"]:
+        failure = setup["errors"][0]
+        return finalize(
+            "failed",
+            failure=failure,
+        )
+    summary["resolved_paths"]["run_root_exists"] = runner_paths.run_root.exists()
+    _write_summary(run_summary_path, summary)
+
+    try:
+        runtime = _load_runtime_dependencies()
+    except Exception as exc:  # noqa: BLE001
+        failure = _build_failure_payload(
+            stage="runtime_import",
+            error_code="FINAL_RUNNER_RUNTIME_IMPORT_FAILED",
+            message=f"final runner runtime 加载失败: {exc}",
+            remediation="检查 final runner 的本地依赖与脚本导入链后重试。",
+            details={"exception_type": exc.__class__.__name__},
+        )
+        return finalize("failed", failure=failure)
+    run_upstream = runtime["run_task_upload_to_keep_list_pipeline"]
+    run_downstream = runtime["run_keep_list_screening_pipeline"]
 
     try:
         upstream_summary = run_upstream(
@@ -367,7 +684,7 @@ def run_task_upload_to_final_export_pipeline(
             remediation="检查上游 runner 的 summary、env、任务上传依赖和邮件同步日志后重试。",
             details={"exception_type": exc.__class__.__name__},
         )
-        return finalize("failed", error=failure["message"], error_code=failure["error_code"], failure=failure)
+        return finalize("failed", failure=failure)
 
     keep_list_resume = ((upstream_summary.get("resume_points") or {}).get("keep_list") or {})
     keep_workbook = str(
@@ -427,7 +744,7 @@ def run_task_upload_to_final_export_pipeline(
             remediation="打开上游 summary，先修复 task upload -> keep-list 的失败，再继续下游。",
             details={"upstream_summary_json": str(upstream_summary_path)},
         )
-        return finalize("failed", error=failure["message"], error_code=failure["error_code"], failure=failure)
+        return finalize("failed", failure=failure)
 
     if not keep_workbook or not Path(keep_workbook).exists():
         failure = _build_failure_payload(
@@ -440,7 +757,7 @@ def run_task_upload_to_final_export_pipeline(
                 "upstream_summary_json": str(upstream_summary_path),
             },
         )
-        return finalize("failed", error=failure["message"], error_code=failure["error_code"], failure=failure)
+        return finalize("failed", failure=failure)
 
     try:
         downstream_summary = run_downstream(
@@ -477,7 +794,7 @@ def run_task_upload_to_final_export_pipeline(
                 "keep_workbook": keep_workbook,
             },
         )
-        return finalize("failed", error=failure["message"], error_code=failure["error_code"], failure=failure)
+        return finalize("failed", failure=failure)
 
     final_exports = _collect_final_exports(downstream_summary)
     positioning_artifacts = _collect_positioning_artifacts(downstream_summary)
@@ -535,7 +852,7 @@ def run_task_upload_to_final_export_pipeline(
             remediation="检查下游 summary、vision preflight、平台 job 和导出状态后重试。",
             details={"downstream_summary_json": str(downstream_summary_path)},
         )
-        return finalize("failed", error=failure["message"], error_code=failure["error_code"], failure=failure)
+        return finalize("failed", failure=failure)
 
     summary["delivery_status"] = downstream_status or "completed"
     return finalize(downstream_status or "completed")

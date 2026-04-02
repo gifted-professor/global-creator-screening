@@ -331,8 +331,9 @@ class FeishuScreeningBridgeTests(unittest.TestCase):
 
     def test_download_task_upload_screening_assets_by_task_name(self) -> None:
         download_dir = self.base_path / "downloads"
+        client = _FakeTaskUploadClient(self._build_new_template_workbook_bytes())
         result = download_task_upload_screening_assets(
-            client=_FakeTaskUploadClient(self._build_new_template_workbook_bytes()),
+            client=client,
             task_upload_url="https://bcnorxdfy50v.feishu.cn/wiki/S0bbwTnlZiJlVMk1Q04ctPXBnje?table=tblYvtOYLoGWCRna&view=vewNwYvkQL",
             task_name="duet",
             download_dir=download_dir,
@@ -344,6 +345,54 @@ class FeishuScreeningBridgeTests(unittest.TestCase):
         self.assertEqual(result["sendingListFileName"], "duet-发信名单.xlsx")
         self.assertTrue(Path(result["templateDownloadedPath"]).exists(), result)
         self.assertTrue(Path(result["sendingListDownloadedPath"]).exists(), result)
+        self.assertEqual(
+            client.download_requests,
+            [
+                "https://unit-test.feishu.mock/open-apis/drive/v1/medias/boxcn-duet-file/download?extra=bitablePerm",
+                "https://unit-test.feishu.mock/open-apis/drive/v1/medias/boxcn-duet-sending-list/download?extra=bitablePerm",
+            ],
+        )
+
+    def test_download_task_upload_screening_assets_by_task_name_accepts_url_only_attachment(self) -> None:
+        download_dir = self.base_path / "downloads-url-only"
+        client = _FakeTaskUploadClient(self._build_new_template_workbook_bytes(), url_only=True)
+        result = download_task_upload_screening_assets(
+            client=client,
+            task_upload_url="https://bcnorxdfy50v.feishu.cn/wiki/S0bbwTnlZiJlVMk1Q04ctPXBnje?table=tblYvtOYLoGWCRna&view=vewNwYvkQL",
+            task_name="duet",
+            download_dir=download_dir,
+        )
+
+        self.assertEqual(result["taskName"], "duet")
+        self.assertEqual(result["templateFileToken"], "")
+        self.assertTrue(result["templateFileUrl"].startswith("https://unit-test.feishu.mock/open-apis/drive/v1/medias/boxcn-duet-file/download"))
+        self.assertTrue(Path(result["templateDownloadedPath"]).exists(), result)
+        self.assertEqual(
+            client.download_requests,
+            [
+                "https://unit-test.feishu.mock/open-apis/drive/v1/medias/boxcn-duet-file/download?extra=bitablePerm",
+                "https://unit-test.feishu.mock/open-apis/drive/v1/medias/boxcn-duet-sending-list/download?extra=bitablePerm",
+            ],
+        )
+
+    def test_inspect_task_upload_downloads_url_only_template_attachment(self) -> None:
+        client = _FakeInspectionClient(self._build_new_template_workbook_bytes(), url_only=True)
+        result = inspect_task_upload_assignments(
+            client=client,
+            task_upload_url="https://bcnorxdfy50v.feishu.cn/wiki/S0bbwTnlZiJlVMk1Q04ctPXBnje?table=tblYvtOYLoGWCRna&view=vewNwYvkQL",
+            employee_info_url="https://bcnorxdfy50v.feishu.cn/wiki/S0bbwTnlZiJlVMk1Q04ctPXBnje?table=tblQho4xE6SrOtmw&view=vewHoxVXaC",
+            download_dir=self.base_path / "downloads-inspect-url-only",
+            download_templates=True,
+        )
+
+        self.assertTrue(result["ok"])
+        duet_item = next(item for item in result["items"] if item["taskName"] == "duet")
+        self.assertEqual(duet_item["templateFileToken"], "")
+        self.assertTrue(Path(duet_item["templateDownloadedPath"]).exists(), duet_item)
+        self.assertIn(
+            "https://unit-test.feishu.mock/open-apis/drive/v1/medias/boxcn-duet-file/download?extra=bitablePerm",
+            client.download_requests,
+        )
 
     def test_inspect_task_upload_keeps_rows_even_when_workbook_attachment_is_missing(self) -> None:
         result = inspect_task_upload_assignments(
@@ -857,6 +906,55 @@ class FeishuScreeningBridgeTests(unittest.TestCase):
         self.assertEqual(Path(result["dbPath"]).resolve(), expected_db_path.resolve())
         self.assertTrue(expected_db_path.resolve().exists())
 
+    def test_download_file_preserves_bitable_attachment_extra_query_from_direct_url(self) -> None:
+        client = FeishuOpenClient(
+            app_id="cli_test",
+            app_secret="secret_test",
+            base_url=self.feishu_base_url,
+        )
+        direct_url = (
+            "https://unit-test.feishu.mock/open-apis/drive/v1/medias/"
+            "YyJLbZ1F3oIOPMxrqZjcnJ4wnUe/download?extra=%7B%22bitablePerm%22%3A%7B%22tableId%22%3A%22"
+            "tblYvtOYLoGWCRna%22%2C%22rev%22%3A5%7D%7D"
+        )
+
+        with patch("urllib.request.urlopen", side_effect=self._fake_urlopen):
+            downloaded = client.download_file(direct_url, desired_name="skg-template.xlsx")
+
+        self.assertEqual(downloaded.file_token, "YyJLbZ1F3oIOPMxrqZjcnJ4wnUe")
+        self.assertEqual(downloaded.file_name, "skg-template.xlsx")
+        self.assertEqual(downloaded.content, self.workbook_bytes)
+        self.assertEqual(
+            self.request_log,
+            [
+                ("POST", "https://unit-test.feishu.mock/open-apis/auth/v3/tenant_access_token/internal"),
+                ("GET", direct_url),
+            ],
+        )
+
+    def test_download_file_rejects_untrusted_direct_url_host(self) -> None:
+        client = FeishuOpenClient(
+            app_id="cli_test",
+            app_secret="secret_test",
+            base_url=self.feishu_base_url,
+        )
+        direct_url = (
+            "https://evil.example/open-apis/drive/v1/medias/"
+            "YyJLbZ1F3oIOPMxrqZjcnJ4wnUe/download?extra=%7B%22bitablePerm%22%3A1%7D"
+        )
+
+        with patch("urllib.request.urlopen", side_effect=self._fake_urlopen):
+            downloaded = client.download_file(direct_url, desired_name="skg-template.xlsx")
+
+        self.assertEqual(downloaded.file_name, "skg-template.xlsx")
+        self.assertEqual(
+            self.request_log,
+            [
+                ("POST", "https://unit-test.feishu.mock/open-apis/auth/v3/tenant_access_token/internal"),
+                ("GET", "https://unit-test.feishu.mock/open-apis/drive/v1/files/YyJLbZ1F3oIOPMxrqZjcnJ4wnUe/download"),
+            ],
+        )
+
     def _build_workbook_bytes(self) -> bytes:
         workbook = Workbook()
         sheet = workbook.active
@@ -952,6 +1050,30 @@ class FeishuScreeningBridgeTests(unittest.TestCase):
                 headers={
                     "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
                     "Content-Disposition": "attachment; filename*=UTF-8''feishu-screening.xlsx",
+                },
+                body=self.workbook_bytes,
+            )
+        if full_url == "https://unit-test.feishu.mock/open-apis/drive/v1/files/YyJLbZ1F3oIOPMxrqZjcnJ4wnUe/download":
+            return _FakeUrlopenResponse(
+                url=full_url,
+                status=200,
+                headers={
+                    "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "Content-Disposition": "attachment; filename*=UTF-8''SKG%200401%20AI%20.xlsx",
+                },
+                body=self.workbook_bytes,
+            )
+        if full_url == (
+            "https://unit-test.feishu.mock/open-apis/drive/v1/medias/"
+            "YyJLbZ1F3oIOPMxrqZjcnJ4wnUe/download?extra=%7B%22bitablePerm%22%3A%7B%22tableId%22%3A%22"
+            "tblYvtOYLoGWCRna%22%2C%22rev%22%3A5%7D%7D"
+        ):
+            return _FakeUrlopenResponse(
+                url=full_url,
+                status=200,
+                headers={
+                    "Content-Type": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    "Content-Disposition": "attachment; filename*=UTF-8''SKG%200401%20AI%20.xlsx",
                 },
                 body=self.workbook_bytes,
             )
@@ -1098,9 +1220,11 @@ class _FakeAttachmentBitableClient(_FakeBitableClient):
 
 
 class _FakeTaskUploadClient(_FakeBitableClient):
-    def __init__(self, workbook_bytes: bytes) -> None:
+    def __init__(self, workbook_bytes: bytes, *, url_only: bool = False) -> None:
         super().__init__()
         self.workbook_bytes = workbook_bytes
+        self.download_requests: list[str] = []
+        self.url_only = bool(url_only)
 
     def get_api_json(self, url_path: str, *, headers: dict[str, str] | None = None) -> dict[str, Any]:
         if url_path == "/bitable/v1/apps/WVxtbuOkdaoqbxscPfJcG3oEnMd/tables":
@@ -1125,6 +1249,17 @@ class _FakeTaskUploadClient(_FakeBitableClient):
         headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         if url_path == "/bitable/v1/apps/WVxtbuOkdaoqbxscPfJcG3oEnMd/tables/tblYvtOYLoGWCRna/records/search":
+            sending_list_attachment = {
+                "name": "duet-发信名单.xlsx",
+                "url": "https://unit-test.feishu.mock/open-apis/drive/v1/medias/boxcn-duet-sending-list/download?extra=bitablePerm",
+            }
+            workbook_attachment = {
+                "name": "红人筛号需求-duet.xlsx",
+                "url": "https://unit-test.feishu.mock/open-apis/drive/v1/medias/boxcn-duet-file/download?extra=bitablePerm",
+            }
+            if not self.url_only:
+                sending_list_attachment["file_token"] = "boxcn-duet-sending-list"
+                workbook_attachment["file_token"] = "boxcn-duet-file"
             return {
                 "code": 0,
                 "msg": "success",
@@ -1137,9 +1272,9 @@ class _FakeTaskUploadClient(_FakeBitableClient):
                                 "任务名": [{"text": "duet", "type": "text"}],
                                 "负责人邮箱": {"type": 1, "value": [{"link": "mailto:yvette@amagency.biz", "text": "yvette@amagency.biz", "type": "url"}]},
                                 "负责人": [{"name": "Yvette"}],
-                                "发信名单": [{"file_token": "boxcn-duet-sending-list", "name": "duet-发信名单.xlsx"}],
+                                "发信名单": [sending_list_attachment],
                                 "达人管理表链接": {"link": "https://example.com/base/foo", "type": "mention"},
-                                "需求上传（excel 格式）": [{"file_token": "boxcn-duet-file", "name": "红人筛号需求-duet.xlsx"}],
+                                "需求上传（excel 格式）": [workbook_attachment],
                             },
                         }
                     ],
@@ -1151,6 +1286,7 @@ class _FakeTaskUploadClient(_FakeBitableClient):
     def download_file(self, file_token_or_url: str, *, desired_name: str | None = None):  # type: ignore[override]
         from feishu_screening_bridge.feishu_api import DownloadedFeishuFile
 
+        self.download_requests.append(str(file_token_or_url))
         return DownloadedFeishuFile(
             file_token=str(file_token_or_url),
             file_name=str(desired_name or "screening.xlsx"),
@@ -1161,6 +1297,9 @@ class _FakeTaskUploadClient(_FakeBitableClient):
 
 
 class _FakeInspectionClient(_FakeTaskUploadClient):
+    def __init__(self, workbook_bytes: bytes, *, url_only: bool = False) -> None:
+        super().__init__(workbook_bytes, url_only=url_only)
+
     def get_api_json(self, url_path: str, *, headers: dict[str, str] | None = None) -> dict[str, Any]:
         if url_path == "/bitable/v1/apps/WVxtbuOkdaoqbxscPfJcG3oEnMd/tables":
             return {
@@ -1183,6 +1322,14 @@ class _FakeInspectionClient(_FakeTaskUploadClient):
         headers: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         if url_path == "/bitable/v1/apps/WVxtbuOkdaoqbxscPfJcG3oEnMd/tables/tblYvtOYLoGWCRna/records/search":
+            sending_list_attachment = {"name": "duet-发信名单.xlsx"}
+            workbook_attachment = {"name": "红人筛号需求-duet.xlsx"}
+            if self.url_only:
+                sending_list_attachment["url"] = "https://unit-test.feishu.mock/open-apis/drive/v1/medias/boxcn-duet-sending-list/download?extra=bitablePerm"
+                workbook_attachment["url"] = "https://unit-test.feishu.mock/open-apis/drive/v1/medias/boxcn-duet-file/download?extra=bitablePerm"
+            else:
+                sending_list_attachment["file_token"] = "boxcn-duet-sending-list"
+                workbook_attachment["file_token"] = "boxcn-duet-file"
             return {
                 "code": 0,
                 "msg": "success",
@@ -1196,9 +1343,9 @@ class _FakeInspectionClient(_FakeTaskUploadClient):
                                 "员工ID": {"type": 1, "value": [{"text": "ou_fbb11a48bd394428", "type": "text"}]},
                                 "负责人邮箱": {"type": 1, "value": [{"link": "mailto:yvette@amagency.biz", "text": "yvette@amagency.biz", "type": "url"}]},
                                 "负责人": [{"name": "Yvette"}],
-                                "发信名单": [{"file_token": "boxcn-duet-sending-list", "name": "duet-发信名单.xlsx"}],
+                                "发信名单": [sending_list_attachment],
                                 "达人管理表链接": {"link": "https://example.com/base/foo", "type": "mention"},
-                                "需求上传（excel 格式）": [{"file_token": "boxcn-duet-file", "name": "红人筛号需求-duet.xlsx"}],
+                                "需求上传（excel 格式）": [workbook_attachment],
                             },
                         }
                     ],

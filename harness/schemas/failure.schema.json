@@ -1,0 +1,79 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "harness/failure.schema.json",
+  "title": "Harness Failure Payload",
+  "type": "object",
+  "required": [
+    "stage",
+    "failure_layer",
+    "error_code",
+    "message",
+    "remediation",
+    "details",
+    "category",
+    "resolution_mode",
+    "retryable",
+    "requires_manual_intervention",
+    "recommended_action",
+    "conclusion"
+  ],
+  "properties": {
+    "stage": {
+      "type": "string"
+    },
+    "failure_layer": {
+      "type": "string",
+      "enum": [
+        "preflight",
+        "setup",
+        "runtime"
+      ]
+    },
+    "error_code": {
+      "type": "string"
+    },
+    "message": {
+      "type": "string"
+    },
+    "remediation": {
+      "type": "string"
+    },
+    "details": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "category": {
+      "type": "string",
+      "enum": [
+        "configuration",
+        "input",
+        "filesystem",
+        "dependency",
+        "runtime",
+        "orchestration",
+        "external_runtime"
+      ]
+    },
+    "resolution_mode": {
+      "type": "string",
+      "enum": [
+        "manual_fix",
+        "manual_investigation",
+        "auto_retry"
+      ]
+    },
+    "retryable": {
+      "type": "boolean"
+    },
+    "requires_manual_intervention": {
+      "type": "boolean"
+    },
+    "recommended_action": {
+      "type": "string"
+    },
+    "conclusion": {
+      "type": "string"
+    }
+  },
+  "additionalProperties": true
+}

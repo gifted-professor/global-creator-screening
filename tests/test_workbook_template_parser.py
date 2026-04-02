@@ -5,6 +5,8 @@ import tempfile
 from pathlib import Path
 import unittest
 
+from openpyxl import load_workbook
+
 from workbook_template_parser import build_visual_prompt_artifacts, compile_workbook
 
 
@@ -141,6 +143,22 @@ class WorkbookTemplateParserTests(unittest.TestCase):
         self.assertEqual(set(bundles), {"youtube"}, bundles)
         self.assertEqual(bundles["youtube"]["platform"], "youtube", bundles)
         self.assertIn("你是 YouTube 达人初筛流程中的视觉复核员", bundles["youtube"]["prompt"])
+
+    def test_compile_workbook_accepts_standardized_main_sheet_on_sheet1(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workbook_path = Path(tmpdir) / "sheet1-template.xlsx"
+            workbook = load_workbook(FIXTURE_WORKBOOK)
+            workbook["需求主表"].title = "Sheet1"
+            workbook.save(workbook_path)
+
+            report = compile_workbook(workbook_path, Path(tmpdir) / "compiled")
+
+            self.assertTrue(report["success"], report)
+            artifacts = report["artifacts"]
+            structured_requirement = json.loads(
+                Path(artifacts["structured_requirement_json"]).read_text(encoding="utf-8")
+            )
+            self.assertEqual(structured_requirement["basic_info"]["project_name"], "Tapo")
 
 
 if __name__ == "__main__":

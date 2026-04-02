@@ -17,6 +17,7 @@ from .visual_prompt_adapter import build_visual_prompt_artifacts
 
 VERSION = "v1-flex-visual-reuse"
 MAIN_SHEET_NAME = "需求主表"
+FALLBACK_MAIN_SHEET_MARKER = "标准化筛号需求主表"
 DEFAULT_OUTPUT_DIRNAME = "compiled_outputs"
 PLATFORM_ORDER = ["tiktok", "instagram", "youtube"]
 
@@ -1015,9 +1016,8 @@ def build_visual_reuse_spec(structured: dict[str, Any]) -> dict[str, Any]:
 
 def build_structured_requirement(workbook_path: Path) -> tuple[dict[str, Any], list[str]]:
     workbook = load_workbook(workbook_path, data_only=True)
-    if MAIN_SHEET_NAME not in workbook.sheetnames:
-        raise ValueError(f"工作簿缺少 {MAIN_SHEET_NAME}")
-    rows = iter_main_rows(workbook[MAIN_SHEET_NAME])
+    worksheet = _resolve_main_sheet(workbook)
+    rows = iter_main_rows(worksheet)
     sections = split_sections(rows)
 
     warnings: list[str] = []
@@ -1049,6 +1049,26 @@ def build_structured_requirement(workbook_path: Path) -> tuple[dict[str, Any], l
         "final_logic": final_logic,
     }
     return structured, warnings
+
+
+def _resolve_main_sheet(workbook: Any) -> Any:
+    if MAIN_SHEET_NAME in workbook.sheetnames:
+        return workbook[MAIN_SHEET_NAME]
+
+    candidates = []
+    for worksheet in workbook.worksheets:
+        title_marker = normalize_text(worksheet["A1"].value)
+        header_marker = normalize_text(worksheet["A3"].value)
+        first_section = normalize_text(worksheet["A4"].value)
+        if (
+            title_marker == FALLBACK_MAIN_SHEET_MARKER
+            and header_marker == "字段"
+            and first_section in {"A. 项目基本信息", "A. 基本信息"}
+        ):
+            candidates.append(worksheet)
+    if len(candidates) == 1:
+        return candidates[0]
+    raise ValueError(f"工作簿缺少 {MAIN_SHEET_NAME}")
 
 
 def ensure_dir(path: Path) -> None:

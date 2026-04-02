@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import io
+import json
 import os
 import subprocess
 import struct
@@ -37,6 +38,7 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
         "OPENAI_VISION_MODEL",
         "VISION_MODEL",
         "VISION_PROVIDER_PREFERENCE",
+        "VISION_VISUAL_REVIEW_PROBE_RANKED_RETRY_ATTEMPTS",
         "VISUAL_REVIEW_ITEM_TIMEOUT_SECONDS",
     }
 
@@ -613,7 +615,7 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
             "save_visual_results",
         ), mock.patch.object(
             backend_app,
-            "ThreadPoolExecutor",
+            "DaemonThreadPoolExecutor",
             FakeExecutor,
         ), mock.patch.object(
             backend_app,
@@ -630,6 +632,16 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
         self.assertIn("alpha", result["visual_results"])
         self.assertFalse(result["visual_results"]["alpha"]["success"])
         self.assertIn("视觉复核超时", result["visual_results"]["alpha"]["error"])
+
+    def test_daemon_thread_pool_executor_marks_worker_threads_daemon(self) -> None:
+        executor = backend_app.DaemonThreadPoolExecutor(max_workers=1, thread_name_prefix="unit-daemon")
+        try:
+            future = executor.submit(lambda: "ok")
+            self.assertEqual(future.result(timeout=1), "ok")
+            self.assertTrue(executor._threads)
+            self.assertTrue(all(thread.daemon for thread in executor._threads))
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
 
 
 class VisualProviderConfigDefaultsTests(unittest.TestCase):
@@ -1614,6 +1626,141 @@ data: [DONE]
             ],
         )
 
+    def test_probe_ranked_race_retries_retryable_probe_failures(self) -> None:
+        call_counts = {}
+
+        def fake_get_runnable(provider_name, *, model="", timeout_seconds=None):
+            return {
+                "name": provider_name,
+                "model": model,
+                "default_model": model,
+                "request_timeout_seconds": timeout_seconds,
+            }
+
+        def fake_probe(provider, platform="instagram", cover_urls=None):
+            key = (provider["name"], provider["model"])
+            call_counts[key] = call_counts.get(key, 0) + 1
+            if call_counts[key] == 1:
+                raise backend_app.VisionProviderError(provider["name"], "HTTP 503 upstream timeout", status_code=503, retryable=True)
+            return {
+                "success": True,
+                "provider": provider["name"],
+                "model": provider["model"],
+                "checked_at": "2026-03-28T00:00:00Z",
+                "decision": "Pass",
+                "reason": "ok",
+                "signals": ["ok"],
+                "response_excerpt": "ok",
+            }
+
+        with mock.patch.object(backend_app, "get_runnable_vision_provider", side_effect=fake_get_runnable), mock.patch.object(
+            backend_app,
+            "probe_vision_provider_with_image",
+            side_effect=fake_probe,
+        ), mock.patch.object(
+            backend_app,
+            "compute_visual_retry_delay_seconds",
+            return_value=0.0,
+        ), mock.patch.object(
+            backend_app.time,
+            "sleep",
+        ) as sleep_mock:
+            race = backend_app.run_probe_ranked_visual_provider_race()
+
+        self.assertTrue(race["success"])
+        self.assertEqual(race["selected_stage"], "preferred")
+        self.assertEqual(race["selected_provider"], "openai")
+        self.assertEqual(call_counts[("openai", "gpt-5.4")], 2)
+        self.assertEqual(call_counts[("reelx", "qwen-vl-max")], 2)
+        self.assertEqual(len(race["retry_history"]), 1)
+        self.assertEqual(race["retry_history"][0]["stage_names"], ["preferred", "preferred_parallel", "secondary", "tertiary"])
+        self.assertEqual(race["candidates"][0]["attempt_count"], 2)
+        self.assertTrue(race["candidates"][0]["retried"])
+        sleep_mock.assert_not_called()
+
+    def test_probe_ranked_race_retries_preferred_stage_before_locking_fallback(self) -> None:
+        call_counts = {}
+
+        def fake_get_runnable(provider_name, *, model="", timeout_seconds=None):
+            return {
+                "name": provider_name,
+                "model": model,
+                "default_model": model,
+                "request_timeout_seconds": timeout_seconds,
+            }
+
+        def fake_probe(provider, platform="instagram", cover_urls=None):
+            key = (provider["name"], provider["model"])
+            call_counts[key] = call_counts.get(key, 0) + 1
+            if key == ("openai", "gpt-5.4") and call_counts[key] == 1:
+                raise backend_app.VisionProviderError(provider["name"], "HTTP 503 upstream timeout", status_code=503, retryable=True)
+            return {
+                "success": True,
+                "provider": provider["name"],
+                "model": provider["model"],
+                "checked_at": "2026-03-28T00:00:00Z",
+                "decision": "Pass",
+                "reason": "ok",
+                "signals": ["ok"],
+                "response_excerpt": "ok",
+            }
+
+        with mock.patch.object(backend_app, "get_runnable_vision_provider", side_effect=fake_get_runnable), mock.patch.object(
+            backend_app,
+            "probe_vision_provider_with_image",
+            side_effect=fake_probe,
+        ), mock.patch.object(
+            backend_app,
+            "compute_visual_retry_delay_seconds",
+            return_value=0.0,
+        ), mock.patch.object(
+            backend_app.time,
+            "sleep",
+        ) as sleep_mock:
+            race = backend_app.run_probe_ranked_visual_provider_race()
+
+        self.assertTrue(race["success"])
+        self.assertEqual(race["selected_stage"], "preferred")
+        self.assertEqual(race["selected_provider"], "openai")
+        self.assertEqual(call_counts[("openai", "gpt-5.4")], 2)
+        self.assertEqual(call_counts[("reelx", "qwen-vl-max")], 1)
+        self.assertEqual(len(race["retry_history"]), 1)
+        self.assertEqual(race["retry_history"][0]["stage_names"], ["preferred"])
+        sleep_mock.assert_not_called()
+
+    def test_probe_ranked_race_does_not_retry_non_retryable_probe_failures(self) -> None:
+        call_counts = {}
+
+        def fake_get_runnable(provider_name, *, model="", timeout_seconds=None):
+            return {
+                "name": provider_name,
+                "model": model,
+                "default_model": model,
+                "request_timeout_seconds": timeout_seconds,
+            }
+
+        def fake_probe(provider, platform="instagram", cover_urls=None):
+            key = (provider["name"], provider["model"])
+            call_counts[key] = call_counts.get(key, 0) + 1
+            raise RuntimeError("HTTP 400 invalid image payload")
+
+        with mock.patch.object(backend_app, "get_runnable_vision_provider", side_effect=fake_get_runnable), mock.patch.object(
+            backend_app,
+            "probe_vision_provider_with_image",
+            side_effect=fake_probe,
+        ), mock.patch.object(
+            backend_app.time,
+            "sleep",
+        ) as sleep_mock:
+            race = backend_app.run_probe_ranked_visual_provider_race()
+
+        self.assertFalse(race["success"])
+        self.assertEqual(len(race["retry_history"]), 0)
+        self.assertEqual(call_counts[("openai", "gpt-5.4")], 1)
+        self.assertEqual(race["candidates"][0]["attempt_count"], 1)
+        self.assertFalse(race["candidates"][0]["retryable"])
+        sleep_mock.assert_not_called()
+
     def test_probe_ranked_candidate_order_shards_across_dual_preferred_pool(self) -> None:
         race = {
             "success": True,
@@ -2054,6 +2201,77 @@ class OperatorConsoleRoutesTests(unittest.TestCase):
         self.assertEqual(launcher.call_args.kwargs["platforms"], ["instagram"])
         self.assertEqual(launcher.call_args.kwargs["vision_provider"], "reelx")
 
+    def test_launch_operator_run_uses_harness_paths_and_bootstrap_summary(self) -> None:
+        class FakeProcess:
+            def __init__(self, command):
+                self.command = command
+                self.pid = 43210
+
+            def poll(self):
+                return None
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            env_path = temp_root / ".env"
+            env_path.write_text(
+                "TASK_UPLOAD_URL=https://env.example/task\nEMPLOYEE_INFO_URL=https://env.example/employee\n",
+                encoding="utf-8",
+            )
+            operator_root = temp_root / "operator_runs"
+
+            with mock.patch.object(backend_app, "OPERATOR_RUNS_ROOT", operator_root):
+                with mock.patch.object(backend_app.subprocess, "Popen", side_effect=lambda command, **kwargs: FakeProcess(command)):
+                    payload = backend_app.launch_operator_run(
+                        task_name="MINISO",
+                        env_file=str(env_path),
+                        platforms=["instagram"],
+                        vision_provider="openai",
+                    )
+
+            summary = payload["summary"]
+            self.assertEqual(payload["id"], summary["run_id"])
+            self.assertEqual(payload["run_root"], summary["run_root"])
+            self.assertEqual(payload["output_root"], summary["run_root"])
+            self.assertTrue(summary["run_root"].startswith(str(operator_root.resolve())))
+            self.assertEqual(summary["env_file_raw"], str(env_path))
+            self.assertEqual(summary["env_file"], str(env_path.resolve()))
+            self.assertEqual(summary["resolved_inputs"]["env_file"]["path"], str(env_path.resolve()))
+            self.assertEqual(summary["resolved_config_sources"]["task_upload_url"], "env_file:TASK_UPLOAD_URL")
+            self.assertEqual(summary["resolved_config_sources"]["employee_info_url"], "env_file:EMPLOYEE_INFO_URL")
+            task_spec = json.loads(Path(summary["task_spec_json"]).read_text(encoding="utf-8"))
+            self.assertEqual(task_spec["scope"], "task-upload-to-final-export")
+            self.assertEqual(task_spec["intent"]["task_name"], "MINISO")
+            self.assertEqual(task_spec["controls"]["requested_platforms"], ["instagram"])
+            self.assertTrue(task_spec["paths"]["upstream_task_spec_json"].endswith("/upstream/task_spec.json"))
+            self.assertTrue(Path(payload["summary_path"]).exists())
+            self.assertEqual(Path(payload["summary_path"]).parent, Path(summary["run_root"]))
+            self.assertEqual(Path(payload["log_path"]).parent, Path(summary["run_root"]))
+            self.assertEqual(Path(payload["task_spec_json"]).parent, Path(summary["run_root"]))
+            self.assertIn("--output-root", payload["command"])
+            self.assertEqual(
+                payload["command"][payload["command"].index("--output-root") + 1],
+                summary["run_root"],
+            )
+            self.assertEqual(
+                payload["command"][payload["command"].index("--env-file") + 1],
+                str(env_path.resolve()),
+            )
+            self.assertNotIn("/temp/runs/task_upload_to_final_export/", summary["run_root"])
+            backend_app._close_operator_log_handle(payload["id"])
+            backend_app.OPERATOR_RUN_PROCESSES.pop(payload["id"], None)
+            with backend_app.OPERATOR_RUNS_LOCK:
+                backend_app.OPERATOR_RUNS.pop(payload["id"], None)
+
+    def test_operator_default_env_file_is_anchored_to_repo_root(self) -> None:
+        original_cwd = Path.cwd()
+        try:
+            os.chdir(backend_app.BASE_DIR / "backend")
+            resolved_env_file = backend_app._resolve_operator_env_file()
+        finally:
+            os.chdir(original_cwd)
+
+        self.assertEqual(resolved_env_file, (backend_app.BASE_DIR / ".env").resolve())
+
     def test_operator_run_detail_serializes_summary_artifacts(self) -> None:
         refreshed_run = {
             "id": "run-2",
@@ -2061,6 +2279,8 @@ class OperatorConsoleRoutesTests(unittest.TestCase):
             "status": "completed",
             "stage": "completed",
             "env_file": "/tmp/.env",
+            "env_file_raw": ".env",
+            "run_root": "/tmp/operator",
             "output_root": "/tmp/operator",
             "summary_path": "/tmp/operator/summary.json",
             "log_path": "/tmp/operator/operator_run.log",
@@ -2073,7 +2293,11 @@ class OperatorConsoleRoutesTests(unittest.TestCase):
             "requested_options": {},
             "summary": {
                 "status": "completed",
+                "run_id": "run-2",
+                "run_root": "/tmp/operator",
+                "env_file_raw": ".env",
                 "summary_json": str(backend_app.BASE_DIR / "temp" / "operator_runs" / "summary.json"),
+                "resolved_config_sources": {"task_upload_url": "env_file:TASK_UPLOAD_URL"},
                 "resolved_paths": {},
                 "artifacts": {
                     "keep_workbook": "",
@@ -2090,6 +2314,8 @@ class OperatorConsoleRoutesTests(unittest.TestCase):
         self.assertTrue(payload["success"])
         self.assertEqual(payload["run"]["status"], "completed")
         self.assertIn("artifacts", payload["run"])
+        self.assertEqual(payload["run"]["summary"]["run_root"], "/tmp/operator")
+        self.assertEqual(payload["run"]["summary"]["env_file_raw"], ".env")
         self.assertIn("summary_json", payload["run"]["artifacts"])
         self.assertIn("all_platforms_final_review", payload["run"]["artifacts"])
 
@@ -2201,9 +2427,13 @@ class OperatorConsoleRoutesTests(unittest.TestCase):
                     "finished_at": "2026-03-30T15:05:00+08:00",
                     "status": "completed",
                     "task_name": "MINISO",
+                    "run_id": run_id,
+                    "run_root": str(output_root),
+                    "env_file_raw": ".env",
                     "env_file": str(backend_app.BASE_DIR / ".env"),
                     "output_root": str(output_root),
                     "summary_json": str(summary_path),
+                    "resolved_config_sources": {"task_upload_url": "env_file:TASK_UPLOAD_URL"},
                     "resolved_paths": {},
                     "artifacts": {
                         "keep_workbook": "",
@@ -2223,6 +2453,9 @@ class OperatorConsoleRoutesTests(unittest.TestCase):
             self.assertTrue(payload["success"])
             self.assertEqual(payload["run"]["id"], run_id)
             self.assertEqual(payload["run"]["status"], "completed")
+            self.assertEqual(payload["run"]["run_root"], str(output_root))
+            self.assertEqual(payload["run"]["env_file_raw"], ".env")
+            self.assertEqual(payload["run"]["summary"]["resolved_config_sources"]["task_upload_url"], "env_file:TASK_UPLOAD_URL")
         finally:
             with backend_app.OPERATOR_RUNS_LOCK:
                 backend_app.OPERATOR_RUNS.pop(run_id, None)
