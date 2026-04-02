@@ -108,6 +108,15 @@ class CreatorEnrichmentTests(unittest.TestCase):
         sheet.append(["US", "Cass And Home", "", "", "https://www.youtube.com/@cass-and-home"])
         workbook.save(self.input_path)
 
+    def _make_four_column_sending_list_workbook(self) -> None:
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "SendingList"
+        sheet.append(["地区", "博主用户名", "邮箱", "主页链接"])
+        sheet.append(["US", "@creatorx", "creator@example.com", "https://www.tiktok.com/@creatorx"])
+        sheet.append(["US", "cass-and-home", "", "https://www.youtube.com/@cass-and-home"])
+        workbook.save(self.input_path)
+
     def _seed_messages(self) -> Database:
         db = Database(self.db_path)
         db.init_schema()
@@ -271,6 +280,31 @@ class CreatorEnrichmentTests(unittest.TestCase):
         self.assertEqual(creator_row["@username"], "creatorx")
         self.assertEqual(creator_row["match_rule"], "email_exact")
         self.assertEqual(creator_row["latest_quote_amount"], "600.0")
+
+        handle_row = rows[1]
+        self.assertEqual(handle_row["Platform"], "YouTube")
+        self.assertEqual(handle_row["@username"], "cassandhome")
+        self.assertEqual(handle_row["match_confidence"], "high")
+
+    def test_enrich_creator_workbook_accepts_four_column_sending_list_workbook(self) -> None:
+        self._make_four_column_sending_list_workbook()
+        db = self._seed_messages()
+        try:
+            result = enrich_creator_workbook(db, self.input_path, self.output_prefix)
+        finally:
+            db.close()
+
+        self.assertEqual(result["source_kind"], "sending_list")
+        self.assertEqual(result["rows"], 2)
+        self.assertEqual(result["matched_rows"], 2)
+
+        with self.output_prefix.with_suffix(".csv").open("r", encoding="utf-8-sig", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+
+        creator_row = rows[0]
+        self.assertEqual(creator_row["Platform"], "TikTok")
+        self.assertEqual(creator_row["@username"], "creatorx")
+        self.assertEqual(creator_row["match_rule"], "email_exact")
 
         handle_row = rows[1]
         self.assertEqual(handle_row["Platform"], "YouTube")

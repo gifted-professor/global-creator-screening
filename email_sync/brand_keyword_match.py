@@ -13,6 +13,7 @@ from .creator_enrichment import (
     SENDING_LIST_COUNTRY_ALIASES,
     SENDING_LIST_EMAIL_ALIASES,
     SENDING_LIST_GENERIC_LINK_ALIASES,
+    SENDING_LIST_HANDLE_ALIASES,
     SENDING_LIST_PLATFORM_LINK_ALIASES,
     _clean_text,
     _extract_emails,
@@ -34,7 +35,6 @@ from .creator_enrichment import (
 from .db import Database
 
 
-HANDLE_COLUMN_ALIASES = ("@username", "username", "用户名", "博主用户名", "handle", "账号", "达人账号")
 PLATFORM_COLUMN_ALIASES = ("platform", "平台")
 PROFILE_COLUMN_ALIASES = tuple(SENDING_LIST_GENERIC_LINK_ALIASES) + tuple(
     alias for aliases in SENDING_LIST_PLATFORM_LINK_ALIASES.values() for alias in aliases
@@ -120,7 +120,7 @@ def _resolve_candidate_columns(
         resolved = _resolve_source_column(headers, PROFILE_COLUMN_ALIASES)
         mapping["profile"] = _stringify(resolved)
     if not mapping["handle"]:
-        resolved = _resolve_source_column(headers, HANDLE_COLUMN_ALIASES)
+        resolved = _resolve_source_column(headers, SENDING_LIST_HANDLE_ALIASES)
         mapping["handle"] = _stringify(resolved)
     if not mapping["platform"]:
         resolved = _resolve_source_column(headers, PLATFORM_COLUMN_ALIASES)
