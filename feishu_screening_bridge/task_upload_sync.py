@@ -56,6 +56,11 @@ _PLATFORM_TOKEN_MAP = {
     "两者": "both",
     "both": "both",
 }
+_TASK_GROUP_ALIASES = {
+    "duet": {"duet", "duet1", "duet-1", "duet2", "duet-2"},
+    "skg": {"skg", "skg1", "skg-1", "skg2", "skg-2"},
+}
+_TASK_GROUP_SUFFIX_PATTERN = re.compile(r"(?:[-_\s]*\d+)$")
 
 
 @dataclass(frozen=True)
@@ -137,6 +142,46 @@ def resolve_task_upload_entry(
             " 请先清理重复记录后再执行任务驱动流程。"
         )
     return matched_entries[0]
+
+
+def resolve_task_upload_entries(
+    *,
+    client: FeishuOpenClient,
+    task_upload_url: str,
+    task_name: str,
+) -> list[TaskUploadEntry]:
+    normalized_task_name = _normalize_lookup_key(task_name)
+    if not normalized_task_name:
+        raise ValueError("task_name 不能为空。")
+
+    entries = _fetch_task_upload_entries(client, task_upload_url)
+    exact_matches = [
+        entry
+        for entry in entries
+        if _normalize_lookup_key(entry.task_name) == normalized_task_name
+    ]
+    if exact_matches:
+        return exact_matches
+
+    target_group_key = _derive_task_group_key(task_name)
+    if not target_group_key:
+        return []
+
+    grouped_matches = [
+        entry
+        for entry in entries
+        if _derive_task_group_key(entry.task_name) == target_group_key
+    ]
+    alias_values = _TASK_GROUP_ALIASES.get(target_group_key)
+    if alias_values:
+        grouped_matches = [
+            entry
+            for entry in grouped_matches
+            if _normalize_lookup_key(entry.task_name) in alias_values
+        ]
+    if alias_values or len(grouped_matches) > 1:
+        return sorted(grouped_matches, key=lambda entry: (_normalize_lookup_key(entry.task_name), entry.record_id))
+    return []
 
 
 def download_task_upload_screening_assets(
@@ -1515,6 +1560,17 @@ def _looks_like_english_name(value: str) -> bool:
 
 def _normalize_lookup_key(value: str) -> str:
     return _normalize_text(value).casefold()
+
+
+def _derive_task_group_key(value: str) -> str:
+    normalized = _normalize_lookup_key(value)
+    if not normalized:
+        return ""
+    stripped = _TASK_GROUP_SUFFIX_PATTERN.sub("", normalized).rstrip("-_ ")
+    compact = re.sub(r"[\s\-_]+", "", stripped)
+    if compact:
+        return compact
+    return re.sub(r"[\s\-_]+", "", normalized)
 
 
 def _first_non_empty(*values: str) -> str:

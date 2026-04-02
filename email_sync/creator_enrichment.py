@@ -823,19 +823,47 @@ def _has_canonical_creator_columns(headers: Sequence[str]) -> bool:
 
 def _iter_sending_list_rows(input_path: Path) -> Iterator[dict[str, Any]]:
     _, load_workbook = _load_workbook()
-    workbook = load_workbook(filename=input_path, read_only=True, data_only=True)
+    workbook = load_workbook(filename=input_path, read_only=False, data_only=True)
     try:
         records_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+        sheet_diagnostics: list[dict[str, Any]] = []
+        contract_detected = False
         for sheet in workbook.worksheets:
-            rows = sheet.iter_rows(values_only=True)
-            header_row = next(rows, ())
-            headers = [_clean_text(cell) for cell in header_row]
+            max_row = int(sheet.max_row or 0)
+            max_col = int(sheet.max_column or 0)
+            hidden_columns = [
+                key for key, value in sheet.column_dimensions.items() if getattr(value, "hidden", False)
+            ]
+            merged_ranges = [str(value) for value in sheet.merged_cells.ranges]
+
+            header_row_number = 0
+            header_values: list[Any] = []
+            for row_number in range(1, max_row + 1):
+                values = [sheet.cell(row_number, column_number).value for column_number in range(1, max_col + 1)]
+                if any(_clean_text(value) for value in values):
+                    header_row_number = row_number
+                    header_values = values
+                    break
+
+            headers = [_clean_text(cell) for cell in header_values]
+            sheet_diagnostics.append(
+                {
+                    "sheet_name": sheet.title,
+                    "max_row": max_row,
+                    "max_col": max_col,
+                    "header_row_number": header_row_number,
+                    "header_values": headers,
+                    "hidden_columns": hidden_columns,
+                    "merged_ranges": merged_ranges,
+                }
+            )
             if not any(headers):
                 continue
 
             parsed_rows: list[dict[str, Any]] = []
-            for row_number, values in enumerate(rows, start=2):
+            for row_number in range(header_row_number + 1, max_row + 1):
                 row_dict: dict[str, Any] = {"sheet_name": sheet.title, "source_row_number": row_number}
+                values = [sheet.cell(row_number, column_number).value for column_number in range(1, max_col + 1)]
                 for index, header in enumerate(headers):
                     if not header:
                         continue
@@ -848,6 +876,8 @@ def _iter_sending_list_rows(input_path: Path) -> Iterator[dict[str, Any]]:
             handle_column = _resolve_source_column(columns, SENDING_LIST_HANDLE_ALIASES)
             email_column = _resolve_source_column(columns, SENDING_LIST_EMAIL_ALIASES)
             link_columns = _resolve_sending_list_link_columns(columns, parsed_rows)
+            if country_column and email_column and handle_column and link_columns:
+                contract_detected = True
             if not link_columns:
                 continue
 
@@ -894,6 +924,27 @@ def _iter_sending_list_rows(input_path: Path) -> Iterator[dict[str, Any]]:
                         existing["Region"] = region
                     if not existing.get("Email") and email:
                         existing["Email"] = email
+
+        if not records_by_key:
+            diagnostics = " | ".join(
+                (
+                    f"{item['sheet_name']}: max_row={item['max_row']}, max_col={item['max_col']}, "
+                    f"header_row={item['header_row_number']}, row{item['header_row_number'] or 1}={item['header_values']}, "
+                    f"hidden_cols={item['hidden_columns']}, merged={item['merged_ranges']}"
+                )
+                for item in sheet_diagnostics
+            )
+            if contract_detected:
+                raise ValueError(
+                    "发信名单已识别到 `地区 / 邮箱 / 博主用户名 / 主页链接` 四列 contract，但没有解析出任何有效博主行。 "
+                    f"workbook={input_path}; diagnostics={diagnostics}"
+                )
+            raise ValueError(
+                "发信名单不符合可识别输入 contract。当前兼容两类格式："
+                "1) `地区 / 邮箱 / 博主用户名 / 主页链接` 四列；"
+                "2) legacy 多链接格式（如 `国家 / Creator / 邮箱地址 / TTlink / YTlink`）。 "
+                f"workbook={input_path}; diagnostics={diagnostics}"
+            )
 
         for row in records_by_key.values():
             yield row
