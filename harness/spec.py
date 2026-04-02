@@ -58,6 +58,7 @@ def build_final_runner_task_spec(
             "output_root": str(runner_paths.output_root),
             "summary_json": str(runner_paths.summary_json),
             "task_spec_json": str(runner_paths.task_spec_json),
+            "workflow_handoff_json": str(runner_paths.workflow_handoff_json),
         },
         "environment": {
             "env_file_raw": str(env_file_raw or ""),
@@ -95,9 +96,11 @@ def build_final_runner_task_spec(
             "upstream_output_root": str(runner_paths.upstream_output_root),
             "upstream_summary_json": str(runner_paths.upstream_summary_json),
             "upstream_task_spec_json": str(runner_paths.upstream_task_spec_json),
+            "upstream_workflow_handoff_json": str(runner_paths.upstream_workflow_handoff_json),
             "downstream_output_root": str(runner_paths.downstream_output_root),
             "downstream_summary_json": str(runner_paths.downstream_summary_json),
             "downstream_task_spec_json": str(runner_paths.downstream_task_spec_json),
+            "downstream_workflow_handoff_json": str(runner_paths.downstream_workflow_handoff_json),
         },
     }
 
@@ -138,6 +141,7 @@ def build_keep_list_upstream_task_spec(
             "output_root": str(runner_paths.output_root),
             "summary_json": str(runner_paths.summary_json),
             "task_spec_json": str(runner_paths.task_spec_json),
+            "workflow_handoff_json": str(runner_paths.workflow_handoff_json),
         },
         "environment": {
             "env_file_raw": str(env_file_raw or ""),
@@ -211,6 +215,7 @@ def build_keep_list_downstream_task_spec(
             "output_root": str(runner_paths.output_root),
             "summary_json": str(runner_paths.summary_json),
             "task_spec_json": str(runner_paths.task_spec_json),
+            "workflow_handoff_json": str(runner_paths.workflow_handoff_json),
         },
         "environment": {
             "env_file_raw": str(env_file_raw or ""),

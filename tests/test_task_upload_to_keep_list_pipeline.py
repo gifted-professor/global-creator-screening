@@ -141,6 +141,8 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
                 summary_json=summary_path,
             )
             persisted = json.loads(summary_path.read_text(encoding="utf-8"))
+            self.assertTrue(Path(summary["workflow_handoff_json"]).exists())
+            workflow_handoff = json.loads(Path(summary["workflow_handoff_json"]).read_text(encoding="utf-8"))
 
         self.assertEqual(summary["status"], "failed")
         self.assertEqual(summary["contract_version"], RUN_CONTRACT_VERSION)
@@ -157,6 +159,9 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
         self.assertFalse(summary["setup"]["completed"])
         self.assertEqual(summary["preflight"]["errors"][0]["error_code"], "FEISHU_APP_ID_MISSING")
         self.assertFalse(Path(summary["task_spec_json"]).exists())
+        self.assertFalse(workflow_handoff["task_spec_available"])
+        self.assertEqual(workflow_handoff["failure"]["failure_layer"], "preflight")
+        self.assertEqual(workflow_handoff["failure_decision"]["category"], "configuration")
         self.assertEqual(persisted["failure"]["error_code"], "FEISHU_APP_ID_MISSING")
 
     def test_runner_defaults_to_run_local_paths_when_output_root_is_omitted(self) -> None:
@@ -503,12 +508,22 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
                 feishu_app_secret="app-secret",
                 stop_after="task-assets",
             )
+            workflow_handoff = json.loads(Path(summary["workflow_handoff_json"]).read_text(encoding="utf-8"))
 
         self.assertEqual(summary["status"], "stopped_after_task-assets")
+        self.assertTrue(summary["workflow_handoff_json"].endswith("/workflow_handoff.json"))
         self.assertEqual(summary["steps"]["task_assets"]["status"], "completed")
         self.assertEqual(summary["artifacts"].get("template_prepare_summary_json", ""), "")
         self.assertEqual(summary["artifacts"].get("template_runtime_prompt_artifacts_json", ""), "")
         self.assertNotIn("template_prompt_artifacts", summary["steps"]["task_assets"])
+        self.assertEqual(workflow_handoff["verdict"]["outcome"], "stopped")
+        self.assertEqual(workflow_handoff["recommended_action"], "resume_run")
+        self.assertTrue(workflow_handoff["task_spec_available"])
+        self.assertTrue(workflow_handoff["resume"]["available"])
+        self.assertEqual(workflow_handoff["resume"]["canonical_resume_point"], "keep_list")
+        self.assertIn("task_assets", workflow_handoff["resume"]["resume_point_keys"])
+        self.assertNotIn("resume_points", workflow_handoff["pointers"])
+        self.assertEqual(workflow_handoff["intent_summary"]["intent"]["stop_after"], "task-assets")
 
     def test_runner_passes_owner_email_overrides_to_mail_sync(self) -> None:
         observed: dict[str, object] = {}

@@ -32,12 +32,15 @@ class FinalRunnerPaths:
     output_root: Path
     summary_json: Path
     task_spec_json: Path
+    workflow_handoff_json: Path
     upstream_output_root: Path
     upstream_summary_json: Path
     upstream_task_spec_json: Path
+    upstream_workflow_handoff_json: Path
     downstream_output_root: Path
     downstream_summary_json: Path
     downstream_task_spec_json: Path
+    downstream_workflow_handoff_json: Path
     output_root_source: str
     summary_json_source: str
 
@@ -49,6 +52,7 @@ class UpstreamRunnerPaths:
     output_root: Path
     summary_json: Path
     task_spec_json: Path
+    workflow_handoff_json: Path
     downloads_dir: Path
     mail_root: Path
     exports_dir: Path
@@ -65,6 +69,7 @@ class DownstreamRunnerPaths:
     output_root: Path
     summary_json: Path
     task_spec_json: Path
+    workflow_handoff_json: Path
     staging_summary_json: Path
     screening_data_dir: Path
     config_dir: Path
@@ -115,12 +120,15 @@ def resolve_final_runner_paths(
         output_root=resolved_run_root,
         summary_json=resolved_summary_json,
         task_spec_json=(resolved_run_root / "task_spec.json").resolve(),
+        workflow_handoff_json=(resolved_run_root / "workflow_handoff.json").resolve(),
         upstream_output_root=(resolved_run_root / "upstream").resolve(),
         upstream_summary_json=(resolved_run_root / "upstream" / "summary.json").resolve(),
         upstream_task_spec_json=(resolved_run_root / "upstream" / "task_spec.json").resolve(),
+        upstream_workflow_handoff_json=(resolved_run_root / "upstream" / "workflow_handoff.json").resolve(),
         downstream_output_root=(resolved_run_root / "downstream").resolve(),
         downstream_summary_json=(resolved_run_root / "downstream" / "summary.json").resolve(),
         downstream_task_spec_json=(resolved_run_root / "downstream" / "task_spec.json").resolve(),
+        downstream_workflow_handoff_json=(resolved_run_root / "downstream" / "workflow_handoff.json").resolve(),
         output_root_source=output_root_source,
         summary_json_source=summary_json_source,
     )
@@ -196,6 +204,7 @@ def resolve_keep_list_upstream_paths(
         output_root=resolved_run_root,
         summary_json=resolved_summary_json,
         task_spec_json=(resolved_run_root / "task_spec.json").resolve(),
+        workflow_handoff_json=(resolved_run_root / "workflow_handoff.json").resolve(),
         downloads_dir=resolved_downloads_dir,
         mail_root=resolved_mail_root,
         exports_dir=(resolved_run_root / "exports").resolve(),
@@ -231,6 +240,7 @@ def resolve_keep_list_downstream_paths(
             else (resolved_run_root / "summary.json").resolve()
         ),
         task_spec_json=(resolved_run_root / "task_spec.json").resolve(),
+        workflow_handoff_json=(resolved_run_root / "workflow_handoff.json").resolve(),
         staging_summary_json=(resolved_run_root / "staging_summary.json").resolve(),
         screening_data_dir=(resolved_run_root / "data").resolve(),
         config_dir=(resolved_run_root / "config").resolve(),
