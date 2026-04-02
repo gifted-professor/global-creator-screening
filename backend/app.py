@@ -11,8 +11,10 @@ import uuid
 import base64
 import hashlib
 import random
+import weakref
 from contextlib import contextmanager
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, as_completed, wait
+from concurrent.futures.thread import _threads_queues, _worker
 from datetime import datetime
 from io import BytesIO
 from pathlib import Path
@@ -83,6 +85,31 @@ def load_dotenv_local():
 
 
 load_dotenv_local()
+
+
+class DaemonThreadPoolExecutor(ThreadPoolExecutor):
+    """Allow timed-out worker calls to stop blocking process exit."""
+
+    def _adjust_thread_count(self):
+        if self._idle_semaphore.acquire(timeout=0):
+            return
+
+        def weakref_cb(_, q=self._work_queue):
+            q.put(None)
+
+        num_threads = len(self._threads)
+        if num_threads >= self._max_workers:
+            return
+        thread_name = "%s_%d" % (self._thread_name_prefix or self, num_threads)
+        worker_thread = threading.Thread(
+            name=thread_name,
+            target=_worker,
+            args=(weakref.ref(self, weakref_cb), self._work_queue, self._initializer, self._initargs),
+        )
+        worker_thread.daemon = True
+        worker_thread.start()
+        self._threads.add(worker_thread)
+        _threads_queues[worker_thread] = self._work_queue
 
 
 def parse_env_flag(name, default=False):
@@ -355,6 +382,10 @@ DEFAULT_VISUAL_REVIEW_PROBE_RANKED_TERTIARY_PROVIDER = "reelx"
 DEFAULT_VISUAL_REVIEW_PROBE_RANKED_TERTIARY_MODEL = "gemini-3-flash-preview"
 DEFAULT_VISUAL_REVIEW_PROBE_RANKED_TERTIARY_TIMEOUT_SECONDS = 20
 DEFAULT_VISUAL_REVIEW_PROBE_RANKED_DISABLE_AFTER_FAILURES = 2
+DEFAULT_VISUAL_REVIEW_PROBE_RANKED_RETRY_ATTEMPTS = max(
+    0,
+    int(os.getenv("VISION_VISUAL_REVIEW_PROBE_RANKED_RETRY_ATTEMPTS", "1")),
+)
 VISUAL_REVIEW_PROBE_RANKED_GROUP_PREFERRED = "preferred"
 VISUAL_REVIEW_PROBE_RANKED_GROUP_FALLBACK = "fallback"
 VISUAL_REVIEW_PROBE_RANKED_SELECTED_STAGE_PREFERRED_POOL = "preferred_pool"
@@ -527,7 +558,14 @@ def _path_is_within_root(path: Path, root: Path) -> bool:
 
 
 def _resolve_operator_env_snapshot(env_file: str = ""):
-    return load_env_file_snapshot(env_file or ".env")
+    raw = str(env_file or ".env").strip() or ".env"
+    candidate = Path(raw).expanduser()
+    if not candidate.is_absolute():
+        candidate = (BASE_DIR / candidate).resolve()
+    return load_env_file_snapshot(
+        str(candidate),
+        default_env_file=str((BASE_DIR / ".env").resolve()),
+    )
 
 
 def _resolve_operator_env_file(env_file: str = "") -> Path:
@@ -2811,6 +2849,16 @@ def _resolve_probe_ranked_disable_after_failures():
     return int(DEFAULT_VISUAL_REVIEW_PROBE_RANKED_DISABLE_AFTER_FAILURES)
 
 
+def _resolve_probe_ranked_retry_attempts():
+    raw_value = str(os.getenv("VISION_VISUAL_REVIEW_PROBE_RANKED_RETRY_ATTEMPTS", "") or "").strip()
+    if raw_value:
+        try:
+            return max(0, int(raw_value))
+        except Exception:
+            pass
+    return int(DEFAULT_VISUAL_REVIEW_PROBE_RANKED_RETRY_ATTEMPTS)
+
+
 def resolve_probe_ranked_channel_race(ranked_context):
     if isinstance(ranked_context, dict) and isinstance(ranked_context.get("channel_race"), dict):
         return dict(ranked_context.get("channel_race") or {})
@@ -2975,6 +3023,8 @@ def probe_visual_review_ranked_candidate(stage, platform="instagram", cover_urls
         "effective_model": configured_model,
         "timeout_seconds": int(stage.get("timeout_seconds") or 0),
         "ok": False,
+        "retryable": False,
+        "attempt_count": 1,
     }
     if not provider:
         result["error"] = "provider_unavailable"
@@ -2983,6 +3033,7 @@ def probe_visual_review_ranked_candidate(stage, platform="instagram", cover_urls
         probe_result = probe_vision_provider_with_image(provider, platform=platform, cover_urls=cover_urls)
     except Exception as exc:
         result["error"] = str(exc)
+        result["retryable"] = is_retryable_visual_exception(exc)
         return result
     result.update({
         "ok": True,
@@ -3001,8 +3052,7 @@ def probe_visual_review_ranked_candidate(stage, platform="instagram", cover_urls
     return result
 
 
-def run_probe_ranked_visual_provider_race(platform="instagram", cover_urls=None):
-    stages = build_visual_review_probe_ranked_plan()
+def _run_probe_ranked_visual_provider_probe_pass(stages, platform="instagram", cover_urls=None):
     results_by_stage = {}
     with ThreadPoolExecutor(max_workers=max(1, len(stages)), thread_name_prefix="vision-probe-race") as executor:
         future_map = {
@@ -3025,9 +3075,79 @@ def run_probe_ranked_visual_provider_race(platform="instagram", cover_urls=None)
                     "model": "",
                     "timeout_seconds": 0,
                     "ok": False,
+                    "retryable": is_retryable_visual_exception(exc),
+                    "attempt_count": 1,
                     "error": str(exc),
                 }
             results_by_stage[stage_name] = candidate_result
+    return results_by_stage
+
+
+def run_probe_ranked_visual_provider_race(platform="instagram", cover_urls=None):
+    stages = build_visual_review_probe_ranked_plan()
+    results_by_stage = _run_probe_ranked_visual_provider_probe_pass(stages, platform=platform, cover_urls=cover_urls)
+    retry_history = []
+
+    # Retry transient probe failures once or twice so brief provider blips do not abort the whole visual chain.
+    for retry_attempt in range(1, _resolve_probe_ranked_retry_attempts() + 1):
+        preferred_success_exists = any(
+            bool((item or {}).get("ok"))
+            and str((item or {}).get("group") or "").strip() == VISUAL_REVIEW_PROBE_RANKED_GROUP_PREFERRED
+            for item in results_by_stage.values()
+        )
+        any_success_exists = any(bool((item or {}).get("ok")) for item in results_by_stage.values())
+        if preferred_success_exists:
+            break
+        if any_success_exists:
+            retry_stages = [
+                stage
+                for stage in stages
+                if str(stage.get("group") or "").strip() == VISUAL_REVIEW_PROBE_RANKED_GROUP_PREFERRED
+                and bool((results_by_stage.get(str(stage.get("stage") or "").strip()) or {}).get("retryable"))
+            ]
+            if not retry_stages:
+                break
+        else:
+            retry_stages = [
+                stage
+                for stage in stages
+                if bool((results_by_stage.get(str(stage.get("stage") or "").strip()) or {}).get("retryable"))
+            ]
+        if not retry_stages:
+            break
+        delay_seconds = compute_visual_retry_delay_seconds(retry_attempt)
+        if delay_seconds > 0:
+            time.sleep(delay_seconds)
+        retried_results = _run_probe_ranked_visual_provider_probe_pass(
+            retry_stages,
+            platform=platform,
+            cover_urls=cover_urls,
+        )
+        retry_snapshot = {
+            "attempt": retry_attempt,
+            "delay_seconds": delay_seconds,
+            "stage_names": [str(stage.get("stage") or "").strip() for stage in retry_stages if str(stage.get("stage") or "").strip()],
+            "results": [],
+        }
+        for stage in retry_stages:
+            stage_name = str(stage.get("stage") or "").strip()
+            previous_result = dict(results_by_stage.get(stage_name) or {})
+            retried_result = dict(retried_results.get(stage_name) or previous_result)
+            retried_result["attempt_count"] = max(1, int(previous_result.get("attempt_count") or 1)) + 1
+            retried_result["retried"] = True
+            results_by_stage[stage_name] = retried_result
+            retry_snapshot["results"].append(
+                {
+                    "stage": stage_name,
+                    "provider": str(retried_result.get("provider") or "").strip(),
+                    "model": str(retried_result.get("model") or "").strip(),
+                    "ok": bool(retried_result.get("ok")),
+                    "retryable": bool(retried_result.get("retryable")),
+                    "error": str(retried_result.get("error") or "").strip(),
+                    "attempt_count": int(retried_result.get("attempt_count") or 1),
+                }
+            )
+        retry_history.append(retry_snapshot)
 
     ordered_candidates = []
     selected_candidate = None
@@ -3094,6 +3214,7 @@ def run_probe_ranked_visual_provider_race(platform="instagram", cover_urls=None)
             for item in successful_candidates
             if str(item.get("group") or "").strip() != VISUAL_REVIEW_PROBE_RANKED_GROUP_PREFERRED
         ],
+        "retry_history": retry_history,
         "candidates": ordered_candidates,
     }
 
@@ -5368,7 +5489,7 @@ def perform_visual_review(platform, payload, progress_callback=None, cancel_chec
         }
         return True
 
-    executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=f"{platform}-visual")
+    executor = DaemonThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=f"{platform}-visual")
     try:
         for _ in range(max_workers):
             if not submit_next(executor):
@@ -5572,7 +5693,7 @@ def perform_positioning_card_analysis(platform, payload, progress_callback=None,
         }
         return True
 
-    executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=f"{platform}-positioning")
+    executor = DaemonThreadPoolExecutor(max_workers=max_workers, thread_name_prefix=f"{platform}-positioning")
     try:
         for _ in range(max_workers):
             if not submit_next(executor):

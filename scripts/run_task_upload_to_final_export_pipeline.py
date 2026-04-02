@@ -13,7 +13,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from backend.final_export_merge import extract_task_owner_context
-from harness.contract import attach_run_contract
+from harness.contract import SUCCESSFUL_TERMINAL_STATUSES, attach_run_contract
 from harness.config import (
     RequiredConfigSpec,
     build_required_config_errors,
@@ -33,7 +33,7 @@ from harness.spec import build_final_runner_task_spec, write_task_spec
 
 
 MATCHING_STRATEGIES = ("legacy-enrichment", "brand-keyword-fast-path")
-SUCCESSFUL_DOWNSTREAM_STATUSES = {"completed", "completed_with_partial_scrape"}
+SUCCESSFUL_DOWNSTREAM_STATUSES = SUCCESSFUL_TERMINAL_STATUSES
 
 
 def _load_runtime_dependencies():
