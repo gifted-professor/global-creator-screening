@@ -160,12 +160,12 @@ def download_task_upload_screening_assets(
     sending_list_downloaded_path = ""
 
     if download_template:
-        if not entry.workbook_file_token:
+        if not _has_attachment_reference(entry.workbook_file_token, entry.workbook_file_url):
             raise ValueError(f"任务 {entry.task_name!r} 缺少 `需求上传（excel 格式）` 附件。")
         template_downloaded_path = str(_download_task_upload_workbook(client, entry, download_root))
 
     if download_sending_list:
-        if not entry.sending_list_file_token:
+        if not _has_attachment_reference(entry.sending_list_file_token, entry.sending_list_file_url):
             raise ValueError(f"任务 {entry.task_name!r} 缺少 `发信名单` 附件。")
         sending_list_downloaded_path = str(_download_task_upload_sending_list(client, entry, download_root))
 
@@ -317,7 +317,7 @@ def inspect_task_upload_assignments(
             "templateParseStats": {},
             "templateParseError": "",
         }
-        if should_download_templates and entry.workbook_file_token:
+        if should_download_templates and _has_attachment_reference(entry.workbook_file_token, entry.workbook_file_url):
             saved_template_path = str(_download_task_upload_workbook(client, entry, download_root))
             downloaded_count += 1
             if parse_templates:
@@ -654,7 +654,7 @@ def sync_task_upload_view_to_email_project(
         skipped_items: list[dict[str, str]] = []
         latest_project_code = ""
         for entry in entries:
-            if not entry.workbook_file_token:
+            if not _has_attachment_reference(entry.workbook_file_token, entry.workbook_file_url):
                 skipped_items.append(
                     {
                         "recordId": entry.record_id,
@@ -775,7 +775,7 @@ def sync_task_upload_view_to_email_project(
     skipped_items: list[dict[str, str]] = []
     latest_project_code = ""
     for entry in entries:
-        if not entry.workbook_file_token:
+        if not _has_attachment_reference(entry.workbook_file_token, entry.workbook_file_url):
             skipped_items.append(
                 {
                     "recordId": entry.record_id,
@@ -852,8 +852,8 @@ def _fetch_task_upload_entries(client: FeishuOpenClient, task_upload_url: str) -
         if not isinstance(item, dict):
             continue
         fields = item.get("fields") or {}
-        workbook = _extract_attachment_with_file_token(fields.get("需求上传（excel 格式）"))
-        sending_list = _extract_attachment_with_file_token(fields.get("发信名单"))
+        workbook = _extract_attachment_reference(fields.get("需求上传（excel 格式）"))
+        sending_list = _extract_attachment_reference(fields.get("发信名单"))
         task_name = _extract_text_like(fields.get("任务名")) or str(item.get("record_id") or "")
         owner_email_candidates = _extract_email_values(fields.get("负责人邮箱"))
         owner_email = ",".join(owner_email_candidates)
@@ -1362,11 +1362,18 @@ def _extract_email_values(value: Any) -> tuple[str, ...]:
     return tuple(results)
 
 
-def _extract_attachment_with_file_token(value: Any) -> dict[str, Any] | None:
+def _has_attachment_reference(file_token: str, file_url: str) -> bool:
+    return bool(str(file_token or "").strip() or str(file_url or "").strip())
+
+
+def _extract_attachment_reference(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, list):
         return None
     for item in value:
-        if isinstance(item, dict) and str(item.get("file_token") or "").strip():
+        if isinstance(item, dict) and _has_attachment_reference(
+            str(item.get("file_token") or ""),
+            str(item.get("url") or ""),
+        ):
             return item
     return None
 

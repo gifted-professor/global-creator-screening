@@ -10,6 +10,7 @@ from urllib import error, parse, request
 
 
 DEFAULT_FEISHU_BASE_URL = "https://open.feishu.cn/open-apis"
+_TRUSTED_FEISHU_HOST_SUFFIXES = ("feishu.cn", "larksuite.com")
 
 _BOX_TOKEN_PATTERN = re.compile(r"(box[a-zA-Z0-9_-]+)")
 
@@ -78,7 +79,10 @@ class FeishuOpenClient:
         access_token = self.get_tenant_access_token()
         last_error: Exception | None = None
 
-        direct_download_url = _extract_drive_download_url(raw)
+        direct_download_url = _extract_drive_download_url(
+            raw,
+            trusted_hosts=_build_trusted_drive_download_hosts(self.base_url),
+        )
         if direct_download_url:
             try:
                 status, headers, body, resolved_url = self._request_bytes(
@@ -426,12 +430,42 @@ def _join_url(base_url: str, url_path: str) -> str:
     return base_url.rstrip("/") + url_path
 
 
-def _extract_drive_download_url(file_token_or_url: str) -> str:
+def _build_trusted_drive_download_hosts(base_url: str) -> tuple[str, ...]:
+    hosts: list[str] = []
+    for raw_url in (base_url, DEFAULT_FEISHU_BASE_URL):
+        parsed = parse.urlparse(str(raw_url or "").strip())
+        host = str(parsed.hostname or "").strip().lower().rstrip(".")
+        if host and host not in hosts:
+            hosts.append(host)
+    return tuple(hosts)
+
+
+def _is_trusted_drive_download_host(hostname: str, trusted_hosts: tuple[str, ...] | list[str] | set[str] | None = None) -> bool:
+    normalized = str(hostname or "").strip().lower().rstrip(".")
+    if not normalized:
+        return False
+    normalized_trusted_hosts = {
+        str(item or "").strip().lower().rstrip(".")
+        for item in (trusted_hosts or ())
+        if str(item or "").strip()
+    }
+    if normalized in normalized_trusted_hosts:
+        return True
+    return any(normalized == suffix or normalized.endswith(f".{suffix}") for suffix in _TRUSTED_FEISHU_HOST_SUFFIXES)
+
+
+def _extract_drive_download_url(
+    file_token_or_url: str,
+    *,
+    trusted_hosts: tuple[str, ...] | list[str] | set[str] | None = None,
+) -> str:
     raw = str(file_token_or_url or "").strip()
     if "://" not in raw:
         return ""
     parsed = parse.urlparse(raw)
     if not parsed.scheme or not parsed.netloc:
+        return ""
+    if not _is_trusted_drive_download_host(str(parsed.hostname or ""), trusted_hosts):
         return ""
     normalized_path = parsed.path or ""
     if "/drive/v1/" not in normalized_path or not normalized_path.endswith("/download"):

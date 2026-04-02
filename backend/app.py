@@ -3090,13 +3090,29 @@ def run_probe_ranked_visual_provider_race(platform="instagram", cover_urls=None)
 
     # Retry transient probe failures once or twice so brief provider blips do not abort the whole visual chain.
     for retry_attempt in range(1, _resolve_probe_ranked_retry_attempts() + 1):
-        if any((item or {}).get("ok") for item in results_by_stage.values()):
+        preferred_success_exists = any(
+            bool((item or {}).get("ok"))
+            and str((item or {}).get("group") or "").strip() == VISUAL_REVIEW_PROBE_RANKED_GROUP_PREFERRED
+            for item in results_by_stage.values()
+        )
+        any_success_exists = any(bool((item or {}).get("ok")) for item in results_by_stage.values())
+        if preferred_success_exists:
             break
-        retry_stages = [
-            stage
-            for stage in stages
-            if bool((results_by_stage.get(str(stage.get("stage") or "").strip()) or {}).get("retryable"))
-        ]
+        if any_success_exists:
+            retry_stages = [
+                stage
+                for stage in stages
+                if str(stage.get("group") or "").strip() == VISUAL_REVIEW_PROBE_RANKED_GROUP_PREFERRED
+                and bool((results_by_stage.get(str(stage.get("stage") or "").strip()) or {}).get("retryable"))
+            ]
+            if not retry_stages:
+                break
+        else:
+            retry_stages = [
+                stage
+                for stage in stages
+                if bool((results_by_stage.get(str(stage.get("stage") or "").strip()) or {}).get("retryable"))
+            ]
         if not retry_stages:
             break
         delay_seconds = compute_visual_retry_delay_seconds(retry_attempt)
