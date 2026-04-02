@@ -47,6 +47,14 @@ _KEEP_OWNER_EMPLOYEE_EMAIL_FIELD = "达人对接人_employee_email"
 _KEEP_OWNER_OWNER_NAME_FIELD = "达人对接人_owner_name"
 _KEEP_OWNER_STATUS_FIELD = "__owner_resolution_status"
 _KEEP_OWNER_ALIAS_FIELD = "__owner_resolution_aliases"
+_LAST_MAIL_KEYS = (
+    "last_mail_message_id",
+    "last_mail_time",
+    "last_mail_subject",
+    "last_mail_snippet",
+    "last_mail_raw_path",
+)
+_EMAIL_PATTERN = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
 
 
 def _load_runtime_dependencies() -> dict[str, Any]:
@@ -100,6 +108,64 @@ def _safe_name(value: str) -> str:
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _normalize_email(value: Any) -> str:
+    return _clean_text(value).lower()
+
+
+def _extract_emails_from_text(value: Any) -> list[str]:
+    matches = []
+    seen: set[str] = set()
+    for match in _EMAIL_PATTERN.finditer(_clean_text(value)):
+        normalized = _normalize_email(match.group(0))
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        matches.append(normalized)
+    return matches
+
+
+def _load_address_entries(raw_value: Any) -> list[dict[str, str]]:
+    try:
+        items = json.loads(_clean_text(raw_value) or "[]")
+    except json.JSONDecodeError:
+        return []
+    result: list[dict[str, str]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        email = _normalize_email(item.get("address") or item.get("email"))
+        name = _clean_text(item.get("name"))
+        if not email and not name:
+            continue
+        result.append({"email": email, "name": name})
+    return result
+
+
+def _extract_address_emails(raw_value: Any) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in _load_address_entries(raw_value):
+        email = _normalize_email(item.get("email"))
+        if not email or email in seen:
+            continue
+        seen.add(email)
+        result.append(email)
+    return result
+
+
+def _extract_external_recipient_emails(*raw_values: Any, excluded_emails: Sequence[str] = ()) -> list[str]:
+    result: list[str] = []
+    seen = {_normalize_email(email) for email in excluded_emails if _normalize_email(email)}
+    for raw_value in raw_values:
+        for email in _extract_address_emails(raw_value):
+            normalized = _normalize_email(email)
+            if not normalized or normalized in seen:
+                continue
+            seen.add(normalized)
+            result.append(normalized)
+    return result
 
 
 def _path_summary(path: Path | None, *, source: str, kind: str) -> dict[str, Any]:
@@ -276,10 +342,15 @@ def _build_mail_only_rows(
     platform = _extract_platform(keep_row) or _flatten_field_value(_get_field_value(existing_fields, "平台"))
     profile_url = _clean_text(keep_row.get("URL")) or _flatten_field_value(_get_field_value(existing_fields, "主页链接"))
     quote_text = _build_quote_text(keep_row) or _flatten_field_value(_get_field_value(existing_fields, "当前网红报价"))
-    last_mail_time = _format_date(keep_row.get("brand_message_sent_at")) or _flatten_field_value(
+    allow_brand_message_fallback = not _clean_text(keep_row.get("evidence_thread_key"))
+    last_mail_time = _format_date(keep_row.get("last_mail_time")) or (
+        _format_date(keep_row.get("brand_message_sent_at")) if allow_brand_message_fallback else ""
+    ) or _flatten_field_value(
         _get_field_value(existing_fields, "达人最后一次回复邮件时间")
     )
-    last_mail_content = _clean_text(keep_row.get("brand_message_snippet")) or _flatten_field_value(
+    last_mail_content = _clean_text(keep_row.get("last_mail_snippet")) or (
+        _clean_text(keep_row.get("brand_message_snippet")) if allow_brand_message_fallback else ""
+    ) or _flatten_field_value(
         _get_field_value(existing_fields, "达人回复的最后一封邮件内容")
     )
     owner_display_name = (
@@ -841,6 +912,312 @@ def _read_thread_text_excerpt(shared_mail_db_path: Path, thread_key: Any) -> str
     return _read_thread_text_excerpt_cached(*_build_thread_excerpt_cache_identity(shared_mail_db_path), _clean_text(thread_key))
 
 
+@lru_cache(maxsize=4096)
+def _read_thread_reply_snapshot_cached(
+    db_path_value: str,
+    db_inode: int,
+    db_size: int,
+    db_mtime_ns: int,
+    db_ctime_ns: int,
+    thread_key: str,
+) -> dict[str, Any]:
+    path = Path(db_path_value).expanduser()
+    if not thread_key or not path.exists() or not path.is_file():
+        return {"messages": [], "latest_message": {}, "thread_creator_candidate_emails": []}
+    try:
+        with sqlite3.connect(str(path)) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = list(
+                conn.execute(
+                    """
+                    SELECT
+                        m.id,
+                        COALESCE(m.account_email, '') AS account_email,
+                        COALESCE(mi.direction, '') AS direction,
+                        COALESCE(mi.sent_sort_at, m.sent_at, m.internal_date, m.created_at, '') AS sent_sort_at,
+                        COALESCE(m.subject, '') AS subject,
+                        COALESCE(m.snippet, '') AS snippet,
+                        COALESCE(m.raw_path, '') AS raw_path,
+                        COALESCE(m.from_json, '') AS from_json,
+                        COALESCE(m.sender_json, '') AS sender_json,
+                        COALESCE(m.to_json, '') AS to_json,
+                        COALESCE(m.cc_json, '') AS cc_json,
+                        COALESCE(m.bcc_json, '') AS bcc_json
+                    FROM message_index mi
+                    JOIN messages m ON m.id = mi.message_row_id
+                    WHERE mi.thread_key = ?
+                    ORDER BY
+                        COALESCE(datetime(mi.sent_sort_at), datetime(m.sent_at), datetime(m.internal_date), datetime(m.created_at)),
+                        m.id
+                    """,
+                    (thread_key,),
+                ).fetchall()
+            )
+    except sqlite3.DatabaseError:
+        return {"messages": [], "latest_message": {}, "thread_creator_candidate_emails": []}
+    latest_message: dict[str, Any] = {}
+    message_payloads: list[dict[str, Any]] = []
+    thread_creator_candidate_emails: list[str] = []
+    seen_creator_candidates: set[str] = set()
+    for row in rows:
+        self_email = _normalize_email(row["account_email"])
+        sender_emails = _extract_address_emails(row["from_json"])
+        for email in _extract_address_emails(row["sender_json"]):
+            if email not in sender_emails:
+                sender_emails.append(email)
+        recipient_emails = _extract_external_recipient_emails(
+            row["to_json"],
+            row["cc_json"],
+            row["bcc_json"],
+            excluded_emails=[self_email],
+        )
+        creator_candidate_emails: list[str] = []
+        if _clean_text(row["direction"]).lower() == "outbound":
+            for email in recipient_emails:
+                creator_candidate_emails.append(email)
+                if email not in seen_creator_candidates:
+                    seen_creator_candidates.add(email)
+                    thread_creator_candidate_emails.append(email)
+        payload = {
+            "row_id": int(row["id"]),
+            "direction": _clean_text(row["direction"]).lower(),
+            "sent_sort_at": _clean_text(row["sent_sort_at"]),
+            "subject": _clean_text(row["subject"]),
+            "snippet": _clean_text(row["snippet"]),
+            "raw_path": _clean_text(row["raw_path"]),
+            "sender_emails": sender_emails,
+            "recipient_emails": recipient_emails,
+            "creator_candidate_emails": creator_candidate_emails,
+        }
+        message_payloads.append(payload)
+        latest_message = payload
+    return {
+        "messages": message_payloads,
+        "latest_message": latest_message,
+        "thread_creator_candidate_emails": thread_creator_candidate_emails,
+    }
+
+
+def _read_thread_reply_snapshot(shared_mail_db_path: Path, thread_key: Any) -> dict[str, Any]:
+    return _read_thread_reply_snapshot_cached(
+        *_build_thread_excerpt_cache_identity(shared_mail_db_path),
+        _clean_text(thread_key),
+    )
+
+
+def _find_snapshot_message_by_raw_path(snapshot: dict[str, Any], raw_path: Any) -> tuple[int, dict[str, Any]]:
+    normalized_raw_path = _clean_text(raw_path)
+    if not normalized_raw_path:
+        return -1, {}
+    for index, message in enumerate(snapshot.get("messages") or []):
+        payload = dict(message or {})
+        if _clean_text(payload.get("raw_path")) == normalized_raw_path:
+            return index, payload
+    return -1, {}
+
+
+def _infer_creator_target_emails_from_snapshot(snapshot: dict[str, Any], *, row_raw_path: Any) -> set[str]:
+    messages = [dict(message or {}) for message in (snapshot.get("messages") or [])]
+    if not messages:
+        return set()
+
+    anchor_index, anchor_message = _find_snapshot_message_by_raw_path(snapshot, row_raw_path)
+    if anchor_message:
+        search_start = anchor_index
+        if _clean_text(anchor_message.get("direction")).lower() != "outbound":
+            search_start = anchor_index - 1
+        for index in range(search_start, -1, -1):
+            message = messages[index]
+            if _clean_text(message.get("direction")).lower() != "outbound":
+                continue
+            recipient_emails = {
+                _normalize_email(email)
+                for email in (message.get("recipient_emails") or [])
+                if _normalize_email(email)
+            }
+            if len(recipient_emails) == 1:
+                return recipient_emails
+            return set()
+        return set()
+
+    thread_creator_candidate_emails = {
+        _normalize_email(email)
+        for email in (snapshot.get("thread_creator_candidate_emails") or [])
+        if _normalize_email(email)
+    }
+    if len(thread_creator_candidate_emails) == 1:
+        return thread_creator_candidate_emails
+    return set()
+
+
+def _extract_creator_reply_target_emails(row: dict[str, Any], snapshot: dict[str, Any]) -> set[str]:
+    candidates: set[str] = set()
+    for key in ("matched_contact_email", "creator_emails", "Email", "matched_email"):
+        for email in _extract_emails_from_text(row.get(key)):
+            candidates.add(email)
+    if candidates:
+        return candidates
+    row_raw_path = (
+        _clean_text(row.get("__brand_message_raw_path"))
+        or _clean_text(row.get("__last_mail_raw_path"))
+        or _clean_text(row.get("brand_message_raw_path"))
+        or _clean_text(row.get("last_mail_raw_path"))
+    )
+    return _infer_creator_target_emails_from_snapshot(snapshot, row_raw_path=row_raw_path)
+
+
+def _resolve_latest_creator_reply(snapshot: dict[str, Any], *, creator_target_emails: set[str]) -> dict[str, Any]:
+    if not creator_target_emails:
+        return {}
+    latest_creator_reply: dict[str, Any] = {}
+    for message in snapshot.get("messages") or []:
+        if _clean_text((message or {}).get("direction")).lower() != "inbound":
+            continue
+        sender_emails = {
+            _normalize_email(email)
+            for email in ((message or {}).get("sender_emails") or [])
+            if _normalize_email(email)
+        }
+        if sender_emails & creator_target_emails:
+            latest_creator_reply = dict(message)
+    return latest_creator_reply
+
+
+@lru_cache(maxsize=4096)
+def _lookup_thread_key_for_raw_path_cached(
+    db_path_value: str,
+    db_inode: int,
+    db_size: int,
+    db_mtime_ns: int,
+    db_ctime_ns: int,
+    raw_path: str,
+) -> str:
+    path = Path(db_path_value).expanduser()
+    normalized_raw_path = _clean_text(raw_path)
+    if not normalized_raw_path or not path.exists() or not path.is_file():
+        return ""
+    try:
+        with sqlite3.connect(str(path)) as conn:
+            row = conn.execute(
+                """
+                SELECT COALESCE(mi.thread_key, '')
+                FROM messages m
+                JOIN message_index mi ON mi.message_row_id = m.id
+                WHERE COALESCE(m.raw_path, '') = ?
+                ORDER BY m.id DESC
+                LIMIT 1
+                """,
+                (normalized_raw_path,),
+            ).fetchone()
+    except sqlite3.DatabaseError:
+        return ""
+    if not row:
+        return ""
+    return _clean_text(row[0])
+
+
+def _lookup_thread_key_for_raw_path(shared_mail_db_path: Path, raw_path: Any) -> str:
+    return _lookup_thread_key_for_raw_path_cached(
+        *_build_thread_excerpt_cache_identity(shared_mail_db_path),
+        _clean_text(raw_path),
+    )
+
+
+def _apply_creator_reply_context(
+    keep_row: dict[str, Any],
+    *,
+    shared_mail_db_path: Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    updated = dict(keep_row)
+    thread_key = _clean_text(updated.get("evidence_thread_key"))
+    if not thread_key:
+        return updated, {
+            "status": "thread_key_missing",
+            "creator_replied": None,
+        }
+    snapshot = _read_thread_reply_snapshot(shared_mail_db_path, thread_key)
+    creator_target_emails = _extract_creator_reply_target_emails(updated, snapshot)
+    latest_creator_reply = _resolve_latest_creator_reply(snapshot, creator_target_emails=creator_target_emails)
+    if latest_creator_reply:
+        updated["last_mail_message_id"] = latest_creator_reply.get("row_id") or ""
+        updated["last_mail_time"] = latest_creator_reply.get("sent_sort_at") or ""
+        updated["last_mail_subject"] = latest_creator_reply.get("subject") or ""
+        updated["last_mail_snippet"] = latest_creator_reply.get("snippet") or ""
+        updated["last_mail_raw_path"] = latest_creator_reply.get("raw_path") or ""
+        return updated, {
+            "status": "creator_replied",
+            "creator_replied": True,
+            "latest_inbound": latest_creator_reply,
+            "latest_message": dict(snapshot.get("latest_message") or {}),
+            "creator_target_emails": sorted(creator_target_emails),
+        }
+    if not creator_target_emails and (snapshot.get("messages") or []):
+        return updated, {
+            "status": "creator_identity_unresolved",
+            "creator_replied": None,
+            "latest_message": dict(snapshot.get("latest_message") or {}),
+            "creator_target_emails": [],
+        }
+    for key in _LAST_MAIL_KEYS:
+        updated[key] = ""
+    return updated, {
+        "status": "outbound_only_or_no_reply",
+        "creator_replied": False,
+        "latest_message": dict(snapshot.get("latest_message") or {}),
+        "creator_target_emails": sorted(creator_target_emails),
+    }
+
+
+def _apply_creator_reply_context_to_export_row(
+    row: dict[str, Any],
+    *,
+    shared_mail_db_path: Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    updated = dict(row)
+    thread_key = _clean_text(updated.get("evidence_thread_key")) or _lookup_thread_key_for_raw_path(
+        shared_mail_db_path,
+        updated.get("__last_mail_raw_path"),
+    )
+    if not thread_key:
+        return updated, {
+            "status": "thread_key_missing",
+            "creator_replied": None,
+        }
+    snapshot = _read_thread_reply_snapshot(shared_mail_db_path, thread_key)
+    creator_target_emails = _extract_creator_reply_target_emails(updated, snapshot)
+    latest_creator_reply = _resolve_latest_creator_reply(snapshot, creator_target_emails=creator_target_emails)
+    if latest_creator_reply:
+        updated["达人最后一次回复邮件时间"] = _format_date(latest_creator_reply.get("sent_sort_at"))
+        updated["达人回复的最后一封邮件内容"] = _clean_text(latest_creator_reply.get("snippet"))
+        updated["__last_mail_raw_path"] = _clean_text(latest_creator_reply.get("raw_path"))
+        return updated, {
+            "status": "creator_replied",
+            "creator_replied": True,
+            "thread_key": thread_key,
+            "latest_inbound": latest_creator_reply,
+            "latest_message": dict(snapshot.get("latest_message") or {}),
+            "creator_target_emails": sorted(creator_target_emails),
+        }
+    if not creator_target_emails and (snapshot.get("messages") or []):
+        return updated, {
+            "status": "creator_identity_unresolved",
+            "creator_replied": None,
+            "thread_key": thread_key,
+            "latest_message": dict(snapshot.get("latest_message") or {}),
+            "creator_target_emails": [],
+        }
+    updated["达人最后一次回复邮件时间"] = ""
+    updated["达人回复的最后一封邮件内容"] = ""
+    updated["__last_mail_raw_path"] = ""
+    return updated, {
+        "status": "outbound_only_or_no_reply",
+        "creator_replied": False,
+        "thread_key": thread_key,
+        "latest_message": dict(snapshot.get("latest_message") or {}),
+        "creator_target_emails": sorted(creator_target_emails),
+    }
+
+
 def _build_owner_search_texts(
     keep_row: dict[str, Any],
     *,
@@ -1025,6 +1402,113 @@ def _build_owner_context_from_keep_row(keep_row: dict[str, Any], fallback_owner_
     }
 
 
+def _build_owner_context_from_export_row(row: dict[str, Any], fallback_owner_context: dict[str, str]) -> dict[str, str]:
+    display_name = _clean_text(row.get("达人对接人"))
+    return {
+        "task_name": _clean_text(row.get("任务名")) or _clean_text(fallback_owner_context.get("task_name")),
+        "linked_bitable_url": _clean_text(row.get("linked_bitable_url"))
+        or _clean_text(fallback_owner_context.get("linked_bitable_url")),
+        "responsible_name": display_name
+        or _clean_text(fallback_owner_context.get("responsible_name"))
+        or _clean_text(fallback_owner_context.get("employee_name")),
+        "employee_name": display_name or _clean_text(fallback_owner_context.get("employee_name")),
+        "employee_english_name": _clean_text(row.get(_KEEP_OWNER_ENGLISH_NAME_FIELD))
+        or _clean_text(fallback_owner_context.get("employee_english_name")),
+        "employee_id": _normalize_employee_id(row.get(_KEEP_OWNER_EMPLOYEE_ID_FIELD) or fallback_owner_context.get("employee_id")),
+        "employee_record_id": _clean_text(row.get(_KEEP_OWNER_EMPLOYEE_RECORD_ID_FIELD))
+        or _clean_text(fallback_owner_context.get("employee_record_id")),
+        "employee_email": _clean_text(row.get(_KEEP_OWNER_EMPLOYEE_EMAIL_FIELD))
+        or _clean_text(fallback_owner_context.get("employee_email")),
+        "owner_name": _clean_text(row.get(_KEEP_OWNER_OWNER_NAME_FIELD))
+        or _clean_text(fallback_owner_context.get("owner_name")),
+    }
+
+
+def _build_rewrite_owner_candidates(
+    payload: dict[str, Any],
+    inspection_items: Sequence[dict[str, Any]],
+) -> list[dict[str, str]]:
+    task_names = {
+        _clean_text((payload.get("task_owner") or {}).get("task_name")),
+        *(_clean_text(row.get("任务名")) for row in (payload.get("rows") or []) if isinstance(row, dict)),
+    }
+    task_names = {name for name in task_names if name}
+    if not task_names:
+        return []
+    normalized_names = {name.casefold() for name in task_names}
+    group_keys = {_derive_task_group_key(name) for name in task_names if _derive_task_group_key(name)}
+    selected_items = [
+        dict(item)
+        for item in inspection_items
+        if isinstance(item, dict)
+        and (
+            _clean_text(item.get("taskName")).casefold() in normalized_names
+            or _derive_task_group_key(_clean_text(item.get("taskName"))) in group_keys
+        )
+    ]
+    return _dedupe_employee_matches(
+        [
+            *(dict(entry) for item in selected_items for entry in (item.get("employeeMatches") or []) if isinstance(entry, dict)),
+            *(_build_group_member_employee_match(item) for item in selected_items),
+        ]
+    )
+
+
+def _resolve_export_row_owner_context(
+    row: dict[str, Any],
+    *,
+    fallback_owner_context: dict[str, str],
+    owner_candidates: Sequence[dict[str, Any]],
+    shared_mail_db_path: Path,
+) -> tuple[dict[str, str], dict[str, Any]]:
+    existing_owner_context = _build_owner_context_from_export_row(row, fallback_owner_context)
+    if not owner_candidates:
+        return existing_owner_context, {"status": "rewrite_owner_candidates_missing", "aliases": []}
+    representative_text = "\n".join(
+        part
+        for part in (
+            _clean_text(row.get("达人回复的最后一封邮件内容")),
+            _clean_text(row.get("达人最后一次回复邮件时间")),
+        )
+        if part
+    )
+    matches = _find_owner_matches(representative_text, owner_candidates)
+    if len(matches) == 1:
+        candidate, aliases = matches[0]
+        return _build_owner_context_from_candidate(candidate, existing_owner_context), {
+            "status": "resolved_from_export_content",
+            "aliases": aliases,
+        }
+    if len(matches) > 1:
+        aliases = [alias for _, matched_aliases in matches for alias in matched_aliases]
+        return existing_owner_context, {
+            "status": "ambiguous_export_owner",
+            "aliases": aliases,
+        }
+    thread_key = _lookup_thread_key_for_raw_path(shared_mail_db_path, row.get("__last_mail_raw_path"))
+    if thread_key:
+        thread_matches = _find_owner_matches(
+            "\n".join(part for part in (representative_text, _read_thread_text_excerpt(shared_mail_db_path, thread_key)) if part),
+            owner_candidates,
+        )
+        if len(thread_matches) == 1:
+            candidate, aliases = thread_matches[0]
+            return _build_owner_context_from_candidate(candidate, existing_owner_context), {
+                "status": "resolved_from_export_thread",
+                "aliases": aliases,
+            }
+        if len(thread_matches) > 1:
+            aliases = [alias for _, matched_aliases in thread_matches for alias in matched_aliases]
+            return existing_owner_context, {
+                "status": "ambiguous_export_owner",
+                "aliases": aliases,
+            }
+    return existing_owner_context, {
+        "status": "rewrite_owner_unresolved",
+        "aliases": [],
+    }
+
+
 def _build_keep_row_owner_lookup(
     keep_frame: pd.DataFrame,
 ) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[tuple[str, str], dict[str, Any]]]:
@@ -1111,13 +1595,18 @@ def _build_skipped_row_from_keep_record(
         keep_workbook=keep_workbook,
     )
     display_name = _clean_text(owner_context.get("responsible_name")) or _clean_text(owner_context.get("employee_name"))
+    allow_brand_message_fallback = not _clean_text(keep_row.get("evidence_thread_key"))
     return {
         "达人ID": _extract_creator_id(keep_row),
         "平台": _extract_platform(keep_row),
         "主页链接": _clean_text(keep_row.get("URL") or keep_row.get("主页链接")),
         "当前网红报价": _build_quote_text(keep_row),
-        "达人最后一次回复邮件时间": _format_date(keep_row.get("brand_message_sent_at")),
-        "达人回复的最后一封邮件内容": _clean_text(keep_row.get("brand_message_snippet")),
+        "达人最后一次回复邮件时间": _format_date(keep_row.get("last_mail_time")) or (
+            _format_date(keep_row.get("brand_message_sent_at")) if allow_brand_message_fallback else ""
+        ),
+        "达人回复的最后一封邮件内容": _clean_text(keep_row.get("last_mail_snippet")) or (
+            _clean_text(keep_row.get("brand_message_snippet")) if allow_brand_message_fallback else ""
+        ),
         "达人对接人": display_name,
         "达人对接人_employee_id": _clean_text(owner_context.get("employee_id")).split(",")[0].strip(),
         "达人对接人_employee_record_id": _clean_text(owner_context.get("employee_record_id")),
@@ -1510,6 +1999,10 @@ def run_shared_mailbox_post_sync_pipeline(
             new_creator_count = 0
 
             for keep_row in keep_frame.to_dict(orient="records"):
+                keep_row, reply_resolution = _apply_creator_reply_context(
+                    keep_row,
+                    shared_mail_db_path=resolved_mail_db_path,
+                )
                 row_owner_context = _build_owner_context_from_keep_row(keep_row, owner_context)
                 row_owner_scope_value = _clean_text(row_owner_context.get("employee_id")) or _clean_text(
                     row_owner_context.get("responsible_name")
@@ -1522,6 +2015,23 @@ def run_shared_mailbox_post_sync_pipeline(
                         reason = f"邮件内容同时命中多个负责人别名（{alias_text}），已跳过写回。"
                     elif owner_status == "unresolved_mail_owner":
                         reason = "邮件内容未命中任何负责人英文名或邮箱别名，已跳过写回。"
+                    combined_skipped_rows.append(
+                        {
+                            "skip_reasons": [reason],
+                            "row": _build_skipped_row_from_keep_record(
+                                keep_row,
+                                owner_context=row_owner_context,
+                                reason=reason,
+                                shared_mail_db_path=resolved_mail_db_path,
+                                shared_mail_raw_dir=resolved_mail_raw_dir,
+                                shared_mail_data_dir=resolved_mail_data_dir,
+                                keep_workbook=keep_workbook,
+                            ),
+                        }
+                    )
+                    continue
+                if reply_resolution.get("creator_replied") is False:
+                    reason = "仅命中负责人发信，达人未回复，已跳过筛选。"
                     combined_skipped_rows.append(
                         {
                             "skip_reasons": [reason],
@@ -1823,11 +2333,203 @@ def run_shared_mailbox_post_sync_pipeline(
     return summary
 
 
+def rewrite_existing_final_payload_from_shared_mailbox(
+    *,
+    shared_mail_db_path: Path,
+    existing_final_payload_json: Path,
+    env_file: str = ".env",
+    task_upload_url: str = "",
+    employee_info_url: str = "",
+    output_root: Path | None = None,
+    summary_json: Path | None = None,
+    feishu_app_id: str = "",
+    feishu_app_secret: str = "",
+    feishu_base_url: str = "",
+    timeout_seconds: float = 0.0,
+    upload_dry_run: bool = False,
+) -> dict[str, Any]:
+    runtime = _load_runtime_dependencies()
+    upload_final_review_payload_to_bitable = runtime["upload_final_review_payload_to_bitable"]
+    inspect_task_upload_assignments = runtime.get("inspect_task_upload_assignments")
+
+    resolved_output_root = (output_root or (REPO_ROOT / "temp" / f"shared_mailbox_payload_rewrite_{datetime.now().strftime('%Y%m%d_%H%M%S')}")).expanduser().resolve()
+    resolved_output_root.mkdir(parents=True, exist_ok=True)
+    resolved_summary_json = (summary_json or (resolved_output_root / "summary.json")).expanduser().resolve()
+    exports_dir = resolved_output_root / "exports"
+    exports_dir.mkdir(parents=True, exist_ok=True)
+
+    payload_path = Path(existing_final_payload_json).expanduser().resolve()
+    payload = json.loads(payload_path.read_text(encoding="utf-8"))
+    rows = [dict(row) for row in (payload.get("rows") or []) if isinstance(row, dict)]
+
+    client, env_values, diagnostics = _build_feishu_client(
+        env_file=env_file,
+        feishu_app_id=feishu_app_id,
+        feishu_app_secret=feishu_app_secret,
+        feishu_base_url=feishu_base_url,
+        timeout_seconds=timeout_seconds,
+    )
+    resolved_task_upload_url, _ = _resolve_cli_env_value(task_upload_url, env_values, "TASK_UPLOAD_URL")
+    resolved_employee_info_url, _ = _resolve_cli_env_value(employee_info_url, env_values, "EMPLOYEE_INFO_URL")
+    if not resolved_task_upload_url:
+        resolved_task_upload_url, _ = _resolve_cli_env_value(task_upload_url, env_values, "FEISHU_SOURCE_URL")
+    if not resolved_employee_info_url:
+        resolved_employee_info_url, _ = _resolve_cli_env_value(employee_info_url, env_values, "FEISHU_SOURCE_URL")
+    owner_candidates: list[dict[str, str]] = []
+    if (
+        callable(inspect_task_upload_assignments)
+        and resolved_task_upload_url
+        and resolved_employee_info_url
+    ):
+        try:
+            inspection = inspect_task_upload_assignments(
+                client=client,
+                task_upload_url=resolved_task_upload_url,
+                employee_info_url=resolved_employee_info_url,
+                download_dir=resolved_output_root / "inspection_downloads",
+                download_templates=False,
+                parse_templates=False,
+            )
+            owner_candidates = _build_rewrite_owner_candidates(payload, inspection.get("items") or [])
+        except Exception:  # noqa: BLE001
+            owner_candidates = []
+
+    fallback_owner_context = {
+        "task_name": _clean_text((payload.get("task_owner") or {}).get("task_name")),
+        "linked_bitable_url": _clean_text((payload.get("task_owner") or {}).get("linked_bitable_url")),
+        "responsible_name": _clean_text((payload.get("task_owner") or {}).get("responsible_name")),
+        "employee_name": _clean_text((payload.get("task_owner") or {}).get("employee_name")),
+        "employee_english_name": _clean_text((payload.get("task_owner") or {}).get("employee_english_name")),
+        "employee_id": _clean_text((payload.get("task_owner") or {}).get("employee_id")),
+        "employee_record_id": _clean_text((payload.get("task_owner") or {}).get("employee_record_id")),
+        "employee_email": _clean_text((payload.get("task_owner") or {}).get("employee_email")),
+        "owner_name": _clean_text((payload.get("task_owner") or {}).get("owner_name")),
+    }
+
+    filtered_rows: list[dict[str, Any]] = []
+    removed_rows: list[dict[str, Any]] = []
+    corrected_reply_count = 0
+    corrected_owner_count = 0
+    unresolved_thread_count = 0
+    for row in rows:
+        updated_row, reply_resolution = _apply_creator_reply_context_to_export_row(
+            row,
+            shared_mail_db_path=shared_mail_db_path,
+        )
+        if reply_resolution.get("creator_replied") is False:
+            removal = dict(updated_row)
+            removal["移除原因"] = "仅命中负责人发信，达人未回复，已从最终写回结果中移除。"
+            removed_rows.append(removal)
+            continue
+        if reply_resolution.get("creator_replied") is None:
+            unresolved_thread_count += 1
+        elif (
+            _clean_text(updated_row.get("达人最后一次回复邮件时间")) != _clean_text(row.get("达人最后一次回复邮件时间"))
+            or _clean_text(updated_row.get("达人回复的最后一封邮件内容")) != _clean_text(row.get("达人回复的最后一封邮件内容"))
+            or _clean_text(updated_row.get("__last_mail_raw_path")) != _clean_text(row.get("__last_mail_raw_path"))
+        ):
+            corrected_reply_count += 1
+        resolved_owner_context, _owner_resolution = _resolve_export_row_owner_context(
+            updated_row,
+            fallback_owner_context=fallback_owner_context,
+            owner_candidates=owner_candidates,
+            shared_mail_db_path=shared_mail_db_path,
+        )
+        owner_display_name = _clean_text(resolved_owner_context.get("responsible_name")) or _clean_text(
+            resolved_owner_context.get("employee_name")
+        )
+        if (
+            owner_display_name != _clean_text(updated_row.get("达人对接人"))
+            or _clean_text(resolved_owner_context.get("employee_id")).split(",")[0].strip()
+            != _clean_text(updated_row.get("达人对接人_employee_id")).split(",")[0].strip()
+            or _clean_text(resolved_owner_context.get("employee_email"))
+            != _clean_text(updated_row.get("达人对接人_employee_email"))
+        ):
+            corrected_owner_count += 1
+        updated_row["达人对接人"] = owner_display_name
+        updated_row[_KEEP_OWNER_ENGLISH_NAME_FIELD] = _clean_text(resolved_owner_context.get("employee_english_name"))
+        updated_row["达人对接人_employee_id"] = _clean_text(resolved_owner_context.get("employee_id")).split(",")[0].strip()
+        updated_row["达人对接人_employee_record_id"] = _clean_text(resolved_owner_context.get("employee_record_id"))
+        updated_row["达人对接人_employee_email"] = _clean_text(resolved_owner_context.get("employee_email"))
+        updated_row["达人对接人_owner_name"] = _clean_text(resolved_owner_context.get("owner_name"))
+        updated_row["任务名"] = _clean_text(updated_row.get("任务名")) or _clean_text(resolved_owner_context.get("task_name"))
+        updated_row["linked_bitable_url"] = _clean_text(updated_row.get("linked_bitable_url")) or _clean_text(
+            resolved_owner_context.get("linked_bitable_url")
+        )
+        filtered_rows.append(updated_row)
+
+    filtered_payload = dict(payload)
+    filtered_payload["rows"] = filtered_rows
+    filtered_payload["row_count"] = len(filtered_rows)
+    filtered_payload["source_payload_json_path"] = str(payload_path)
+    filtered_payload["reply_filter_applied_at"] = iso_now()
+
+    filtered_payload_json_path = exports_dir / "all_platforms_final_review_payload.json"
+    filtered_payload_json_path.write_text(json.dumps(filtered_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    filtered_workbook_path = exports_dir / "all_platforms_final_review.xlsx"
+    filtered_frame = pd.DataFrame(filtered_rows, columns=FINAL_UPLOAD_COLUMNS)
+    with pd.ExcelWriter(filtered_workbook_path, engine="openpyxl") as writer:
+        filtered_frame.to_excel(writer, index=False, sheet_name="final_review")
+
+    removed_json_path = exports_dir / "removed_no_reply_rows.json"
+    removed_xlsx_path = exports_dir / "removed_no_reply_rows.xlsx"
+    removed_json_path.write_text(
+        json.dumps(
+            {
+                "removed_count": len(removed_rows),
+                "removed_rows": removed_rows,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    removed_frame = pd.DataFrame(removed_rows, columns=(*FINAL_UPLOAD_COLUMNS, "移除原因"))
+    with pd.ExcelWriter(removed_xlsx_path, engine="openpyxl") as writer:
+        removed_frame.to_excel(writer, index=False, sheet_name="removed_no_reply")
+
+    upload_summary = upload_final_review_payload_to_bitable(
+        client,
+        payload_json_path=filtered_payload_json_path,
+        dry_run=bool(upload_dry_run),
+        suppress_ai_labels=True,
+    )
+    upload_failed = (not bool(upload_summary.get("ok", True))) or int(upload_summary.get("failed_count") or 0) > 0
+
+    summary = {
+        "started_at": iso_now(),
+        "finished_at": iso_now(),
+        "status": "completed_with_failures" if upload_failed else "completed",
+        "mode": "rewrite_existing_final_payload",
+        "shared_mail_db_path": str(Path(shared_mail_db_path).expanduser().resolve()),
+        "source_payload_json_path": str(payload_path),
+        "filtered_payload_json_path": str(filtered_payload_json_path),
+        "filtered_workbook_path": str(filtered_workbook_path),
+        "removed_json_path": str(removed_json_path),
+        "removed_xlsx_path": str(removed_xlsx_path),
+        "input_row_count": len(rows),
+        "kept_row_count": len(filtered_rows),
+        "removed_no_reply_count": len(removed_rows),
+        "corrected_reply_count": corrected_reply_count,
+        "corrected_owner_count": corrected_owner_count,
+        "owner_candidate_count": len(owner_candidates),
+        "unresolved_thread_count": unresolved_thread_count,
+        "upload_failed": upload_failed,
+        "upload_summary": upload_summary,
+        "diagnostics": diagnostics,
+    }
+    _write_json(resolved_summary_json, summary)
+    return summary
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Route a pre-synced shared mailbox db into task-specific keep-list/downstream pipelines and incremental Feishu updates."
     )
     parser.add_argument("--shared-mail-db-path", required=True, help="共享邮箱已经同步好的 email_sync.db。")
+    parser.add_argument("--existing-final-payload-json", default="", help="已完成链路的 all_platforms_final_review_payload.json；传入后只做 reply filter + 飞书重写。")
     parser.add_argument("--shared-mail-raw-dir", default="", help="共享邮箱 raw 邮件目录；默认推断为 email_sync.db 同级 raw。")
     parser.add_argument("--shared-mail-data-dir", default="", help="共享邮箱邮件数据根目录；默认推断为 email_sync.db 所在目录。")
     parser.add_argument("--env-file", default=".env", help="本地 env 文件路径，默认 ./.env。")
@@ -1885,35 +2587,51 @@ def _parse_mapping_overrides(values: Sequence[str] | None) -> dict[str, str]:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    summary = run_shared_mailbox_post_sync_pipeline(
-        shared_mail_db_path=Path(args.shared_mail_db_path),
-        shared_mail_raw_dir=Path(args.shared_mail_raw_dir) if args.shared_mail_raw_dir else None,
-        shared_mail_data_dir=Path(args.shared_mail_data_dir) if args.shared_mail_data_dir else None,
-        env_file=args.env_file,
-        task_upload_url=args.task_upload_url or "",
-        employee_info_url=args.employee_info_url or "",
-        output_root=Path(args.output_root) if args.output_root else None,
-        summary_json=Path(args.summary_json) if args.summary_json else None,
-        task_name_filters=args.task_name,
-        feishu_app_id=args.feishu_app_id or "",
-        feishu_app_secret=args.feishu_app_secret or "",
-        feishu_base_url=args.feishu_base_url or "",
-        timeout_seconds=float(args.timeout_seconds or 0.0),
-        owner_email_overrides=_parse_mapping_overrides(args.owner_email_override),
-        folder_prefixes=list(args.folder_prefix or []),
-        matching_strategy=args.matching_strategy,
-        brand_keyword=args.brand_keyword or "",
-        brand_match_include_from=True if args.brand_match_include_from is None else bool(args.brand_match_include_from),
-        platform_filters=args.platform,
-        vision_provider=args.vision_provider or "",
-        max_identifiers_per_platform=max(0, int(args.max_identifiers_per_platform)),
-        poll_interval=max(1.0, float(args.poll_interval)),
-        skip_scrape=bool(args.skip_scrape),
-        skip_visual=bool(args.skip_visual),
-        skip_positioning_card_analysis=bool(args.skip_positioning_card_analysis),
-        upload_dry_run=bool(args.upload_dry_run),
-        reuse_existing=not bool(args.no_reuse_existing),
-    )
+    if args.existing_final_payload_json:
+        summary = rewrite_existing_final_payload_from_shared_mailbox(
+            shared_mail_db_path=Path(args.shared_mail_db_path),
+            existing_final_payload_json=Path(args.existing_final_payload_json),
+            env_file=args.env_file,
+            task_upload_url=args.task_upload_url or "",
+            employee_info_url=args.employee_info_url or "",
+            output_root=Path(args.output_root) if args.output_root else None,
+            summary_json=Path(args.summary_json) if args.summary_json else None,
+            feishu_app_id=args.feishu_app_id or "",
+            feishu_app_secret=args.feishu_app_secret or "",
+            feishu_base_url=args.feishu_base_url or "",
+            timeout_seconds=float(args.timeout_seconds or 0.0),
+            upload_dry_run=bool(args.upload_dry_run),
+        )
+    else:
+        summary = run_shared_mailbox_post_sync_pipeline(
+            shared_mail_db_path=Path(args.shared_mail_db_path),
+            shared_mail_raw_dir=Path(args.shared_mail_raw_dir) if args.shared_mail_raw_dir else None,
+            shared_mail_data_dir=Path(args.shared_mail_data_dir) if args.shared_mail_data_dir else None,
+            env_file=args.env_file,
+            task_upload_url=args.task_upload_url or "",
+            employee_info_url=args.employee_info_url or "",
+            output_root=Path(args.output_root) if args.output_root else None,
+            summary_json=Path(args.summary_json) if args.summary_json else None,
+            task_name_filters=args.task_name,
+            feishu_app_id=args.feishu_app_id or "",
+            feishu_app_secret=args.feishu_app_secret or "",
+            feishu_base_url=args.feishu_base_url or "",
+            timeout_seconds=float(args.timeout_seconds or 0.0),
+            owner_email_overrides=_parse_mapping_overrides(args.owner_email_override),
+            folder_prefixes=list(args.folder_prefix or []),
+            matching_strategy=args.matching_strategy,
+            brand_keyword=args.brand_keyword or "",
+            brand_match_include_from=True if args.brand_match_include_from is None else bool(args.brand_match_include_from),
+            platform_filters=args.platform,
+            vision_provider=args.vision_provider or "",
+            max_identifiers_per_platform=max(0, int(args.max_identifiers_per_platform)),
+            poll_interval=max(1.0, float(args.poll_interval)),
+            skip_scrape=bool(args.skip_scrape),
+            skip_visual=bool(args.skip_visual),
+            skip_positioning_card_analysis=bool(args.skip_positioning_card_analysis),
+            upload_dry_run=bool(args.upload_dry_run),
+            reuse_existing=not bool(args.no_reuse_existing),
+        )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0 if summary.get("status") == "completed" else 1
 

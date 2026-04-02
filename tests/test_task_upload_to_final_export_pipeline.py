@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from harness.contract import FAILURE_SCHEMA_VERSION, RUN_CONTRACT_VERSION
 import harness.paths as harness_paths
@@ -723,6 +724,108 @@ class TaskUploadToFinalExportRunnerTests(unittest.TestCase):
         self.assertEqual(workflow_handoff["failure"]["error_code"], "EMPLOYEE_INFO_URL_MISSING")
         self.assertEqual(workflow_handoff["failure"]["failure_layer"], "preflight")
         self.assertEqual(workflow_handoff["failure_decision"]["category"], "configuration")
+
+    def test_runner_serializes_task_group_alias_into_child_runs(self) -> None:
+        observed_upstream_tasks: list[str] = []
+        observed_downstream_tasks: list[str] = []
+
+        class FakeFeishuClient:
+            def __init__(self, **_: object) -> None:
+                pass
+
+        def fake_resolve_task_upload_entries(**kwargs):
+            self.assertEqual(kwargs["task_name"], "duet")
+            return [
+                SimpleNamespace(task_name="Duet1"),
+                SimpleNamespace(task_name="Duet2"),
+            ]
+
+        def fake_upstream(**kwargs):
+            task_name = kwargs["task_name"]
+            observed_upstream_tasks.append(task_name)
+            keep_path = Path(kwargs["output_root"]) / "exports" / f"{task_name}_keep.xlsx"
+            template_path = Path(kwargs["output_root"]) / "downloads" / "template.xlsx"
+            keep_path.parent.mkdir(parents=True, exist_ok=True)
+            keep_path.touch()
+            template_path.parent.mkdir(parents=True, exist_ok=True)
+            template_path.touch()
+            return {
+                "status": "stopped_after_keep-list",
+                "contract": {"canonical_boundary": "keep-list"},
+                "resume_points": {
+                    "keep_list": {
+                        "keep_workbook": str(keep_path),
+                        "template_workbook": str(template_path),
+                    }
+                },
+                "artifacts": {
+                    "keep_workbook": str(keep_path),
+                    "template_workbook": str(template_path),
+                },
+            }
+
+        def fake_downstream(**kwargs):
+            task_name = kwargs["task_name"]
+            observed_downstream_tasks.append(task_name)
+            export_path = Path(kwargs["output_root"]) / "exports" / "instagram" / f"{task_name}_final_review.xlsx"
+            export_path.parent.mkdir(parents=True, exist_ok=True)
+            export_path.touch()
+            return {
+                "status": "completed",
+                "platforms": {
+                    "instagram": {
+                        "status": "completed",
+                        "exports": {"final_review": str(export_path)},
+                    }
+                },
+                "artifacts": {},
+            }
+
+        final_runner._load_runtime_dependencies = lambda: {
+            "DEFAULT_FEISHU_BASE_URL": "https://open.feishu.cn/open-apis",
+            "FeishuOpenClient": FakeFeishuClient,
+            "resolve_task_upload_entries": fake_resolve_task_upload_entries,
+            "run_task_upload_to_keep_list_pipeline": fake_upstream,
+            "run_keep_list_screening_pipeline": fake_downstream,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            env_path = temp_root / ".env"
+            env_path.write_text("", encoding="utf-8")
+            summary = final_runner.run_task_upload_to_final_export_pipeline(
+                task_name="duet",
+                env_file=str(env_path),
+                output_root=temp_root / "run",
+                task_upload_url="https://example.com/task",
+                employee_info_url="https://example.com/employee",
+                feishu_app_id="app-id",
+                feishu_app_secret="app-secret",
+                platform_filters=["instagram"],
+            )
+
+        self.assertEqual(summary["status"], "completed")
+        self.assertEqual(summary["delivery_status"], "completed")
+        self.assertEqual(observed_upstream_tasks, ["Duet1", "Duet2"])
+        self.assertEqual(observed_downstream_tasks, ["Duet1", "Duet2"])
+        self.assertEqual(summary["steps"]["fan_out"]["mode"], "serial")
+        self.assertEqual(summary["steps"]["fan_out"]["requested_task_name"], "duet")
+        self.assertEqual(summary["steps"]["fan_out"]["resolved_task_names"], ["Duet1", "Duet2"])
+        self.assertEqual(len(summary["steps"]["fan_out"]["children"]), 2)
+        self.assertEqual(
+            sorted(summary["artifacts"]["final_exports_by_task"].keys()),
+            ["Duet1", "Duet2"],
+        )
+        self.assertTrue(
+            summary["artifacts"]["final_exports_by_task"]["Duet1"]["instagram"]["final_review"].endswith(
+                "Duet1_final_review.xlsx"
+            )
+        )
+        self.assertTrue(
+            summary["artifacts"]["final_exports_by_task"]["Duet2"]["instagram"]["final_review"].endswith(
+                "Duet2_final_review.xlsx"
+            )
+        )
 
 
 if __name__ == "__main__":

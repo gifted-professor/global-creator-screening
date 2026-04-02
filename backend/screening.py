@@ -131,6 +131,19 @@ def render_visual_exclusion_summary(rule):
     return ""
 
 
+def normalize_visual_notice_items(items):
+    normalized = []
+    for item in items or []:
+        if isinstance(item, dict):
+            if any(str(item.get(field) or "").strip() for field in ("label", "value", "note", "policy", "key")):
+                normalized.append(dict(item))
+            continue
+        text = str(item or "").strip()
+        if text:
+            normalized.append({"value": text})
+    return normalized
+
+
 def resolve_visual_runtime_contract(active_rulespec, platform):
     normalized_platform = str(platform or "").strip().lower()
     if not normalized_platform:
@@ -141,6 +154,8 @@ def resolve_visual_runtime_contract(active_rulespec, platform):
     exclusion_summaries = []
     cover_count = None
     min_hit_features = None
+    manual_review_items = normalize_visual_notice_items((active_rulespec or {}).get("manual_review_items") or [])
+    compliance_notes = normalize_visual_notice_items((active_rulespec or {}).get("compliance_notes") or [])
 
     for rule in iter_rulespec_rules(active_rulespec):
         platforms = normalize_rule_platforms(rule)
@@ -164,6 +179,8 @@ def resolve_visual_runtime_contract(active_rulespec, platform):
         and min_hit_features is None
         and not positive_feature_labels
         and not exclusion_summaries
+        and not manual_review_items
+        and not compliance_notes
         and not goal
     ):
         return {}
@@ -176,6 +193,8 @@ def resolve_visual_runtime_contract(active_rulespec, platform):
         "min_hit_features": min_hit_features or 1,
         "positive_feature_labels": positive_feature_labels,
         "exclusion_summaries": exclusion_summaries,
+        "manual_review_items": manual_review_items,
+        "compliance_notes": compliance_notes,
     }
 
 

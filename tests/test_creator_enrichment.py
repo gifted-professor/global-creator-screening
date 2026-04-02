@@ -112,9 +112,9 @@ class CreatorEnrichmentTests(unittest.TestCase):
         workbook = Workbook()
         sheet = workbook.active
         sheet.title = "SendingList"
-        sheet.append(["地区", "博主用户名", "邮箱", "主页链接"])
-        sheet.append(["US", "@creatorx", "creator@example.com", "https://www.tiktok.com/@creatorx"])
-        sheet.append(["US", "cass-and-home", "", "https://www.youtube.com/@cass-and-home"])
+        sheet.append(["地区", "邮箱", "博主用户名", "主页链接"])
+        sheet.append(["US", "creator@example.com", "@creatorx", "https://www.tiktok.com/@creatorx"])
+        sheet.append(["US", "", "cass-and-home", "https://www.youtube.com/@cass-and-home"])
         workbook.save(self.input_path)
 
     def _seed_messages(self) -> Database:

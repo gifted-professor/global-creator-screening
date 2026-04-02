@@ -39,6 +39,7 @@ _ROW_UPDATE_MODE_KEY = "__feishu_update_mode"
 _UPDATE_MODE_CREATE_ONLY = "create_only"
 _UPDATE_MODE_CREATE_OR_UPDATE = "create_or_update"
 _UPDATE_MODE_MAIL_ONLY = "mail_only_update"
+_UPDATE_MODE_CREATE_OR_MAIL_ONLY = "create_or_mail_only_update"
 _MAIL_ONLY_FIELD_NAMES = (
     "当前网红报价",
     "达人最后一次回复邮件时间",
@@ -256,6 +257,11 @@ def upload_final_review_payload_to_bitable(
         should_update_existing = existing_record is not None and update_mode in {
             _UPDATE_MODE_CREATE_OR_UPDATE,
             _UPDATE_MODE_MAIL_ONLY,
+            _UPDATE_MODE_CREATE_OR_MAIL_ONLY,
+        }
+        use_mail_only_fields = existing_record is not None and update_mode in {
+            _UPDATE_MODE_MAIL_ONLY,
+            _UPDATE_MODE_CREATE_OR_MAIL_ONLY,
         }
         if update_mode == _UPDATE_MODE_MAIL_ONLY and existing_record is None:
             skipped_existing_rows.append(
@@ -281,7 +287,7 @@ def upload_final_review_payload_to_bitable(
             continue
 
         try:
-            if update_mode == _UPDATE_MODE_MAIL_ONLY:
+            if use_mail_only_fields:
                 fields = _build_mail_only_feishu_fields(
                     row,
                     field_schemas,
@@ -337,7 +343,7 @@ def upload_final_review_payload_to_bitable(
                     body={"fields": fields},
                 )
         except Exception as exc:  # noqa: BLE001
-            if "URLFieldConvFail" in str(exc) and "主页链接" in fields and update_mode != _UPDATE_MODE_MAIL_ONLY:
+            if "URLFieldConvFail" in str(exc) and "主页链接" in fields and not use_mail_only_fields:
                 fallback_fields = dict(fields)
                 fallback_fields.pop("主页链接", None)
                 try:
@@ -977,6 +983,7 @@ def _resolve_row_update_mode(row: dict[str, Any]) -> str:
         _UPDATE_MODE_CREATE_ONLY,
         _UPDATE_MODE_CREATE_OR_UPDATE,
         _UPDATE_MODE_MAIL_ONLY,
+        _UPDATE_MODE_CREATE_OR_MAIL_ONLY,
     }:
         return mode
     return _UPDATE_MODE_CREATE_ONLY

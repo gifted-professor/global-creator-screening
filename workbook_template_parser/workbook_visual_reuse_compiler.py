@@ -651,6 +651,17 @@ def parse_manual_review(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], lis
             payload["notes"] = clean_text(value)
         else:
             raw_text = clean_text(value) or clean_text(note)
+            if not raw_text and clean_text(label):
+                payload["extra_items"].append(
+                    {
+                        "source_cell": f"A{row['row']}",
+                        "label": clean_text(label),
+                        "value": clean_text(label),
+                        "note": None,
+                    }
+                )
+                warnings.append(f"A{row['row']} 存在整行人工复核提醒，已保留为 extra_items。")
+                continue
             if raw_text:
                 payload["extra_items"].append(
                     {

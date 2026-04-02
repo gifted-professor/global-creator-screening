@@ -176,6 +176,7 @@ Recent decisions affecting current work:
 ### Pending Todos
 
 - Phase 25.1 execution: 收口 upstream summary 脱敏、`发信名单` 缺件诊断、以及 LLM review auth / stage observability
+- Task-upload alias fan-out: 适配一个项目名命中多个负责人拆分任务的场景（例如 `duet -> Duet1 / Duet2`）；优先设计成单入口先解析真实任务集合，再按真实任务名串行执行并做 top-level 聚合，而不是直接并行分叉；同时把 `发信名单` 的最小输入 contract 固化为 `博主用户名 / 主页链接 / 地区 / 邮箱` 四列
 - Phase 26 planning: 为 Phases 20-21 补齐 verification bundle、summary frontmatter 与 DEP traceability 收口
 - Phase 27 planning: 重建 Phase 22 planning/sumary/verification artifact，并把 bounded proof 与 fallback contract 固化到正式 phase 文档
 - Phase 28 planning: 补建 Phase 23 artifact bundle，并为 Phase 24 增加正式 verification 和 `23 -> 24` integration 证据
@@ -187,6 +188,7 @@ Recent decisions affecting current work:
 ### Blockers/Concerns
 
 - Phase 25.1 当前是基于用户提供的 `temp/miniso_step1_keep_list_20260331_1611` 与 `temp/duet_full_rerun_20260331_1606` 结论来 planning；这两个 run root 目前不在工作区里，执行时应优先保住 fixture/regression 覆盖，并在拿到真实 artifact 后再补 live 证据
+- 2026-04-02 live proof: 当前 `task-upload -> final-export` 单入口对 `task_name` 仍是精确匹配，`duet` 不会自动展开到 `Duet1 / Duet2`；后续适配应先补“别名命中多个真实任务”的显式诊断与聚合 contract，再决定是否需要并行执行
 - 当前仓库仍要兼容 lite `active_rulespec.json`；后续优化不能假设所有入口都会先产出 full `rules`
 - 外部 qwen benchmark 仍在 sibling docs；后续 prompt 调优应继续走 override / benchmark route，而不是把 sibling benchmark 文件迁入变成阻塞项
 - UI v1 不能假设统一邮箱 `partnerships@amagency.biz` 已经通过 IMAP 暴露 `邮件备份(30316)` 或项目专属目录；默认执行路径要继续沿用已验证的老邮箱 route

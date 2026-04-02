@@ -172,10 +172,18 @@ def select_platform_identifiers(platform: str, max_identifiers_per_platform: int
     return identifiers
 
 
-def build_scrape_payload(platform: str, identifiers: list[str]) -> dict[str, Any]:
+def build_scrape_payload(
+    platform: str,
+    identifiers: list[str],
+    *,
+    exclude_pinned_posts: bool = True,
+) -> dict[str, Any]:
     values = [str(item).strip() for item in identifiers if str(item).strip()]
     if platform == "tiktok":
-        return {"profiles": values}
+        return {
+            "profiles": values,
+            "excludePinnedPosts": bool(exclude_pinned_posts),
+        }
     if platform == "instagram":
         return {"usernames": values}
     if platform == "youtube":
@@ -598,6 +606,7 @@ def run_keep_list_screening_pipeline(
     skip_visual: bool = False,
     skip_positioning_card_analysis: bool = False,
     visual_postcheck_max_rounds: int = 3,
+    include_pinned_posts: bool = False,
     task_owner_name: str = "",
     task_owner_employee_id: str = "",
     task_owner_employee_record_id: str = "",
@@ -1064,7 +1073,11 @@ def run_keep_list_screening_pipeline(
                     current_stage="scrape_starting",
                     summary_writer=persist_summary,
                 )
-                scrape_payload_body = build_scrape_payload(platform, requested_identifiers)
+                scrape_payload_body = build_scrape_payload(
+                    platform,
+                    requested_identifiers,
+                    exclude_pinned_posts=not bool(include_pinned_posts),
+                )
                 scrape_payload = require_success(
                     client.post("/api/jobs/scrape", json={"platform": platform, "payload": scrape_payload_body}),
                     f"{platform} scrape start",
@@ -1421,6 +1434,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="staging-only / local observation run；不触发 scrape/visual/export，且跳过 vision probe。",
     )
     parser.add_argument("--skip-visual", action="store_true", help="跑 scrape 和导出，但跳过视觉复核。")
+    parser.add_argument("--include-pinned-posts", action="store_true", help="TikTok scrape 时保留置顶内容；默认去掉置顶。")
     parser.add_argument("--visual-postcheck-max-rounds", type=int, default=3, help="视觉完成后自动补跑失败账号的最大轮数；默认 3。")
     parser.add_argument("--skip-positioning-card-analysis", action="store_true", help="跳过 visual-pass 后的定位卡分析。")
     parser.add_argument("--task-owner-name", default="", help="任务负责人展示名，用于总表 `达人对接人`。")
@@ -1450,6 +1464,7 @@ def main(argv: list[str] | None = None) -> int:
         probe_vision_provider_only=bool(args.probe_vision_provider_only),
         skip_scrape=bool(args.skip_scrape),
         skip_visual=bool(args.skip_visual),
+        include_pinned_posts=bool(args.include_pinned_posts),
         visual_postcheck_max_rounds=max(0, int(args.visual_postcheck_max_rounds)),
         skip_positioning_card_analysis=bool(args.skip_positioning_card_analysis),
         task_owner_name=args.task_owner_name or "",

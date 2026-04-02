@@ -19,11 +19,15 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
         self.original_loader = pipeline._load_runtime_dependencies
         self.original_build_client = pipeline._build_feishu_client
         pipeline._read_thread_text_excerpt_cached.cache_clear()
+        pipeline._read_thread_reply_snapshot_cached.cache_clear()
+        pipeline._lookup_thread_key_for_raw_path_cached.cache_clear()
 
     def tearDown(self) -> None:
         pipeline._load_runtime_dependencies = self.original_loader
         pipeline._build_feishu_client = self.original_build_client
         pipeline._read_thread_text_excerpt_cached.cache_clear()
+        pipeline._read_thread_reply_snapshot_cached.cache_clear()
+        pipeline._lookup_thread_key_for_raw_path_cached.cache_clear()
 
     def test_read_thread_text_excerpt_cache_invalidates_when_db_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -100,6 +104,1280 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
             self.assertNotIn("old snippet", second)
 
             db.close()
+
+    def test_apply_creator_reply_context_clears_outbound_only_threads(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "email_sync.db"
+            db = Database(db_path)
+            db.init_schema()
+            now = "2026-04-02T10:00:00+08:00"
+
+            db.conn.execute(
+                """
+                INSERT INTO messages (
+                    account_email, folder_name, uid, uidvalidity, message_id, subject, in_reply_to, references_header,
+                    sent_at, sent_at_raw, internal_date, internal_date_raw, flags_json, size_bytes,
+                    from_json, to_json, cc_json, bcc_json, reply_to_json, sender_json,
+                    body_text, body_html, snippet, headers_json, raw_path, raw_sha256, raw_size_bytes,
+                    has_attachments, attachment_count, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, ?, '[]', 0, ?, ?, '[]', '[]', '[]', '[]', ?, '', ?, '{}', ?, '', 0, 0, 0, ?, ?)
+                """,
+                (
+                    "partnerships@amagency.biz",
+                    "INBOX",
+                    1,
+                    1,
+                    "<msg-1>",
+                    "Duet outreach",
+                    now,
+                    now,
+                    now,
+                    now,
+                    '[{"email":"yvette@amagency.biz","name":"Yvette"}]',
+                    '[{"email":"creator@example.com","name":"Creator"}]',
+                    "Hi @Username",
+                    "Hi @Username",
+                    "raw/outbound.eml",
+                    now,
+                    now,
+                ),
+            )
+            message_row_id = int(db.conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+            db.conn.execute(
+                """
+                INSERT INTO message_index (
+                    message_row_id, normalized_subject, direction, thread_key, thread_root_message_id,
+                    thread_parent_message_id, thread_depth, sent_sort_at, external_contact_count, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    message_row_id,
+                    "duet outreach",
+                    "outbound",
+                    "thread-outbound",
+                    "<msg-1>",
+                    "",
+                    0,
+                    now,
+                    1,
+                    now,
+                ),
+            )
+            db.conn.commit()
+            db.close()
+
+            keep_row, resolution = pipeline._apply_creator_reply_context(
+                {
+                    "evidence_thread_key": "thread-outbound",
+                    "last_mail_message_id": "1",
+                    "last_mail_time": "2026-04-02T10:00:00+08:00",
+                    "last_mail_subject": "Duet outreach",
+                    "last_mail_snippet": "Hi @Username",
+                    "last_mail_raw_path": "raw/outbound.eml",
+                },
+                shared_mail_db_path=db_path,
+            )
+
+            self.assertEqual(resolution["status"], "outbound_only_or_no_reply")
+            self.assertFalse(resolution["creator_replied"])
+            self.assertEqual(keep_row["last_mail_message_id"], "")
+            self.assertEqual(keep_row["last_mail_time"], "")
+            self.assertEqual(keep_row["last_mail_subject"], "")
+            self.assertEqual(keep_row["last_mail_snippet"], "")
+            self.assertEqual(keep_row["last_mail_raw_path"], "")
+
+    def test_apply_creator_reply_context_prefers_latest_inbound_reply_over_later_outbound_follow_up(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "email_sync.db"
+            db = Database(db_path)
+            db.init_schema()
+            now = "2026-04-02T10:00:00+08:00"
+
+            def insert_message(*, uid: int, message_id: str, sent_at: str, direction: str, subject: str, from_json: str, to_json: str, snippet: str, raw_path: str) -> None:
+                db.conn.execute(
+                    """
+                    INSERT INTO messages (
+                        account_email, folder_name, uid, uidvalidity, message_id, subject, in_reply_to, references_header,
+                        sent_at, sent_at_raw, internal_date, internal_date_raw, flags_json, size_bytes,
+                        from_json, to_json, cc_json, bcc_json, reply_to_json, sender_json,
+                        body_text, body_html, snippet, headers_json, raw_path, raw_sha256, raw_size_bytes,
+                        has_attachments, attachment_count, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, ?, '[]', 0, ?, ?, '[]', '[]', '[]', '[]', ?, '', ?, '{}', ?, '', 0, 0, 0, ?, ?)
+                    """,
+                    (
+                        "partnerships@amagency.biz",
+                        "INBOX",
+                        uid,
+                        1,
+                        message_id,
+                        subject,
+                        sent_at,
+                        sent_at,
+                        sent_at,
+                        sent_at,
+                        from_json,
+                        to_json,
+                        snippet,
+                        snippet,
+                        raw_path,
+                        now,
+                        now,
+                    ),
+                )
+                message_row_id = int(db.conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+                db.conn.execute(
+                    """
+                    INSERT INTO message_index (
+                        message_row_id, normalized_subject, direction, thread_key, thread_root_message_id,
+                        thread_parent_message_id, thread_depth, sent_sort_at, external_contact_count, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        message_row_id,
+                        "duet outreach",
+                        direction,
+                        "thread-mixed",
+                        "<msg-root>",
+                        "",
+                        0,
+                        sent_at,
+                        1,
+                        now,
+                    ),
+                )
+
+            insert_message(
+                uid=1,
+                message_id="<msg-root>",
+                sent_at="2026-04-01T09:00:00+08:00",
+                direction="outbound",
+                subject="Duet outreach",
+                from_json='[{"email":"yvette@amagency.biz","name":"Yvette"}]',
+                to_json='[{"email":"creator@example.com","name":"Creator"}]',
+                snippet="Initial outreach",
+                raw_path="raw/outbound-1.eml",
+            )
+            insert_message(
+                uid=2,
+                message_id="<msg-reply>",
+                sent_at="2026-04-01T10:00:00+08:00",
+                direction="inbound",
+                subject="Re: Duet outreach",
+                from_json='[{"email":"creator@example.com","name":"Creator"}]',
+                to_json='[{"email":"partnerships@amagency.biz","name":"AM Agency"}]',
+                snippet="My rate is $300",
+                raw_path="raw/inbound-1.eml",
+            )
+            insert_message(
+                uid=3,
+                message_id="<msg-followup>",
+                sent_at="2026-04-01T11:00:00+08:00",
+                direction="outbound",
+                subject="Re: Duet outreach",
+                from_json='[{"email":"yvette@amagency.biz","name":"Yvette"}]',
+                to_json='[{"email":"creator@example.com","name":"Creator"}]',
+                snippet="Can we move to WhatsApp?",
+                raw_path="raw/outbound-2.eml",
+            )
+            db.conn.commit()
+            db.close()
+
+            keep_row, resolution = pipeline._apply_creator_reply_context(
+                {
+                    "evidence_thread_key": "thread-mixed",
+                    "last_mail_message_id": "3",
+                    "last_mail_time": "2026-04-01T11:00:00+08:00",
+                    "last_mail_subject": "Re: Duet outreach",
+                    "last_mail_snippet": "Can we move to WhatsApp?",
+                    "last_mail_raw_path": "raw/outbound-2.eml",
+                },
+                shared_mail_db_path=db_path,
+            )
+
+            self.assertEqual(resolution["status"], "creator_replied")
+            self.assertTrue(resolution["creator_replied"])
+            self.assertEqual(keep_row["last_mail_message_id"], 2)
+            self.assertEqual(keep_row["last_mail_time"], "2026-04-01T10:00:00+08:00")
+            self.assertEqual(keep_row["last_mail_subject"], "Re: Duet outreach")
+            self.assertEqual(keep_row["last_mail_snippet"], "My rate is $300")
+            self.assertEqual(keep_row["last_mail_raw_path"], "raw/inbound-1.eml")
+
+    def test_apply_creator_reply_context_rejects_inbound_messages_not_sent_by_creator(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "email_sync.db"
+            db = Database(db_path)
+            db.init_schema()
+            now = "2026-04-02T10:00:00+08:00"
+
+            def insert_message(*, uid: int, message_id: str, sent_at: str, direction: str, from_json: str, to_json: str, snippet: str, raw_path: str) -> None:
+                db.conn.execute(
+                    """
+                    INSERT INTO messages (
+                        account_email, folder_name, uid, uidvalidity, message_id, subject, in_reply_to, references_header,
+                        sent_at, sent_at_raw, internal_date, internal_date_raw, flags_json, size_bytes,
+                        from_json, to_json, cc_json, bcc_json, reply_to_json, sender_json,
+                        body_text, body_html, snippet, headers_json, raw_path, raw_sha256, raw_size_bytes,
+                        has_attachments, attachment_count, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, ?, '[]', 0, ?, ?, '[]', '[]', '[]', '[]', ?, '', ?, '{}', ?, '', 0, 0, 0, ?, ?)
+                    """,
+                    (
+                        "partnerships@amagency.biz",
+                        "INBOX",
+                        uid,
+                        1,
+                        message_id,
+                        "Duet outreach",
+                        sent_at,
+                        sent_at,
+                        sent_at,
+                        sent_at,
+                        from_json,
+                        to_json,
+                        snippet,
+                        snippet,
+                        raw_path,
+                        now,
+                        now,
+                    ),
+                )
+                message_row_id = int(db.conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+                db.conn.execute(
+                    """
+                    INSERT INTO message_index (
+                        message_row_id, normalized_subject, direction, thread_key, thread_root_message_id,
+                        thread_parent_message_id, thread_depth, sent_sort_at, external_contact_count, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        message_row_id,
+                        "duet outreach",
+                        direction,
+                        "thread-non-creator-inbound",
+                        "<msg-root>",
+                        "",
+                        0,
+                        sent_at,
+                        1,
+                        now,
+                    ),
+                )
+
+            insert_message(
+                uid=1,
+                message_id="<msg-root>",
+                sent_at="2026-04-01T09:00:00+08:00",
+                direction="outbound",
+                from_json='[{"email":"yvette@amagency.biz","name":"Yvette"}]',
+                to_json='[{"email":"creator@example.com","name":"Creator"}]',
+                snippet="Initial outreach",
+                raw_path="raw/outbound.eml",
+            )
+            insert_message(
+                uid=2,
+                message_id="<msg-reply-all>",
+                sent_at="2026-04-01T10:00:00+08:00",
+                direction="inbound",
+                from_json='[{"email":"teammate@amagency.biz","name":"Teammate"}]',
+                to_json='[{"email":"partnerships@amagency.biz","name":"AM Agency"}]',
+                snippet="Internal follow-up",
+                raw_path="raw/inbound-teammate.eml",
+            )
+            db.conn.commit()
+            db.close()
+
+            keep_row, resolution = pipeline._apply_creator_reply_context(
+                {
+                    "evidence_thread_key": "thread-non-creator-inbound",
+                    "last_mail_message_id": "2",
+                    "last_mail_time": "2026-04-01T10:00:00+08:00",
+                    "last_mail_subject": "Re: Duet outreach",
+                    "last_mail_snippet": "Internal follow-up",
+                    "last_mail_raw_path": "raw/inbound-teammate.eml",
+                },
+                shared_mail_db_path=db_path,
+            )
+
+            self.assertEqual(resolution["status"], "outbound_only_or_no_reply")
+            self.assertFalse(resolution["creator_replied"])
+            self.assertEqual(keep_row["last_mail_message_id"], "")
+            self.assertEqual(keep_row["last_mail_time"], "")
+            self.assertEqual(keep_row["last_mail_snippet"], "")
+            self.assertEqual(keep_row["last_mail_raw_path"], "")
+
+    def test_apply_creator_reply_context_to_export_row_uses_explicit_creator_email_for_multi_recipient_threads(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "email_sync.db"
+            db = Database(db_path)
+            db.init_schema()
+            now = "2026-04-02T10:00:00+08:00"
+
+            def insert_message(
+                *,
+                uid: int,
+                message_id: str,
+                sent_at: str,
+                direction: str,
+                from_json: str,
+                to_json: str,
+                cc_json: str,
+                snippet: str,
+                raw_path: str,
+            ) -> None:
+                db.conn.execute(
+                    """
+                    INSERT INTO messages (
+                        account_email, folder_name, uid, uidvalidity, message_id, subject, in_reply_to, references_header,
+                        sent_at, sent_at_raw, internal_date, internal_date_raw, flags_json, size_bytes,
+                        from_json, to_json, cc_json, bcc_json, reply_to_json, sender_json,
+                        body_text, body_html, snippet, headers_json, raw_path, raw_sha256, raw_size_bytes,
+                        has_attachments, attachment_count, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, ?, '[]', 0, ?, ?, ?, '[]', '[]', '[]', ?, '', ?, '{}', ?, '', 0, 0, 0, ?, ?)
+                    """,
+                    (
+                        "partnerships@amagency.biz",
+                        "INBOX",
+                        uid,
+                        1,
+                        message_id,
+                        "Duet outreach",
+                        sent_at,
+                        sent_at,
+                        sent_at,
+                        sent_at,
+                        from_json,
+                        to_json,
+                        cc_json,
+                        snippet,
+                        snippet,
+                        raw_path,
+                        now,
+                        now,
+                    ),
+                )
+                message_row_id = int(db.conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+                db.conn.execute(
+                    """
+                    INSERT INTO message_index (
+                        message_row_id, normalized_subject, direction, thread_key, thread_root_message_id,
+                        thread_parent_message_id, thread_depth, sent_sort_at, external_contact_count, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        message_row_id,
+                        "duet outreach",
+                        direction,
+                        "thread-explicit-creator",
+                        "<msg-root>",
+                        "",
+                        0,
+                        sent_at,
+                        2,
+                        now,
+                    ),
+                )
+
+            insert_message(
+                uid=1,
+                message_id="<msg-root>",
+                sent_at="2026-04-01T09:00:00+08:00",
+                direction="outbound",
+                from_json='[{"email":"yvette@amagency.biz","name":"Yvette"}]',
+                to_json='[{"email":"manager@example.com","name":"Manager"}]',
+                cc_json='[{"email":"creator@example.com","name":"Creator"}]',
+                snippet="Initial outreach",
+                raw_path="raw/outbound.eml",
+            )
+            insert_message(
+                uid=2,
+                message_id="<msg-reply>",
+                sent_at="2026-04-01T10:00:00+08:00",
+                direction="inbound",
+                from_json='[{"email":"creator@example.com","name":"Creator"}]',
+                to_json='[{"email":"partnerships@amagency.biz","name":"AM Agency"}]',
+                cc_json="[]",
+                snippet="Creator reply",
+                raw_path="raw/inbound.eml",
+            )
+            db.conn.commit()
+            db.close()
+
+            updated_row, resolution = pipeline._apply_creator_reply_context_to_export_row(
+                {
+                    "达人ID": "alpha",
+                    "matched_contact_email": "creator@example.com",
+                    "__last_mail_raw_path": "raw/outbound.eml",
+                },
+                shared_mail_db_path=db_path,
+            )
+
+            self.assertEqual(resolution["status"], "creator_replied")
+            self.assertTrue(resolution["creator_replied"])
+            self.assertEqual(updated_row["达人最后一次回复邮件时间"], "2026/04/01")
+            self.assertEqual(updated_row["达人回复的最后一封邮件内容"], "Creator reply")
+            self.assertEqual(updated_row["__last_mail_raw_path"], "raw/inbound.eml")
+
+    def test_apply_creator_reply_context_to_export_row_infers_creator_from_cc_when_cc_is_only_external_recipient(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "email_sync.db"
+            db = Database(db_path)
+            db.init_schema()
+            now = "2026-04-02T10:00:00+08:00"
+
+            def insert_message(
+                *,
+                uid: int,
+                message_id: str,
+                sent_at: str,
+                direction: str,
+                from_json: str,
+                to_json: str,
+                cc_json: str,
+                snippet: str,
+                raw_path: str,
+            ) -> None:
+                db.conn.execute(
+                    """
+                    INSERT INTO messages (
+                        account_email, folder_name, uid, uidvalidity, message_id, subject, in_reply_to, references_header,
+                        sent_at, sent_at_raw, internal_date, internal_date_raw, flags_json, size_bytes,
+                        from_json, to_json, cc_json, bcc_json, reply_to_json, sender_json,
+                        body_text, body_html, snippet, headers_json, raw_path, raw_sha256, raw_size_bytes,
+                        has_attachments, attachment_count, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, ?, '[]', 0, ?, ?, ?, '[]', '[]', '[]', ?, '', ?, '{}', ?, '', 0, 0, 0, ?, ?)
+                    """,
+                    (
+                        "partnerships@amagency.biz",
+                        "INBOX",
+                        uid,
+                        1,
+                        message_id,
+                        "Duet outreach",
+                        sent_at,
+                        sent_at,
+                        sent_at,
+                        sent_at,
+                        from_json,
+                        to_json,
+                        cc_json,
+                        snippet,
+                        snippet,
+                        raw_path,
+                        now,
+                        now,
+                    ),
+                )
+                message_row_id = int(db.conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+                db.conn.execute(
+                    """
+                    INSERT INTO message_index (
+                        message_row_id, normalized_subject, direction, thread_key, thread_root_message_id,
+                        thread_parent_message_id, thread_depth, sent_sort_at, external_contact_count, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        message_row_id,
+                        "duet outreach",
+                        direction,
+                        "thread-cc-only-external",
+                        "<msg-root>",
+                        "",
+                        0,
+                        sent_at,
+                        1,
+                        now,
+                    ),
+                )
+
+            insert_message(
+                uid=1,
+                message_id="<msg-root>",
+                sent_at="2026-04-01T09:00:00+08:00",
+                direction="outbound",
+                from_json='[{"email":"yvette@amagency.biz","name":"Yvette"}]',
+                to_json='[{"email":"partnerships@amagency.biz","name":"AM Agency"}]',
+                cc_json='[{"email":"creator@example.com","name":"Creator"}]',
+                snippet="Initial outreach",
+                raw_path="raw/outbound.eml",
+            )
+            insert_message(
+                uid=2,
+                message_id="<msg-reply>",
+                sent_at="2026-04-01T10:00:00+08:00",
+                direction="inbound",
+                from_json='[{"email":"creator@example.com","name":"Creator"}]',
+                to_json='[{"email":"partnerships@amagency.biz","name":"AM Agency"}]',
+                cc_json="[]",
+                snippet="Creator reply",
+                raw_path="raw/inbound.eml",
+            )
+            db.conn.commit()
+            db.close()
+
+            updated_row, resolution = pipeline._apply_creator_reply_context_to_export_row(
+                {
+                    "达人ID": "alpha",
+                    "__last_mail_raw_path": "raw/outbound.eml",
+                },
+                shared_mail_db_path=db_path,
+            )
+
+            self.assertEqual(resolution["status"], "creator_replied")
+            self.assertTrue(resolution["creator_replied"])
+            self.assertEqual(updated_row["达人回复的最后一封邮件内容"], "Creator reply")
+            self.assertEqual(updated_row["__last_mail_raw_path"], "raw/inbound.eml")
+
+    def test_apply_creator_reply_context_to_export_row_marks_legacy_multi_recipient_threads_unresolved(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "email_sync.db"
+            db = Database(db_path)
+            db.init_schema()
+            now = "2026-04-02T10:00:00+08:00"
+
+            def insert_message(
+                *,
+                uid: int,
+                message_id: str,
+                sent_at: str,
+                direction: str,
+                from_json: str,
+                to_json: str,
+                cc_json: str,
+                snippet: str,
+                raw_path: str,
+            ) -> None:
+                db.conn.execute(
+                    """
+                    INSERT INTO messages (
+                        account_email, folder_name, uid, uidvalidity, message_id, subject, in_reply_to, references_header,
+                        sent_at, sent_at_raw, internal_date, internal_date_raw, flags_json, size_bytes,
+                        from_json, to_json, cc_json, bcc_json, reply_to_json, sender_json,
+                        body_text, body_html, snippet, headers_json, raw_path, raw_sha256, raw_size_bytes,
+                        has_attachments, attachment_count, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, ?, '[]', 0, ?, ?, ?, '[]', '[]', '[]', ?, '', ?, '{}', ?, '', 0, 0, 0, ?, ?)
+                    """,
+                    (
+                        "partnerships@amagency.biz",
+                        "INBOX",
+                        uid,
+                        1,
+                        message_id,
+                        "Duet outreach",
+                        sent_at,
+                        sent_at,
+                        sent_at,
+                        sent_at,
+                        from_json,
+                        to_json,
+                        cc_json,
+                        snippet,
+                        snippet,
+                        raw_path,
+                        now,
+                        now,
+                    ),
+                )
+                message_row_id = int(db.conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+                db.conn.execute(
+                    """
+                    INSERT INTO message_index (
+                        message_row_id, normalized_subject, direction, thread_key, thread_root_message_id,
+                        thread_parent_message_id, thread_depth, sent_sort_at, external_contact_count, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        message_row_id,
+                        "duet outreach",
+                        direction,
+                        "thread-ambiguous-creator",
+                        "<msg-root>",
+                        "",
+                        0,
+                        sent_at,
+                        2,
+                        now,
+                    ),
+                )
+
+            insert_message(
+                uid=1,
+                message_id="<msg-root>",
+                sent_at="2026-04-01T09:00:00+08:00",
+                direction="outbound",
+                from_json='[{"email":"yvette@amagency.biz","name":"Yvette"}]',
+                to_json='[{"email":"manager@example.com","name":"Manager"}]',
+                cc_json='[{"email":"creator@example.com","name":"Creator"}]',
+                snippet="Initial outreach",
+                raw_path="raw/outbound.eml",
+            )
+            insert_message(
+                uid=2,
+                message_id="<msg-reply>",
+                sent_at="2026-04-01T10:00:00+08:00",
+                direction="inbound",
+                from_json='[{"email":"creator@example.com","name":"Creator"}]',
+                to_json='[{"email":"partnerships@amagency.biz","name":"AM Agency"}]',
+                cc_json="[]",
+                snippet="Creator reply",
+                raw_path="raw/inbound.eml",
+            )
+            db.conn.commit()
+            db.close()
+
+            original_row = {
+                "达人ID": "alpha",
+                "达人最后一次回复邮件时间": "2026/04/01",
+                "达人回复的最后一封邮件内容": "Original content",
+                "__last_mail_raw_path": "raw/outbound.eml",
+            }
+            updated_row, resolution = pipeline._apply_creator_reply_context_to_export_row(
+                original_row,
+                shared_mail_db_path=db_path,
+            )
+
+            self.assertEqual(resolution["status"], "creator_identity_unresolved")
+            self.assertIsNone(resolution["creator_replied"])
+            self.assertEqual(updated_row["达人最后一次回复邮件时间"], "2026/04/01")
+            self.assertEqual(updated_row["达人回复的最后一封邮件内容"], "Original content")
+            self.assertEqual(updated_row["__last_mail_raw_path"], "raw/outbound.eml")
+
+    def test_rewrite_existing_final_payload_filters_outbound_only_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            db_path = temp_path / "email_sync.db"
+            payload_path = temp_path / "all_platforms_final_review_payload.json"
+            output_root = temp_path / "rewrite_output"
+            db = Database(db_path)
+            db.init_schema()
+            now = "2026-04-02T10:00:00+08:00"
+
+            def insert_message(*, uid: int, message_id: str, thread_key: str, sent_at: str, direction: str, snippet: str, raw_path: str) -> None:
+                from_json = '[{"email":"yvette@amagency.biz","name":"Yvette"}]' if direction == "outbound" else '[{"email":"creator@example.com","name":"Creator"}]'
+                to_json = '[{"email":"creator@example.com","name":"Creator"}]' if direction == "outbound" else '[{"email":"yvette@amagency.biz","name":"Yvette"}]'
+                db.conn.execute(
+                    """
+                    INSERT INTO messages (
+                        account_email, folder_name, uid, uidvalidity, message_id, subject, in_reply_to, references_header,
+                        sent_at, sent_at_raw, internal_date, internal_date_raw, flags_json, size_bytes,
+                        from_json, to_json, cc_json, bcc_json, reply_to_json, sender_json,
+                        body_text, body_html, snippet, headers_json, raw_path, raw_sha256, raw_size_bytes,
+                        has_attachments, attachment_count, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, ?, '[]', 0, ?, ?, '[]', '[]', '[]', '[]', ?, '', ?, '{}', ?, '', 0, 0, 0, ?, ?)
+                    """,
+                    (
+                        "partnerships@amagency.biz",
+                        "INBOX",
+                        uid,
+                        1,
+                        message_id,
+                        "Duet outreach",
+                        sent_at,
+                        sent_at,
+                        sent_at,
+                        sent_at,
+                        from_json,
+                        to_json,
+                        snippet,
+                        snippet,
+                        raw_path,
+                        now,
+                        now,
+                    ),
+                )
+                message_row_id = int(db.conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+                db.conn.execute(
+                    """
+                    INSERT INTO message_index (
+                        message_row_id, normalized_subject, direction, thread_key, thread_root_message_id,
+                        thread_parent_message_id, thread_depth, sent_sort_at, external_contact_count, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        message_row_id,
+                        "duet outreach",
+                        direction,
+                        thread_key,
+                        "<msg-root>",
+                        "",
+                        0,
+                        sent_at,
+                        1,
+                        now,
+                    ),
+                )
+
+            insert_message(
+                uid=1,
+                message_id="<msg-outbound-only>",
+                thread_key="thread-outbound-only",
+                sent_at="2026-04-01T09:00:00+08:00",
+                direction="outbound",
+                snippet="Initial outreach only",
+                raw_path="raw/outbound-only.eml",
+            )
+            insert_message(
+                uid=2,
+                message_id="<msg-outbound-1>",
+                thread_key="thread-with-reply",
+                sent_at="2026-04-01T09:00:00+08:00",
+                direction="outbound",
+                snippet="Initial outreach",
+                raw_path="raw/outbound-1.eml",
+            )
+            insert_message(
+                uid=3,
+                message_id="<msg-inbound-1>",
+                thread_key="thread-with-reply",
+                sent_at="2026-04-01T10:00:00+08:00",
+                direction="inbound",
+                snippet="Creator reply",
+                raw_path="raw/inbound-1.eml",
+            )
+            insert_message(
+                uid=4,
+                message_id="<msg-outbound-2>",
+                thread_key="thread-with-reply",
+                sent_at="2026-04-01T11:00:00+08:00",
+                direction="outbound",
+                snippet="Outbound follow up",
+                raw_path="raw/outbound-2.eml",
+            )
+            db.conn.commit()
+            db.close()
+
+            payload_path.write_text(
+                json.dumps(
+                    {
+                        "rows": [
+                            {
+                                "达人ID": "alpha",
+                                "平台": "tiktok",
+                                "主页链接": "https://www.tiktok.com/@alpha",
+                                "达人对接人": "Yvette",
+                                "达人对接人_employee_id": "ou_yvette",
+                                "达人对接人_employee_email": "yvette@amagency.biz",
+                                "linked_bitable_url": "https://bitable.example/duet",
+                                "任务名": "Duet1",
+                                "达人最后一次回复邮件时间": "2026/04/01",
+                                "达人回复的最后一封邮件内容": "Initial outreach only",
+                                "__last_mail_raw_path": "raw/outbound-only.eml",
+                            },
+                            {
+                                "达人ID": "beta",
+                                "平台": "tiktok",
+                                "主页链接": "https://www.tiktok.com/@beta",
+                                "达人对接人": "Yvette",
+                                "达人对接人_employee_id": "ou_yvette",
+                                "达人对接人_employee_email": "yvette@amagency.biz",
+                                "linked_bitable_url": "https://bitable.example/duet",
+                                "任务名": "Duet1",
+                                "达人最后一次回复邮件时间": "2026/04/01",
+                                "达人回复的最后一封邮件内容": "Outbound follow up",
+                                "__last_mail_raw_path": "raw/outbound-2.eml",
+                            },
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            uploaded_payloads: list[dict[str, object]] = []
+
+            def fake_upload_final_review_payload_to_bitable(client, **kwargs):
+                uploaded_payloads.append(json.loads(Path(kwargs["payload_json_path"]).read_text(encoding="utf-8")))
+                archive_dir = Path(kwargs["payload_json_path"]).parent / "feishu_upload_local_archive"
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                result_json = archive_dir / "feishu_bitable_upload_result.json"
+                result_json.write_text(json.dumps({"created_count": 1, "updated_count": 0}, ensure_ascii=False), encoding="utf-8")
+                return {
+                    "created_count": 1,
+                    "updated_count": 0,
+                    "failed_count": 0,
+                    "failed_rows": [],
+                    "skipped_existing_count": 0,
+                    "skipped_existing_rows": [],
+                    "result_json_path": str(result_json),
+                }
+
+            pipeline._load_runtime_dependencies = lambda: {
+                "upload_final_review_payload_to_bitable": fake_upload_final_review_payload_to_bitable,
+            }
+            pipeline._build_feishu_client = lambda **kwargs: (SimpleNamespace(), {}, {})
+
+            summary = pipeline.rewrite_existing_final_payload_from_shared_mailbox(
+                shared_mail_db_path=db_path,
+                existing_final_payload_json=payload_path,
+                env_file=".env",
+                output_root=output_root,
+                upload_dry_run=False,
+            )
+
+            self.assertEqual(summary["input_row_count"], 2)
+            self.assertEqual(summary["kept_row_count"], 1)
+            self.assertEqual(summary["removed_no_reply_count"], 1)
+            self.assertEqual(summary["corrected_reply_count"], 1)
+            self.assertEqual(len(uploaded_payloads), 1)
+            self.assertEqual(len(uploaded_payloads[0]["rows"]), 1)
+            self.assertEqual(uploaded_payloads[0]["rows"][0]["达人ID"], "beta")
+            self.assertEqual(uploaded_payloads[0]["rows"][0]["达人回复的最后一封邮件内容"], "Creator reply")
+            self.assertEqual(uploaded_payloads[0]["rows"][0]["__last_mail_raw_path"], "raw/inbound-1.eml")
+
+            removed_rows = json.loads((output_root / "exports" / "removed_no_reply_rows.json").read_text(encoding="utf-8"))
+            self.assertEqual(removed_rows["removed_count"], 1)
+            self.assertEqual(removed_rows["removed_rows"][0]["达人ID"], "alpha")
+
+    def test_rewrite_existing_final_payload_re_resolves_row_level_owner_for_group_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            db_path = temp_path / "email_sync.db"
+            payload_path = temp_path / "all_platforms_final_review_payload.json"
+            output_root = temp_path / "rewrite_output"
+            db = Database(db_path)
+            db.init_schema()
+            now = "2026-04-02T10:00:00+08:00"
+
+            def insert_message(
+                *,
+                uid: int,
+                message_id: str,
+                thread_key: str,
+                sent_at: str,
+                direction: str,
+                snippet: str,
+                raw_path: str,
+                from_json: str,
+                to_json: str,
+            ) -> None:
+                db.conn.execute(
+                    """
+                    INSERT INTO messages (
+                        account_email, folder_name, uid, uidvalidity, message_id, subject, in_reply_to, references_header,
+                        sent_at, sent_at_raw, internal_date, internal_date_raw, flags_json, size_bytes,
+                        from_json, to_json, cc_json, bcc_json, reply_to_json, sender_json,
+                        body_text, body_html, snippet, headers_json, raw_path, raw_sha256, raw_size_bytes,
+                        has_attachments, attachment_count, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, ?, '[]', 0, ?, ?, '[]', '[]', '[]', '[]', ?, '', ?, '{}', ?, '', 0, 0, 0, ?, ?)
+                    """,
+                    (
+                        "partnerships@amagency.biz",
+                        "INBOX",
+                        uid,
+                        1,
+                        message_id,
+                        "Duet outreach",
+                        sent_at,
+                        sent_at,
+                        sent_at,
+                        sent_at,
+                        from_json,
+                        to_json,
+                        snippet,
+                        snippet,
+                        raw_path,
+                        now,
+                        now,
+                    ),
+                )
+                message_row_id = int(db.conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+                db.conn.execute(
+                    """
+                    INSERT INTO message_index (
+                        message_row_id, normalized_subject, direction, thread_key, thread_root_message_id,
+                        thread_parent_message_id, thread_depth, sent_sort_at, external_contact_count, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        message_row_id,
+                        "duet outreach",
+                        direction,
+                        thread_key,
+                        "<msg-root>",
+                        "",
+                        0,
+                        sent_at,
+                        1,
+                        now,
+                    ),
+                )
+
+            insert_message(
+                uid=1,
+                message_id="<msg-outbound-astrid>",
+                thread_key="thread-astrid",
+                sent_at="2026-04-01T09:00:00+08:00",
+                direction="outbound",
+                snippet="Hi creator, Astrid here.",
+                raw_path="raw/outbound-astrid.eml",
+                from_json='[{"email":"astrid@amagency.biz","name":"Astrid"}]',
+                to_json='[{"email":"creator@example.com","name":"Creator"}]',
+            )
+            insert_message(
+                uid=2,
+                message_id="<msg-inbound-astrid>",
+                thread_key="thread-astrid",
+                sent_at="2026-04-01T10:00:00+08:00",
+                direction="inbound",
+                snippet="Hi Astrid, my rate is $500.",
+                raw_path="raw/inbound-astrid.eml",
+                from_json='[{"email":"creator@example.com","name":"Creator"}]',
+                to_json='[{"email":"astrid@amagency.biz","name":"Astrid"}]',
+            )
+            insert_message(
+                uid=3,
+                message_id="<msg-outbound-yvette>",
+                thread_key="thread-yvette",
+                sent_at="2026-04-01T09:00:00+08:00",
+                direction="outbound",
+                snippet="Hi creator, Yvette here.",
+                raw_path="raw/outbound-yvette.eml",
+                from_json='[{"email":"yvette@amagency.biz","name":"Yvette"}]',
+                to_json='[{"email":"creator2@example.com","name":"Creator"}]',
+            )
+            insert_message(
+                uid=4,
+                message_id="<msg-inbound-yvette>",
+                thread_key="thread-yvette",
+                sent_at="2026-04-01T10:00:00+08:00",
+                direction="inbound",
+                snippet="Hi Yvette, I can do this for $700.",
+                raw_path="raw/inbound-yvette.eml",
+                from_json='[{"email":"creator2@example.com","name":"Creator"}]',
+                to_json='[{"email":"yvette@amagency.biz","name":"Yvette"}]',
+            )
+            db.conn.commit()
+            db.close()
+
+            payload_path.write_text(
+                json.dumps(
+                    {
+                        "task_owner": {
+                            "task_name": "Duet2",
+                            "responsible_name": "黄淇",
+                            "employee_name": "黄淇",
+                            "employee_id": "ou_astrid",
+                            "employee_record_id": "rec_astrid",
+                            "employee_email": "astrid@amagency.biz",
+                            "owner_name": "astrid@amagency.biz",
+                            "linked_bitable_url": "https://bitable.example/duet",
+                        },
+                        "rows": [
+                            {
+                                "达人ID": "alpha",
+                                "平台": "tiktok",
+                                "主页链接": "https://www.tiktok.com/@alpha",
+                                "达人对接人": "黄淇",
+                                "达人对接人_employee_id": "ou_astrid",
+                                "达人对接人_employee_email": "astrid@amagency.biz",
+                                "linked_bitable_url": "https://bitable.example/duet",
+                                "任务名": "Duet2",
+                                "达人最后一次回复邮件时间": "2026/04/01",
+                                "达人回复的最后一封邮件内容": "old",
+                                "__last_mail_raw_path": "raw/outbound-astrid.eml",
+                            },
+                            {
+                                "达人ID": "beta",
+                                "平台": "tiktok",
+                                "主页链接": "https://www.tiktok.com/@beta",
+                                "达人对接人": "黄淇",
+                                "达人对接人_employee_id": "ou_astrid",
+                                "达人对接人_employee_email": "astrid@amagency.biz",
+                                "linked_bitable_url": "https://bitable.example/duet",
+                                "任务名": "Duet2",
+                                "达人最后一次回复邮件时间": "2026/04/01",
+                                "达人回复的最后一封邮件内容": "old",
+                                "__last_mail_raw_path": "raw/outbound-yvette.eml",
+                            },
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            uploaded_payloads: list[dict[str, object]] = []
+
+            def fake_upload_final_review_payload_to_bitable(client, **kwargs):
+                uploaded_payloads.append(json.loads(Path(kwargs["payload_json_path"]).read_text(encoding="utf-8")))
+                archive_dir = Path(kwargs["payload_json_path"]).parent / "feishu_upload_local_archive"
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                result_json = archive_dir / "feishu_bitable_upload_result.json"
+                result_json.write_text(json.dumps({"created_count": 2, "updated_count": 0}, ensure_ascii=False), encoding="utf-8")
+                return {
+                    "created_count": 2,
+                    "updated_count": 0,
+                    "failed_count": 0,
+                    "failed_rows": [],
+                    "skipped_existing_count": 0,
+                    "skipped_existing_rows": [],
+                    "result_json_path": str(result_json),
+                }
+
+            pipeline._load_runtime_dependencies = lambda: {
+                "upload_final_review_payload_to_bitable": fake_upload_final_review_payload_to_bitable,
+                "inspect_task_upload_assignments": lambda **kwargs: {
+                    "items": [
+                        {
+                            "recordId": "rec_duet_1",
+                            "taskName": "Duet1",
+                            "employeeMatches": [
+                                {
+                                    "employeeRecordId": "rec_yvette",
+                                    "employeeId": "ou_yvette",
+                                    "employeeName": "Yvette",
+                                    "employeeEnglishName": "Yvette",
+                                    "employeeEmail": "yvette@amagency.biz",
+                                }
+                            ],
+                            "employeeRecordId": "rec_yvette",
+                            "employeeId": "ou_yvette",
+                            "employeeName": "Yvette",
+                            "employeeEnglishName": "Yvette",
+                            "employeeEmail": "yvette@amagency.biz",
+                        },
+                        {
+                            "recordId": "rec_duet_2",
+                            "taskName": "Duet2",
+                            "employeeMatches": [
+                                {
+                                    "employeeRecordId": "rec_astrid",
+                                    "employeeId": "ou_astrid",
+                                    "employeeName": "黄淇",
+                                    "employeeEnglishName": "Astrid",
+                                    "employeeEmail": "astrid@amagency.biz",
+                                }
+                            ],
+                            "employeeRecordId": "rec_astrid",
+                            "employeeId": "ou_astrid",
+                            "employeeName": "黄淇",
+                            "employeeEnglishName": "Astrid",
+                            "employeeEmail": "astrid@amagency.biz",
+                        },
+                    ]
+                },
+            }
+            pipeline._build_feishu_client = lambda **kwargs: (
+                SimpleNamespace(),
+                {
+                    "TASK_UPLOAD_URL": "https://task-upload.example.com",
+                    "EMPLOYEE_INFO_URL": "https://employee.example.com",
+                },
+                {},
+            )
+
+            summary = pipeline.rewrite_existing_final_payload_from_shared_mailbox(
+                shared_mail_db_path=db_path,
+                existing_final_payload_json=payload_path,
+                env_file=".env",
+                output_root=output_root,
+                upload_dry_run=False,
+            )
+
+            self.assertEqual(summary["kept_row_count"], 2)
+            self.assertEqual(summary["corrected_owner_count"], 1)
+            self.assertEqual(summary["owner_candidate_count"], 2)
+            uploaded_rows = uploaded_payloads[0]["rows"]
+            owner_by_id = {row["达人ID"]: row for row in uploaded_rows}
+            self.assertEqual(owner_by_id["alpha"]["达人对接人_employee_id"], "ou_astrid")
+            self.assertEqual(owner_by_id["beta"]["达人对接人_employee_id"], "ou_yvette")
+            self.assertEqual(owner_by_id["beta"]["达人对接人"], "Yvette")
+            self.assertEqual(owner_by_id["beta"]["达人回复的最后一封邮件内容"], "Hi Yvette, I can do this for $700.")
+
+    def test_rewrite_existing_final_payload_uses_feishu_source_url_fallback_for_owner_inspection(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            db_path = temp_path / "email_sync.db"
+            payload_path = temp_path / "all_platforms_final_review_payload.json"
+            output_root = temp_path / "rewrite_output"
+            inspection_calls: list[dict[str, object]] = []
+
+            payload_path.write_text(
+                json.dumps(
+                    {
+                        "task_owner": {
+                            "task_name": "Duet1",
+                        },
+                        "rows": [],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            def fake_inspect_task_upload_assignments(**kwargs):
+                inspection_calls.append(kwargs)
+                return {"items": []}
+
+            pipeline._load_runtime_dependencies = lambda: {
+                "upload_final_review_payload_to_bitable": lambda *args, **kwargs: {},
+                "inspect_task_upload_assignments": fake_inspect_task_upload_assignments,
+            }
+            pipeline._build_feishu_client = lambda **kwargs: (
+                SimpleNamespace(),
+                {
+                    "FEISHU_SOURCE_URL": "https://feishu-source.example.com",
+                },
+                {},
+            )
+
+            summary = pipeline.rewrite_existing_final_payload_from_shared_mailbox(
+                shared_mail_db_path=db_path,
+                existing_final_payload_json=payload_path,
+                env_file=".env",
+                output_root=output_root,
+                upload_dry_run=True,
+            )
+
+            self.assertEqual(summary["status"], "completed")
+            self.assertEqual(len(inspection_calls), 1)
+            self.assertEqual(inspection_calls[0]["task_upload_url"], "https://feishu-source.example.com")
+            self.assertEqual(inspection_calls[0]["employee_info_url"], "https://feishu-source.example.com")
+
+    def test_rewrite_existing_final_payload_marks_status_when_upload_reports_failures(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            db_path = temp_path / "email_sync.db"
+            payload_path = temp_path / "all_platforms_final_review_payload.json"
+            output_root = temp_path / "rewrite_output"
+            db = Database(db_path)
+            db.init_schema()
+            now = "2026-04-02T10:00:00+08:00"
+
+            def insert_message(*, uid: int, message_id: str, direction: str, sent_at: str, snippet: str, from_json: str, to_json: str, raw_path: str) -> None:
+                db.conn.execute(
+                    """
+                    INSERT INTO messages (
+                        account_email, folder_name, uid, uidvalidity, message_id, subject, in_reply_to, references_header,
+                        sent_at, sent_at_raw, internal_date, internal_date_raw, flags_json, size_bytes,
+                        from_json, to_json, cc_json, bcc_json, reply_to_json, sender_json,
+                        body_text, body_html, snippet, headers_json, raw_path, raw_sha256, raw_size_bytes,
+                        has_attachments, attachment_count, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, ?, '[]', 0, ?, ?, '[]', '[]', '[]', '[]', ?, '', ?, '{}', ?, '', 0, 0, 0, ?, ?)
+                    """,
+                    (
+                        "partnerships@amagency.biz",
+                        "INBOX",
+                        uid,
+                        1,
+                        message_id,
+                        "Duet outreach",
+                        sent_at,
+                        sent_at,
+                        sent_at,
+                        sent_at,
+                        from_json,
+                        to_json,
+                        snippet,
+                        snippet,
+                        raw_path,
+                        now,
+                        now,
+                    ),
+                )
+                message_row_id = int(db.conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+                db.conn.execute(
+                    """
+                    INSERT INTO message_index (
+                        message_row_id, normalized_subject, direction, thread_key, thread_root_message_id,
+                        thread_parent_message_id, thread_depth, sent_sort_at, external_contact_count, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        message_row_id,
+                        "duet outreach",
+                        direction,
+                        "thread-upload-failure",
+                        "<msg-root>",
+                        "",
+                        0,
+                        sent_at,
+                        1,
+                        now,
+                    ),
+                )
+
+            insert_message(
+                uid=1,
+                message_id="<msg-root>",
+                direction="outbound",
+                sent_at="2026-04-01T09:00:00+08:00",
+                snippet="Initial outreach",
+                from_json='[{"email":"yvette@amagency.biz","name":"Yvette"}]',
+                to_json='[{"email":"creator@example.com","name":"Creator"}]',
+                raw_path="raw/outbound.eml",
+            )
+            insert_message(
+                uid=2,
+                message_id="<msg-reply>",
+                direction="inbound",
+                sent_at="2026-04-01T10:00:00+08:00",
+                snippet="Creator reply",
+                from_json='[{"email":"creator@example.com","name":"Creator"}]',
+                to_json='[{"email":"partnerships@amagency.biz","name":"AM Agency"}]',
+                raw_path="raw/inbound.eml",
+            )
+            db.conn.commit()
+            db.close()
+
+            payload_path.write_text(
+                json.dumps(
+                    {
+                        "rows": [
+                            {
+                                "达人ID": "alpha",
+                                "平台": "tiktok",
+                                "主页链接": "https://www.tiktok.com/@alpha",
+                                "达人对接人": "Yvette",
+                                "达人对接人_employee_id": "ou_yvette",
+                                "达人对接人_employee_email": "yvette@amagency.biz",
+                                "linked_bitable_url": "https://bitable.example/duet",
+                                "任务名": "Duet1",
+                                "达人最后一次回复邮件时间": "2026/04/01",
+                                "达人回复的最后一封邮件内容": "Initial outreach",
+                                "__last_mail_raw_path": "raw/outbound.eml",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            def fake_upload_final_review_payload_to_bitable(client, **kwargs):
+                archive_dir = Path(kwargs["payload_json_path"]).parent / "feishu_upload_local_archive"
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                result_json = archive_dir / "feishu_bitable_upload_result.json"
+                result_json.write_text(json.dumps({"ok": False, "failed_count": 1}, ensure_ascii=False), encoding="utf-8")
+                return {
+                    "ok": False,
+                    "created_count": 0,
+                    "updated_count": 0,
+                    "failed_count": 1,
+                    "failed_rows": [{"row": {"达人ID": "alpha"}, "error": "owner mismatch"}],
+                    "skipped_existing_count": 0,
+                    "skipped_existing_rows": [],
+                    "result_json_path": str(result_json),
+                }
+
+            pipeline._load_runtime_dependencies = lambda: {
+                "upload_final_review_payload_to_bitable": fake_upload_final_review_payload_to_bitable,
+            }
+            pipeline._build_feishu_client = lambda **kwargs: (SimpleNamespace(), {}, {})
+
+            summary = pipeline.rewrite_existing_final_payload_from_shared_mailbox(
+                shared_mail_db_path=db_path,
+                existing_final_payload_json=payload_path,
+                env_file=".env",
+                output_root=output_root,
+                upload_dry_run=False,
+            )
+
+            self.assertEqual(summary["status"], "completed_with_failures")
+            self.assertTrue(summary["upload_failed"])
+            self.assertEqual(summary["upload_summary"]["failed_count"], 1)
 
     def test_task_group_alias_skg_collapses_to_single_group_run(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -314,6 +314,7 @@ class MainCliTests(unittest.TestCase):
                 "25",
                 "--skip-scrape",
                 "--skip-visual",
+                "--include-pinned-posts",
             ]
         )
         self.assertEqual(args.keep_workbook, "exports/miniso_keep.xlsx")
@@ -325,10 +326,18 @@ class MainCliTests(unittest.TestCase):
         self.assertEqual(args.max_identifiers_per_platform, 25)
         self.assertTrue(args.skip_scrape)
         self.assertTrue(args.skip_visual)
+        self.assertTrue(args.include_pinned_posts)
 
     def test_keep_list_runner_builds_platform_specific_scrape_payloads(self) -> None:
         self.assertEqual(build_scrape_payload("instagram", ["alpha"]), {"usernames": ["alpha"]})
-        self.assertEqual(build_scrape_payload("tiktok", ["beta"]), {"profiles": ["beta"]})
+        self.assertEqual(
+            build_scrape_payload("tiktok", ["beta"]),
+            {"profiles": ["beta"], "excludePinnedPosts": True},
+        )
+        self.assertEqual(
+            build_scrape_payload("tiktok", ["beta"], exclude_pinned_posts=False),
+            {"profiles": ["beta"], "excludePinnedPosts": False},
+        )
         self.assertEqual(build_scrape_payload("youtube", ["https://youtube.com/@gamma"]), {"urls": ["https://youtube.com/@gamma"]})
 
     def test_feishu_bridge_import_command_defaults_to_repo_local_runtime_without_legacy_root(self) -> None:

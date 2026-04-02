@@ -122,9 +122,32 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
                 token="apify_api_test",
             )
 
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["data"]["status"], "RUNNING")
-        mocked_run.assert_called_once()
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["data"]["status"], "RUNNING")
+            mocked_run.assert_called_once()
+
+    def test_build_actor_input_defaults_to_excluding_tiktok_pinned_posts(self) -> None:
+        payload = backend_app.build_actor_input(
+            "tiktok",
+            ["https://www.tiktok.com/@apple"],
+            {"limit": 6},
+        )
+
+        self.assertTrue(payload["excludePinnedPosts"])
+
+        explicit_false_payload = backend_app.build_actor_input(
+            "tiktok",
+            ["https://www.tiktok.com/@apple"],
+            {"limit": 6, "excludePinnedPosts": False},
+        )
+        self.assertFalse(explicit_false_payload["excludePinnedPosts"])
+
+        snake_case_payload = backend_app.build_actor_input(
+            "tiktok",
+            ["https://www.tiktok.com/@apple"],
+            {"limit": 6, "exclude_pinned_posts": False},
+        )
+        self.assertFalse(snake_case_payload["excludePinnedPosts"])
 
     def test_health_check_includes_rich_vision_preflight_contract(self) -> None:
         os.environ["OPENAI_API_KEY"] = "sk-live-12345678"
@@ -457,6 +480,72 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
             [item["status"] for item in result["profile_reviews"]],
             ["Pass", "Pass"],
         )
+
+    def test_perform_scrape_splits_missing_retry_batches_with_smaller_chunk_size(self) -> None:
+        identifiers = [f"user{i}" for i in range(1, 19)]
+        batch_calls = []
+
+        def build_instagram_item(identifier: str) -> dict[str, object]:
+            return {
+                "url": f"https://instagram.com/{identifier}",
+                "username": identifier,
+                "biography": "US creator",
+                "latestPosts": [{"timestamp": "2026-03-29T00:00:00+00:00", "displayUrl": f"https://example.com/{identifier}.jpg"}],
+            }
+
+        def fake_run_apify_batch(platform, batch, payload, progress_callback=None, cancel_check=None):
+            batch_calls.append(list(batch))
+            if len(batch_calls) == 1:
+                raise backend_app.ApifyRuntimeError(
+                    "poll",
+                    "Apify 预算不足：当前批次需要约 0.179200 USD，但可用 token 的最高剩余额度只有 0.134907 USD。",
+                    retryable=True,
+                    apify={"apify_run_id": "run-batch-1", "apify_dataset_id": "dataset-batch-1"},
+                )
+            return {
+                "success": True,
+                "raw_items": [build_instagram_item(identifier) for identifier in batch],
+                "apify": {"usage_total_usd": 0.05},
+            }
+
+        with mock.patch.dict(backend_app.PLATFORM_BATCH_SIZES, {"instagram": 20}, clear=False), mock.patch.dict(
+            os.environ,
+            {"INSTAGRAM_MISSING_RETRY_BATCH_SIZE": "10"},
+            clear=False,
+        ), mock.patch.object(
+            backend_app,
+            "run_apify_batch",
+            side_effect=fake_run_apify_batch,
+        ), mock.patch.object(
+            backend_app,
+            "load_upload_metadata",
+            return_value={identifier: {"handle": identifier, "region": "US"} for identifier in identifiers},
+        ), mock.patch.object(
+            backend_app,
+            "load_active_rulespec",
+            return_value={},
+        ), mock.patch.object(
+            backend_app,
+            "write_json_file",
+        ), mock.patch.object(
+            backend_app,
+            "save_profile_reviews",
+        ):
+            result = backend_app.perform_scrape(
+                "instagram",
+                {"usernames": identifiers},
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(batch_calls[0], identifiers)
+        self.assertEqual(len(batch_calls[1]), 10)
+        self.assertEqual(len(batch_calls[2]), 8)
+        self.assertEqual(set(batch_calls[1]) | set(batch_calls[2]), set(identifiers))
+        self.assertEqual(result["retry_summary"]["initial_batch_failure_count"], 1)
+        self.assertEqual(result["retry_summary"]["attempt_count"], 1)
+        self.assertEqual(result["retry_summary"]["remaining_missing_count"], 0)
+        self.assertEqual(result["retry_summary"]["history"][0]["batch_size"], 10)
+        self.assertEqual(set(result["successful_identifiers"]), set(identifiers))
 
     def test_probe_endpoint_returns_success_payload_for_selected_provider(self) -> None:
         os.environ["OPENAI_API_KEY"] = "sk-live-12345678"
@@ -823,6 +912,20 @@ class VisualProviderConfigDefaultsTests(unittest.TestCase):
     def test_visual_review_prompt_selection_falls_back_to_rulespec_visual_contract(self) -> None:
         active_rulespec = {
             "goal": "优先保留家庭生活感强的账号",
+            "manual_review_items": [
+                {
+                    "label": "人工判断项/合规提醒",
+                    "value": "当封面出现奶瓶等情况，判断达人为哺乳期妈妈时需要人工复核",
+                }
+            ],
+            "compliance_notes": [
+                {
+                    "key": "protected_attribute_notice",
+                    "label": "受保护属性相关判断",
+                    "value": "不要根据年龄、种族等受保护属性做判断",
+                    "policy": "never_compile_to_automation",
+                }
+            ],
             "rules": [
                 {
                     "type": "visual_feature_group",
@@ -855,10 +958,49 @@ class VisualProviderConfigDefaultsTests(unittest.TestCase):
         self.assertEqual(selection["resolved_cover_limit"], 5)
         self.assertEqual(selection["visual_runtime_contract"]["goal"], "优先保留家庭生活感强的账号")
         self.assertEqual(selection["visual_runtime_contract"]["positive_feature_labels"], ["家庭场景", "宠物陪伴", "户外生活"])
+        self.assertEqual(
+            selection["visual_runtime_contract"]["manual_review_items"][0]["value"],
+            "当封面出现奶瓶等情况，判断达人为哺乳期妈妈时需要人工复核",
+        )
         self.assertIn("审核目标：优先保留家庭生活感强的账号", selection["prompt"])
         self.assertIn("优先确认是否命中以下至少 2 类视觉特征", selection["prompt"])
         self.assertIn("同时排除以下视觉风险", selection["prompt"])
         self.assertIn("出现绿幕背景", selection["prompt"])
+        self.assertIn("人工复核提醒", selection["prompt"])
+        self.assertIn("奶瓶等情况", selection["prompt"])
+        self.assertIn("合规提醒", selection["prompt"])
+        self.assertIn("不要根据年龄、种族、民族、肤色、宗教等受保护属性做判断", selection["prompt"])
+
+    def test_visual_review_prompt_selection_uses_generic_fallback_when_rulespec_only_contains_reminders(self) -> None:
+        active_rulespec = {
+            "manual_review_items": [
+                {
+                    "label": "人工判断项/合规提醒",
+                    "value": "当封面出现奶瓶等情况，判断达人为哺乳期妈妈时需要人工复核",
+                }
+            ],
+            "compliance_notes": [
+                {
+                    "key": "protected_attribute_notice",
+                    "label": "受保护属性相关判断",
+                    "value": "不要根据年龄、种族等受保护属性做判断",
+                    "policy": "never_compile_to_automation",
+                }
+            ],
+            "rules": [],
+        }
+
+        selection = backend_app.resolve_visual_review_prompt_selection(
+            "openai",
+            "instagram",
+            model_name="gpt-5.4",
+            active_visual_prompts={},
+            active_rulespec=active_rulespec,
+        )
+
+        self.assertEqual(selection["source"], "generic_fallback")
+        self.assertEqual(selection["visual_runtime_contract"]["manual_review_items"][0]["value"], "当封面出现奶瓶等情况，判断达人为哺乳期妈妈时需要人工复核")
+        self.assertNotIn("奶瓶等情况", selection["prompt"])
 
     def test_positioning_card_prompt_selection_uses_rulespec_goal_and_features(self) -> None:
         active_rulespec = {
