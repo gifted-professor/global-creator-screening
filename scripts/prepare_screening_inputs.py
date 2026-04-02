@@ -35,6 +35,7 @@ CANONICAL_UPLOAD_EXPORT_COLUMNS = [
 ]
 SENDING_LIST_COUNTRY_ALIASES = ("country", "国家", "region", "地区")
 SENDING_LIST_CREATOR_ALIASES = ("creator", "nickname", "达人", "红人", "博主")
+SENDING_LIST_HANDLE_ALIASES = ("@username", "username", "用户名", "博主用户名", "handle", "账号", "达人账号")
 SENDING_LIST_EMAIL_ALIASES = ("邮箱地址", "邮箱", "email", "emailaddress", "mail")
 SENDING_LIST_GENERIC_LINK_ALIASES = ("link", "url", "主页链接", "账号链接", "profilelink", "profileurl")
 SENDING_LIST_PLATFORM_LINK_ALIASES = {
@@ -401,6 +402,7 @@ def build_canonical_upload_from_sending_list(
         columns = list(frame.columns)
         country_column = resolve_source_column(columns, SENDING_LIST_COUNTRY_ALIASES)
         creator_column = resolve_source_column(columns, SENDING_LIST_CREATOR_ALIASES)
+        handle_column = resolve_source_column(columns, SENDING_LIST_HANDLE_ALIASES)
         email_column = resolve_source_column(columns, SENDING_LIST_EMAIL_ALIASES)
         link_columns = resolve_sending_list_link_columns(frame)
         if not link_columns:
@@ -418,6 +420,7 @@ def build_canonical_upload_from_sending_list(
                 continue
             input_row_count += 1
             nickname = clean_source_cell(row_dict.get(creator_column)) if creator_column else ""
+            handle = clean_source_cell(row_dict.get(handle_column)) if handle_column else ""
             region = clean_source_cell(row_dict.get(country_column)) if country_column else ""
             email = clean_source_cell(row_dict.get(email_column)) if email_column else ""
             row_seen_keys: set[tuple[str, str]] = set()
@@ -431,6 +434,7 @@ def build_canonical_upload_from_sending_list(
                     continue
                 identifier = (
                     backend_app.screening.extract_platform_identifier(platform, raw_link_value)
+                    or backend_app.screening.extract_platform_identifier(platform, handle)
                     or backend_app.screening.extract_platform_identifier(platform, nickname)
                 )
                 if not identifier:

@@ -52,6 +52,16 @@ def build_sending_list_workbook(path: Path) -> None:
     workbook.save(path)
 
 
+def build_four_column_sending_list_workbook(path: Path) -> None:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Creators"
+    sheet.append(["地区", "博主用户名", "邮箱", "主页链接"])
+    sheet.append(["US", "@creatoralpha", "insta@example.com", "https://www.instagram.com/creatoralpha/"])
+    sheet.append(["US", "creatorbeta", "tiktok@example.com", "https://www.tiktok.com/@creatorbeta"])
+    workbook.save(path)
+
+
 def build_keep_workbook(path: Path) -> None:
     workbook = Workbook()
     sheet = workbook.active
@@ -228,6 +238,37 @@ class PrepareScreeningInputsTests(unittest.TestCase):
             self.assertEqual(instagram_metadata["creatoralpha"]["email"], "insta@example.com", instagram_metadata)
             self.assertEqual(tiktok_metadata["creatormixed"]["email"], "mixed@example.com", tiktok_metadata)
             self.assertEqual(youtube_metadata["creatormixed"]["region"], "US", youtube_metadata)
+
+    def test_prepare_screening_inputs_accepts_four_column_sending_list_workbook(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            sending_list_workbook = tmp_path / "sending_list_4col.xlsx"
+            screening_data_dir = tmp_path / "screening_data"
+            config_dir = tmp_path / "config"
+            temp_dir = tmp_path / "temp"
+            template_output_dir = tmp_path / "parsed_outputs"
+
+            build_four_column_sending_list_workbook(sending_list_workbook)
+
+            summary = prepare_screening_inputs(
+                creator_workbook=sending_list_workbook,
+                template_workbook=FIXTURE_TEMPLATE,
+                template_output_dir=template_output_dir,
+                screening_data_dir=screening_data_dir,
+                config_dir=config_dir,
+                temp_dir=temp_dir,
+            )
+
+            self.assertEqual(summary["upload"]["parsed_source_kind"], "sending_list", summary)
+            instagram_metadata_path = Path(summary["upload"]["upload_metadata_paths"]["instagram"])
+            tiktok_metadata_path = Path(summary["upload"]["upload_metadata_paths"]["tiktok"])
+            instagram_metadata = json.loads(instagram_metadata_path.read_text(encoding="utf-8"))
+            tiktok_metadata = json.loads(tiktok_metadata_path.read_text(encoding="utf-8"))
+
+            self.assertIn("creatoralpha", instagram_metadata, instagram_metadata)
+            self.assertIn("creatorbeta", tiktok_metadata, tiktok_metadata)
+            self.assertEqual(instagram_metadata["creatoralpha"]["email"], "insta@example.com", instagram_metadata)
+            self.assertEqual(tiktok_metadata["creatorbeta"]["region"], "US", tiktok_metadata)
 
     def test_prepare_screening_inputs_accepts_keep_workbook_and_reports_row_counts(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

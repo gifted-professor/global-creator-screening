@@ -157,6 +157,7 @@ CANONICAL_SOURCE_HEADERS = [
 ]
 SENDING_LIST_COUNTRY_ALIASES = ("country", "国家", "region", "地区")
 SENDING_LIST_CREATOR_ALIASES = ("creator", "nickname", "达人", "红人", "博主")
+SENDING_LIST_HANDLE_ALIASES = ("@username", "username", "用户名", "博主用户名", "handle", "账号", "达人账号")
 SENDING_LIST_EMAIL_ALIASES = ("邮箱地址", "邮箱", "email", "emailaddress", "mail")
 SENDING_LIST_GENERIC_LINK_ALIASES = ("link", "url", "主页链接", "账号链接", "profilelink", "profileurl")
 SENDING_LIST_PLATFORM_LINK_ALIASES = {
@@ -844,6 +845,7 @@ def _iter_sending_list_rows(input_path: Path) -> Iterator[dict[str, Any]]:
             columns = [header for header in headers if header]
             country_column = _resolve_source_column(columns, SENDING_LIST_COUNTRY_ALIASES)
             creator_column = _resolve_source_column(columns, SENDING_LIST_CREATOR_ALIASES)
+            handle_column = _resolve_source_column(columns, SENDING_LIST_HANDLE_ALIASES)
             email_column = _resolve_source_column(columns, SENDING_LIST_EMAIL_ALIASES)
             link_columns = _resolve_sending_list_link_columns(columns, parsed_rows)
             if not link_columns:
@@ -851,6 +853,7 @@ def _iter_sending_list_rows(input_path: Path) -> Iterator[dict[str, Any]]:
 
             for row_dict in parsed_rows:
                 nickname = _clean_source_cell(row_dict.get(creator_column)) if creator_column else ""
+                handle = _clean_source_cell(row_dict.get(handle_column)) if handle_column else ""
                 region = _clean_source_cell(row_dict.get(country_column)) if country_column else ""
                 email = _clean_source_cell(row_dict.get(email_column)) if email_column else ""
                 row_seen_keys: set[tuple[str, str]] = set()
@@ -862,7 +865,7 @@ def _iter_sending_list_rows(input_path: Path) -> Iterator[dict[str, Any]]:
                     platform = _infer_platform_from_value(raw_link_value) or default_platform
                     if not platform:
                         continue
-                    identifier = _normalize_handle(raw_link_value) or _normalize_handle(nickname)
+                    identifier = _normalize_handle(raw_link_value) or _normalize_handle(handle) or _normalize_handle(nickname)
                     if not identifier:
                         continue
                     record_key = (platform, identifier)
