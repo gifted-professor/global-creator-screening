@@ -52,6 +52,21 @@ python3 scripts/run_shared_mailbox_post_sync_pipeline.py \
 3. 检查 `summary.json` 和 payload
 4. 最后才去掉 `--upload-dry-run`
 
+## 当前 run 读取口径
+
+shared-mailbox 这条文档讲的是业务主线；但 shared-mailbox 顶层 `summary.json` 目前还不是 canonical harness run summary。
+
+所以现在看一轮 run，建议按这个顺序读：
+
+1. 先看 top-level `summary.json` 里的 `status`、聚合计数和 `task_results`，确认整轮 shared-mailbox 主线是否完成、哪些任务失败
+2. 再按具体任务下钻到 child canonical runs，优先看这些子 run 的 `workflow_handoff.json`、`verdict`、`failure_decision` 和 `task_spec.json`
+3. 如需补运行态细节，再继续看对应 task-level / upstream / downstream 的原始 summary 和日志
+
+路径上也分两层理解：
+
+- shared-mailbox 顶层 run 先以 `output_root` 和 top-level `summary.json` 为准
+- child canonical runs 再以各自的 `run_root` 为准，不再默认把产物理解成 repo 根目录下的共享临时文件
+
 ## 完整执行 SOP
 
 如果现在要按任务名跑一轮完整 shared-mailbox 主线，最推荐按下面顺序走。
