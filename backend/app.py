@@ -5853,12 +5853,37 @@ def select_missing_retry_identifiers(platform, filtered_result, requested_lookup
     return retry_identifiers
 
 
+def _resolve_boolean_payload_flag(payload, *keys, default=False):
+    for key in keys:
+        if key not in (payload or {}):
+            continue
+        value = (payload or {}).get(key)
+        if isinstance(value, bool):
+            return value
+        if value in (None, ""):
+            continue
+        if isinstance(value, (int, float)):
+            return bool(value)
+        normalized = str(value).strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+        return bool(normalized)
+    return bool(default)
+
+
 def build_actor_input(platform, batch, payload):
     if platform == "tiktok":
         return {
             "profiles": batch,
             "resultsPerPage": int(payload.get("limit", 20)),
-            "excludePinnedPosts": bool(payload.get("excludePinnedPosts", False)),
+            "excludePinnedPosts": _resolve_boolean_payload_flag(
+                payload,
+                "excludePinnedPosts",
+                "exclude_pinned_posts",
+                default=True,
+            ),
             "shouldDownloadVideos": bool(payload.get("downloadVideos", False)),
             "shouldDownloadCovers": bool(payload.get("downloadCovers", True)),
             "shouldDownloadAvatars": bool(payload.get("downloadAvatars", False)),

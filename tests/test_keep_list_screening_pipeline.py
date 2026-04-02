@@ -888,6 +888,9 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             backend_app.app.test_client().scrape_start_calls[0]["payload"]["profiles"],
             ["https://tiktok.com/@alpha"],
         )
+        self.assertTrue(
+            backend_app.app.test_client().scrape_start_calls[0]["payload"]["excludePinnedPosts"]
+        )
 
     def test_runner_blocks_visual_and_export_when_scrape_contains_missing_profiles(self) -> None:
         preflight = {

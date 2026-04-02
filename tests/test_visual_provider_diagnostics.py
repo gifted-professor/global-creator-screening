@@ -122,9 +122,32 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
                 token="apify_api_test",
             )
 
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json()["data"]["status"], "RUNNING")
-        mocked_run.assert_called_once()
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.json()["data"]["status"], "RUNNING")
+            mocked_run.assert_called_once()
+
+    def test_build_actor_input_defaults_to_excluding_tiktok_pinned_posts(self) -> None:
+        payload = backend_app.build_actor_input(
+            "tiktok",
+            ["https://www.tiktok.com/@apple"],
+            {"limit": 6},
+        )
+
+        self.assertTrue(payload["excludePinnedPosts"])
+
+        explicit_false_payload = backend_app.build_actor_input(
+            "tiktok",
+            ["https://www.tiktok.com/@apple"],
+            {"limit": 6, "excludePinnedPosts": False},
+        )
+        self.assertFalse(explicit_false_payload["excludePinnedPosts"])
+
+        snake_case_payload = backend_app.build_actor_input(
+            "tiktok",
+            ["https://www.tiktok.com/@apple"],
+            {"limit": 6, "exclude_pinned_posts": False},
+        )
+        self.assertFalse(snake_case_payload["excludePinnedPosts"])
 
     def test_health_check_includes_rich_vision_preflight_contract(self) -> None:
         os.environ["OPENAI_API_KEY"] = "sk-live-12345678"
