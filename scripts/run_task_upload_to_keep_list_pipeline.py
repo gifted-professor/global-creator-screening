@@ -19,6 +19,7 @@ from harness.config import (
     resolve_keep_list_upstream_config,
 )
 from harness.failures import attach_failure_to_summary, build_failure_payload as build_harness_failure_payload
+from harness.handoff import write_workflow_handoff
 from harness.paths import resolve_keep_list_upstream_paths
 from harness.preflight import (
     build_preflight_error,
@@ -693,6 +694,7 @@ def run_task_upload_to_keep_list_pipeline(
         "output_root": str(resolved_output_root),
         "summary_json": str(run_summary_path),
         "task_spec_json": str(runner_paths.task_spec_json),
+        "workflow_handoff_json": str(runner_paths.workflow_handoff_json),
         "resolved_config_sources": resolved_config_sources,
         "stop_after": normalized_stop_after,
         "reuse_existing": bool(reuse_existing),
@@ -715,6 +717,7 @@ def run_task_upload_to_keep_list_pipeline(
         "resolved_paths": {
             "run_root": str(runner_paths.run_root),
             "task_spec_json": str(runner_paths.task_spec_json),
+            "workflow_handoff_json": str(runner_paths.workflow_handoff_json),
             "downloads_dir": str(downloads_dir),
             "mail_root": str(mail_root),
             "exports_dir": str(exports_dir),
@@ -801,6 +804,15 @@ def run_task_upload_to_keep_list_pipeline(
         folder_overrides=dict(folder_overrides or {}),
     )
 
+    def persist_summary(payload: dict[str, Any]) -> None:
+        _write_summary(run_summary_path, payload)
+        write_workflow_handoff(
+            runner_paths.workflow_handoff_json,
+            summary=payload,
+            task_spec=task_spec,
+            task_spec_available=bool(payload.get("setup", {}).get("completed")),
+        )
+
     def finalize(status: str, **extra: Any) -> dict[str, Any]:
         summary["status"] = status
         summary["finished_at"] = iso_now()
@@ -809,7 +821,7 @@ def run_task_upload_to_keep_list_pipeline(
         if isinstance(failure, dict):
             attach_failure_to_summary(summary, failure)
         attach_run_contract(summary)
-        _write_summary(run_summary_path, summary)
+        persist_summary(summary)
         return summary
 
     def mark_stop(step_name: str) -> dict[str, Any]:
@@ -880,7 +892,7 @@ def run_task_upload_to_keep_list_pipeline(
         "mail_root": _path_summary(mail_root, source=runner_paths.mail_root_source, kind="dir"),
         "exports_dir": _path_summary(exports_dir, source="output_root", kind="dir"),
     }
-    _write_summary(run_summary_path, summary)
+    persist_summary(summary)
 
     try:
         runtime = _load_runtime_dependencies()
@@ -1071,7 +1083,7 @@ def run_task_upload_to_keep_list_pipeline(
             "sending_list_workbook": task_assets["artifacts"]["sending_list_workbook"],
         }
         summary["canonical_artifacts"]["task_assets"] = _json_clone(summary["resume_points"]["task_assets"])
-        _write_summary(run_summary_path, summary)
+        persist_summary(summary)
         if normalized_stop_after == "task-assets":
             return mark_stop("task-assets")
 
@@ -1126,7 +1138,7 @@ def run_task_upload_to_keep_list_pipeline(
         summary["resume_points"]["task_assets"]["template_prepare_summary_json"] = summary["artifacts"]["template_prepare_summary_json"]
         summary["resume_points"]["task_assets"]["template_runtime_prompt_artifacts_json"] = summary["artifacts"]["template_runtime_prompt_artifacts_json"]
         summary["canonical_artifacts"]["task_assets"] = _json_clone(summary["resume_points"]["task_assets"])
-        _write_summary(run_summary_path, summary)
+        persist_summary(summary)
 
         normalized_existing_mail_db_path = str(existing_mail_db_path or "").strip()
         if normalized_existing_mail_db_path:
@@ -1293,7 +1305,7 @@ def run_task_upload_to_keep_list_pipeline(
         summary["canonical_artifacts"]["mail_sync"] = _json_clone(summary["resume_points"]["mail_sync"])
         summary["resume_context"]["downstream_reuse_allowed"] = bool(downstream_reuse_allowed)
         summary["resume_context"]["downstream_reuse_reason"] = downstream_reuse_reason
-        _write_summary(run_summary_path, summary)
+        persist_summary(summary)
         if normalized_stop_after == "mail-sync":
             return mark_stop("mail-sync")
 
@@ -1370,7 +1382,7 @@ def run_task_upload_to_keep_list_pipeline(
                 "unique_email_workbook": brand_match_step["artifacts"]["unique_xlsx"],
                 "shared_email_workbook": brand_match_step["artifacts"]["shared_xlsx"],
             }
-            _write_summary(run_summary_path, summary)
+            persist_summary(summary)
             if normalized_stop_after == "brand-match":
                 return mark_stop("brand-match")
 
@@ -1440,7 +1452,7 @@ def run_task_upload_to_keep_list_pipeline(
                 "unresolved_workbook": shared_resolution_step["artifacts"]["unresolved_xlsx"],
                 "llm_candidates_jsonl": shared_resolution_step["artifacts"]["llm_candidates_jsonl"],
             }
-            _write_summary(run_summary_path, summary)
+            persist_summary(summary)
             if normalized_stop_after == "shared-resolution":
                 return mark_stop("shared-resolution")
 
@@ -1579,7 +1591,7 @@ def run_task_upload_to_keep_list_pipeline(
             summary["resume_points"]["enrichment"] = {
                 "high_confidence_workbook": enrichment_step["artifacts"]["high_xlsx"],
             }
-            _write_summary(run_summary_path, summary)
+            persist_summary(summary)
             if normalized_stop_after == "enrichment":
                 return mark_stop("enrichment")
 
@@ -1646,7 +1658,7 @@ def run_task_upload_to_keep_list_pipeline(
                 "llm_review_input_prefix": str(llm_prefix),
                 "llm_candidates_jsonl": llm_candidates_step["artifacts"]["llm_candidates_jsonl"],
             }
-            _write_summary(run_summary_path, summary)
+            persist_summary(summary)
             if normalized_stop_after == "llm-candidates":
                 return mark_stop("llm-candidates")
 
@@ -1731,7 +1743,7 @@ def run_task_upload_to_keep_list_pipeline(
                 "--platform instagram --max-identifiers-per-platform 1"
             ),
         }
-        _write_summary(run_summary_path, summary)
+        persist_summary(summary)
         if normalized_stop_after == "keep-list":
             return mark_stop("keep-list")
     except Exception as exc:  # noqa: BLE001

@@ -21,6 +21,7 @@ from harness.config import (
     resolve_final_runner_config,
 )
 from harness.failures import attach_failure_to_summary, build_failure_payload as build_harness_failure_payload
+from harness.handoff import write_workflow_handoff
 from harness.paths import resolve_final_runner_paths
 from harness.preflight import (
     build_preflight_error,
@@ -481,6 +482,7 @@ def run_task_upload_to_final_export_pipeline(
         "output_root": str(resolved_output_root),
         "summary_json": str(run_summary_path),
         "task_spec_json": str(task_spec_path),
+        "workflow_handoff_json": str(runner_paths.workflow_handoff_json),
         "resolved_config_sources": resolved_config_sources,
         "matching_strategy": normalized_matching_strategy,
         "brand_keyword": normalized_brand_keyword,
@@ -529,12 +531,15 @@ def run_task_upload_to_final_export_pipeline(
             "run_root": str(runner_paths.run_root),
             "output_root": str(resolved_output_root),
             "task_spec_json": str(task_spec_path),
+            "workflow_handoff_json": str(runner_paths.workflow_handoff_json),
             "upstream_output_root": str(upstream_output_root),
             "upstream_summary_json": str(upstream_summary_path),
             "upstream_task_spec_json": str(runner_paths.upstream_task_spec_json),
+            "upstream_workflow_handoff_json": str(runner_paths.upstream_workflow_handoff_json),
             "downstream_output_root": str(downstream_output_root),
             "downstream_summary_json": str(downstream_summary_path),
             "downstream_task_spec_json": str(runner_paths.downstream_task_spec_json),
+            "downstream_workflow_handoff_json": str(runner_paths.downstream_workflow_handoff_json),
         },
         "contract": {
             "scope": "task-upload-to-final-export",
@@ -566,6 +571,15 @@ def run_task_upload_to_final_export_pipeline(
     }
     attach_run_contract(summary)
 
+    def persist_summary(payload: dict[str, Any]) -> None:
+        _write_summary(run_summary_path, payload)
+        write_workflow_handoff(
+            runner_paths.workflow_handoff_json,
+            summary=payload,
+            task_spec=task_spec,
+            task_spec_available=bool(payload.get("setup", {}).get("completed")),
+        )
+
     def finalize(status: str, **extra: Any) -> dict[str, Any]:
         summary["status"] = status
         summary["finished_at"] = iso_now()
@@ -574,7 +588,7 @@ def run_task_upload_to_final_export_pipeline(
         if isinstance(failure, dict):
             attach_failure_to_summary(summary, failure)
         attach_run_contract(summary)
-        _write_summary(run_summary_path, summary)
+        persist_summary(summary)
         return summary
 
     if not preflight["ready"]:
@@ -628,7 +642,7 @@ def run_task_upload_to_final_export_pipeline(
             failure=failure,
         )
     summary["resolved_paths"]["run_root_exists"] = runner_paths.run_root.exists()
-    _write_summary(run_summary_path, summary)
+    persist_summary(summary)
 
     try:
         runtime = _load_runtime_dependencies()
@@ -734,7 +748,7 @@ def run_task_upload_to_final_export_pipeline(
             skip_positioning_card_analysis=bool(skip_positioning_card_analysis),
         ),
     }
-    _write_summary(run_summary_path, summary)
+    persist_summary(summary)
 
     if str(upstream_summary.get("status") or "") == "failed":
         failure = _build_failure_payload(

@@ -26,6 +26,9 @@
     "run_root": {
       "type": "string"
     },
+    "workflow_handoff_json": {
+      "type": "string"
+    },
     "output_root": {
       "type": "string"
     },

@@ -5,7 +5,7 @@ import json
 import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -15,6 +15,7 @@ if str(REPO_ROOT) not in sys.path:
 from harness.contract import attach_run_contract
 from harness.config import resolve_keep_list_downstream_config
 from harness.failures import attach_failure_to_summary, build_failure_payload as build_harness_failure_payload
+from harness.handoff import write_workflow_handoff
 from harness.paths import resolve_keep_list_downstream_paths
 from harness.preflight import (
     build_preflight_error,
@@ -308,6 +309,7 @@ def _persist_platform_summary(
     platform_summary: dict[str, Any],
     current_stage: str | None = None,
     status: str | None = None,
+    summary_writer: Callable[[dict[str, Any]], None] | None = None,
 ) -> None:
     if current_stage is not None:
         platform_summary["current_stage"] = current_stage
@@ -315,7 +317,10 @@ def _persist_platform_summary(
         platform_summary["status"] = status
     platform_summary["last_updated_at"] = backend_app.iso_now()
     summary["platforms"][platform] = platform_summary
-    _write_summary(run_summary_path, summary)
+    if summary_writer is not None:
+        summary_writer(summary)
+    else:
+        _write_summary(run_summary_path, summary)
 
 
 def _build_positioning_stage_payload(status: str, reason: str = "", **extra: Any) -> dict[str, Any]:
@@ -664,6 +669,7 @@ def run_keep_list_screening_pipeline(
         "output_root": str(resolved_output_root),
         "summary_json": str(run_summary_path),
         "task_spec_json": str(runner_paths.task_spec_json),
+        "workflow_handoff_json": str(runner_paths.workflow_handoff_json),
         "staging_summary_json": str(staging_summary_path),
         "resolved_config_sources": resolved_config_sources,
         "resolved_inputs": {
@@ -741,6 +747,15 @@ def run_keep_list_screening_pipeline(
         linked_bitable_url=str(linked_bitable_url or "").strip(),
     )
 
+    def persist_summary(payload: dict[str, Any]) -> None:
+        _write_summary(run_summary_path, payload)
+        write_workflow_handoff(
+            runner_paths.workflow_handoff_json,
+            summary=payload,
+            task_spec=task_spec,
+            task_spec_available=bool(payload.get("setup", {}).get("completed")),
+        )
+
     def _finalize_failure(
         *,
         failure: dict[str, Any],
@@ -752,7 +767,7 @@ def run_keep_list_screening_pipeline(
         summary["finished_at"] = finished_at
         attach_failure_to_summary(summary, failure, expose_top_level=expose_top_level)
         attach_run_contract(summary)
-        _write_summary(run_summary_path, summary)
+        persist_summary(summary)
         return summary
 
     if not preflight["ready"]:
@@ -915,7 +930,7 @@ def run_keep_list_screening_pipeline(
             }
         summary["preflight"]["ready"] = True
         summary["preflight"]["errors"] = []
-        _write_summary(run_summary_path, summary)
+        persist_summary(summary)
 
         try:
             client = backend_app.app.test_client()
@@ -978,7 +993,7 @@ def run_keep_list_screening_pipeline(
                 summary["status"] = "vision_probe_only"
                 summary["finished_at"] = backend_app.iso_now()
                 attach_run_contract(summary)
-                _write_summary(run_summary_path, summary)
+                persist_summary(summary)
                 return summary
 
             for platform in requested_platforms:
@@ -998,6 +1013,7 @@ def run_keep_list_screening_pipeline(
                     backend_app=backend_app,
                     platform=platform,
                     platform_summary=platform_summary,
+                    summary_writer=persist_summary,
                 )
 
                 if not requested_identifiers:
@@ -1010,6 +1026,7 @@ def run_keep_list_screening_pipeline(
                         platform=platform,
                         platform_summary=platform_summary,
                         current_stage="platform_skipped",
+                        summary_writer=persist_summary,
                     )
                     continue
 
@@ -1034,6 +1051,7 @@ def run_keep_list_screening_pipeline(
                         platform=platform,
                         platform_summary=platform_summary,
                         current_stage="scrape_skipped",
+                        summary_writer=persist_summary,
                     )
                     continue
 
@@ -1044,6 +1062,7 @@ def run_keep_list_screening_pipeline(
                     platform=platform,
                     platform_summary=platform_summary,
                     current_stage="scrape_starting",
+                    summary_writer=persist_summary,
                 )
                 scrape_payload_body = build_scrape_payload(platform, requested_identifiers)
                 scrape_payload = require_success(
@@ -1058,6 +1077,7 @@ def run_keep_list_screening_pipeline(
                     platform=platform,
                     platform_summary=platform_summary,
                     current_stage="scrape_running",
+                    summary_writer=persist_summary,
                 )
                 scrape_job = poll_job(client, scrape_payload["job"]["id"], f"{platform} scrape poll", max(1.0, float(poll_interval)))
                 platform_summary["scrape_job"] = scrape_job
@@ -1078,6 +1098,7 @@ def run_keep_list_screening_pipeline(
                     platform=platform,
                     platform_summary=platform_summary,
                     current_stage="scrape_completed" if scrape_job["status"] == "completed" else "scrape_poll_finished",
+                    summary_writer=persist_summary,
                 )
                 scrape_was_salvaged = False
                 if scrape_job["status"] != "completed":
@@ -1091,6 +1112,7 @@ def run_keep_list_screening_pipeline(
                             platform=platform,
                             platform_summary=platform_summary,
                             current_stage="scrape_partial_ready",
+                            summary_writer=persist_summary,
                         )
                     else:
                         platform_summary["status"] = "scrape_failed"
@@ -1101,6 +1123,7 @@ def run_keep_list_screening_pipeline(
                             platform=platform,
                             platform_summary=platform_summary,
                             current_stage="scrape_failed",
+                            summary_writer=persist_summary,
                         )
                         continue
 
@@ -1145,6 +1168,7 @@ def run_keep_list_screening_pipeline(
                         platform=platform,
                         platform_summary=platform_summary,
                         current_stage="missing_profiles_blocked",
+                        summary_writer=persist_summary,
                     )
                     continue
                 if skip_visual:
@@ -1162,6 +1186,7 @@ def run_keep_list_screening_pipeline(
                         platform=platform,
                         platform_summary=platform_summary,
                         current_stage="visual_starting",
+                        summary_writer=persist_summary,
                     )
                     visual_payload = require_success(
                         client.post("/api/jobs/visual-review", json={"platform": platform, "payload": visual_payload_body}),
@@ -1175,6 +1200,7 @@ def run_keep_list_screening_pipeline(
                         platform=platform,
                         platform_summary=platform_summary,
                         current_stage="visual_running",
+                        summary_writer=persist_summary,
                     )
                     platform_summary["visual_job"] = poll_job(
                         client,
@@ -1246,6 +1272,7 @@ def run_keep_list_screening_pipeline(
                                 platform=platform,
                                 platform_summary=platform_summary,
                                 current_stage="positioning_card_analysis_starting",
+                                summary_writer=persist_summary,
                             )
                             positioning_payload = require_success(
                                 client.post(
@@ -1262,6 +1289,7 @@ def run_keep_list_screening_pipeline(
                                 platform=platform,
                                 platform_summary=platform_summary,
                                 current_stage="positioning_card_analysis_running",
+                                summary_writer=persist_summary,
                             )
                             platform_summary["positioning_card_analysis"] = poll_job(
                                 client,
@@ -1284,6 +1312,7 @@ def run_keep_list_screening_pipeline(
                     platform=platform,
                     platform_summary=platform_summary,
                     current_stage="exporting_artifacts",
+                    summary_writer=persist_summary,
                 )
                 platform_summary["artifact_status"] = require_success(
                     client.get(f"/api/artifacts/{platform}/status"),
@@ -1298,6 +1327,7 @@ def run_keep_list_screening_pipeline(
                     platform=platform,
                     platform_summary=platform_summary,
                     current_stage="completed",
+                    summary_writer=persist_summary,
                 )
         except Exception as exc:  # noqa: BLE001
             failure = _build_failure_payload(
@@ -1363,7 +1393,7 @@ def run_keep_list_screening_pipeline(
                 expose_top_level=False,
             )
         attach_run_contract(summary)
-        _write_summary(run_summary_path, summary)
+        persist_summary(summary)
         return summary
     finally:
         restore_backend_runtime_state(runtime_snapshot)

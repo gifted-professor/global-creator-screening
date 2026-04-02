@@ -104,6 +104,7 @@ class TaskUploadToFinalExportRunnerTests(unittest.TestCase):
             )
             persisted_summary = json.loads(summary_path.read_text(encoding="utf-8"))
             task_spec = json.loads(Path(summary["task_spec_json"]).read_text(encoding="utf-8"))
+            workflow_handoff = json.loads(Path(summary["workflow_handoff_json"]).read_text(encoding="utf-8"))
 
         self.assertEqual(summary["status"], "completed")
         self.assertEqual(summary["contract_version"], RUN_CONTRACT_VERSION)
@@ -115,6 +116,7 @@ class TaskUploadToFinalExportRunnerTests(unittest.TestCase):
         self.assertEqual(summary["env_file_raw"], str(env_path))
         self.assertEqual(summary["env_file"], str(env_path.resolve()))
         self.assertEqual(summary["env_file"], persisted_summary["resolved_inputs"]["env_file"]["path"])
+        self.assertTrue(summary["workflow_handoff_json"].endswith("/workflow_handoff.json"))
         self.assertIn("resolved_config_sources", summary)
         self.assertEqual(summary["resolved_config_sources"]["matching_strategy"], "cli")
         self.assertEqual(summary["resolved_config_sources"]["brand_keyword"], "cli")
@@ -124,8 +126,22 @@ class TaskUploadToFinalExportRunnerTests(unittest.TestCase):
         self.assertEqual(task_spec["intent"]["task_name"], "MINISO")
         self.assertEqual(task_spec["intent"]["task_upload_url"], "https://example.com/task")
         self.assertEqual(task_spec["controls"]["requested_platforms"], ["instagram"])
+        self.assertEqual(task_spec["run"]["workflow_handoff_json"], summary["workflow_handoff_json"])
         self.assertTrue(task_spec["paths"]["upstream_task_spec_json"].endswith("/upstream/task_spec.json"))
+        self.assertTrue(task_spec["paths"]["upstream_workflow_handoff_json"].endswith("/upstream/workflow_handoff.json"))
         self.assertTrue(task_spec["paths"]["downstream_task_spec_json"].endswith("/downstream/task_spec.json"))
+        self.assertTrue(task_spec["paths"]["downstream_workflow_handoff_json"].endswith("/downstream/workflow_handoff.json"))
+        self.assertEqual(workflow_handoff["verdict"]["outcome"], "completed")
+        self.assertEqual(workflow_handoff["recommended_action"], "consume_outputs")
+        self.assertTrue(workflow_handoff["task_spec_available"])
+        self.assertEqual(
+            workflow_handoff["pointers"]["upstream_workflow_handoff_json"],
+            summary["resolved_paths"]["upstream_workflow_handoff_json"],
+        )
+        self.assertEqual(
+            workflow_handoff["pointers"]["downstream_workflow_handoff_json"],
+            summary["resolved_paths"]["downstream_workflow_handoff_json"],
+        )
         self.assertEqual(summary["steps"]["upstream"]["status"], "stopped_after_keep-list")
         self.assertEqual(summary["steps"]["downstream"]["status"], "completed")
         self.assertEqual(summary["contract"]["canonical_internal_boundary"], "keep-list")
@@ -564,6 +580,8 @@ class TaskUploadToFinalExportRunnerTests(unittest.TestCase):
                 env_file=str(env_path),
                 output_root=temp_root / "run",
             )
+            self.assertTrue(Path(summary["workflow_handoff_json"]).exists())
+            workflow_handoff = json.loads(Path(summary["workflow_handoff_json"]).read_text(encoding="utf-8"))
 
         self.assertEqual(summary["status"], "failed")
         self.assertEqual(summary["contract_version"], RUN_CONTRACT_VERSION)
@@ -584,6 +602,10 @@ class TaskUploadToFinalExportRunnerTests(unittest.TestCase):
         self.assertEqual(summary["preflight"]["feishu_app_secret_present"], False)
         self.assertEqual(summary["preflight"]["errors"][0]["error_code"], "EMPLOYEE_INFO_URL_MISSING")
         self.assertFalse(Path(summary["task_spec_json"]).exists())
+        self.assertFalse(workflow_handoff["task_spec_available"])
+        self.assertEqual(workflow_handoff["failure"]["error_code"], "EMPLOYEE_INFO_URL_MISSING")
+        self.assertEqual(workflow_handoff["failure"]["failure_layer"], "preflight")
+        self.assertEqual(workflow_handoff["failure_decision"]["category"], "configuration")
 
 
 if __name__ == "__main__":
