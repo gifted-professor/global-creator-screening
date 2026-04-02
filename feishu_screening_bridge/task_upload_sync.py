@@ -69,8 +69,10 @@ class TaskUploadEntry:
     responsible_name: str
     linked_bitable_url: str
     workbook_file_token: str
+    workbook_file_url: str
     workbook_file_name: str
     sending_list_file_token: str
+    sending_list_file_url: str
     sending_list_file_name: str
 
 
@@ -172,9 +174,11 @@ def download_task_upload_screening_assets(
         "taskName": entry.task_name,
         "linkedBitableUrl": entry.linked_bitable_url,
         "templateFileToken": entry.workbook_file_token,
+        "templateFileUrl": entry.workbook_file_url,
         "templateFileName": entry.workbook_file_name,
         "templateDownloadedPath": template_downloaded_path,
         "sendingListFileToken": entry.sending_list_file_token,
+        "sendingListFileUrl": entry.sending_list_file_url,
         "sendingListFileName": entry.sending_list_file_name,
         "sendingListDownloadedPath": sending_list_downloaded_path,
     }
@@ -346,9 +350,11 @@ def inspect_task_upload_assignments(
             "preferredOwnerEmail": preferred_owner_email,
             "linkedBitableUrl": entry.linked_bitable_url,
             "templateFileToken": entry.workbook_file_token,
+            "templateFileUrl": entry.workbook_file_url,
             "templateFileName": entry.workbook_file_name,
             "templateDownloadedPath": saved_template_path,
             "sendingListFileToken": entry.sending_list_file_token,
+            "sendingListFileUrl": entry.sending_list_file_url,
             "sendingListFileName": entry.sending_list_file_name,
             "templateParseRequested": parse_requested,
             "employeeMatched": employee is not None,
@@ -865,8 +871,10 @@ def _fetch_task_upload_entries(client: FeishuOpenClient, task_upload_url: str) -
                 responsible_name=responsible_name,
                 linked_bitable_url=linked_bitable_url,
                 workbook_file_token=str((workbook or {}).get("file_token") or "").strip(),
+                workbook_file_url=str((workbook or {}).get("url") or "").strip(),
                 workbook_file_name=str((workbook or {}).get("name") or "").strip() or "screening.xlsx",
                 sending_list_file_token=str((sending_list or {}).get("file_token") or "").strip(),
+                sending_list_file_url=str((sending_list or {}).get("url") or "").strip(),
                 sending_list_file_name=str((sending_list or {}).get("name") or "").strip() or "creator-source.xlsx",
             )
         )
@@ -944,7 +952,7 @@ def _download_task_upload_workbook(
         client,
         record_id=entry.record_id,
         attachment_label="需求上传（excel 格式）",
-        file_token=entry.workbook_file_token,
+        file_token_or_url=entry.workbook_file_url or entry.workbook_file_token,
         file_name=entry.workbook_file_name,
         download_root=download_root,
     )
@@ -959,7 +967,7 @@ def _download_task_upload_sending_list(
         client,
         record_id=entry.record_id,
         attachment_label="发信名单",
-        file_token=entry.sending_list_file_token,
+        file_token_or_url=entry.sending_list_file_url or entry.sending_list_file_token,
         file_name=entry.sending_list_file_name,
         download_root=download_root,
     )
@@ -970,11 +978,11 @@ def _download_task_upload_attachment(
     *,
     record_id: str,
     attachment_label: str,
-    file_token: str,
+    file_token_or_url: str,
     file_name: str,
     download_root: Path,
 ) -> Path:
-    downloaded = client.download_file(file_token, desired_name=file_name)
+    downloaded = client.download_file(file_token_or_url, desired_name=file_name)
     record_dir = download_root / record_id / attachment_label
     record_dir.mkdir(parents=True, exist_ok=True)
     return _write_unique_file(record_dir, downloaded.file_name, downloaded.content)

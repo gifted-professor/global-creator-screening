@@ -71,9 +71,37 @@ class FeishuOpenClient:
         return token
 
     def download_file(self, file_token_or_url: str, *, desired_name: str | None = None) -> DownloadedFeishuFile:
-        file_token = extract_file_token(file_token_or_url)
+        raw = str(file_token_or_url or "").strip()
+        if not raw:
+            raise ValueError("file_token 或 file_url 不能为空。")
+        file_token = extract_file_token(raw)
         access_token = self.get_tenant_access_token()
         last_error: Exception | None = None
+
+        direct_download_url = _extract_drive_download_url(raw)
+        if direct_download_url:
+            try:
+                status, headers, body, resolved_url = self._request_bytes(
+                    "GET",
+                    direct_download_url,
+                    headers={"Authorization": f"Bearer {access_token}"},
+                )
+            except FeishuApiError as exc:
+                last_error = exc
+            else:
+                if status == 200 and not _looks_like_json(headers.get("Content-Type", ""), body):
+                    file_name = _normalize_download_name(
+                        desired_name
+                        or _extract_filename_from_headers(headers)
+                        or f"{file_token}{_guess_extension(headers.get('Content-Type', ''))}"
+                    )
+                    return DownloadedFeishuFile(
+                        file_token=file_token,
+                        file_name=file_name,
+                        content_type=str(headers.get("Content-Type") or "application/octet-stream"),
+                        content=body,
+                        source_url=resolved_url,
+                    )
 
         for resource in ("files", "medias"):
             url_path = f"/drive/v1/{resource}/{parse.quote(file_token, safe='')}/download"
@@ -334,6 +362,10 @@ def extract_file_token(file_token_or_url: str) -> str:
     if query_token:
         return query_token
 
+    drive_match = re.search(r"/drive/v1/(?:files|medias)/([^/?#]+)/", parsed.path)
+    if drive_match:
+        return parse.unquote(drive_match.group(1))
+
     match = _BOX_TOKEN_PATTERN.search(raw)
     if match:
         return match.group(1)
@@ -387,9 +419,26 @@ def _guess_extension(content_type: str) -> str:
 
 
 def _join_url(base_url: str, url_path: str) -> str:
+    if "://" in str(url_path or ""):
+        return str(url_path)
     if not url_path.startswith("/"):
         url_path = "/" + url_path
     return base_url.rstrip("/") + url_path
+
+
+def _extract_drive_download_url(file_token_or_url: str) -> str:
+    raw = str(file_token_or_url or "").strip()
+    if "://" not in raw:
+        return ""
+    parsed = parse.urlparse(raw)
+    if not parsed.scheme or not parsed.netloc:
+        return ""
+    normalized_path = parsed.path or ""
+    if "/drive/v1/" not in normalized_path or not normalized_path.endswith("/download"):
+        return ""
+    if "/files/" not in normalized_path and "/medias/" not in normalized_path:
+        return ""
+    return raw
 
 
 def _looks_like_json(content_type: str, body: bytes) -> bool:

@@ -684,8 +684,10 @@ class BitableUploadTests(unittest.TestCase):
                 responsible_name="陈俊仁",
                 linked_bitable_url="https://correct.example.com/base/app?table=tbl&view=vew",
                 workbook_file_token="box1",
+                workbook_file_url="https://unit-test.feishu.mock/open-apis/drive/v1/medias/box1/download?extra=bitablePerm",
                 workbook_file_name="template.xlsx",
                 sending_list_file_token="box2",
+                sending_list_file_url="https://unit-test.feishu.mock/open-apis/drive/v1/medias/box2/download?extra=bitablePerm",
                 sending_list_file_name="sending.xlsx",
             )
 

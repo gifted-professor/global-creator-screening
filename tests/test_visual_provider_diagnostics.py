@@ -38,6 +38,7 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
         "OPENAI_VISION_MODEL",
         "VISION_MODEL",
         "VISION_PROVIDER_PREFERENCE",
+        "VISION_VISUAL_REVIEW_PROBE_RANKED_RETRY_ATTEMPTS",
         "VISUAL_REVIEW_ITEM_TIMEOUT_SECONDS",
     }
 
@@ -614,7 +615,7 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
             "save_visual_results",
         ), mock.patch.object(
             backend_app,
-            "ThreadPoolExecutor",
+            "DaemonThreadPoolExecutor",
             FakeExecutor,
         ), mock.patch.object(
             backend_app,
@@ -631,6 +632,16 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
         self.assertIn("alpha", result["visual_results"])
         self.assertFalse(result["visual_results"]["alpha"]["success"])
         self.assertIn("视觉复核超时", result["visual_results"]["alpha"]["error"])
+
+    def test_daemon_thread_pool_executor_marks_worker_threads_daemon(self) -> None:
+        executor = backend_app.DaemonThreadPoolExecutor(max_workers=1, thread_name_prefix="unit-daemon")
+        try:
+            future = executor.submit(lambda: "ok")
+            self.assertEqual(future.result(timeout=1), "ok")
+            self.assertTrue(executor._threads)
+            self.assertTrue(all(thread.daemon for thread in executor._threads))
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
 
 
 class VisualProviderConfigDefaultsTests(unittest.TestCase):
@@ -1614,6 +1625,91 @@ data: [DONE]
                 ("reelx", "gemini-3-flash-preview"),
             ],
         )
+
+    def test_probe_ranked_race_retries_retryable_probe_failures(self) -> None:
+        call_counts = {}
+
+        def fake_get_runnable(provider_name, *, model="", timeout_seconds=None):
+            return {
+                "name": provider_name,
+                "model": model,
+                "default_model": model,
+                "request_timeout_seconds": timeout_seconds,
+            }
+
+        def fake_probe(provider, platform="instagram", cover_urls=None):
+            key = (provider["name"], provider["model"])
+            call_counts[key] = call_counts.get(key, 0) + 1
+            if call_counts[key] == 1:
+                raise backend_app.VisionProviderError(provider["name"], "HTTP 503 upstream timeout", status_code=503, retryable=True)
+            return {
+                "success": True,
+                "provider": provider["name"],
+                "model": provider["model"],
+                "checked_at": "2026-03-28T00:00:00Z",
+                "decision": "Pass",
+                "reason": "ok",
+                "signals": ["ok"],
+                "response_excerpt": "ok",
+            }
+
+        with mock.patch.object(backend_app, "get_runnable_vision_provider", side_effect=fake_get_runnable), mock.patch.object(
+            backend_app,
+            "probe_vision_provider_with_image",
+            side_effect=fake_probe,
+        ), mock.patch.object(
+            backend_app,
+            "compute_visual_retry_delay_seconds",
+            return_value=0.0,
+        ), mock.patch.object(
+            backend_app.time,
+            "sleep",
+        ) as sleep_mock:
+            race = backend_app.run_probe_ranked_visual_provider_race()
+
+        self.assertTrue(race["success"])
+        self.assertEqual(race["selected_stage"], "preferred")
+        self.assertEqual(race["selected_provider"], "openai")
+        self.assertEqual(call_counts[("openai", "gpt-5.4")], 2)
+        self.assertEqual(call_counts[("reelx", "qwen-vl-max")], 2)
+        self.assertEqual(len(race["retry_history"]), 1)
+        self.assertEqual(race["retry_history"][0]["stage_names"], ["preferred", "preferred_parallel", "secondary", "tertiary"])
+        self.assertEqual(race["candidates"][0]["attempt_count"], 2)
+        self.assertTrue(race["candidates"][0]["retried"])
+        sleep_mock.assert_not_called()
+
+    def test_probe_ranked_race_does_not_retry_non_retryable_probe_failures(self) -> None:
+        call_counts = {}
+
+        def fake_get_runnable(provider_name, *, model="", timeout_seconds=None):
+            return {
+                "name": provider_name,
+                "model": model,
+                "default_model": model,
+                "request_timeout_seconds": timeout_seconds,
+            }
+
+        def fake_probe(provider, platform="instagram", cover_urls=None):
+            key = (provider["name"], provider["model"])
+            call_counts[key] = call_counts.get(key, 0) + 1
+            raise RuntimeError("HTTP 400 invalid image payload")
+
+        with mock.patch.object(backend_app, "get_runnable_vision_provider", side_effect=fake_get_runnable), mock.patch.object(
+            backend_app,
+            "probe_vision_provider_with_image",
+            side_effect=fake_probe,
+        ), mock.patch.object(
+            backend_app.time,
+            "sleep",
+        ) as sleep_mock:
+            race = backend_app.run_probe_ranked_visual_provider_race()
+
+        self.assertFalse(race["success"])
+        self.assertEqual(len(race["retry_history"]), 0)
+        self.assertEqual(call_counts[("openai", "gpt-5.4")], 1)
+        self.assertEqual(race["candidates"][0]["attempt_count"], 1)
+        self.assertFalse(race["candidates"][0]["retryable"])
+        sleep_mock.assert_not_called()
 
     def test_probe_ranked_candidate_order_shards_across_dual_preferred_pool(self) -> None:
         race = {
