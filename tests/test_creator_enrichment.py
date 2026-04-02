@@ -5,9 +5,11 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from openpyxl import Workbook
 
+import email_sync.creator_enrichment as creator_enrichment
 from email_sync.creator_enrichment import enrich_creator_workbook
 from email_sync.db import Database
 from email_sync.relation_index import rebuild_relation_index
@@ -116,6 +118,58 @@ class CreatorEnrichmentTests(unittest.TestCase):
         sheet.append(["US", "creator@example.com", "@creatorx", "https://www.tiktok.com/@creatorx"])
         sheet.append(["US", "", "cass-and-home", "https://www.youtube.com/@cass-and-home"])
         workbook.save(self.input_path)
+
+    def test_low_level_header_detection_handles_partial_read_only_rows(self) -> None:
+        class FakeSheet:
+            def __init__(self) -> None:
+                self.title = "SendingList"
+                self.max_row = 2
+                self.max_column = 4
+                self._rows = [
+                    ["地区", "邮箱", "博主用户名", "主页链接"],
+                    ["US", "creator@example.com", "@creatorx", "https://www.tiktok.com/@creatorx"],
+                ]
+
+            def cell(self, row_number: int, column_number: int) -> SimpleNamespace:
+                value = ""
+                if 1 <= row_number <= len(self._rows):
+                    row = self._rows[row_number - 1]
+                    if 1 <= column_number <= len(row):
+                        value = row[column_number - 1]
+                return SimpleNamespace(value=value)
+
+            def iter_rows(self, min_row: int = 1, max_row: int | None = None, values_only: bool = False):
+                end_row = max_row or self.max_row
+                for row_number in range(min_row, end_row + 1):
+                    row = self._rows[row_number - 1]
+                    if row_number == 1:
+                        row = row[:1]
+                    if values_only:
+                        yield tuple(row)
+                    else:
+                        yield tuple(SimpleNamespace(value=value) for value in row)
+
+        class FakeWorkbook:
+            def __init__(self) -> None:
+                self.worksheets = [FakeSheet()]
+
+            def close(self) -> None:
+                return None
+
+        original_loader = creator_enrichment._load_workbook
+        creator_enrichment._load_workbook = lambda: (None, lambda **_: FakeWorkbook())
+        try:
+            headers = creator_enrichment._source_headers(self.input_path)
+            rows = list(creator_enrichment._iter_sheet_rows(self.input_path, headers))
+        finally:
+            creator_enrichment._load_workbook = original_loader
+
+        self.assertEqual(headers, ["地区", "邮箱", "博主用户名", "主页链接"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["地区"], "US")
+        self.assertEqual(rows[0]["邮箱"], "creator@example.com")
+        self.assertEqual(rows[0]["博主用户名"], "@creatorx")
+        self.assertEqual(rows[0]["主页链接"], "https://www.tiktok.com/@creatorx")
 
     def _seed_messages(self) -> Database:
         db = Database(self.db_path)
@@ -285,6 +339,21 @@ class CreatorEnrichmentTests(unittest.TestCase):
         self.assertEqual(handle_row["Platform"], "YouTube")
         self.assertEqual(handle_row["@username"], "cassandhome")
         self.assertEqual(handle_row["match_confidence"], "high")
+
+    def test_real_duet_sending_list_headers_are_all_detected(self) -> None:
+        duet_path = Path(
+            "temp/runs/task_upload_to_final_export/20260402_145244_duet_8864d6e5/children/01_Duet1/upstream/downloads/reczxcYykT/发信名单/duet 冷名单.xlsx"
+        )
+        if not duet_path.exists():
+            self.skipTest(f"missing fixture workbook: {duet_path}")
+
+        headers = creator_enrichment._source_headers(duet_path)
+        rows = list(creator_enrichment._iter_sending_list_rows(duet_path))
+
+        self.assertEqual(headers[:4], ["地区", "邮箱", "博主用户名", "主页链接"])
+        self.assertGreater(len(rows), 1000)
+        self.assertIn("Platform", rows[0])
+        self.assertIn("@username", rows[0])
 
     def test_enrich_creator_workbook_accepts_four_column_sending_list_workbook(self) -> None:
         self._make_four_column_sending_list_workbook()

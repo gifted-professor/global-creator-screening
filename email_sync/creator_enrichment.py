@@ -685,17 +685,34 @@ def _load_workbook() -> Any:
     return Workbook, load_workbook
 
 
+def _sheet_row_values(sheet: Any, row_number: int, max_col: int) -> list[Any]:
+    return [sheet.cell(row_number, column_number).value for column_number in range(1, max_col + 1)]
+
+
+def _resolve_sheet_header_row(sheet: Any) -> tuple[int, list[str], int, int]:
+    max_row = int(sheet.max_row or 0)
+    max_col = int(sheet.max_column or 0)
+    header_row_number = 0
+    header_values: list[str] = []
+    for row_number in range(1, max_row + 1):
+        values = _sheet_row_values(sheet, row_number, max_col)
+        normalized_values = [_clean_text(value) for value in values]
+        if any(normalized_values):
+            header_row_number = row_number
+            header_values = normalized_values
+            break
+    return header_row_number, header_values, max_row, max_col
+
+
 def _source_headers(input_path: Path) -> list[str]:
     _, load_workbook = _load_workbook()
-    workbook = load_workbook(filename=input_path, read_only=True, data_only=True)
+    workbook = load_workbook(filename=input_path, read_only=False, data_only=True)
     try:
         ordered_headers: list[str] = []
         seen: set[str] = set()
         for sheet in workbook.worksheets:
-            iterator = sheet.iter_rows(min_row=1, max_row=1, values_only=True)
-            header_row = next(iterator, ())
-            for cell in header_row:
-                header = _clean_text(cell)
+            _header_row_number, headers, _max_row, _max_col = _resolve_sheet_header_row(sheet)
+            for header in headers:
                 if not header or header in seen:
                     continue
                 seen.add(header)
@@ -707,14 +724,15 @@ def _source_headers(input_path: Path) -> list[str]:
 
 def _iter_sheet_rows(input_path: Path, source_headers: Sequence[str]) -> Iterator[dict[str, Any]]:
     _, load_workbook = _load_workbook()
-    workbook = load_workbook(filename=input_path, read_only=True, data_only=True)
+    workbook = load_workbook(filename=input_path, read_only=False, data_only=True)
     try:
         for sheet in workbook.worksheets:
-            rows = sheet.iter_rows(values_only=True)
-            header_row = next(rows, ())
-            headers = [_clean_text(cell) for cell in header_row]
+            header_row_number, headers, max_row, max_col = _resolve_sheet_header_row(sheet)
+            if not header_row_number or not any(headers):
+                continue
             header_positions = {header: index for index, header in enumerate(headers) if header}
-            for row_number, values in enumerate(rows, start=2):
+            for row_number in range(header_row_number + 1, max_row + 1):
+                values = _sheet_row_values(sheet, row_number, max_col)
                 row: dict[str, Any] = {
                     "sheet_name": sheet.title,
                     "source_row_number": row_number,
@@ -829,23 +847,11 @@ def _iter_sending_list_rows(input_path: Path) -> Iterator[dict[str, Any]]:
         sheet_diagnostics: list[dict[str, Any]] = []
         contract_detected = False
         for sheet in workbook.worksheets:
-            max_row = int(sheet.max_row or 0)
-            max_col = int(sheet.max_column or 0)
+            header_row_number, headers, max_row, max_col = _resolve_sheet_header_row(sheet)
             hidden_columns = [
                 key for key, value in sheet.column_dimensions.items() if getattr(value, "hidden", False)
             ]
             merged_ranges = [str(value) for value in sheet.merged_cells.ranges]
-
-            header_row_number = 0
-            header_values: list[Any] = []
-            for row_number in range(1, max_row + 1):
-                values = [sheet.cell(row_number, column_number).value for column_number in range(1, max_col + 1)]
-                if any(_clean_text(value) for value in values):
-                    header_row_number = row_number
-                    header_values = values
-                    break
-
-            headers = [_clean_text(cell) for cell in header_values]
             sheet_diagnostics.append(
                 {
                     "sheet_name": sheet.title,
@@ -863,7 +869,7 @@ def _iter_sending_list_rows(input_path: Path) -> Iterator[dict[str, Any]]:
             parsed_rows: list[dict[str, Any]] = []
             for row_number in range(header_row_number + 1, max_row + 1):
                 row_dict: dict[str, Any] = {"sheet_name": sheet.title, "source_row_number": row_number}
-                values = [sheet.cell(row_number, column_number).value for column_number in range(1, max_col + 1)]
+                values = _sheet_row_values(sheet, row_number, max_col)
                 for index, header in enumerate(headers):
                     if not header:
                         continue

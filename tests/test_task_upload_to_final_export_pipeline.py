@@ -93,6 +93,9 @@ class TaskUploadToFinalExportRunnerTests(unittest.TestCase):
                 summary_json=summary_path,
                 task_upload_url="https://example.com/task",
                 employee_info_url="https://example.com/employee",
+                existing_mail_db_path="/tmp/shared/email_sync.db",
+                existing_mail_raw_dir="/tmp/shared/raw",
+                existing_mail_data_dir="/tmp/shared",
                 feishu_app_id="app-id",
                 feishu_app_secret="app-secret",
                 owner_email_overrides={"MINISO": "eden@amagency.biz"},
@@ -127,6 +130,9 @@ class TaskUploadToFinalExportRunnerTests(unittest.TestCase):
         self.assertEqual(task_spec["intent"]["task_name"], "MINISO")
         self.assertEqual(task_spec["intent"]["task_upload_url"], "https://example.com/task")
         self.assertEqual(task_spec["controls"]["requested_platforms"], ["instagram"])
+        self.assertEqual(task_spec["paths"]["existing_mail_db_path"], "/tmp/shared/email_sync.db")
+        self.assertEqual(task_spec["paths"]["existing_mail_raw_dir"], "/tmp/shared/raw")
+        self.assertEqual(task_spec["paths"]["existing_mail_data_dir"], "/tmp/shared")
         self.assertEqual(task_spec["run"]["workflow_handoff_json"], summary["workflow_handoff_json"])
         self.assertTrue(task_spec["paths"]["upstream_task_spec_json"].endswith("/upstream/task_spec.json"))
         self.assertTrue(task_spec["paths"]["upstream_workflow_handoff_json"].endswith("/upstream/workflow_handoff.json"))
@@ -146,6 +152,9 @@ class TaskUploadToFinalExportRunnerTests(unittest.TestCase):
         self.assertEqual(summary["steps"]["upstream"]["status"], "stopped_after_keep-list")
         self.assertEqual(summary["steps"]["downstream"]["status"], "completed")
         self.assertEqual(summary["contract"]["canonical_internal_boundary"], "keep-list")
+        self.assertEqual(summary["inputs"]["existing_mail_db_path"], "/tmp/shared/email_sync.db")
+        self.assertEqual(summary["inputs"]["existing_mail_raw_dir"], "/tmp/shared/raw")
+        self.assertEqual(summary["inputs"]["existing_mail_data_dir"], "/tmp/shared")
         self.assertTrue(summary["artifacts"]["keep_workbook"].endswith("MINISO_final_keep.xlsx"))
         self.assertIn("instagram", summary["artifacts"]["final_exports"])
         self.assertTrue(summary["artifacts"]["all_platforms_final_review"].endswith("all_platforms_final_review.xlsx"))
@@ -155,6 +164,9 @@ class TaskUploadToFinalExportRunnerTests(unittest.TestCase):
         self.assertIn("--platform instagram", summary["resume_points"]["keep_list"]["recommended_command"])
         self.assertIn("--vision-provider openai", summary["resume_points"]["keep_list"]["recommended_command"])
         self.assertEqual(observed["upstream_kwargs"]["stop_after"], "keep-list")
+        self.assertEqual(observed["upstream_kwargs"]["existing_mail_db_path"], "/tmp/shared/email_sync.db")
+        self.assertEqual(observed["upstream_kwargs"]["existing_mail_raw_dir"], "/tmp/shared/raw")
+        self.assertEqual(observed["upstream_kwargs"]["existing_mail_data_dir"], "/tmp/shared")
         self.assertEqual(observed["upstream_kwargs"]["owner_email_overrides"], {"MINISO": "eden@amagency.biz"})
         self.assertEqual(observed["upstream_kwargs"]["matching_strategy"], "brand-keyword-fast-path")
         self.assertEqual(observed["downstream_kwargs"]["vision_provider"], "openai")
@@ -826,6 +838,25 @@ class TaskUploadToFinalExportRunnerTests(unittest.TestCase):
                 "Duet2_final_review.xlsx"
             )
         )
+
+    def test_parser_accepts_existing_mail_sidecar_args(self) -> None:
+        parser = final_runner.build_parser()
+        args = parser.parse_args(
+            [
+                "--task-name",
+                "MINISO",
+                "--existing-mail-db-path",
+                "/tmp/shared/email_sync.db",
+                "--existing-mail-raw-dir",
+                "/tmp/shared/raw",
+                "--existing-mail-data-dir",
+                "/tmp/shared",
+            ]
+        )
+
+        self.assertEqual(args.existing_mail_db_path, "/tmp/shared/email_sync.db")
+        self.assertEqual(args.existing_mail_raw_dir, "/tmp/shared/raw")
+        self.assertEqual(args.existing_mail_data_dir, "/tmp/shared")
 
 
 if __name__ == "__main__":
