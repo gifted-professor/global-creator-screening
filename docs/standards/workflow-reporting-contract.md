@@ -117,12 +117,16 @@
 
 ### 8. 是否需要我决策
 
-必须明确回答：
+`$workflow` v1 当前固定回答：
 
 - `不需要`
-- `需要`
 
-如果需要，必须把待决策问题写清楚，不能只写“需要确认一下”。
+原因是当前 `workflow_handoff.json` machine contract 还没有正式的“需要用户分叉决策”信号。
+
+在上游新增正式 signal 之前：
+
+- 不要根据 `manual_fix` / `manual_investigation` / `retry_run` 自行推导 `需要`
+- 不要让报告层发明 repo 里不存在的分叉决策状态
 
 ## Running Rule
 
@@ -147,7 +151,7 @@
 
 - 必须给结论
 - 下一步建议最多两个
-- 如需用户决策，必须说明具体要决策什么
+- Section 8 仍固定为 `不需要`
 
 ## Canonical Markdown Template
 
@@ -206,7 +210,7 @@
 - ...
 
 8. 是否需要我决策
-需要：是否先补配置后重跑，还是先检查下游输入完整性？
+不需要
 ```
 
 ## Relationship To Workflow Handoff

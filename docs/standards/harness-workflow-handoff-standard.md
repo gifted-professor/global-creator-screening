@@ -51,6 +51,14 @@
 - `task-upload-to-keep-list`
 - `keep-list-screening`
 
+外部 `$workflow` v1 只应接受“有效的 v1 handoff”：
+
+- `workflow_handoff_version=harness.workflow-handoff.v1-draft`
+- 顶层 required 字段齐全
+- `verdict`、`resume`、`intent_summary`、`pointers` 等关键嵌套结构可读
+
+不要把旧版 handoff、缺字段 handoff 或脏 JSON 当成“正式支持的 canonical run”。
+
 字段原则：
 
 - `summary.json` 仍是详细执行记录
@@ -58,3 +66,11 @@
 - `workflow_handoff.json` 只暴露 verdict-first 的动作分流信息，不重复整个 artifact 面
 - `resume` 只暴露稳定摘要：`available / canonical_resume_point / resume_point_keys`
 - 不再把整块 `resume_points` 原样透传给外部 workflow
+
+当前 handoff machine contract 还没有正式的“需要用户做分叉决策”信号。
+
+因此 `$workflow` v1 在 Section 8 必须固定回答：
+
+- `不需要`
+
+如果未来真的要向人汇报“需要你决策”，必须先在 handoff machine contract 里增加明确字段或信号，再由 `$workflow` 消费。
