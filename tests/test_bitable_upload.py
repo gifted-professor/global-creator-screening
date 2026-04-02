@@ -341,6 +341,91 @@ class BitableUploadTests(unittest.TestCase):
         self.assertEqual(gamma_update["fields"]["ai 是否通过"], "是")
         self.assertEqual(client.created_records[0]["fields"]["达人ID"], "delta")
 
+    def test_upload_payload_create_or_mail_only_mode_updates_existing_but_creates_new_rows(self) -> None:
+        client = _FakeBitableUploadClient()
+        resolved_view = ResolvedBitableView(
+            source_url="https://example.com/base/app?table=tbl&view=vew",
+            source_kind="base",
+            source_token="app_token",
+            app_token="app_token",
+            table_id="tbl",
+            view_id="vew",
+            table_name="达人管理",
+            view_name="总视图",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            payload_path = root / "payload.json"
+            raw_mail_path = root / "beta-last.eml"
+            raw_mail_path.write_text("Subject: update\n\nbody", encoding="utf-8")
+            payload_path.write_text(
+                json.dumps(
+                    {
+                        "rows": [
+                            {
+                                "达人ID": "beta",
+                                "平台": "tiktok",
+                                "主页链接": "https://www.tiktok.com/@beta",
+                                "# Followers(K)#": 888,
+                                "当前网红报价": "$200",
+                                "达人最后一次回复邮件时间": "2026/03/31",
+                                "达人回复的最后一封邮件内容": "latest follow-up",
+                                "达人对接人": "陈俊仁",
+                                "达人对接人_employee_id": "ou_beta",
+                                "__feishu_attachment_local_paths": [str(raw_mail_path)],
+                                "__feishu_update_mode": "create_or_mail_only_update",
+                            },
+                            {
+                                "达人ID": "epsilon",
+                                "平台": "instagram",
+                                "主页链接": "https://www.instagram.com/epsilon",
+                                "# Followers(K)#": 301,
+                                "Average Views (K)": 42,
+                                "互动率": "8.5%",
+                                "当前网红报价": "$350",
+                                "达人最后一次回复邮件时间": "2026/03/30",
+                                "达人回复的最后一封邮件内容": "epsilon reply",
+                                "达人对接人": "陈俊仁",
+                                "达人对接人_employee_id": "ou_epsilon",
+                                "ai是否通过": "是",
+                                "ai筛号反馈理由": "ok",
+                                "标签(ai)": "母婴用品-家庭/宝妈",
+                                "ai评价": "good",
+                                "__feishu_update_mode": "create_or_mail_only_update",
+                            },
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            with patch(
+                "feishu_screening_bridge.bitable_upload.resolve_bitable_view_from_url",
+                return_value=resolved_view,
+            ):
+                result = upload_final_review_payload_to_bitable(
+                    client,
+                    payload_json_path=payload_path,
+                    linked_bitable_url="https://example.com/base/app?table=tbl&view=vew",
+                )
+
+        self.assertEqual(result["created_count"], 1)
+        self.assertEqual(result["updated_count"], 1)
+        self.assertEqual(result["failed_count"], 0)
+        beta_update = client.updated_records[0]
+        self.assertEqual(beta_update["record_id"], "rec_existing")
+        self.assertEqual(
+            set(beta_update["fields"].keys()),
+            {"当前网红报价", "达人最后一次回复邮件时间", "达人回复的最后一封邮件内容", "文本 12"},
+        )
+        self.assertNotIn("Followers(K)", beta_update["fields"])
+        created_fields = client.created_records[0]["fields"]
+        self.assertEqual(created_fields["达人ID"], "epsilon")
+        self.assertEqual(created_fields["ai 是否通过"], "是")
+        self.assertEqual(created_fields["Followers(K)"], 301)
+
     def test_upload_payload_can_suppress_ai_labels(self) -> None:
         client = _FakeBitableUploadClient()
         resolved_view = ResolvedBitableView(

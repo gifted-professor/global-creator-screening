@@ -458,6 +458,72 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
             ["Pass", "Pass"],
         )
 
+    def test_perform_scrape_splits_missing_retry_batches_with_smaller_chunk_size(self) -> None:
+        identifiers = [f"user{i}" for i in range(1, 19)]
+        batch_calls = []
+
+        def build_instagram_item(identifier: str) -> dict[str, object]:
+            return {
+                "url": f"https://instagram.com/{identifier}",
+                "username": identifier,
+                "biography": "US creator",
+                "latestPosts": [{"timestamp": "2026-03-29T00:00:00+00:00", "displayUrl": f"https://example.com/{identifier}.jpg"}],
+            }
+
+        def fake_run_apify_batch(platform, batch, payload, progress_callback=None, cancel_check=None):
+            batch_calls.append(list(batch))
+            if len(batch_calls) == 1:
+                raise backend_app.ApifyRuntimeError(
+                    "poll",
+                    "Apify 预算不足：当前批次需要约 0.179200 USD，但可用 token 的最高剩余额度只有 0.134907 USD。",
+                    retryable=True,
+                    apify={"apify_run_id": "run-batch-1", "apify_dataset_id": "dataset-batch-1"},
+                )
+            return {
+                "success": True,
+                "raw_items": [build_instagram_item(identifier) for identifier in batch],
+                "apify": {"usage_total_usd": 0.05},
+            }
+
+        with mock.patch.dict(backend_app.PLATFORM_BATCH_SIZES, {"instagram": 20}, clear=False), mock.patch.dict(
+            os.environ,
+            {"INSTAGRAM_MISSING_RETRY_BATCH_SIZE": "10"},
+            clear=False,
+        ), mock.patch.object(
+            backend_app,
+            "run_apify_batch",
+            side_effect=fake_run_apify_batch,
+        ), mock.patch.object(
+            backend_app,
+            "load_upload_metadata",
+            return_value={identifier: {"handle": identifier, "region": "US"} for identifier in identifiers},
+        ), mock.patch.object(
+            backend_app,
+            "load_active_rulespec",
+            return_value={},
+        ), mock.patch.object(
+            backend_app,
+            "write_json_file",
+        ), mock.patch.object(
+            backend_app,
+            "save_profile_reviews",
+        ):
+            result = backend_app.perform_scrape(
+                "instagram",
+                {"usernames": identifiers},
+            )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(batch_calls[0], identifiers)
+        self.assertEqual(len(batch_calls[1]), 10)
+        self.assertEqual(len(batch_calls[2]), 8)
+        self.assertEqual(set(batch_calls[1]) | set(batch_calls[2]), set(identifiers))
+        self.assertEqual(result["retry_summary"]["initial_batch_failure_count"], 1)
+        self.assertEqual(result["retry_summary"]["attempt_count"], 1)
+        self.assertEqual(result["retry_summary"]["remaining_missing_count"], 0)
+        self.assertEqual(result["retry_summary"]["history"][0]["batch_size"], 10)
+        self.assertEqual(set(result["successful_identifiers"]), set(identifiers))
+
     def test_probe_endpoint_returns_success_payload_for_selected_provider(self) -> None:
         os.environ["OPENAI_API_KEY"] = "sk-live-12345678"
 

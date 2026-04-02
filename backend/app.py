@@ -191,6 +191,19 @@ PLATFORM_BATCH_SIZES = {
     "instagram": int(os.getenv("INSTAGRAM_BATCH_SIZE", "50")),
     "youtube": int(os.getenv("YOUTUBE_BATCH_SIZE", "5")),
 }
+
+
+def resolve_missing_retry_batch_size(platform):
+    default_batch_size = max(1, int(PLATFORM_BATCH_SIZES.get(platform, 20) or 20))
+    env_key = f"{str(platform or '').strip().upper()}_MISSING_RETRY_BATCH_SIZE"
+    raw_value = str(os.getenv(env_key, "") or "").strip()
+    if not raw_value:
+        return min(default_batch_size, 10)
+    try:
+        parsed_value = int(raw_value)
+    except Exception:
+        return min(default_batch_size, 10)
+    return max(1, min(default_batch_size, parsed_value))
 DEFAULT_SCRAPE_MISSING_RETRY_ATTEMPTS = max(0, int(os.getenv("SCRAPE_MISSING_RETRY_ATTEMPTS", "1")))
 PLATFORM_ESTIMATED_COST_PER_IDENTIFIER_USD = {
     "tiktok": float(os.getenv("APIFY_TIKTOK_COST_PER_PROFILE_USD", "0.0")),
@@ -6567,12 +6580,14 @@ def perform_scrape(platform, payload, progress_callback=None, cancel_check=None)
         retry_identifiers = select_missing_retry_identifiers(platform, filtered, requested_lookup)
         if not retry_identifiers:
             break
-        retry_batches = chunk_list(retry_identifiers, PLATFORM_BATCH_SIZES.get(platform, 20))
+        retry_batch_size = resolve_missing_retry_batch_size(platform)
+        retry_batches = chunk_list(retry_identifiers, retry_batch_size)
         previous_missing_identifiers = set(
             extract_missing_profile_review_identifiers(platform, filtered.get("missing_profiles") or [])
         )
         retry_record = {
             "attempt": retry_attempt,
+            "batch_size": retry_batch_size,
             "requested_identifier_count": len(retry_identifiers),
             "requested_identifiers": retry_identifiers,
             "requested_identifier_preview": retry_identifiers[:10],
