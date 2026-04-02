@@ -46,6 +46,9 @@ class FinalExportMergeTests(unittest.TestCase):
                         "brand_message_sent_at": "2026-03-30T21:55:31+00:00",
                         "brand_message_snippet": "Hi team, rate is $300 per video.",
                         "brand_message_raw_path": str(raw_mail_path),
+                        "creator_emails": "alpha@example.com | manager@example.com",
+                        "matched_contact_email": "alpha@example.com",
+                        "matched_contact_name": "Alpha",
                     }
                 ]
             ).to_excel(keep_workbook, index=False)
@@ -85,6 +88,10 @@ class FinalExportMergeTests(unittest.TestCase):
             self.assertEqual(workbook.loc[0, "达人最后一次回复邮件时间"], "2026/03/30")
             self.assertEqual(workbook.loc[0, "达人回复的最后一封邮件内容"], "Hi team, rate is $300 per video.")
             self.assertEqual(payload["rows"][0]["__feishu_update_mode"], "create_or_mail_only_update")
+            self.assertEqual(payload["rows"][0]["creator_emails"], "alpha@example.com | manager@example.com")
+            self.assertEqual(payload["rows"][0]["matched_contact_email"], "alpha@example.com")
+            self.assertEqual(payload["rows"][0]["matched_contact_name"], "Alpha")
+            self.assertEqual(payload["rows"][0]["__brand_message_raw_path"], str(raw_mail_path))
             self.assertEqual(payload["rows"][0]["__last_mail_raw_path"], str(raw_mail_path))
             self.assertEqual(payload["rows"][0]["__feishu_attachment_local_paths"], [str(raw_mail_path.resolve())])
 

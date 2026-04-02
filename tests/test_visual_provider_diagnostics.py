@@ -912,6 +912,20 @@ class VisualProviderConfigDefaultsTests(unittest.TestCase):
     def test_visual_review_prompt_selection_falls_back_to_rulespec_visual_contract(self) -> None:
         active_rulespec = {
             "goal": "优先保留家庭生活感强的账号",
+            "manual_review_items": [
+                {
+                    "label": "人工判断项/合规提醒",
+                    "value": "当封面出现奶瓶等情况，判断达人为哺乳期妈妈时需要人工复核",
+                }
+            ],
+            "compliance_notes": [
+                {
+                    "key": "protected_attribute_notice",
+                    "label": "受保护属性相关判断",
+                    "value": "不要根据年龄、种族等受保护属性做判断",
+                    "policy": "never_compile_to_automation",
+                }
+            ],
             "rules": [
                 {
                     "type": "visual_feature_group",
@@ -944,10 +958,49 @@ class VisualProviderConfigDefaultsTests(unittest.TestCase):
         self.assertEqual(selection["resolved_cover_limit"], 5)
         self.assertEqual(selection["visual_runtime_contract"]["goal"], "优先保留家庭生活感强的账号")
         self.assertEqual(selection["visual_runtime_contract"]["positive_feature_labels"], ["家庭场景", "宠物陪伴", "户外生活"])
+        self.assertEqual(
+            selection["visual_runtime_contract"]["manual_review_items"][0]["value"],
+            "当封面出现奶瓶等情况，判断达人为哺乳期妈妈时需要人工复核",
+        )
         self.assertIn("审核目标：优先保留家庭生活感强的账号", selection["prompt"])
         self.assertIn("优先确认是否命中以下至少 2 类视觉特征", selection["prompt"])
         self.assertIn("同时排除以下视觉风险", selection["prompt"])
         self.assertIn("出现绿幕背景", selection["prompt"])
+        self.assertIn("人工复核提醒", selection["prompt"])
+        self.assertIn("奶瓶等情况", selection["prompt"])
+        self.assertIn("合规提醒", selection["prompt"])
+        self.assertIn("不要根据年龄、种族、民族、肤色、宗教等受保护属性做判断", selection["prompt"])
+
+    def test_visual_review_prompt_selection_uses_generic_fallback_when_rulespec_only_contains_reminders(self) -> None:
+        active_rulespec = {
+            "manual_review_items": [
+                {
+                    "label": "人工判断项/合规提醒",
+                    "value": "当封面出现奶瓶等情况，判断达人为哺乳期妈妈时需要人工复核",
+                }
+            ],
+            "compliance_notes": [
+                {
+                    "key": "protected_attribute_notice",
+                    "label": "受保护属性相关判断",
+                    "value": "不要根据年龄、种族等受保护属性做判断",
+                    "policy": "never_compile_to_automation",
+                }
+            ],
+            "rules": [],
+        }
+
+        selection = backend_app.resolve_visual_review_prompt_selection(
+            "openai",
+            "instagram",
+            model_name="gpt-5.4",
+            active_visual_prompts={},
+            active_rulespec=active_rulespec,
+        )
+
+        self.assertEqual(selection["source"], "generic_fallback")
+        self.assertEqual(selection["visual_runtime_contract"]["manual_review_items"][0]["value"], "当封面出现奶瓶等情况，判断达人为哺乳期妈妈时需要人工复核")
+        self.assertNotIn("奶瓶等情况", selection["prompt"])
 
     def test_positioning_card_prompt_selection_uses_rulespec_goal_and_features(self) -> None:
         active_rulespec = {

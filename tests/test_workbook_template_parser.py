@@ -160,6 +160,31 @@ class WorkbookTemplateParserTests(unittest.TestCase):
             )
             self.assertEqual(structured_requirement["basic_info"]["project_name"], "Tapo")
 
+    def test_compile_workbook_preserves_label_only_manual_review_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workbook_path = Path(tmpdir) / "manual-review-inline.xlsx"
+            workbook = load_workbook(FIXTURE_WORKBOOK)
+            worksheet = workbook[workbook.sheetnames[0]]
+            worksheet["A65"] = "当封面出现奶瓶等情况，判断达人为哺乳期妈妈时需要人工复核"
+            worksheet["B65"] = None
+            worksheet["C65"] = None
+            workbook.save(workbook_path)
+
+            report = compile_workbook(workbook_path, Path(tmpdir) / "compiled")
+
+            self.assertTrue(report["success"], report)
+            artifacts = report["artifacts"]
+            rulespec = json.loads(Path(artifacts["rulespec_json"]).read_text(encoding="utf-8"))
+            prompts = json.loads(Path(artifacts["visual_prompts_json"]).read_text(encoding="utf-8"))
+
+            self.assertIn(
+                "当封面出现奶瓶等情况，判断达人为哺乳期妈妈时需要人工复核",
+                json.dumps(rulespec["manual_review_items"], ensure_ascii=False),
+            )
+            first_prompt = next(iter(prompts.values()))["prompt"]
+            self.assertIn("人工判断提醒", first_prompt)
+            self.assertIn("奶瓶等情况", first_prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -751,7 +751,11 @@ def build_all_platforms_final_review_artifacts(
                     "达人对接人_owner_name": _clean_text(row_owner_context.get("owner_name")),
                     "linked_bitable_url": _clean_text(row_owner_context.get("linked_bitable_url")),
                     "任务名": _clean_text(row_owner_context.get("task_name")),
+                    "creator_emails": _clean_text(keep_row.get("creator_emails")),
+                    "matched_contact_email": _clean_text(keep_row.get("matched_contact_email")),
+                    "matched_contact_name": _clean_text(keep_row.get("matched_contact_name")),
                     _ROW_UPDATE_MODE_KEY: _UPDATE_MODE_CREATE_OR_MAIL_ONLY,
+                    "__brand_message_raw_path": _clean_text(keep_row.get("brand_message_raw_path")),
                     _LAST_MAIL_RAW_PATH_KEY: last_mail_raw_path,
                     _ROW_ATTACHMENT_PATHS_KEY: row_attachment_paths,
                 }

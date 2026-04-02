@@ -2156,6 +2156,81 @@ def resolve_generic_visual_review_prompt(provider_name, model_name=""):
     return VISION_PROMPT
 
 
+VISUAL_CONTRACT_SENSITIVE_TERMS = (
+    "黑人",
+    "白人",
+    "黄种人",
+    "亚裔",
+    "拉丁裔",
+    "中老年",
+    "老年",
+    "老人",
+    "种族",
+    "民族",
+    "年龄",
+    "race",
+    "ethnic",
+    "black",
+    "white",
+)
+
+
+def normalize_visual_contract_prompt_text(value):
+    return str(value or "").strip()
+
+
+def render_visual_contract_manual_item(item):
+    if not isinstance(item, dict):
+        return normalize_visual_contract_prompt_text(item)
+    label = normalize_visual_contract_prompt_text(item.get("label"))
+    value = normalize_visual_contract_prompt_text(item.get("value"))
+    note = normalize_visual_contract_prompt_text(item.get("note"))
+    if label and value and value != label:
+        return f"{label}：{value}"
+    if label and note and note != label:
+        return f"{label}：{note}"
+    return label or value or note
+
+
+def render_visual_contract_compliance_note(item):
+    if not isinstance(item, dict):
+        return normalize_visual_contract_prompt_text(item)
+    label = normalize_visual_contract_prompt_text(item.get("label"))
+    value = normalize_visual_contract_prompt_text(item.get("value"))
+    note = normalize_visual_contract_prompt_text(item.get("note"))
+    if label and value and value != label:
+        return f"{label}：{value}"
+    if value:
+        return value
+    if label and note and note != label:
+        return f"{label}：{note}"
+    return label or note
+
+
+def visual_contract_has_protected_attribute_notice(compliance_notes):
+    for item in compliance_notes or []:
+        if not isinstance(item, dict):
+            continue
+        combined = " ".join(
+            normalize_visual_contract_prompt_text(item.get(field))
+            for field in ("key", "label", "value", "note", "policy")
+        ).lower()
+        if "protected_attribute" in combined or "受保护属性" in combined:
+            return True
+    return False
+
+
+def visual_contract_is_sensitive_compliance_item(item):
+    if not isinstance(item, dict):
+        combined = normalize_visual_contract_prompt_text(item).lower()
+    else:
+        combined = " ".join(
+            normalize_visual_contract_prompt_text(item.get(field))
+            for field in ("key", "label", "value", "note", "policy")
+        ).lower()
+    return any(term.lower() in combined for term in VISUAL_CONTRACT_SENSITIVE_TERMS)
+
+
 def build_rulespec_visual_contract_prompt(platform, visual_contract):
     if not isinstance(visual_contract, dict):
         return ""
@@ -2171,6 +2246,21 @@ def build_rulespec_visual_contract_prompt(platform, visual_contract):
         for item in (visual_contract.get("exclusion_summaries") or [])
         if str(item or "").strip()
     ]
+    manual_review_items = [
+        item
+        for item in (
+            render_visual_contract_manual_item(raw_item)
+            for raw_item in (visual_contract.get("manual_review_items") or [])
+        )
+        if item
+    ]
+    compliance_notes_raw = list(visual_contract.get("compliance_notes") or [])
+    compliance_note_pairs = [
+        (raw_item, render_visual_contract_compliance_note(raw_item))
+        for raw_item in compliance_notes_raw
+        if render_visual_contract_compliance_note(raw_item)
+    ]
+    include_protected_notice = visual_contract_has_protected_attribute_notice(compliance_notes_raw)
     cover_count = screening.coerce_positive_int(visual_contract.get("cover_count")) or VISUAL_REVIEW_REQUEST_COVER_LIMIT
     min_hit_features = screening.coerce_positive_int(visual_contract.get("min_hit_features")) or 1
     if not goal and not feature_labels and not exclusion_summaries:
@@ -2192,6 +2282,25 @@ def build_rulespec_visual_contract_prompt(platform, visual_contract):
         lines.extend(["", "同时排除以下视觉风险："])
         for label in exclusion_summaries:
             lines.append(f"- {label}")
+    if manual_review_items:
+        lines.extend(
+            [
+                "",
+                "人工复核提醒：以下情况不要直接当作自动通过或自动拒绝条件；若明显出现，请在 reason 或 signals 里点明，供人工复核：",
+            ]
+        )
+        for item in manual_review_items:
+            lines.append(f"- {item}")
+    if include_protected_notice or compliance_note_pairs:
+        lines.extend(["", "合规提醒："])
+        if include_protected_notice:
+            lines.append("- 不要根据年龄、种族、民族、肤色、宗教等受保护属性做判断。")
+        for raw_item, rendered_note in compliance_note_pairs:
+            if include_protected_notice and "受保护属性" in rendered_note:
+                continue
+            if include_protected_notice and visual_contract_is_sensitive_compliance_item(raw_item):
+                continue
+            lines.append(f"- {rendered_note}")
     lines.extend(
         [
             "",
