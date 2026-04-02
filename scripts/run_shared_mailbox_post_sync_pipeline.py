@@ -753,7 +753,14 @@ def _read_mail_text_excerpt(paths: Sequence[str]) -> str:
 
 
 @lru_cache(maxsize=4096)
-def _read_thread_text_excerpt_cached(db_path_value: str, thread_key: str) -> str:
+def _read_thread_text_excerpt_cached(
+    db_path_value: str,
+    db_inode: int,
+    db_size: int,
+    db_mtime_ns: int,
+    db_ctime_ns: int,
+    thread_key: str,
+) -> str:
     path = Path(db_path_value).expanduser()
     if not thread_key or not path.exists() or not path.is_file():
         return ""
@@ -821,11 +828,17 @@ def _read_thread_text_excerpt_cached(db_path_value: str, thread_key: str) -> str
     return "\n\n".join(parts)
 
 
+def _build_thread_excerpt_cache_identity(shared_mail_db_path: Path) -> tuple[str, int, int, int, int]:
+    path = Path(str(shared_mail_db_path or "")).expanduser()
+    try:
+        stat = path.stat()
+    except OSError:
+        return str(path), 0, 0, 0, 0
+    return str(path), int(stat.st_ino), int(stat.st_size), int(stat.st_mtime_ns), int(stat.st_ctime_ns)
+
+
 def _read_thread_text_excerpt(shared_mail_db_path: Path, thread_key: Any) -> str:
-    return _read_thread_text_excerpt_cached(
-        str(Path(str(shared_mail_db_path or "")).expanduser()),
-        _clean_text(thread_key),
-    )
+    return _read_thread_text_excerpt_cached(*_build_thread_excerpt_cache_identity(shared_mail_db_path), _clean_text(thread_key))
 
 
 def _build_owner_search_texts(

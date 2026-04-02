@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,10 +18,88 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
     def setUp(self) -> None:
         self.original_loader = pipeline._load_runtime_dependencies
         self.original_build_client = pipeline._build_feishu_client
+        pipeline._read_thread_text_excerpt_cached.cache_clear()
 
     def tearDown(self) -> None:
         pipeline._load_runtime_dependencies = self.original_loader
         pipeline._build_feishu_client = self.original_build_client
+        pipeline._read_thread_text_excerpt_cached.cache_clear()
+
+    def test_read_thread_text_excerpt_cache_invalidates_when_db_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "email_sync.db"
+            db = Database(db_path)
+            db.init_schema()
+            now = "2026-04-02T10:00:00+08:00"
+
+            db.conn.execute(
+                """
+                INSERT INTO messages (
+                    account_email, folder_name, uid, uidvalidity, message_id, subject, in_reply_to, references_header,
+                    sent_at, sent_at_raw, internal_date, internal_date_raw, flags_json, size_bytes,
+                    from_json, to_json, cc_json, bcc_json, reply_to_json, sender_json,
+                    body_text, body_html, snippet, headers_json, raw_path, raw_sha256, raw_size_bytes,
+                    has_attachments, attachment_count, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, '', '', ?, ?, ?, ?, '[]', 0, ?, ?, '[]', '[]', '[]', '[]', ?, '', ?, '{}', '', '', 0, 0, 0, ?, ?)
+                """,
+                (
+                    "partnerships@amagency.biz",
+                    "INBOX",
+                    1,
+                    1,
+                    "<msg-1>",
+                    "SKG outreach",
+                    now,
+                    now,
+                    now,
+                    now,
+                    '[{"email":"rhea@amagency.biz","name":"Rhea"}]',
+                    '[{"email":"creator@example.com","name":"alpha"}]',
+                    "old body",
+                    "old snippet",
+                    now,
+                    now,
+                ),
+            )
+            message_row_id = int(db.conn.execute("SELECT last_insert_rowid()").fetchone()[0])
+            db.conn.execute(
+                """
+                INSERT INTO message_index (
+                    message_row_id, normalized_subject, direction, thread_key, thread_root_message_id,
+                    thread_parent_message_id, thread_depth, sent_sort_at, external_contact_count, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    message_row_id,
+                    "skg outreach",
+                    "outbound",
+                    "thread-cache",
+                    "<msg-1>",
+                    "",
+                    0,
+                    now,
+                    1,
+                    now,
+                ),
+            )
+            db.conn.commit()
+
+            first = pipeline._read_thread_text_excerpt(db_path, "thread-cache")
+            self.assertIn("old snippet", first)
+
+            db.conn.execute(
+                "UPDATE messages SET snippet = ?, body_text = ?, updated_at = ? WHERE id = ?",
+                ("new snippet", "new body", "2026-04-02T10:05:00+08:00", message_row_id),
+            )
+            db.conn.commit()
+            future_ns = max(time.time_ns(), db_path.stat().st_mtime_ns + 1_000_000)
+            os.utime(db_path, ns=(future_ns, future_ns))
+
+            second = pipeline._read_thread_text_excerpt(db_path, "thread-cache")
+            self.assertIn("new snippet", second)
+            self.assertNotIn("old snippet", second)
+
+            db.close()
 
     def test_task_group_alias_skg_collapses_to_single_group_run(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
