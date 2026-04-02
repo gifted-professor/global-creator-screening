@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+from functools import lru_cache
 import json
 from pathlib import Path
 import re
+import sqlite3
 import sys
 from typing import Any, Sequence
 
@@ -723,6 +725,7 @@ def _build_owner_candidate_aliases(candidate: dict[str, Any]) -> list[str]:
     seen: set[str] = set()
     for raw in (
         candidate.get("employeeEnglishName"),
+        candidate.get("employeeEmail"),
         _clean_text(candidate.get("employeeEmail")).split("@", 1)[0].strip(),
         candidate.get("employeeName"),
     ):
@@ -749,14 +752,90 @@ def _read_mail_text_excerpt(paths: Sequence[str]) -> str:
     return ""
 
 
-def _build_owner_search_text(
+@lru_cache(maxsize=4096)
+def _read_thread_text_excerpt_cached(db_path_value: str, thread_key: str) -> str:
+    path = Path(db_path_value).expanduser()
+    if not thread_key or not path.exists() or not path.is_file():
+        return ""
+    try:
+        with sqlite3.connect(str(path)) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = list(
+                conn.execute(
+                    """
+                    SELECT
+                        COALESCE(mi.direction, '') AS direction,
+                        COALESCE(m.subject, '') AS subject,
+                        COALESCE(m.snippet, '') AS snippet,
+                        COALESCE(m.body_text, '') AS body_text,
+                        COALESCE(m.from_json, '') AS from_json,
+                        COALESCE(m.to_json, '') AS to_json,
+                        COALESCE(m.cc_json, '') AS cc_json,
+                        COALESCE(m.reply_to_json, '') AS reply_to_json,
+                        COALESCE(m.sender_json, '') AS sender_json
+                    FROM message_index mi
+                    JOIN messages m ON m.id = mi.message_row_id
+                    WHERE mi.thread_key = ?
+                    ORDER BY
+                        COALESCE(datetime(mi.sent_sort_at), datetime(m.sent_at), datetime(m.internal_date), datetime(m.created_at)),
+                        m.id
+                    """,
+                    (thread_key,),
+                ).fetchall()
+            )
+    except sqlite3.DatabaseError:
+        return ""
+    if not rows:
+        return ""
+    selected_rows = rows
+    if len(selected_rows) > 8:
+        selected_rows = [*selected_rows[:4], *selected_rows[-4:]]
+    parts: list[str] = []
+    total_chars = 0
+    max_chars = 65536
+    for row in selected_rows:
+        chunk = "\n".join(
+            part
+            for part in (
+                f"direction={_clean_text(row['direction'])}",
+                f"from={_clean_text(row['from_json'])}",
+                f"to={_clean_text(row['to_json'])}",
+                f"cc={_clean_text(row['cc_json'])}",
+                f"reply_to={_clean_text(row['reply_to_json'])}",
+                f"sender={_clean_text(row['sender_json'])}",
+                _clean_text(row["subject"]),
+                _clean_text(row["snippet"]),
+                _clean_text(row["body_text"]),
+            )
+            if part
+        )
+        if not chunk:
+            continue
+        remaining = max_chars - total_chars
+        if remaining <= 0:
+            break
+        if len(chunk) > remaining:
+            chunk = chunk[:remaining]
+        parts.append(chunk)
+        total_chars += len(chunk)
+    return "\n\n".join(parts)
+
+
+def _read_thread_text_excerpt(shared_mail_db_path: Path, thread_key: Any) -> str:
+    return _read_thread_text_excerpt_cached(
+        str(Path(str(shared_mail_db_path or "")).expanduser()),
+        _clean_text(thread_key),
+    )
+
+
+def _build_owner_search_texts(
     keep_row: dict[str, Any],
     *,
     shared_mail_db_path: Path,
     shared_mail_raw_dir: Path | None,
     shared_mail_data_dir: Path | None,
     keep_workbook: Path,
-) -> str:
+) -> dict[str, str]:
     attachment_paths = _build_mail_attachment_paths(
         keep_row,
         shared_mail_db_path=shared_mail_db_path,
@@ -765,15 +844,19 @@ def _build_owner_search_text(
         keep_workbook=keep_workbook,
     )
     excerpt = _read_mail_text_excerpt(attachment_paths)
-    parts = [
+    representative_parts = [
         _clean_text(keep_row.get("brand_message_subject")),
         _clean_text(keep_row.get("brand_message_snippet")),
+        _clean_text(keep_row.get("last_mail_subject")),
         _clean_text(keep_row.get("last_mail_snippet")),
         _clean_text(keep_row.get("matched_email")),
         _clean_text(keep_row.get("brand_message_folder")),
         excerpt,
     ]
-    return "\n".join(part for part in parts if part)
+    return {
+        "representative_text": "\n".join(part for part in representative_parts if part),
+        "thread_text": _read_thread_text_excerpt(shared_mail_db_path, keep_row.get("evidence_thread_key")),
+    }
 
 
 def _match_owner_aliases(search_text: str, candidate: dict[str, Any]) -> list[str]:
@@ -783,6 +866,15 @@ def _match_owner_aliases(search_text: str, candidate: dict[str, Any]) -> list[st
         if pattern.search(search_text):
             matched_aliases.append(alias)
     return matched_aliases
+
+
+def _find_owner_matches(search_text: str, owner_candidates: Sequence[dict[str, Any]]) -> list[tuple[dict[str, Any], list[str]]]:
+    matches: list[tuple[dict[str, Any], list[str]]] = []
+    for candidate in owner_candidates:
+        aliases = _match_owner_aliases(search_text, candidate)
+        if aliases:
+            matches.append((candidate, aliases))
+    return matches
 
 
 def _resolve_group_row_owner_context(
@@ -795,18 +887,15 @@ def _resolve_group_row_owner_context(
     shared_mail_data_dir: Path | None,
     keep_workbook: Path,
 ) -> tuple[dict[str, str], dict[str, Any]]:
-    search_text = _build_owner_search_text(
+    evidence = _build_owner_search_texts(
         keep_row,
         shared_mail_db_path=shared_mail_db_path,
         shared_mail_raw_dir=shared_mail_raw_dir,
         shared_mail_data_dir=shared_mail_data_dir,
         keep_workbook=keep_workbook,
     )
-    matches: list[tuple[dict[str, Any], list[str]]] = []
-    for candidate in owner_candidates:
-        aliases = _match_owner_aliases(search_text, candidate)
-        if aliases:
-            matches.append((candidate, aliases))
+    representative_text = str(evidence.get("representative_text") or "")
+    matches = _find_owner_matches(representative_text, owner_candidates)
     if len(matches) == 1:
         candidate, aliases = matches[0]
         return _build_owner_context_from_candidate(candidate, task_owner_context), {
@@ -819,6 +908,21 @@ def _resolve_group_row_owner_context(
             "status": "ambiguous_mail_owner",
             "aliases": aliases,
         }
+    thread_text = str(evidence.get("thread_text") or "")
+    if thread_text:
+        thread_matches = _find_owner_matches("\n".join(part for part in (representative_text, thread_text) if part), owner_candidates)
+        if len(thread_matches) == 1:
+            candidate, aliases = thread_matches[0]
+            return _build_owner_context_from_candidate(candidate, task_owner_context), {
+                "status": "resolved_from_mail_thread",
+                "aliases": aliases,
+            }
+        if len(thread_matches) > 1:
+            aliases = [alias for _, matched_aliases in thread_matches for alias in matched_aliases]
+            return _build_empty_owner_context(task_owner_context), {
+                "status": "ambiguous_mail_owner",
+                "aliases": aliases,
+            }
     return _build_empty_owner_context(task_owner_context), {
         "status": "unresolved_mail_owner",
         "aliases": [],
