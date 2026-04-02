@@ -1,0 +1,4 @@
+interface:
+  display_name: "Workflow"
+  short_description: "Read canonical run handoffs and return structured reports"
+  default_prompt: "Use $workflow to read a canonical run via workflow_handoff.json and return a structured report."
