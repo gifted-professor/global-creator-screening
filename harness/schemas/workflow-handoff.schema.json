@@ -1,0 +1,197 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "harness/workflow-handoff.schema.json",
+  "title": "Harness Workflow Handoff",
+  "type": "object",
+  "required": [
+    "workflow_handoff_version",
+    "source_contract_version",
+    "source_failure_schema_version",
+    "scope",
+    "canonical_boundary",
+    "run_id",
+    "run_root",
+    "status",
+    "summary_json",
+    "task_spec_json",
+    "task_spec_available",
+    "current_stage",
+    "next_report_triggers",
+    "verdict",
+    "recommended_action",
+    "retryable",
+    "requires_manual_intervention",
+    "resume",
+    "intent_summary",
+    "pointers"
+  ],
+  "properties": {
+    "workflow_handoff_version": {
+      "type": "string",
+      "const": "harness.workflow-handoff.v1-draft"
+    },
+    "source_contract_version": {
+      "type": "string"
+    },
+    "source_failure_schema_version": {
+      "type": "string"
+    },
+    "scope": {
+      "type": "string"
+    },
+    "canonical_boundary": {
+      "type": "string"
+    },
+    "run_id": {
+      "type": "string"
+    },
+    "run_root": {
+      "type": "string"
+    },
+    "status": {
+      "type": "string"
+    },
+    "summary_json": {
+      "type": "string"
+    },
+    "task_spec_json": {
+      "type": "string"
+    },
+    "task_spec_available": {
+      "type": "boolean"
+    },
+    "current_stage": {
+      "type": "string"
+    },
+    "next_report_triggers": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": [
+          "stage_changed",
+          "structured_failure",
+          "run_terminal"
+        ]
+      }
+    },
+    "verdict": {
+      "$ref": "./run-summary.schema.json#/$defs/verdict"
+    },
+    "failure_decision": {
+      "$ref": "./run-summary.schema.json#/$defs/failureDecision"
+    },
+    "failure": {
+      "type": "object",
+      "required": [
+        "error_code",
+        "message",
+        "failure_layer",
+        "stage"
+      ],
+      "properties": {
+        "error_code": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "failure_layer": {
+          "type": "string"
+        },
+        "stage": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "recommended_action": {
+      "type": "string"
+    },
+    "retryable": {
+      "type": "boolean"
+    },
+    "requires_manual_intervention": {
+      "type": "boolean"
+    },
+    "resume": {
+      "type": "object",
+      "required": [
+        "available",
+        "canonical_resume_point",
+        "resume_point_keys"
+      ],
+      "properties": {
+        "available": {
+          "type": "boolean"
+        },
+        "canonical_resume_point": {
+          "type": "string"
+        },
+        "resume_point_keys": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "intent_summary": {
+      "type": "object",
+      "required": [
+        "intent",
+        "controls"
+      ],
+      "properties": {
+        "intent": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "controls": {
+          "type": "object",
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": false
+    },
+    "pointers": {
+      "type": "object",
+      "required": [
+        "run_root",
+        "summary_json",
+        "task_spec_json"
+      ],
+      "properties": {
+        "run_root": {
+          "type": "string"
+        },
+        "summary_json": {
+          "type": "string"
+        },
+        "task_spec_json": {
+          "type": "string"
+        },
+        "upstream_workflow_handoff_json": {
+          "type": "string"
+        },
+        "upstream_summary_json": {
+          "type": "string"
+        },
+        "upstream_task_spec_json": {
+          "type": "string"
+        },
+        "downstream_workflow_handoff_json": {
+          "type": "string"
+        },
+        "downstream_summary_json": {
+          "type": "string"
+        },
+        "downstream_task_spec_json": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

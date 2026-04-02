@@ -162,6 +162,8 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
                 skip_scrape=True,
             )
             persisted_summary = json.loads(summary_path.read_text(encoding="utf-8"))
+            self.assertTrue(Path(summary["workflow_handoff_json"]).exists())
+            workflow_handoff = json.loads(Path(summary["workflow_handoff_json"]).read_text(encoding="utf-8"))
 
         self.assertEqual(summary["status"], "failed")
         self.assertEqual(summary["contract_version"], RUN_CONTRACT_VERSION)
@@ -178,6 +180,9 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         self.assertFalse(summary["setup"]["completed"])
         self.assertEqual(summary["preflight"]["errors"][0]["error_code"], "KEEP_WORKBOOK_MISSING")
         self.assertFalse(Path(summary["task_spec_json"]).exists())
+        self.assertFalse(workflow_handoff["task_spec_available"])
+        self.assertEqual(workflow_handoff["failure"]["failure_layer"], "preflight")
+        self.assertEqual(workflow_handoff["failure_decision"]["category"], "input")
         self.assertEqual(persisted_summary["failure"]["error_code"], "KEEP_WORKBOOK_MISSING")
 
     def test_runner_allows_missing_env_file_for_local_keep_and_template_inputs(self) -> None:
@@ -305,6 +310,7 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
                 skip_scrape=True,
             )
             task_spec = json.loads(Path(summary["task_spec_json"]).read_text(encoding="utf-8"))
+            workflow_handoff = json.loads(Path(summary["workflow_handoff_json"]).read_text(encoding="utf-8"))
 
         self.assertEqual(summary["vision_preflight"]["status"], "configured")
         self.assertTrue(summary["run_id"])
@@ -313,12 +319,21 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         self.assertEqual(summary["env_file"], str(env_path.resolve()))
         self.assertEqual(summary["resolved_inputs"]["env_file"]["path"], str(env_path.resolve()))
         self.assertEqual(summary["resolved_config_sources"]["env_file"], "cli")
+        self.assertEqual(summary["workflow_handoff_json"], str((temp_root / "run" / "workflow_handoff.json").resolve()))
         self.assertTrue(summary["setup"]["completed"])
         self.assertEqual(task_spec["scope"], "keep-list-screening")
         self.assertEqual(task_spec["canonical_boundary"], "screening")
         self.assertEqual(task_spec["intent"]["keep_workbook"], str(keep_path.resolve()))
         self.assertEqual(task_spec["intent"]["requested_platforms"], ["instagram"])
+        self.assertEqual(task_spec["run"]["workflow_handoff_json"], summary["workflow_handoff_json"])
         self.assertTrue(task_spec["paths"]["staging_summary_json"].endswith("/staging_summary.json"))
+        self.assertEqual(workflow_handoff["verdict"]["outcome"], "completed")
+        self.assertEqual(workflow_handoff["recommended_action"], "consume_outputs")
+        self.assertTrue(workflow_handoff["task_spec_available"])
+        self.assertEqual(workflow_handoff["current_stage"], "instagram:scrape_skipped")
+        self.assertEqual(workflow_handoff["next_report_triggers"], [])
+        self.assertFalse(workflow_handoff["resume"]["available"])
+        self.assertEqual(workflow_handoff["intent_summary"]["controls"]["skip_scrape"], True)
         self.assertTrue(summary["resolved_inputs"]["keep_workbook"]["exists"])
         self.assertEqual(summary["resolved_inputs"]["keep_workbook"]["source"], "cli_or_default")
         self.assertEqual(summary["preflight"]["template_input_mode"], "template_workbook")
