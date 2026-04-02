@@ -1,6 +1,6 @@
 # Shared Mailbox Post-Sync 链路说明
 
-更新时间：`2026-04-01`
+更新时间：`2026-04-02`
 
 详细复盘另见：
 
@@ -13,6 +13,73 @@
 - `SKG` 这类按任务名运行的真实语义
 - `keep-list -> Apify -> visual -> positioning -> export -> upload`
 - 抓取失败、补抓、`Missing`、阻断导出的行为
+
+## 2026-04-02 当前主线口径
+
+这一节优先级高于下面的历史复盘段落。
+
+如果只想知道“现在这条线到底怎么跑、哪些边界已经验证过”，按这一节理解就可以。
+
+### 当前正式链路
+
+1. 先跑 `scripts/run_shared_mailbox_sync.py`，把共享邮箱同步到本地 `email_sync.db`
+2. 再跑 `scripts/run_shared_mailbox_post_sync_pipeline.py`，按任务名从当前飞书 `task-upload` 拉有效任务
+3. 从任务上传记录里实时读取：
+   - 需求模板附件
+   - 发信名单附件
+   - 目标飞书表链接
+   - 员工信息 / 负责人映射
+4. 先做 shared-mailbox 命中和 keep-list 归并：
+   - 老达人只做邮件增量更新
+   - 新达人才进入完整筛号链路
+5. 下游完整筛号链路是：
+   - `staging`
+   - `scrape`
+   - `visual review`
+   - `positioning card analysis`
+   - `final export`
+   - `feishu writeback`
+
+### 这次已经验证过的运行边界
+
+- 任务上传附件不再要求只能靠 `file_token`
+- 现在支持：
+  - 标准 `file_token` 附件
+  - 飞书返回的完整下载 URL
+  - 只有 URL、没有 `file_token` 的附件记录
+- 直链下载只会信任飞书 host，并保留 `bitablePerm` 这类权限参数
+- 模板主 sheet 名即使从 `需求主表` 变成 `Sheet1`，只要内容结构还是标准模板，parser 也能继续解析
+- single-entry final runner 现在把 `completed`、`completed_with_partial_scrape`、`staged_only`、`vision_probe_only` 都当成成功终态
+- visual provider race 现在会先给 preferred provider 重试窗口，再决定是否锁到 fallback
+- visual / positioning 超时后的残留 worker 不会再把进程收尾拖死
+
+### 现在最准确的一句话
+
+只要：
+
+- 任务上传里的模板和发信名单还是合法 Excel 附件
+- 模板字段结构 / 语义没有大改
+- parser 能正常解析出 rulespec 和 visual prompts
+
+那当前这条链路就可以从：
+
+- `task-name`
+- 到 shared-mailbox 邮件匹配
+- 到 downstream screening
+- 到最终 payload / 飞书真实写回
+
+完整跑通。
+
+### 已实跑验证
+
+`2026-04-01` 到 `2026-04-02` 这轮，已经实跑验证过：
+
+- `SKG-1` fresh dry-run：通过
+- `SKG-2` fresh dry-run：通过
+- `SKG-1` live writeback：通过
+- `SKG-2` live writeback：通过
+
+所以这份文档下面的历史段落可以继续看，但如果和这里有冲突，以这一节为准。
 
 ## 一句话概述
 
