@@ -160,6 +160,7 @@ def collect_platforms(spec: dict[str, Any], explicit_platform: str | None = None
 
 def build_visual_prompt_bundle(spec: dict[str, Any], platform: str) -> dict[str, Any]:
     visual_scope = spec.get("visual_scope") or {}
+    final_logic = spec.get("final_logic") or {}
     positive_features_raw = list(visual_scope.get("positive_features") or [])
     negative_features_raw = list(visual_scope.get("negative_features") or [])
     manual_items_raw = list(spec.get("manual_review_items") or [])
@@ -196,6 +197,7 @@ def build_visual_prompt_bundle(spec: dict[str, Any], platform: str) -> dict[str,
     goal = normalize_text(spec.get("goal"))
     platform_name = PLATFORM_LABELS.get(platform, platform or "达人")
     include_protected_notice = has_protected_attribute_notice(compliance_notes_raw)
+    manual_hit_action = normalize_text(final_logic.get("manual_hit_action")).lower()
 
     lines = [
         f"你是 {platform_name} 达人初筛流程中的视觉复核员。输入图片是一位博主最近最多 {cover_count} 张封面，按时间顺序拆成最多 2 张 3x3 九宫格。请综合全部输入图片一起判断。",
@@ -224,7 +226,24 @@ def build_visual_prompt_bundle(spec: dict[str, Any], platform: str) -> dict[str,
             lines.append(f"{index}. {item}")
 
     if manual_items:
-        lines.extend(["", "人工判断提醒：不要把以下事项当作自动通过或自动拒绝条件："])
+        if manual_hit_action == "manual_review":
+            lines.extend(
+                [
+                    "",
+                    "人工复核提醒：以下事项只用于补充需要人工关注的可见线索，不要把它们单独当作自动通过或自动拒绝条件：",
+                    "- 只记录画面里直接看到的物体、人物、场景或动作，不要把身份、关系、阶段等推断当成事实。",
+                    "- 如果人工判断项本身带有推断性结论，也不要直接沿用该结论；请改写成可见线索，方便人工复核。",
+                    "- 最终 `decision` 仍只能输出 `Pass` 或 `Reject`；如果命中这些事项，请把需要人工复核的线索写进 `reason` 和 `signals`。",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    "",
+                    "人工判断提醒：不要把以下事项当作自动通过或自动拒绝条件：",
+                    "- 只记录画面里直接看到的线索，不要把主观推断当事实。",
+                ]
+            )
         for item in manual_items:
             lines.append(f"- {item}")
 

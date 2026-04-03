@@ -5,6 +5,8 @@ import tempfile
 from pathlib import Path
 import unittest
 
+from openpyxl import Workbook
+
 from workbook_template_parser import build_visual_prompt_artifacts, compile_workbook
 
 
@@ -141,6 +143,78 @@ class WorkbookTemplateParserTests(unittest.TestCase):
         self.assertEqual(set(bundles), {"youtube"}, bundles)
         self.assertEqual(bundles["youtube"]["platform"], "youtube", bundles)
         self.assertIn("你是 YouTube 达人初筛流程中的视觉复核员", bundles["youtube"]["prompt"])
+
+    def test_compile_workbook_preserves_label_only_manual_review_items_and_manual_review_prompt(self) -> None:
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "需求主表"
+        rows = [
+            ("字段", "内容", "说明"),
+            ("A. 基本信息", "", ""),
+            ("项目名称", "MINISO", ""),
+            ("品牌 / 产品", "MINISO 母婴场景", ""),
+            ("适用平台", "Instagram", ""),
+            ("B. 步骤1：基础资质审核", "", ""),
+            ("地区要求", "美国", ""),
+            ("C. 步骤2：数据审核", "", ""),
+            ("中位数播放量阈值", 10000, ""),
+            ("D. 步骤3：内容 / 视觉审核", "", ""),
+            ("产品展示", "需要", ""),
+            ("E. 步骤4：排除项审核", "", ""),
+            ("不符合时处理", "排除", ""),
+            ("F. 人工判断项 / 合规提醒", "", ""),
+            ("当封面出现奶瓶时，需要人工复核，不要直接判断达人为哺乳期妈妈", "", ""),
+            ("合规提醒", "只记录看得到的母婴用品线索，不要推断身份", ""),
+            ("G. 最终判定逻辑", "", ""),
+            ("人工判断项命中时如何处理", "转人工", ""),
+            ("满足条件时输出", "通过", ""),
+            ("不满足时输出", "不通过", ""),
+        ]
+        for row_index, row in enumerate(rows, start=1):
+            for column_index, value in enumerate(row, start=1):
+                sheet.cell(row=row_index, column=column_index).value = value
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            workbook_path = Path(tmpdir) / "miniso_manual_review.xlsx"
+            workbook.save(workbook_path)
+
+            report = compile_workbook(workbook_path, Path(tmpdir))
+            artifacts = report["artifacts"]
+            structured = json.loads(Path(artifacts["structured_requirement_json"]).read_text(encoding="utf-8"))
+            prompts = json.loads(Path(artifacts["visual_prompts_json"]).read_text(encoding="utf-8"))
+
+        self.assertTrue(report["success"], report)
+        self.assertEqual(len(structured["manual_review"]["extra_items"]), 1)
+        self.assertEqual(
+            structured["manual_review"]["extra_items"][0]["source_cell"],
+            "B15",
+        )
+        self.assertEqual(
+            structured["manual_review"]["extra_items"][0]["label"],
+            "当封面出现奶瓶时，需要人工复核，不要直接判断达人为哺乳期妈妈",
+        )
+        self.assertIsNone(structured["manual_review"]["extra_items"][0]["value"])
+        self.assertIsNone(structured["manual_review"]["extra_items"][0]["note"])
+        self.assertEqual(len(structured["manual_review"]["compliance_notes"]), 1)
+        self.assertEqual(structured["manual_review"]["compliance_notes"][0]["source_cell"], "B16")
+        self.assertEqual(structured["manual_review"]["compliance_notes"][0]["label"], "合规提醒")
+        self.assertEqual(
+            structured["manual_review"]["compliance_notes"][0]["value"],
+            "只记录看得到的母婴用品线索，不要推断身份",
+        )
+        self.assertEqual(
+            structured["manual_review"]["compliance_notes"][0]["policy"],
+            "never_compile_to_automation",
+        )
+        prompt = prompts["instagram"]["prompt"]
+        self.assertIn("人工复核提醒：以下事项只用于补充需要人工关注的可见线索", prompt)
+        self.assertIn("只记录画面里直接看到的物体、人物、场景或动作", prompt)
+        self.assertIn("不要把身份、关系、阶段等推断当成事实", prompt)
+        self.assertIn("如果人工判断项本身带有推断性结论，也不要直接沿用该结论", prompt)
+        self.assertIn("最终 `decision` 仍只能输出 `Pass` 或 `Reject`", prompt)
+        self.assertIn("当封面出现奶瓶时，需要人工复核，不要直接判断达人为哺乳期妈妈", prompt)
+        self.assertIn("合规提醒：", prompt)
+        self.assertIn("只记录看得到的母婴用品线索，不要推断身份", prompt)
 
 
 if __name__ == "__main__":

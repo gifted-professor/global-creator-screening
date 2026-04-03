@@ -635,6 +635,22 @@ def parse_manual_review(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], lis
             payload["full_video_review"] = bool(parsed_bool)
         elif "其他主观判断项" in label:
             payload["other_subjective_items"] = clean_text(value)
+        elif "合规提醒" in label:
+            compliance_value = clean_text(value) or clean_text(note)
+            if not compliance_value:
+                normalized_label = clean_text(label)
+                if normalized_label and normalized_label != "合规提醒":
+                    compliance_value = normalized_label
+            if compliance_value:
+                payload["compliance_notes"].append(
+                    {
+                        "source_cell": row["value_cell"],
+                        "label": label,
+                        "value": compliance_value,
+                        "note": clean_text(note),
+                        "policy": "never_compile_to_automation",
+                    }
+                )
         elif "受保护属性相关判断" in label:
             payload["protected_attribute_notice"] = clean_text(value)
             if payload["protected_attribute_notice"]:
@@ -650,6 +666,10 @@ def parse_manual_review(rows: list[dict[str, Any]]) -> tuple[dict[str, Any], lis
             payload["notes"] = clean_text(value)
         else:
             raw_text = clean_text(value) or clean_text(note)
+            if not raw_text:
+                normalized_label = clean_text(label)
+                if normalized_label and normalized_label not in {"合规提醒", "补充说明"}:
+                    raw_text = normalized_label
             if raw_text:
                 payload["extra_items"].append(
                     {
