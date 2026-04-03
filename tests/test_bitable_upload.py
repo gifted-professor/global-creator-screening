@@ -63,11 +63,11 @@ class _FakeBitableUploadClient:
                 {"field_id": "fld3", "field_name": "主页链接", "type": 15, "property": None},
                 {"field_id": "fld4", "field_name": "Followers(K)", "type": 2, "property": {"formatter": "0"}},
                 {"field_id": "fld5", "field_name": "Following", "type": 2, "property": {"formatter": "0"}},
-                {"field_id": "fld6", "field_name": "Average Views (K)", "type": 2, "property": {"formatter": "0"}},
+                {"field_id": "fld6", "field_name": "Median Views (K)", "type": 2, "property": {"formatter": "0"}},
                 {"field_id": "fld7", "field_name": "互动率", "type": 1, "property": None},
                 {"field_id": "fld8", "field_name": "当前网红报价", "type": 1, "property": None},
                 {"field_id": "fld9", "field_name": "达人最后一次回复邮件时间", "type": 5, "property": {"date_formatter": "yyyy/MM/dd"}},
-                {"field_id": "fld10", "field_name": "达人回复的最后一封邮件内容", "type": 1, "property": None},
+                {"field_id": "fld10", "field_name": "full body", "type": 1, "property": None},
                 {"field_id": "fld11", "field_name": "达人对接人", "type": 11, "property": {"multiple": False}},
                 {
                     "field_id": "fld12",
@@ -185,7 +185,7 @@ class BitableUploadTests(unittest.TestCase):
                                 "主页链接": "https://www.instagram.com/alpha",
                                 "# Followers(K)#": 123.4,
                                 "Following": 321.9,
-                                "Average Views (K)": 56.7,
+                                "Median Views (K)": 56.7,
                                 "互动率": "12.3%",
                                 "当前网红报价": "$100",
                                 "达人最后一次回复邮件时间": "2026/03/30",
@@ -234,7 +234,7 @@ class BitableUploadTests(unittest.TestCase):
             self.assertEqual(created_fields["平台"], "instagram")
             self.assertEqual(created_fields["Followers(K)"], 123.4)
             self.assertEqual(created_fields["Following"], 321.9)
-            self.assertEqual(created_fields["Average Views (K)"], 56.7)
+            self.assertEqual(created_fields["Median Views (K)"], 56.7)
             self.assertEqual(created_fields["ai 是否通过"], "是")
             self.assertEqual(created_fields["标签（ai）"], ["家庭用品和家电-家庭博主"])
             self.assertEqual(
@@ -247,6 +247,7 @@ class BitableUploadTests(unittest.TestCase):
             )
             self.assertEqual(created_fields["达人对接人"], [{"id": "ou_alpha"}])
             self.assertIsInstance(created_fields["达人最后一次回复邮件时间"], int)
+            self.assertEqual(created_fields["full body"], "hi")
             self.assertEqual(created_fields["文本 12"], [{"file_token": "boxcn-upload-1", "name": "alpha-last.eml"}])
             self.assertEqual(client.uploaded_local_files[0]["local_path"], str(raw_mail_path))
             self.assertEqual(client.uploaded_local_files[0]["parent_type"], "bitable_file")
@@ -341,7 +342,7 @@ class BitableUploadTests(unittest.TestCase):
                                 "平台": "instagram",
                                 "主页链接": "https://www.instagram.com/gamma",
                                 "# Followers(K)#": 300,
-                                "Average Views (K)": 40,
+                                "Median Views (K)": 40,
                                 "互动率": "9.1%",
                                 "当前网红报价": "$300",
                                 "达人最后一次回复邮件时间": "2026/03/31",
@@ -387,10 +388,10 @@ class BitableUploadTests(unittest.TestCase):
         gamma_update = next(item for item in client.updated_records if item["record_id"] == "rec_unscreened")
         self.assertEqual(
             set(beta_update["fields"].keys()),
-            {"当前网红报价", "达人最后一次回复邮件时间", "达人回复的最后一封邮件内容", "文本 12"},
+            {"当前网红报价", "达人最后一次回复邮件时间", "full body", "文本 12"},
         )
         self.assertEqual(beta_update["fields"]["当前网红报价"], "$200")
-        self.assertEqual(beta_update["fields"]["达人回复的最后一封邮件内容"], "latest follow-up")
+        self.assertEqual(beta_update["fields"]["full body"], "latest follow-up")
         self.assertEqual(beta_update["fields"]["文本 12"], [{"file_token": "boxcn-upload-1", "name": "beta-last.eml"}])
         self.assertEqual(gamma_update["fields"]["达人ID"], "gamma")
         self.assertEqual(gamma_update["fields"]["ai 是否通过"], "是")
@@ -436,7 +437,7 @@ class BitableUploadTests(unittest.TestCase):
                                 "平台": "instagram",
                                 "主页链接": "https://www.instagram.com/epsilon",
                                 "# Followers(K)#": 301,
-                                "Average Views (K)": 42,
+                                "Median Views (K)": 42,
                                 "互动率": "8.5%",
                                 "当前网红报价": "$350",
                                 "达人最后一次回复邮件时间": "2026/03/30",
@@ -473,7 +474,7 @@ class BitableUploadTests(unittest.TestCase):
         self.assertEqual(beta_update["record_id"], "rec_existing")
         self.assertEqual(
             set(beta_update["fields"].keys()),
-            {"当前网红报价", "达人最后一次回复邮件时间", "达人回复的最后一封邮件内容", "文本 12"},
+            {"当前网红报价", "达人最后一次回复邮件时间", "full body", "文本 12"},
         )
         self.assertNotIn("Followers(K)", beta_update["fields"])
         created_fields = client.created_records[0]["fields"]

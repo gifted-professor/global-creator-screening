@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime, timezone
 import os
 from pathlib import Path
 import re
 from time import perf_counter
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from email_sync.config import Settings
 from email_sync.db import Database
@@ -61,6 +62,13 @@ _TASK_GROUP_ALIASES = {
     "skg": {"skg", "skg1", "skg-1", "skg2", "skg-2"},
 }
 _TASK_GROUP_SUFFIX_PATTERN = re.compile(r"(?:[-_\s]*\d+)$")
+_TASK_START_DATE_FIELD_NAMES = (
+    "任务开始时间",
+    "开始时间",
+    "任务开始日期",
+    "开始日期",
+)
+_SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 
 @dataclass(frozen=True)
@@ -79,6 +87,7 @@ class TaskUploadEntry:
     sending_list_file_token: str
     sending_list_file_url: str
     sending_list_file_name: str
+    task_start_date: str = ""
 
 
 @dataclass(frozen=True)
@@ -217,6 +226,7 @@ def download_task_upload_screening_assets(
     return {
         "recordId": entry.record_id,
         "taskName": entry.task_name,
+        "taskStartDate": entry.task_start_date,
         "linkedBitableUrl": entry.linked_bitable_url,
         "templateFileToken": entry.workbook_file_token,
         "templateFileUrl": entry.workbook_file_url,
@@ -387,6 +397,7 @@ def inspect_task_upload_assignments(
         item = {
             "recordId": entry.record_id,
             "taskName": entry.task_name,
+            "taskStartDate": entry.task_start_date,
             "employeeId": entry.employee_id,
             "responsibleName": entry.responsible_name,
             "ownerName": entry.owner_name,
@@ -905,6 +916,7 @@ def _fetch_task_upload_entries(client: FeishuOpenClient, task_upload_url: str) -
         responsible_name = _extract_person_name(fields.get("负责人"))
         owner_name = owner_email or responsible_name or ""
         linked_bitable_url = _extract_mention_link(fields.get("达人管理表链接"))
+        task_start_date = _extract_task_start_date(fields)
         results.append(
             TaskUploadEntry(
                 record_id=str(item.get("record_id") or ""),
@@ -921,6 +933,7 @@ def _fetch_task_upload_entries(client: FeishuOpenClient, task_upload_url: str) -
                 sending_list_file_token=str((sending_list or {}).get("file_token") or "").strip(),
                 sending_list_file_url=str((sending_list or {}).get("url") or "").strip(),
                 sending_list_file_name=str((sending_list or {}).get("name") or "").strip() or "creator-source.xlsx",
+                task_start_date=task_start_date,
             )
         )
     return results
@@ -1451,6 +1464,75 @@ def _extract_mention_link(value: Any) -> str:
     if isinstance(value, dict):
         return _normalize_text(value.get("link") or value.get("url"))
     return ""
+
+
+def _extract_task_start_date(fields: dict[str, Any]) -> str:
+    for field_name in _TASK_START_DATE_FIELD_NAMES:
+        normalized = _extract_date_like(fields.get(field_name))
+        if normalized:
+            return normalized
+    return ""
+
+
+def _extract_date_like(value: Any) -> str:
+    if isinstance(value, dict):
+        nested = value.get("value")
+        if nested is not None:
+            return _extract_date_like(nested)
+        for key in ("text", "link", "name"):
+            candidate = _extract_date_like(value.get(key))
+            if candidate:
+                return candidate
+        return ""
+    if isinstance(value, list):
+        for item in value:
+            candidate = _extract_date_like(item)
+            if candidate:
+                return candidate
+        return ""
+    if isinstance(value, (int, float)):
+        return _normalize_timestamp_to_date(float(value))
+
+    text = _normalize_text(value)
+    if not text:
+        return ""
+    if text.isdigit():
+        normalized = _normalize_timestamp_to_date(float(text))
+        if normalized:
+            return normalized
+
+    normalized_text = text.replace("Z", "+00:00")
+    try:
+        parsed_datetime = datetime.fromisoformat(normalized_text)
+    except ValueError:
+        parsed_datetime = None
+    if parsed_datetime is not None:
+        if parsed_datetime.tzinfo is None:
+            return parsed_datetime.date().isoformat()
+        return parsed_datetime.astimezone(_SHANGHAI_TZ).date().isoformat()
+
+    normalized_date_text = text.replace("/", "-")
+    try:
+        return date.fromisoformat(normalized_date_text).isoformat()
+    except ValueError:
+        pass
+
+    match = re.search(r"(\d{4})[/-](\d{1,2})[/-](\d{1,2})", text)
+    if match:
+        year, month, day = match.groups()
+        try:
+            return date(int(year), int(month), int(day)).isoformat()
+        except ValueError:
+            return ""
+    return ""
+
+
+def _normalize_timestamp_to_date(value: float) -> str:
+    if value <= 0:
+        return ""
+    timestamp = value / 1000 if value > 10_000_000_000 else value
+    parsed = datetime.fromtimestamp(timestamp, tz=timezone.utc).astimezone(_SHANGHAI_TZ)
+    return parsed.date().isoformat()
 
 
 def _require_text(field_index: dict[tuple[str, str], dict[str, Any]], section: str, field_name: str) -> str:

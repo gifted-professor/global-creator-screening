@@ -12,6 +12,57 @@ from backend.final_export_merge import build_all_platforms_final_review_artifact
 
 
 class FinalExportMergeTests(unittest.TestCase):
+    def test_keep_lookup_falls_back_across_platforms_for_mail_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            exports_dir = root / "exports"
+            instagram_export = exports_dir / "instagram" / "instagram_final_review.xlsx"
+            instagram_export.parent.mkdir(parents=True, exist_ok=True)
+
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "alpha",
+                        "username": "alpha",
+                        "profile_url": "https://www.instagram.com/alpha/",
+                        "upload_handle": "alpha",
+                        "final_status": "Pass",
+                        "final_reason": "内容契合",
+                    }
+                ]
+            ).to_excel(instagram_export, index=False)
+
+            keep_workbook = root / "upstream" / "exports" / "keep.xlsx"
+            keep_workbook.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(
+                [
+                    {
+                        "Platform": "TikTok",
+                        "@username": "alpha",
+                        "URL": "https://www.tiktok.com/@alpha",
+                        "last_mail_time": "2026-04-03T05:27:00+08:00",
+                        "last_mail_snippet": "hello from mail thread",
+                    }
+                ]
+            ).to_excel(keep_workbook, index=False)
+
+            output_path = exports_dir / "all_platforms_final_review.xlsx"
+            payload_path = exports_dir / "all_platforms_final_review_payload.json"
+            build_all_platforms_final_review_artifacts(
+                output_path=output_path,
+                payload_json_path=payload_path,
+                final_exports={
+                    "instagram": {
+                        "final_review": str(instagram_export),
+                    }
+                },
+                keep_workbook=keep_workbook,
+                task_owner={"responsible_name": "陈俊仁"},
+            )
+
+            workbook = pd.read_excel(output_path).fillna("")
+            self.assertEqual(workbook.loc[0, "full body"], "hello from mail thread")
+
     def test_fast_path_brand_message_fields_flow_into_export_and_payload(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -37,7 +88,7 @@ class FinalExportMergeTests(unittest.TestCase):
             raw_dir = root / "upstream" / "raw"
             raw_dir.mkdir(parents=True, exist_ok=True)
             raw_mail_path = raw_dir / "alpha-brand-message.eml"
-            raw_mail_path.write_text("Subject: alpha\n\n报价 $300", encoding="utf-8")
+            raw_mail_path.write_text("Subject: alpha\n\nHi team,\n\nFull body rate is $300 per video.", encoding="utf-8")
             pd.DataFrame(
                 [
                     {
@@ -87,7 +138,9 @@ class FinalExportMergeTests(unittest.TestCase):
             payload = json.loads(payload_path.read_text(encoding="utf-8"))
             self.assertEqual(workbook.loc[0, "当前网红报价"], "$300 per video")
             self.assertEqual(workbook.loc[0, "达人最后一次回复邮件时间"], "2026/03/31")
-            self.assertEqual(workbook.loc[0, "达人回复的最后一封邮件内容"], "Hi team, rate is $300 per video.")
+            self.assertEqual(workbook.loc[0, "full body"], "Hi team,\n\nFull body rate is $300 per video.")
+            self.assertEqual(payload["rows"][0]["full body"], "Hi team,\n\nFull body rate is $300 per video.")
+            self.assertEqual(payload["rows"][0]["达人回复的最后一封邮件内容"], "Hi team,\n\nFull body rate is $300 per video.")
             self.assertEqual(payload["rows"][0]["__feishu_update_mode"], "create_or_mail_only_update")
             self.assertEqual(payload["rows"][0]["creator_emails"], "alpha@example.com | manager@example.com")
             self.assertEqual(payload["rows"][0]["matched_contact_email"], "alpha@example.com")
@@ -439,13 +492,13 @@ class FinalExportMergeTests(unittest.TestCase):
 
             instagram_row = rows.loc[rows["达人ID"] == "ejay.cruzz"].iloc[0].to_dict()
             self.assertEqual(instagram_row["# Followers(K)#"], 290.2)
-            self.assertEqual(instagram_row["Average Views (K)"], "")
+            self.assertEqual(instagram_row["Median Views (K)"], "")
             self.assertIn("无视频播放数据", instagram_row["ai筛号反馈理由"])
             self.assertIn("无视频播放数据", instagram_row["ai评价"])
 
             tiktok_row = rows.loc[rows["达人ID"] == "farrobear"].iloc[0].to_dict()
             self.assertEqual(tiktok_row["# Followers(K)#"], "")
-            self.assertEqual(tiktok_row["Average Views (K)"], "")
+            self.assertEqual(tiktok_row["Median Views (K)"], "")
             self.assertIn("无抓取数据，需人工确认", tiktok_row["ai筛号反馈理由"])
             self.assertIn("无抓取数据，需人工确认", tiktok_row["ai评价"])
 
@@ -501,7 +554,7 @@ class FinalExportMergeTests(unittest.TestCase):
             row = payload["rows"][0]
             self.assertEqual(row["# Followers(K)#"], 1376.3)
             self.assertEqual(row["Following"], 2.3)
-            self.assertEqual(row["Average Views (K)"], 242.7)
+            self.assertEqual(row["Median Views (K)"], 242.7)
             self.assertEqual(row["互动率"], "16.1%")
 
     def test_processing_failures_and_positioning_errors_are_explicit_in_combined_sheet(self) -> None:
@@ -735,6 +788,50 @@ class FinalExportMergeTests(unittest.TestCase):
             self.assertEqual(tiktok_row["ai筛号反馈理由"], "视觉复核异常，需人工确认")
             self.assertNotIn("quan2go", tiktok_row["ai筛号反馈理由"])
             self.assertNotIn("定位卡未完成", tiktok_row["ai筛号反馈理由"])
+
+    def test_manual_review_rows_are_emitted_when_all_platforms_fail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            exports_dir = root / "exports"
+            keep_workbook = root / "upstream" / "exports" / "keep.xlsx"
+            keep_workbook.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(
+                [
+                    {
+                        "Platform": "TikTok",
+                        "@username": "beta",
+                        "URL": "https://www.tiktok.com/@beta",
+                        "last_mail_time": "2026-04-03T05:27:00+08:00",
+                        "last_mail_snippet": "Please share more details.",
+                    }
+                ]
+            ).to_excel(keep_workbook, index=False)
+
+            output_path = exports_dir / "all_platforms_final_review.xlsx"
+            payload_path = exports_dir / "all_platforms_final_review_payload.json"
+            build_all_platforms_final_review_artifacts(
+                output_path=output_path,
+                payload_json_path=payload_path,
+                final_exports={},
+                keep_workbook=keep_workbook,
+                manual_review_rows=[
+                    {
+                        "identifier": "beta",
+                        "platform": "youtube",
+                        "profile_url": "https://www.youtube.com/@beta",
+                        "reason": "TikTok / Instagram / YouTube 均未抓取到有效资料，需人工确认。",
+                    }
+                ],
+                task_owner={"responsible_name": "陈俊仁"},
+            )
+
+            workbook = pd.read_excel(output_path).fillna("")
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+            self.assertEqual(workbook.loc[0, "达人ID"], "beta")
+            self.assertEqual(workbook.loc[0, "平台"], "youtube")
+            self.assertEqual(workbook.loc[0, "ai是否通过"], "转人工")
+            self.assertIn("需人工确认", workbook.loc[0, "ai筛号反馈理由"])
+            self.assertEqual(payload["rows"][0]["ai是否通过"], "转人工")
 
 
 if __name__ == "__main__":

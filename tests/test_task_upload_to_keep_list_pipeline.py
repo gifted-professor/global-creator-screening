@@ -1023,6 +1023,191 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
             "default_account_preferred_with_employee_fallback",
         )
 
+    def test_runner_defaults_sent_since_to_task_upload_start_date(self) -> None:
+        observed: dict[str, object] = {}
+
+        class FakeDb:
+            def __init__(self, db_path):
+                self.db_path = Path(db_path)
+
+            def close(self):
+                return None
+
+        def fake_download_task_upload_screening_assets(**kwargs):
+            download_dir = Path(kwargs["download_dir"])
+            template_path = download_dir / "template.xlsx"
+            sending_list_path = download_dir / "sending_list.xlsx"
+            template_path.parent.mkdir(parents=True, exist_ok=True)
+            template_path.touch()
+            sending_list_path.touch()
+            return {
+                "recordId": "rec123",
+                "taskName": "MINISO",
+                "taskStartDate": "2026-04-01",
+                "linkedBitableUrl": "https://bitable.example/miniso",
+                "templateDownloadedPath": str(template_path),
+                "sendingListDownloadedPath": str(sending_list_path),
+            }
+
+        def fake_sync_task_upload_mailboxes(**kwargs):
+            observed["sent_since"] = kwargs["sent_since"]
+            mail_root = Path(kwargs["mail_data_dir"])
+            db_path = mail_root / "MINISO" / "email_sync.db"
+            raw_dir = mail_root / "MINISO" / "raw"
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            db_path.touch()
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            return {
+                "selectedCount": 1,
+                "syncedCount": 1,
+                "failedCount": 0,
+                "items": [
+                    {
+                        "taskName": "MINISO",
+                        "employeeName": "Alice",
+                        "resolvedFolder": "其他文件夹/MINISO",
+                        "mailFetchedCount": 3,
+                        "mailSyncOk": True,
+                        "mailSyncError": "",
+                        "mailDbPath": str(db_path),
+                        "mailRawDir": str(raw_dir),
+                        "mailDataDir": str(db_path.parent),
+                    }
+                ],
+            }
+
+        task_runner._load_runtime_dependencies = lambda: {
+            "Settings": object,
+            "Database": FakeDb,
+            "FeishuOpenClient": lambda **kwargs: object(),
+            "DEFAULT_FEISHU_BASE_URL": "https://open.feishu.cn",
+            "download_task_upload_screening_assets": fake_download_task_upload_screening_assets,
+            "sync_task_upload_mailboxes": fake_sync_task_upload_mailboxes,
+            "match_brand_keyword": lambda **kwargs: {},
+            "resolve_shared_email_candidates": lambda **kwargs: {},
+            "run_shared_email_final_review": lambda **kwargs: {},
+            "enrich_creator_workbook": lambda **kwargs: {},
+            "prepare_llm_review_candidates": lambda **kwargs: {},
+            "run_and_apply_llm_review": lambda **kwargs: {},
+            "resolve_sync_sent_since": lambda value: __import__("datetime").date.fromisoformat(value) if value else __import__("datetime").date(2025, 12, 27),
+            "load_local_env": lambda env_file: {},
+            "get_preferred_value": lambda cli_value, env_values, env_key, default="": str(cli_value or "").strip() or str(env_values.get(env_key, default) or "").strip(),
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            env_path = self._write_env_file(temp_root)
+            summary = task_runner.run_task_upload_to_keep_list_pipeline(
+                task_name="MINISO",
+                env_file=env_path,
+                output_root=temp_root / "run",
+                summary_json=temp_root / "run" / "summary.json",
+                stop_after="mail-sync",
+                task_upload_url="https://example.com/task",
+                employee_info_url="https://example.com/employee",
+                feishu_app_id="app-id",
+                feishu_app_secret="app-secret",
+            )
+
+        self.assertEqual(summary["status"], "stopped_after_mail-sync")
+        self.assertEqual(summary["resolved_inputs"]["mail_sync"]["sent_since"], "2026-04-01")
+        self.assertEqual(summary["resolved_inputs"]["mail_sync"]["sent_since_source"], "task_upload_start_time")
+        self.assertEqual(summary["resolved_inputs"]["mail_sync"]["task_start_date"], "2026-04-01")
+        self.assertEqual(observed["sent_since"], "2026-04-01")
+
+    def test_runner_prefers_cli_sent_since_over_task_upload_start_date(self) -> None:
+        observed: dict[str, object] = {}
+
+        class FakeDb:
+            def __init__(self, db_path):
+                self.db_path = Path(db_path)
+
+            def close(self):
+                return None
+
+        def fake_download_task_upload_screening_assets(**kwargs):
+            download_dir = Path(kwargs["download_dir"])
+            template_path = download_dir / "template.xlsx"
+            sending_list_path = download_dir / "sending_list.xlsx"
+            template_path.parent.mkdir(parents=True, exist_ok=True)
+            template_path.touch()
+            sending_list_path.touch()
+            return {
+                "recordId": "rec123",
+                "taskName": "MINISO",
+                "taskStartDate": "2026-04-01",
+                "linkedBitableUrl": "https://bitable.example/miniso",
+                "templateDownloadedPath": str(template_path),
+                "sendingListDownloadedPath": str(sending_list_path),
+            }
+
+        def fake_sync_task_upload_mailboxes(**kwargs):
+            observed["sent_since"] = kwargs["sent_since"]
+            mail_root = Path(kwargs["mail_data_dir"])
+            db_path = mail_root / "MINISO" / "email_sync.db"
+            raw_dir = mail_root / "MINISO" / "raw"
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            db_path.touch()
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            return {
+                "selectedCount": 1,
+                "syncedCount": 1,
+                "failedCount": 0,
+                "items": [
+                    {
+                        "taskName": "MINISO",
+                        "employeeName": "Alice",
+                        "resolvedFolder": "其他文件夹/MINISO",
+                        "mailFetchedCount": 3,
+                        "mailSyncOk": True,
+                        "mailSyncError": "",
+                        "mailDbPath": str(db_path),
+                        "mailRawDir": str(raw_dir),
+                        "mailDataDir": str(db_path.parent),
+                    }
+                ],
+            }
+
+        task_runner._load_runtime_dependencies = lambda: {
+            "Settings": object,
+            "Database": FakeDb,
+            "FeishuOpenClient": lambda **kwargs: object(),
+            "DEFAULT_FEISHU_BASE_URL": "https://open.feishu.cn",
+            "download_task_upload_screening_assets": fake_download_task_upload_screening_assets,
+            "sync_task_upload_mailboxes": fake_sync_task_upload_mailboxes,
+            "match_brand_keyword": lambda **kwargs: {},
+            "resolve_shared_email_candidates": lambda **kwargs: {},
+            "run_shared_email_final_review": lambda **kwargs: {},
+            "enrich_creator_workbook": lambda **kwargs: {},
+            "prepare_llm_review_candidates": lambda **kwargs: {},
+            "run_and_apply_llm_review": lambda **kwargs: {},
+            "resolve_sync_sent_since": lambda value: __import__("datetime").date.fromisoformat(value) if value else __import__("datetime").date(2025, 12, 27),
+            "load_local_env": lambda env_file: {},
+            "get_preferred_value": lambda cli_value, env_values, env_key, default="": str(cli_value or "").strip() or str(env_values.get(env_key, default) or "").strip(),
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            env_path = self._write_env_file(temp_root)
+            summary = task_runner.run_task_upload_to_keep_list_pipeline(
+                task_name="MINISO",
+                env_file=env_path,
+                output_root=temp_root / "run",
+                summary_json=temp_root / "run" / "summary.json",
+                stop_after="mail-sync",
+                sent_since="2026-04-02",
+                task_upload_url="https://example.com/task",
+                employee_info_url="https://example.com/employee",
+                feishu_app_id="app-id",
+                feishu_app_secret="app-secret",
+            )
+
+        self.assertEqual(summary["status"], "stopped_after_mail-sync")
+        self.assertEqual(summary["resolved_inputs"]["mail_sync"]["sent_since"], "2026-04-02")
+        self.assertEqual(summary["resolved_inputs"]["mail_sync"]["sent_since_source"], "cli")
+        self.assertEqual(summary["resolved_inputs"]["mail_sync"]["task_start_date"], "2026-04-01")
+        self.assertEqual(observed["sent_since"], "2026-04-02")
+
     def test_runner_can_reuse_existing_artifacts_from_prior_summary(self) -> None:
         class FakeClient:
             pass

@@ -43,6 +43,7 @@ def _load_runtime_dependencies():
     from feishu_screening_bridge.task_upload_sync import (
         download_task_upload_screening_assets,
         inspect_task_upload_assignments,
+        resolve_task_upload_entry,
         sync_task_upload_mailboxes,
     )
 
@@ -53,6 +54,7 @@ def _load_runtime_dependencies():
         "DEFAULT_FEISHU_BASE_URL": DEFAULT_FEISHU_BASE_URL,
         "download_task_upload_screening_assets": download_task_upload_screening_assets,
         "inspect_task_upload_assignments": inspect_task_upload_assignments,
+        "resolve_task_upload_entry": resolve_task_upload_entry,
         "sync_task_upload_mailboxes": sync_task_upload_mailboxes,
         "match_brand_keyword": match_brand_keyword,
         "resolve_shared_email_candidates": resolve_shared_email_candidates,
@@ -482,6 +484,21 @@ def _resolve_downstream_reuse(
     return True, "upstream_inputs_unchanged"
 
 
+def _resolve_mail_sync_sent_since(
+    *,
+    explicit_sent_since: str,
+    task_start_date: str,
+    resolve_sync_sent_since: Any,
+) -> tuple[str, str]:
+    raw_explicit_sent_since = str(explicit_sent_since or "").strip()
+    if raw_explicit_sent_since:
+        return resolve_sync_sent_since(raw_explicit_sent_since).isoformat(), "cli"
+    normalized_task_start_date = str(task_start_date or "").strip()
+    if normalized_task_start_date:
+        return resolve_sync_sent_since(normalized_task_start_date).isoformat(), "task_upload_start_time"
+    return resolve_sync_sent_since(None).isoformat(), "default_today_only"
+
+
 def _build_template_prompt_artifacts(
     *,
     template_workbook: Path,
@@ -740,7 +757,8 @@ def run_task_upload_to_keep_list_pipeline(
             },
             "mail_sync": {
                 "sent_since": resolved_sent_since,
-                "sent_since_source": "cli" if str(sent_since or "").strip() else "default_today_only",
+                "sent_since_source": "cli" if str(sent_since or "").strip() else "pending_task_upload_start_time_or_default",
+                "task_start_date": "",
                 "source_mode": "pre_synced_mail_db" if str(existing_mail_db_path or "").strip() else "task_mail_sync",
                 "mail_limit": int(max(0, int(mail_limit))),
                 "mail_workers": int(max(1, int(mail_workers))),
@@ -908,8 +926,7 @@ def run_task_upload_to_keep_list_pipeline(
         enrich_creator_workbook = runtime["enrich_creator_workbook"]
         prepare_llm_review_candidates = runtime["prepare_llm_review_candidates"]
         run_and_apply_llm_review = runtime["run_and_apply_llm_review"]
-        resolved_sent_since = resolve_sync_sent_since(sent_since or None).isoformat()
-        summary["resolved_inputs"]["mail_sync"]["sent_since"] = resolved_sent_since
+        resolve_task_upload_entry = runtime.get("resolve_task_upload_entry")
     except Exception as exc:  # noqa: BLE001
         failure = _build_failure_payload(
             stage="runtime_import",
@@ -1052,6 +1069,7 @@ def run_task_upload_to_keep_list_pipeline(
                 "reused": False,
                 "record_id": task_assets_result.get("recordId", ""),
                 "linked_bitable_url": task_assets_result.get("linkedBitableUrl", ""),
+                "task_start_date": str(task_assets_result.get("taskStartDate") or "").strip(),
                 "artifacts": {
                     "template_workbook": str(task_assets_result.get("templateDownloadedPath") or ""),
                     "sending_list_workbook": str(task_assets_result.get("sendingListDownloadedPath") or ""),
@@ -1084,6 +1102,29 @@ def run_task_upload_to_keep_list_pipeline(
             "sending_list_workbook": task_assets["artifacts"]["sending_list_workbook"],
         }
         summary["canonical_artifacts"]["task_assets"] = _json_clone(summary["resume_points"]["task_assets"])
+        resolved_task_start_date = str(
+            task_assets.get("task_start_date")
+            or task_assets.get("raw", {}).get("taskStartDate")
+            or ""
+        ).strip()
+        if not resolved_task_start_date and not str(sent_since or "").strip() and callable(resolve_task_upload_entry):
+            try:
+                resolved_task_entry = resolve_task_upload_entry(
+                    client=client,
+                    task_upload_url=resolved_task_upload_url,
+                    task_name=normalized_task_name,
+                )
+                resolved_task_start_date = str(getattr(resolved_task_entry, "task_start_date", "") or "").strip()
+            except Exception:
+                resolved_task_start_date = ""
+        resolved_sent_since, resolved_sent_since_source = _resolve_mail_sync_sent_since(
+            explicit_sent_since=str(sent_since or "").strip(),
+            task_start_date=resolved_task_start_date,
+            resolve_sync_sent_since=resolve_sync_sent_since,
+        )
+        summary["resolved_inputs"]["mail_sync"]["sent_since"] = resolved_sent_since
+        summary["resolved_inputs"]["mail_sync"]["sent_since_source"] = resolved_sent_since_source
+        summary["resolved_inputs"]["mail_sync"]["task_start_date"] = resolved_task_start_date
         persist_summary(summary)
         if normalized_stop_after == "task-assets":
             return mark_stop("task-assets")
@@ -1247,6 +1288,7 @@ def run_task_upload_to_keep_list_pipeline(
             "failed_count": mail_sync_result.get("failedCount", 0),
             "task": {
                 "task_name": mail_item.get("taskName", ""),
+                "task_start_date": resolved_task_start_date,
                 "employee_name": mail_item.get("employeeName", ""),
                 "credential_source": mail_item.get("mailCredentialSource", ""),
                 "login_email": mail_item.get("mailLoginEmail", ""),
@@ -1283,7 +1325,7 @@ def run_task_upload_to_keep_list_pipeline(
             input_refs={
                 "sending_list_workbook": summary["artifacts"]["sending_list_workbook"],
                 "mail_data_dir": str(mail_root if not normalized_existing_mail_db_path else existing_mail_data_dir or Path(normalized_existing_mail_db_path).expanduser().resolve().parent),
-                "sent_since": resolve_sync_sent_since(sent_since or None).isoformat(),
+                "sent_since": resolved_sent_since,
                 "reset_state": bool(reset_state),
             },
             owned_artifact_keys=("mail_db_path", "mail_raw_dir", "mail_data_dir"),

@@ -30,6 +30,12 @@ This document covers the chain from:
 
 It does not document every helper module in the repo. It focuses on the operational path that people actually run.
 
+Current note:
+
+- the official upstream matching logic is now the mail funnel described in this document
+- operationally, that funnel is: brand filter -> sending-list match -> regex match -> LLM tail
+- the keep workbook remains the canonical downstream handoff artifact
+
 ## Canonical Entry Points
 
 | stage | canonical script | when to use it |
@@ -39,6 +45,113 @@ It does not document every helper module in the repo. It focuses on the operatio
 | downstream only | `scripts/run_keep_list_screening_pipeline.py` | rerun scrape / visual / export from an existing keep workbook |
 | shared mailbox sync only | `scripts/run_shared_mailbox_sync.py` | only refresh the shared mailbox cache / `email_sync.db` |
 | post-sync rewrite only | `scripts/run_shared_mailbox_post_sync_pipeline.py` | re-filter an existing final payload using real reply threads, then rewrite Feishu |
+
+## Execution Machine Quick Guide
+
+If you are operating on the execution machine, read this section first.
+
+### What The Official Upstream Chain Is
+
+The official upstream mail-screening logic is now:
+
+1. brand / task-name filter
+2. sending-list match
+3. regex match
+4. LLM tail match
+5. keep workbook
+
+Do not interpret the upstream as:
+
+- “scan all local mail first and then see what happens”
+- or “sending-list and regex are optional side paths”
+
+They are now the formal funnel.
+
+### What You Should Normally Run
+
+If you want the full chain:
+
+```bash
+python3 scripts/run_task_upload_to_final_export_pipeline.py --task-name <TASK_NAME>
+```
+
+If you only want to inspect upstream mail matching quality:
+
+```bash
+python3 scripts/run_task_upload_to_keep_list_pipeline.py \
+  --task-name <TASK_NAME> \
+  --stop-after keep-list
+```
+
+If you already have a keep workbook and only want scrape / visual / final export:
+
+```bash
+python3 scripts/run_keep_list_screening_pipeline.py \
+  --keep-workbook "<keep workbook>" \
+  --template-workbook "<template workbook>" \
+  --env-file .env
+```
+
+### How Mail Time Window Works Now
+
+The execution machine should no longer assume upstream will scan the whole local mailbox history by default.
+
+Current `sent_since` priority is:
+
+1. explicit CLI `--sent-since`
+2. Feishu task-upload field:
+   - `任务开始时间`
+   - `开始时间`
+   - `任务开始日期`
+   - `开始日期`
+3. fallback default today-only window
+
+Practical meaning:
+
+- if you do not pass `--sent-since`, the runner should use the task’s start time from Feishu
+- if you need repair / backfill / historical rerun behavior, pass `--sent-since` explicitly
+
+### What To Expect From Upstream Output
+
+The keep workbook is still the normal downstream boundary artifact.
+
+But conceptually, that keep workbook now comes from this funnel:
+
+- brand-correct thread
+- sending-list exact evidence if available
+- regex extraction from `latest_external_full_body`
+- LLM only on the unresolved tail
+
+### What Goes To Apify
+
+Only these rows should auto-enter downstream scrape:
+
+- sending-list resolved
+- regex resolved
+- `llm` resolved with `high` confidence
+
+These should not auto-enter downstream scrape:
+
+- `llm medium`
+- `llm low`
+- `uncertain`
+- auto-replies / OOO / ticket acknowledgements
+
+### Field Conventions You Should Assume
+
+Current final field conventions are:
+
+- mail content field: `full body`
+- views field: `Median Views (K)`
+- reply times should be interpreted in `Asia/Shanghai`
+
+### Common Misunderstandings To Avoid
+
+- The formal upstream chain is not “legacy enrichment first.”
+- `brand-keyword-fast-path` is the intended default.
+- A normal keep workbook is the canonical downstream boundary.
+- Do not assume missing CLI `--sent-since` means “scan all local mail.”
+- Do not auto-trust `llm` rows unless they are high confidence.
 
 ## High-Level Data Flow
 
@@ -228,6 +341,28 @@ When it fetches mail itself, the core call is:
 
 When a shared mailbox DB is passed in, upstream only records the reference and skips real IMAP fetch work.
 
+### Mail Window Rule
+
+The upstream runner no longer treats mailbox search as an unbounded local-history scan.
+
+Current `sent_since` precedence is:
+
+1. explicit CLI `--sent-since`
+2. Feishu task-upload row `任务开始时间 / 开始时间 / 任务开始日期 / 开始日期`
+3. fallback default today-only behavior
+
+This means:
+
+- if the operator passes `--sent-since`, that always wins
+- if the operator does not pass it, the runner now tries to use the task’s start date from the Feishu task-upload row
+- only when the task row does not contain a usable start-time field does the old default window apply
+
+Operational intent:
+
+- do not sweep the entire local mailbox history for a fresh task by default
+- use the task’s own start time as the natural mailbox lower bound
+- keep manual override available for repair or backfill runs
+
 Code map:
 
 - `scripts/run_task_upload_to_keep_list_pipeline.py`
@@ -251,51 +386,111 @@ Operational pitfall:
 - a mailbox DB can have `messages` but still be operationally unusable if relation / thread indexes are missing
 - for reply-based rewrite logic, `message_index` and valid `thread_key` resolution matter more than raw message count
 
-## Step 4: Sending List Normalization And Matching
+## Step 4: Upstream Mail Funnel
 
 This stage is where the repo decides which creators are actually matched to usable email evidence.
 
-There are currently two major matching flows:
+Current official upstream chain is:
 
-### A. Legacy Enrichment
+1. brand keyword / task-name match
+2. sending-list match
+3. regex match
+4. LLM tail match
+5. keep workbook
 
-Used through:
+This is now the intended formal logic for shared-mailbox brands such as `SKG`, `MINISO`, and `DUET`.
 
-- `email_sync.creator_enrichment.enrich_creator_workbook()`
+### Official Ordering
 
-This path:
+#### 1. Brand keyword / task-name filter
 
-- parses the sending list workbook
-- normalizes creator identifiers
-- extracts creator emails
-- rebuilds / uses the relation index
-- matches creators to threads
-- emits evidence fields such as:
-  - `creator_emails`
-  - `matched_contact_email`
-  - `evidence_thread_key`
-  - `last_mail_*`
-  - `latest_quote_*`
+Only keep emails or threads that belong to the current task / brand.
 
-### B. Brand Keyword Fast Path
+This is the first and mandatory filter.
 
-Used when `matching_strategy=brand-keyword-fast-path`.
+Operational rule:
 
-This path goes through:
+- do not match creator identity before the brand / task-name filter
+- do not allow cross-brand mailbox noise to survive past this stage
 
-- brand keyword match
-- shared-email resolution
-- final review for shared-email groups
+#### 2. Sending-list match
 
-It is more appropriate when the shared mailbox is the main source of truth and there are many manager / shared-email threads.
+After brand filtering, try the strongest sending-list evidence first.
+
+Current strong evidence types are:
+
+- exact sender-email hit
+- exact creator handle hit when the sending list already carries that handle
+- explicit creator profile link when available
+
+The point of this stage is precision:
+
+- if a creator is already cleanly explainable by the task’s own sending list, resolve here
+- do not waste regex or LLM on rows that are already exact sending-list hits
+
+#### 3. Regex match
+
+For emails that are brand-correct but not resolved by the sending list, use thread/body extraction rules.
+
+Primary source text:
+
+- `latest_external_full_body`
+
+Typical patterns:
+
+- `Hi creator_id`
+- `Hi @ creator_id`
+- `Hi *creator_id*`
+- `Hello creator_id`
+- `Hallo creator_id`
+- quoted forms such as `> Hi creator_id`
+- explicit social labels such as `TikTok: creator_id`
+- profile URLs in signature blocks
+
+This stage is especially important when:
+
+- replies come from managers or agencies
+- the reply email address no longer matches the original sending-list mailbox
+- the creator handle survives in the quoted outreach thread instead of the sender email
+
+#### 4. LLM tail match
+
+Only unresolved tail rows should go to the model.
+
+The model’s job is:
+
+- read the full thread context
+- infer the most likely creator handle
+- return evidence
+- return confidence
+
+Operational rule:
+
+- the model is a tail resolver, not the first matching layer
+
+### Production Default
+
+On current `main`, the production default for task-upload-driven keep-list runs is still:
+
+- `matching_strategy=brand-keyword-fast-path`
+
+But operationally, the intended upstream identification logic should now be understood as:
+
+1. task assets
+2. mail sync
+3. brand filtering
+4. sending-list matching
+5. regex matching
+6. LLM tail matching
+7. keep workbook
 
 Code map:
 
 - `scripts/run_task_upload_to_keep_list_pipeline.py`
-- `email_sync/creator_enrichment.py`
 - `email_sync/brand_keyword_match.py`
 - `email_sync/shared_email_resolution.py`
 - `email_sync/llm_review.py`
+- `scripts/prepare_screening_inputs.py`
 
 ## Step 5: Sending List Input Contract
 
@@ -362,6 +557,31 @@ Key idea:
 
 - the keep workbook is the stable resume boundary
 - once it exists, scrape / visual / export can be rerun without re-downloading Feishu assets or re-fetching mail
+
+### Keep Workbook vs Mail-Thread Fields
+
+The canonical downstream resume boundary is still the keep workbook.
+
+Typical examples:
+
+- `*_shared_email_resolution_final_keep.xlsx`
+- `*_llm_reviewed_keep.xlsx`
+
+At the same time, the repo now also uses mail-thread-style fields to explain how a creator ID was resolved.
+
+Typical fields include:
+
+- `final_id_final` or `final_id`
+- `latest_external_full_body`
+- `latest_external_clean_body`
+- `resolution_stage_final`
+- `resolution_confidence_final`
+
+Operational interpretation:
+
+- the keep workbook remains the canonical handoff artifact
+- but upstream mail matching should now be thought of as a funnel that produces a creator-ID decision plus evidence fields
+- execution machines should reason about keep generation using the funnel order above, not as a flat one-shot workbook enrichment step
 
 ## Step 7: Downstream Staging
 
@@ -500,6 +720,18 @@ They are used later by the shared-mailbox rewrite path to distinguish:
 - manager / agency replies
 - internal teammate reply-all noise
 
+Current field behavior:
+
+- the mail-content field written downstream now uses `full body`
+- it prefers full thread-aware mail body fields over short snippets
+- if needed it can fall back to raw `.eml` parsing
+
+Current metric behavior:
+
+- the final views field is now `Median Views (K)`
+- median is preferred over average when both are available
+- legacy average fields only survive as compatibility fallback
+
 ## Step 12: Final Feishu Upload
 
 The final upload goes through:
@@ -517,7 +749,7 @@ That means:
 - if the row already exists, only update:
   - `当前网红报价`
   - `达人最后一次回复邮件时间`
-  - `达人回复的最后一封邮件内容`
+  - `full body`
 
 This avoids re-creating duplicate creator rows while still allowing the latest mail context to refresh.
 
@@ -526,6 +758,12 @@ Important guardrails:
 - if the target Feishu table lacks `达人对接人`, upload is blocked
 - if the target table contains existing unscoped records without `达人对接人`, upload is blocked
 - duplicate groups in payload or existing records are surfaced as failures instead of being silently merged
+
+Current compatibility note:
+
+- the code still accepts older payload aliases that map to the old Chinese mail-content field name
+- but the current target Feishu schema should use `full body`
+- the current target views field should use `Median Views (K)`
 
 ## Step 13: Shared-Mailbox Post-Sync Rewrite
 
@@ -757,6 +995,219 @@ Avoid handing off:
 - the whole repo directory as a zip
 - unrelated historical run roots
 - secrets mixed into normal artifact bundles
+
+## Mail-Thread to Final-ID Funnel
+
+This is the formal mailbox-thread identification contract for shared-mailbox brands such as `SKG`, `MINISO`, and `DUET`.
+
+The purpose of this stage is only to produce a creator identity decision from mailbox evidence.
+
+It does not run scrape, visual review, or final Feishu upload.
+
+Important clarification:
+
+- this funnel should now be treated as the official upstream matching logic
+- the keep workbook is still the downstream boundary artifact
+- but conceptually the keep workbook is the result of this funnel, not a separate competing chain
+
+### Stage Goal
+
+For each brand-filtered reply thread, produce:
+
+- `final_id`
+- `resolution_stage`
+- `evidence`
+- `latest_external_clean_body`
+- `latest_external_full_body`
+- `raw_path`
+
+### Input Scope
+
+The funnel should operate on:
+
+- a bounded sync window such as `2026-04-01` through `2026-04-03`
+- brand-keyword-filtered threads
+- thread-level records, not single isolated emails
+
+Use the latest external message as the anchor message, but keep the full quoted thread text available for evidence extraction.
+
+### Body Fields
+
+Use two body representations:
+
+- `latest_external_clean_body`
+  the newest external reply body only, trimmed as much as safely possible
+- `latest_external_full_body`
+  the newest external reply plus quoted history that can expose the original outreach greeting such as `Hi @ creator_id`
+
+`latest_external_full_body` is the primary text for regex extraction.
+
+`latest_external_clean_body` is the operator-facing inspection field.
+
+### Teammate Filter
+
+Before regex or LLM creator extraction, filter internal teammate names from candidate handles.
+
+Current temporary teammate blocklist:
+
+- `William`
+- `Eden`
+- `Rhea`
+- `Elin`
+- `Yvette`
+- `Astrid`
+- `Lilith`
+- `Ruby`
+
+Common spelling variants should also be filtered when obvious, for example `Lillith`.
+
+### Resolution Funnel
+
+Run the following stages in order.
+
+#### `pass0_sending_list`
+
+Before regex extraction, try the strongest possible sending-list join on the already brand-filtered thread set.
+
+This stage should prioritize the sending list that belongs to the current task or brand.
+
+Behavior rules:
+
+- run only after the brand keyword / task-name filter
+- respect the same `sent_since` window used for mailbox sync
+- use exact sender-email equality first
+- allow exact creator-handle or creator-link hits when the sending list already provides them
+- do not mix brands that happen to share the same mailbox database
+- if exactly one creator row is implied by the sending list evidence, resolve the thread here
+
+This stage is the highest-confidence creator identity layer after the brand filter.
+
+#### `regex_pass1`
+
+Greeting-based extraction from `latest_external_full_body`.
+
+Match patterns such as:
+
+- `Hi creator_id`
+- `Hi @creator_id`
+- `Hi @ creator_id`
+- `Hello creator_id`
+- `Hallo creator_id`
+- quoted forms such as `> Hi creator_id`
+
+If the stage yields exactly one non-teammate candidate handle, resolve the thread here.
+
+#### `regex_pass2`
+
+If pass 1 does not uniquely resolve, look for stronger explicit creator signals in the same thread text:
+
+- `TikTok: creator_id`
+- `Instagram: creator_id`
+- social profile URLs
+- explicit signature handles
+- obvious `@handle` forms that are not teammate names
+
+If the stage yields exactly one strong candidate handle, resolve the thread here.
+
+#### `llm`
+
+Only unresolved tail threads should go to the model.
+
+The LLM should read the full thread context and output:
+
+- the most likely creator handle
+- a short evidence snippet
+- a confidence-aware justification
+
+The model should not be used on the whole keyword-hit population by default.
+
+### Operational Shape
+
+The intended funnel is:
+
+1. sync mailbox window
+2. filter by brand keyword
+3. collapse to reply threads
+4. run `pass0_sending_list`
+5. run `regex_pass1`
+6. run `regex_pass2`
+7. send only the unresolved tail to the LLM
+8. emit a fixed `final_id` table for downstream use
+
+### Apify Gate
+
+When the upstream mail funnel hands off into downstream screening, only the following rows should be allowed into Apify-ready staging:
+
+- sending-list exact hits
+- regex-resolved hits
+- `llm` hits with `high` confidence only
+
+The following rows should not auto-enter Apify:
+
+- `llm` medium / low / unknown confidence
+- unresolved rows
+- obvious auto-replies / OOO / ticket acknowledgements
+
+This behavior is now implemented in the current mail-funnel preparation path.
+
+### Current SKG Reference Snapshot
+
+Using `latest_external_full_body` plus teammate filtering, the first full-body regex experiment produced:
+
+- `regex_pass1 = 252`
+- `regex_pass2 = 6`
+- `llm = 37`
+- `unresolved = 0`
+
+This confirms that most thread identification should be solved before the model layer.
+
+When `pass0_sending_list` is inserted ahead of regex on the same `SKG` thread set, the reference experiment produced:
+
+- `pass0_sending_list = 66`
+- `regex_pass1 = 162`
+- `regex_pass2 = 4`
+- `llm = 33`
+
+Important interpretation:
+
+- `pass0_sending_list` only reduced the final LLM tail by `4` rows on that sample
+- but those rows were upgraded from model inference to exact sending-list evidence
+- so this stage is worth keeping for precision, even though most of its hits overlap with later regex stages
+
+### LLM Concurrency
+
+Thread-level creator-ID extraction has been stable at `12` concurrent workers in local benchmarking.
+
+Use `12` as the default concurrency target for the unresolved LLM tail unless the provider or environment suggests otherwise.
+
+## Platform Fallback Design
+
+After the mailbox funnel emits `final_id`, downstream platform probing should follow this order:
+
+1. TikTok
+2. Instagram
+3. YouTube
+4. manual review
+
+Behavior contract:
+
+- first build `TikTok`, `Instagram`, and `YouTube` profile URLs from `final_id`
+- try TikTok first
+- if TikTok scrape succeeds and yields usable review input, stop there
+- only if TikTok fails, try Instagram
+- only if Instagram also fails, try YouTube
+- if all three fail, mark the row as `转人工`
+
+Recommended downstream fields:
+
+- `resolved_platform`
+- `resolved_profile_url`
+- `platform_attempt_order`
+- `fallback_reason`
+
+This platform fallback happens after the mailbox identification funnel is complete.
+
+It should not be mixed into the mail-thread resolution stages above.
 ## Operator Checklist
 
 Before a run:
@@ -787,3 +1238,7 @@ These behavior changes are now intentional and should be preserved unless there 
 - `达人对接人` is re-resolved from task upload + employee info during rewrite
 - `F.人工判断项/合规提醒` enters the visual prompt
 - reminder-only rulespecs fall back to the generic prompt instead of replacing it
+- task-upload-driven mailbox runs now default `sent_since` from the Feishu task start time when no explicit CLI override is provided
+- `full body` is the canonical final mail-content field for export and Feishu upload
+- `Median Views (K)` is the canonical final views field for export and Feishu upload
+- the formal keep workbook and the experimental mail-thread funnel workbook are different contracts and must not be treated as interchangeable

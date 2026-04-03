@@ -274,6 +274,7 @@ class FeishuScreeningBridgeTests(unittest.TestCase):
         self.assertEqual(result["downloadedCount"], 1)
         item = result["items"][0]
         self.assertEqual(item["taskName"], "duet")
+        self.assertEqual(item["taskStartDate"], "2026-04-01")
         self.assertEqual(item["matchedBy"], "employee_id")
         self.assertEqual(item["ownerEmail"], "yvette@amagency.biz")
         self.assertEqual(item["employeeEmail"], "yvette@amagency.biz")
@@ -340,6 +341,7 @@ class FeishuScreeningBridgeTests(unittest.TestCase):
         )
 
         self.assertEqual(result["taskName"], "duet")
+        self.assertEqual(result["taskStartDate"], "2026-04-01")
         self.assertEqual(result["recordId"], "rec-task-001")
         self.assertEqual(result["sendingListFileToken"], "boxcn-duet-sending-list")
         self.assertEqual(result["sendingListFileName"], "duet-发信名单.xlsx")
@@ -1148,6 +1150,7 @@ class _FakeBitableClient(FeishuOpenClient):
                             "record_id": "rec-task-001",
                             "fields": {
                                 "任务名": [{"text": "duet", "type": "text"}],
+                                "任务开始时间": "2026-04-01 09:00:00",
                                 "员工ID": {"type": 1, "value": [{"text": "ou_fbb11a48bd394428", "type": "text"}]},
                                 "负责人邮箱": {"type": 1, "value": [{"link": "mailto:yvette@amagency.biz", "text": "yvette@amagency.biz", "type": "url"}]},
                                 "负责人": [{"name": "Yvette"}],
@@ -1270,6 +1273,7 @@ class _FakeTaskUploadClient(_FakeBitableClient):
                             "record_id": "rec-task-001",
                             "fields": {
                                 "任务名": [{"text": "duet", "type": "text"}],
+                                "任务开始时间": "2026-04-01 09:00:00",
                                 "负责人邮箱": {"type": 1, "value": [{"link": "mailto:yvette@amagency.biz", "text": "yvette@amagency.biz", "type": "url"}]},
                                 "负责人": [{"name": "Yvette"}],
                                 "发信名单": [sending_list_attachment],
@@ -1340,6 +1344,7 @@ class _FakeInspectionClient(_FakeTaskUploadClient):
                             "record_id": "rec-task-001",
                             "fields": {
                                 "任务名": [{"text": "duet", "type": "text"}],
+                                "任务开始时间": "2026-04-01 09:00:00",
                                 "员工ID": {"type": 1, "value": [{"text": "ou_fbb11a48bd394428", "type": "text"}]},
                                 "负责人邮箱": {"type": 1, "value": [{"link": "mailto:yvette@amagency.biz", "text": "yvette@amagency.biz", "type": "url"}]},
                                 "负责人": [{"name": "Yvette"}],

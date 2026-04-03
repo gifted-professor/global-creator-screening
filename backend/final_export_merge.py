@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import math
 import re
+import statistics
 from pathlib import Path
 from typing import Any
 
@@ -10,19 +11,21 @@ import pandas as pd
 
 from backend import creator_cache
 from backend.timezone_utils import format_shanghai_date
+from email_sync.mail_parser import parse_email_message
 
 
+_FULL_BODY_FIELD_NAME = "full body"
 FINAL_UPLOAD_COLUMNS = (
     "达人ID",
     "平台",
     "主页链接",
     "# Followers(K)#",
     "Following",
-    "Average Views (K)",
+    "Median Views (K)",
     "互动率",
     "当前网红报价",
     "达人最后一次回复邮件时间",
-    "达人回复的最后一封邮件内容",
+    _FULL_BODY_FIELD_NAME,
     "达人对接人",
     "ai是否通过",
     "ai筛号反馈理由",
@@ -241,6 +244,13 @@ def _average(values: list[float]) -> float | None:
     return sum(normalized) / len(normalized)
 
 
+def _median(values: list[float]) -> float | None:
+    normalized = [value for value in values if value is not None]
+    if not normalized:
+        return None
+    return float(statistics.median(normalized))
+
+
 def _resolve_metric_note(apify_row: dict[str, Any], avg_views: Any) -> str:
     followers = _coerce_number((apify_row or {}).get("followers"))
     avg_views_num = _coerce_number(avg_views)
@@ -367,6 +377,76 @@ def _resolve_existing_local_paths(*values: Any, base_dirs: list[Path | None] | N
     return _dedupe_preserve_order(candidates)
 
 
+def _extract_mail_body_from_raw_text(raw_text: str) -> str:
+    cleaned = raw_text.replace("\r\n", "\n")
+    if "\n\n" in cleaned:
+        cleaned = cleaned.split("\n\n", 1)[1]
+    return cleaned.strip()
+
+
+def _load_mail_full_body_from_raw_path(
+    raw_path: Any,
+    *,
+    base_dirs: list[Path | None] | None = None,
+    cache: dict[str, str] | None = None,
+) -> str:
+    resolved_paths = _resolve_existing_local_paths(raw_path, base_dirs=base_dirs)
+    if not resolved_paths:
+        return ""
+    resolved = str(Path(resolved_paths[0]).expanduser().resolve())
+    if cache is not None and resolved in cache:
+        return cache[resolved]
+
+    full_body = ""
+    try:
+        raw_bytes = Path(resolved).read_bytes()
+        parsed = parse_email_message(
+            raw_bytes,
+            account_email="",
+            folder_name="",
+            uid=0,
+            uidvalidity=0,
+            flags=[],
+            internal_date_raw=None,
+            size_bytes=len(raw_bytes),
+        )
+        full_body = _clean_text(parsed.body_text) or _clean_text(parsed.snippet)
+        if not full_body:
+            full_body = _extract_mail_body_from_raw_text(raw_bytes.decode("utf-8", errors="replace"))
+    except Exception:
+        try:
+            full_body = _extract_mail_body_from_raw_text(Path(resolved).read_text(encoding="utf-8", errors="replace"))
+        except Exception:
+            full_body = ""
+
+    if cache is not None:
+        cache[resolved] = full_body
+    return full_body
+
+
+def _resolve_mail_full_body(
+    keep_row: dict[str, Any],
+    *,
+    last_mail_raw_path: Any = "",
+    base_dirs: list[Path | None] | None = None,
+    cache: dict[str, str] | None = None,
+) -> str:
+    return _clean_text(
+        _first_non_blank(
+            keep_row.get("last_mail_full_body"),
+            keep_row.get("brand_message_full_body"),
+            keep_row.get("latest_external_full_body"),
+            _load_mail_full_body_from_raw_path(
+                last_mail_raw_path or keep_row.get("last_mail_raw_path") or keep_row.get("brand_message_raw_path"),
+                base_dirs=base_dirs,
+                cache=cache,
+            ),
+            keep_row.get("last_mail_snippet"),
+            keep_row.get("brand_message_snippet"),
+        )
+    )
+
+
 def _build_metrics_from_raw_platform_data(platform: str, data: Any) -> dict[str, dict[str, float | None]]:
     metrics: dict[str, dict[str, float | None]] = {}
     if platform == "instagram" and isinstance(data, list):
@@ -388,11 +468,13 @@ def _build_metrics_from_raw_platform_data(platform: str, data: Any) -> dict[str,
                 if isinstance(post, dict) and _coerce_number(post.get("likesCount")) is not None
             ]
             avg_views = _average([value for value in view_values if value is not None])
+            median_views = _median([value for value in view_values if value is not None])
             avg_likes = _average([value for value in like_values if value is not None])
             metrics[handle] = {
                 "followers": _coerce_number(item.get("followersCount")),
                 "following": _coerce_number(item.get("followsCount")),
                 "avg_views": avg_views,
+                "median_views": median_views,
                 "avg_likes": avg_likes,
             }
         return metrics
@@ -433,6 +515,7 @@ def _build_metrics_from_raw_platform_data(platform: str, data: Any) -> dict[str,
                 "followers": bucket.get("followers"),
                 "following": bucket.get("following"),
                 "avg_views": _average(bucket.get("views") or []),
+                "median_views": _median(bucket.get("views") or []),
                 "avg_likes": _average(bucket.get("likes") or []),
             }
         return metrics
@@ -660,6 +743,7 @@ def build_all_platforms_final_review_artifacts(
     payload_rows: list[dict[str, Any]] = []
     skipped_payload_rows: list[dict[str, Any]] = []
     seen_creator_keys: set[tuple[str, str]] = set()
+    mail_body_cache: dict[str, str] = {}
 
     for platform, export_map in final_exports.items():
         final_review_path = Path(_clean_text((export_map or {}).get("final_review"))).expanduser()
@@ -710,14 +794,35 @@ def build_all_platforms_final_review_artifacts(
                     run_root / "upstream" / "mail_data" if run_root else None,
                 ],
             )
-            avg_views = _first_non_blank(apify_row.get("avg_views"), record.get("runtime_avg_views"), record.get("upload_avg_views"))
+            mail_body_text = _resolve_mail_full_body(
+                keep_row,
+                last_mail_raw_path=last_mail_raw_path,
+                base_dirs=[
+                    Path.cwd(),
+                    keep_workbook_path.parent if keep_workbook_path else None,
+                    final_review_path.parent,
+                    run_root,
+                    run_root / "upstream" if run_root else None,
+                    run_root / "upstream" / "exports" if run_root else None,
+                    run_root / "upstream" / "mail_data" if run_root else None,
+                ],
+                cache=mail_body_cache,
+            )
+            median_views = _first_non_blank(
+                apify_row.get("median_views"),
+                record.get("runtime_median_views"),
+                record.get("upload_median_views"),
+                apify_row.get("avg_views"),
+                record.get("runtime_avg_views"),
+                record.get("upload_avg_views"),
+            )
             avg_likes = _first_non_blank(apify_row.get("avg_likes"), record.get("upload_avg_likes"))
             engagement_rate = ""
-            avg_views_num = _coerce_number(avg_views)
+            median_views_num = _coerce_number(median_views)
             avg_likes_num = _coerce_number(avg_likes)
-            metric_note = _resolve_metric_note(apify_row, avg_views)
-            if avg_views_num is not None and avg_views_num > 0 and avg_likes_num is not None:
-                engagement_rate = _format_percentage(avg_likes_num / avg_views_num)
+            metric_note = _resolve_metric_note(apify_row, median_views)
+            if median_views_num is not None and median_views_num > 0 and avg_likes_num is not None:
+                engagement_rate = _format_percentage(avg_likes_num / median_views_num)
             else:
                 engagement_rate = _compute_engagement_rate(record)
 
@@ -782,7 +887,7 @@ def build_all_platforms_final_review_artifacts(
                 "主页链接": profile_url or _clean_text(keep_row.get("URL")),
                 "# Followers(K)#": _format_k_value(_first_non_blank(apify_row.get("followers"), record.get("upload_followers"), "")),
                 "Following": _format_k_value(_first_non_blank(apify_row.get("following"), record.get("upload_following"), "")),
-                "Average Views (K)": _format_k_value(avg_views),
+                "Median Views (K)": _format_k_value(median_views),
                 "互动率": engagement_rate,
                 "当前网红报价": _build_quote_text(keep_row),
                 "达人最后一次回复邮件时间": _format_date(
@@ -791,12 +896,7 @@ def build_all_platforms_final_review_artifacts(
                         keep_row.get("brand_message_sent_at"),
                     )
                 ),
-                "达人回复的最后一封邮件内容": _clean_text(
-                    _first_non_blank(
-                        keep_row.get("last_mail_snippet"),
-                        keep_row.get("brand_message_snippet"),
-                    )
-                ),
+                _FULL_BODY_FIELD_NAME: mail_body_text,
                 "达人对接人": _clean_text(row_owner_context.get("responsible_name"))
                 or _clean_text(row_owner_context.get("employee_name"))
                 or owner_display_name,
@@ -821,6 +921,7 @@ def build_all_platforms_final_review_artifacts(
                     "matched_contact_email": _clean_text(keep_row.get("matched_contact_email")),
                     "matched_contact_name": _clean_text(keep_row.get("matched_contact_name")),
                     _ROW_UPDATE_MODE_KEY: _UPDATE_MODE_CREATE_OR_MAIL_ONLY,
+                    "达人回复的最后一封邮件内容": mail_body_text,
                     "__brand_message_raw_path": _clean_text(keep_row.get("brand_message_raw_path")),
                     _LAST_MAIL_RAW_PATH_KEY: last_mail_raw_path,
                     _ROW_ATTACHMENT_PATHS_KEY: row_attachment_paths,
@@ -876,13 +977,22 @@ def build_all_platforms_final_review_artifacts(
                 keep_workbook_path.parent if keep_workbook_path else None,
             ],
         )
+        mail_body_text = _resolve_mail_full_body(
+            keep_row,
+            last_mail_raw_path=last_mail_raw_path,
+            base_dirs=[
+                Path.cwd(),
+                keep_workbook_path.parent if keep_workbook_path else None,
+            ],
+            cache=mail_body_cache,
+        )
         display_row = {
             "达人ID": _clean_text(_first_non_blank(handle, keep_row.get("@username"))),
             "平台": platform,
             "主页链接": profile_url or _clean_text(keep_row.get("URL")),
             "# Followers(K)#": "",
             "Following": "",
-            "Average Views (K)": "",
+            "Median Views (K)": "",
             "互动率": "",
             "当前网红报价": _build_quote_text(keep_row),
             "达人最后一次回复邮件时间": _format_date(
@@ -891,12 +1001,7 @@ def build_all_platforms_final_review_artifacts(
                     keep_row.get("brand_message_sent_at"),
                 )
             ),
-            "达人回复的最后一封邮件内容": _clean_text(
-                _first_non_blank(
-                    keep_row.get("last_mail_snippet"),
-                    keep_row.get("brand_message_snippet"),
-                )
-            ),
+            _FULL_BODY_FIELD_NAME: mail_body_text,
             "达人对接人": _clean_text(row_owner_context.get("responsible_name"))
             or _clean_text(row_owner_context.get("employee_name"))
             or owner_display_name,
@@ -920,6 +1025,7 @@ def build_all_platforms_final_review_artifacts(
                 "matched_contact_email": _clean_text(keep_row.get("matched_contact_email")),
                 "matched_contact_name": _clean_text(keep_row.get("matched_contact_name")),
                 _ROW_UPDATE_MODE_KEY: _UPDATE_MODE_CREATE_OR_MAIL_ONLY,
+                "达人回复的最后一封邮件内容": mail_body_text,
                 "__brand_message_raw_path": _clean_text(keep_row.get("brand_message_raw_path")),
                 _LAST_MAIL_RAW_PATH_KEY: last_mail_raw_path,
                 _ROW_ATTACHMENT_PATHS_KEY: row_attachment_paths,

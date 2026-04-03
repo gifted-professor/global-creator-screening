@@ -20,10 +20,17 @@ _FIELD_NAME_ALIASES = {
     "# followers(k)#": "Followers(K)",
     "followers(k)": "Followers(K)",
     "following": "Following",
+    "average views (k)": "Median Views (K)",
+    "averageviews(k)": "Median Views (K)",
+    "median views (k)": "Median Views (K)",
+    "medianviews(k)": "Median Views (K)",
     "ai是否通过": "ai 是否通过",
     "标签(ai)": "标签（ai）",
     "标签（ai）": "标签（ai）",
     "ai评价": "ai 评价",
+    "达人回复的最后一封邮件内容": "full body",
+    "full_body": "full body",
+    "full-body": "full body",
 }
 _INTERNAL_PAYLOAD_KEYS = {
     "达人对接人_employee_id",
@@ -45,6 +52,7 @@ _MAIL_ONLY_FIELD_NAMES = (
     "当前网红报价",
     "达人最后一次回复邮件时间",
     "达人回复的最后一封邮件内容",
+    "full body",
 )
 
 _UPLOAD_BASE_KEY_FIELDS = ("达人ID", "平台")
@@ -762,7 +770,7 @@ def _existing_record_sort_key(snapshot: ExistingRecordSnapshot) -> tuple[Any, ..
         bool(_flatten_field_value(fields.get("ai评价") or fields.get("ai 评价"))),
         bool(_flatten_field_value(fields.get("当前网红报价"))),
         _coerce_date_to_ms(_flatten_field_value(fields.get("达人最后一次回复邮件时间"))) or 0,
-        len(_flatten_field_value(fields.get("达人回复的最后一封邮件内容"))),
+        len(_flatten_field_value(fields.get("full body") or fields.get("达人回复的最后一封邮件内容"))),
         len(_flatten_field_value(fields.get("主页链接"))),
         snapshot.record_id,
     )
