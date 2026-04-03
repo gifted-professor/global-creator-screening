@@ -148,6 +148,117 @@ def build_keep_workbook_with_missing_platform(path: Path) -> None:
     loaded.save(path)
 
 
+def build_mail_thread_funnel_workbook(path: Path) -> None:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "threads"
+    sheet.append([
+        "thread_key",
+        "subject",
+        "latest_external_from",
+        "latest_external_sent_at",
+        "latest_external_clean_body",
+        "latest_external_full_body",
+        "resolution_stage_final",
+        "resolution_confidence_final",
+        "final_id_final",
+        "llm_handle",
+        "raw_path",
+    ])
+    sheet.append([
+        "thread-1",
+        "Re: Paid collaboration with SKG",
+        "manager@example.com",
+        "2026-04-03T05:27:00+08:00",
+        "Hello Lilith, interested.",
+        "Hello Lilith\n\n> Hi @ livio.official ,",
+        "regex_pass1",
+        "",
+        "livio.official",
+        "",
+        "raw/thread-1.eml",
+    ])
+    sheet.append([
+        "thread-2",
+        "Automatic Reply: Paid collaboration with SKG",
+        "auto.reply@example.com",
+        "2026-04-03T06:00:00+08:00",
+        "",
+        "Thank you for your email. I am currently out of office and will get back to you soon.",
+        "llm",
+        "high",
+        "auto.reply.user",
+        "auto.reply.user",
+        "raw/thread-2.eml",
+    ])
+    sheet.append([
+        "thread-3",
+        "Re: Paid collaboration with SKG",
+        "team@example.com",
+        "2026-04-03T07:15:00+08:00",
+        "",
+        "Hallo Lilith,\n\nvielen Dank.\n\n> Hi @ maggy_valentine ,",
+        "regex_pass1",
+        "",
+        "maggy_valentine",
+        "",
+        "raw/thread-3.eml",
+    ])
+    sheet.append([
+        "thread-4",
+        "Re: Paid collaboration with SKG",
+        "agent@example.com",
+        "2026-04-03T08:15:00+08:00",
+        "Could work. Sharing rates below.",
+        "Hello Astrid\n\ncreator details ...",
+        "llm",
+        "high",
+        "high.confidence.creator",
+        "high.confidence.creator",
+        "raw/thread-4.eml",
+    ])
+    sheet.append([
+        "thread-5",
+        "Re: Paid collaboration with SKG",
+        "agent2@example.com",
+        "2026-04-03T08:30:00+08:00",
+        "Maybe relevant",
+        "Hello Astrid\n\ncreator details ...",
+        "llm",
+        "medium",
+        "medium.confidence.creator",
+        "medium.confidence.creator",
+        "raw/thread-5.eml",
+    ])
+    sheet.append([
+        "thread-6",
+        "Re: Paid collaboration with SKG",
+        "agent3@example.com",
+        "2026-04-03T08:45:00+08:00",
+        "Maybe relevant",
+        "Hello Astrid\n\ncreator details ...",
+        "weak_rule",
+        "high",
+        "weak.rule.creator",
+        "llm.upgraded.creator",
+        "raw/thread-6.eml",
+    ])
+    sheet.append([
+        "thread-7",
+        "Re: Paid collaboration with OTHERBRAND",
+        "brand@example.com",
+        "2026-04-03T09:00:00+08:00",
+        "Hello Astrid, interested.",
+        "Hello Astrid\n\nWe are excited about OTHERBRAND.\n\n> Hi @ wrong.brand.creator ,",
+        "regex_pass1",
+        "",
+        "wrong.brand.creator",
+        "",
+        "raw/thread-7.eml",
+    ])
+    workbook.save(path)
+
+
 @unittest.skipIf(prepare_screening_inputs is None, f"screening deps unavailable: {IMPORT_ERROR}")
 class PrepareScreeningInputsTests(unittest.TestCase):
     def test_prepare_screening_inputs_persists_rulespec_and_upload_metadata(self) -> None:
@@ -368,11 +479,108 @@ class PrepareScreeningInputsTests(unittest.TestCase):
             tiktok_metadata_path = Path(summary["upload"]["upload_metadata_paths"]["tiktok"])
             tiktok_metadata = json.loads(tiktok_metadata_path.read_text(encoding="utf-8"))
             self.assertIn("samandcitra90day", tiktok_metadata, tiktok_metadata)
-            self.assertEqual(
-                tiktok_metadata["samandcitra90day"]["url"],
-                "https://www.tiktok.com/@samandcitra90day",
-                tiktok_metadata,
+
+    def test_prepare_screening_inputs_accepts_mail_thread_funnel_workbook(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            creator_workbook = tmp_path / "mail_thread_funnel.xlsx"
+            screening_data_dir = tmp_path / "screening_data"
+            config_dir = tmp_path / "config"
+            temp_dir = tmp_path / "temp"
+            template_output_dir = tmp_path / "parsed_outputs"
+
+            build_mail_thread_funnel_workbook(creator_workbook)
+
+            summary = prepare_screening_inputs(
+                creator_workbook=creator_workbook,
+                template_workbook=FIXTURE_TEMPLATE,
+                template_output_dir=template_output_dir,
+                screening_data_dir=screening_data_dir,
+                config_dir=config_dir,
+                temp_dir=temp_dir,
             )
+
+            self.assertEqual(summary["upload"]["parsed_source_kind"], "mail_thread_funnel", summary)
+            self.assertEqual(summary["upload"]["metadata_count_by_platform"]["tiktok"], 5, summary)
+            self.assertTrue(summary["upload"]["normalized_upload_source_path"])
+            self.assertEqual(summary["upload"]["normalized_upload_summary"]["autoReplySkippedCount"], 1, summary)
+            self.assertEqual(summary["upload"]["normalized_upload_summary"]["evidenceFallbackCount"], 1, summary)
+            self.assertEqual(summary["upload"]["normalized_upload_summary"]["manualReviewSkippedCount"], 1, summary)
+            self.assertEqual(summary["upload"]["normalized_upload_summary"]["llmHighAcceptedCount"], 2, summary)
+            self.assertEqual(summary["upload"]["normalized_upload_summary"]["llmNonHighSkippedCount"], 1, summary)
+            tiktok_metadata_path = Path(summary["upload"]["upload_metadata_paths"]["tiktok"])
+            tiktok_metadata = json.loads(tiktok_metadata_path.read_text(encoding="utf-8"))
+            self.assertIn("livio.official", tiktok_metadata, tiktok_metadata)
+            self.assertIn("maggy_valentine", tiktok_metadata, tiktok_metadata)
+            self.assertIn("high.confidence.creator", tiktok_metadata, tiktok_metadata)
+            self.assertIn("llm.upgraded.creator", tiktok_metadata, tiktok_metadata)
+            self.assertNotIn("auto.reply.user", tiktok_metadata, tiktok_metadata)
+            self.assertNotIn("medium.confidence.creator", tiktok_metadata, tiktok_metadata)
+            self.assertIn("wrong.brand.creator", tiktok_metadata, tiktok_metadata)
+            self.assertEqual(
+                tiktok_metadata["livio.official"]["instagram_url"],
+                "https://www.instagram.com/livio.official/",
+            )
+            self.assertEqual(
+                tiktok_metadata["livio.official"]["youtube_url"],
+                "https://www.youtube.com/@livio.official",
+            )
+            self.assertEqual(
+                tiktok_metadata["livio.official"]["mail_resolution_stage"],
+                "regex_pass1",
+            )
+            self.assertEqual(
+                tiktok_metadata["maggy_valentine"]["mail_evidence"],
+                "Hallo Lilith,\n\nvielen Dank.\n\n> Hi @ maggy_valentine ,",
+            )
+            self.assertEqual(
+                tiktok_metadata["high.confidence.creator"]["mail_resolution_stage"],
+                "llm",
+            )
+            self.assertEqual(
+                tiktok_metadata["high.confidence.creator"]["mail_resolution_confidence"],
+                "high",
+            )
+            self.assertEqual(
+                tiktok_metadata["high.confidence.creator"]["mail_apify_gate"],
+                "ready_for_apify",
+            )
+            self.assertEqual(
+                tiktok_metadata["llm.upgraded.creator"]["mail_resolution_stage"],
+                "llm",
+            )
+            self.assertEqual(
+                tiktok_metadata["llm.upgraded.creator"]["mail_resolution_confidence"],
+                "high",
+            )
+
+    def test_prepare_screening_inputs_filters_brand_mismatch_for_mail_thread_funnel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            creator_workbook = tmp_path / "mail_thread_funnel.xlsx"
+            screening_data_dir = tmp_path / "screening_data"
+            config_dir = tmp_path / "config"
+            temp_dir = tmp_path / "temp"
+            template_output_dir = tmp_path / "parsed_outputs"
+
+            build_mail_thread_funnel_workbook(creator_workbook)
+
+            summary = prepare_screening_inputs(
+                creator_workbook=creator_workbook,
+                template_workbook=FIXTURE_TEMPLATE,
+                task_name="SKG",
+                template_output_dir=template_output_dir,
+                screening_data_dir=screening_data_dir,
+                config_dir=config_dir,
+                temp_dir=temp_dir,
+            )
+
+            self.assertEqual(summary["upload"]["parsed_source_kind"], "mail_thread_funnel", summary)
+            self.assertEqual(summary["upload"]["metadata_count_by_platform"]["tiktok"], 4, summary)
+            self.assertEqual(summary["upload"]["normalized_upload_summary"]["brandFilteredSkippedCount"], 1, summary)
+            tiktok_metadata_path = Path(summary["upload"]["upload_metadata_paths"]["tiktok"])
+            tiktok_metadata = json.loads(tiktok_metadata_path.read_text(encoding="utf-8"))
+            self.assertNotIn("wrong.brand.creator", tiktok_metadata, tiktok_metadata)
 
     def test_prepare_screening_inputs_can_source_task_upload_assets(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

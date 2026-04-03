@@ -32,6 +32,19 @@ CANONICAL_UPLOAD_EXPORT_COLUMNS = [
     "nickname",
     "Region",
     "email",
+    "tiktok_url",
+    "instagram_url",
+    "youtube_url",
+    "platform_attempt_order",
+    "mail_thread_key",
+    "mail_resolution_stage",
+    "mail_resolution_confidence",
+    "mail_apify_gate",
+    "mail_evidence",
+    "mail_raw_path",
+    "latest_external_from",
+    "latest_external_sent_at",
+    "subject",
 ]
 SENDING_LIST_COUNTRY_ALIASES = ("country", "国家", "region", "地区")
 SENDING_LIST_CREATOR_ALIASES = ("creator", "nickname", "达人", "红人", "博主")
@@ -43,6 +56,251 @@ SENDING_LIST_PLATFORM_LINK_ALIASES = {
     "tiktok": ("ttlink", "tturl", "tiktoklink", "tiktokurl", "douyinlink"),
     "youtube": ("ytlink", "yturl", "youtubelink", "youtubeurl", "channelurl", "channellink"),
 }
+MAIL_THREAD_FINAL_ID_ALIASES = ("final_id_final", "final_id")
+MAIL_THREAD_STAGE_ALIASES = ("resolution_stage_final", "resolution_stage")
+MAIL_THREAD_CONFIDENCE_ALIASES = (
+    "resolution_confidence_final",
+    "llm_confidence",
+    "resolution_confidence",
+    "confidence",
+)
+MAIL_THREAD_LLM_HANDLE_ALIASES = ("llm_handle",)
+MAIL_THREAD_EVIDENCE_ALIASES = ("llm_evidence", "latest_external_clean_body", "latest_external_body_preview")
+MAIL_THREAD_AUTO_REPLY_PATTERNS = (
+    re.compile(
+        r"(out of office|automatic reply|auto.?reply|ooo\b|vacation|abwesenheitsnotiz|thank you for your email|derzeit keine erreichbarkeit)",
+        re.I,
+    ),
+    re.compile(r"(deine anfrage ist bei uns gelandet|ticket#|\[##gl-\d+##\])", re.I),
+)
+MAIL_THREAD_APIFY_READY_STAGES = {
+    "pass0_sending_list_email",
+    "pass0_sending_list_handle",
+    "sending_list",
+    "regex_pass1",
+    "regex_pass2",
+    "regex_in_sending_list",
+    "regex_out_of_sending_list",
+}
+
+
+def _clean_mail_thread_value(value: Any) -> str:
+    return clean_source_cell(value)
+
+
+def _mail_thread_row_is_empty(row_dict: dict[str, Any]) -> bool:
+    return not any(_clean_mail_thread_value(value) for value in (row_dict or {}).values())
+
+
+def _select_mail_thread_value(row_dict: dict[str, Any], aliases: tuple[str, ...]) -> str:
+    normalized_row = {
+        normalize_source_column_name(column): value
+        for column, value in (row_dict or {}).items()
+        if not str(column).startswith("__")
+    }
+    for alias in aliases:
+        value = _clean_mail_thread_value(normalized_row.get(normalize_source_column_name(alias)))
+        if value:
+            return value
+    return ""
+
+
+def _has_mail_thread_funnel_columns(headers: list[str]) -> bool:
+    normalized_headers = {normalize_source_column_name(header) for header in headers if not str(header).startswith("__")}
+    return (
+        any(normalize_source_column_name(alias) in normalized_headers for alias in MAIL_THREAD_FINAL_ID_ALIASES)
+        and (
+            normalize_source_column_name("latest_external_full_body") in normalized_headers
+            or normalize_source_column_name("raw_path") in normalized_headers
+        )
+    )
+
+
+def _resolve_mail_thread_effective_body(row_dict: dict[str, Any]) -> str:
+    clean_body = _clean_mail_thread_value(row_dict.get("latest_external_clean_body"))
+    if clean_body:
+        return clean_body
+    return _clean_mail_thread_value(row_dict.get("latest_external_full_body"))
+
+
+def _normalize_mail_thread_stage(value: Any) -> str:
+    return _clean_mail_thread_value(value).strip().lower()
+
+
+def _normalize_mail_thread_confidence(value: Any) -> str:
+    return _clean_mail_thread_value(value).strip().lower()
+
+
+def _normalize_brand_token(value: Any) -> str:
+    text = _clean_mail_thread_value(value).strip().lower()
+    return re.sub(r"[^a-z0-9]+", "", text)
+
+
+def _mail_thread_matches_target_brand(row_dict: dict[str, Any], target_brand: str) -> bool:
+    normalized_brand = _normalize_brand_token(target_brand)
+    if not normalized_brand:
+        return True
+    haystacks = (
+        _clean_mail_thread_value(row_dict.get("subject")),
+        _resolve_mail_thread_effective_body(row_dict),
+    )
+    return any(normalized_brand in _normalize_brand_token(haystack) for haystack in haystacks if haystack)
+
+
+def _is_mail_thread_auto_reply_like(row_dict: dict[str, Any]) -> bool:
+    subject = _clean_mail_thread_value(row_dict.get("subject"))
+    effective_body = _resolve_mail_thread_effective_body(row_dict)
+    for pattern in MAIL_THREAD_AUTO_REPLY_PATTERNS:
+        if pattern.search(subject) or pattern.search(effective_body):
+            return True
+    return False
+
+
+def _resolve_mail_thread_apify_gate(row_dict: dict[str, Any]) -> tuple[str, str, str]:
+    stage = _normalize_mail_thread_stage(_select_mail_thread_value(row_dict, MAIL_THREAD_STAGE_ALIASES))
+    confidence = _normalize_mail_thread_confidence(_select_mail_thread_value(row_dict, MAIL_THREAD_CONFIDENCE_ALIASES))
+    if stage in MAIL_THREAD_APIFY_READY_STAGES:
+        return "ready_for_apify", stage, confidence
+    if stage == "llm":
+        if confidence == "high":
+            return "ready_for_apify", stage, confidence
+        return "manual_review", stage, confidence or "unknown"
+    if stage in {"weak_rule", "regex_out_list_ambiguous", "uncertain"}:
+        return "manual_review", stage, confidence or "unknown"
+    if stage.startswith("filtered_"):
+        return "filtered_out", stage, confidence or "unknown"
+    return "manual_review", stage, confidence or "unknown"
+
+
+def _resolve_mail_thread_handle_stage_and_confidence(row_dict: dict[str, Any]) -> tuple[str, str, str]:
+    handle = _clean_mail_thread_value(_select_mail_thread_value(row_dict, MAIL_THREAD_FINAL_ID_ALIASES))
+    stage = _normalize_mail_thread_stage(_select_mail_thread_value(row_dict, MAIL_THREAD_STAGE_ALIASES))
+    confidence = _normalize_mail_thread_confidence(_select_mail_thread_value(row_dict, MAIL_THREAD_CONFIDENCE_ALIASES))
+    llm_handle = _clean_mail_thread_value(_select_mail_thread_value(row_dict, MAIL_THREAD_LLM_HANDLE_ALIASES))
+    if stage == "weak_rule" and llm_handle and confidence == "high":
+        return llm_handle, "llm", "high"
+    return handle, stage, confidence
+
+
+def build_canonical_upload_from_mail_thread_funnel(
+    source_path: Path,
+    frames: list[Any],
+    *,
+    target_brand: str = "",
+) -> tuple[Any | None, dict[str, Any]]:
+    records_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    record_sort_key: dict[tuple[str, str], tuple[str, int]] = {}
+    input_row_count = 0
+    skipped_row_count = 0
+    converted_row_count = 0
+    auto_reply_skipped_count = 0
+    evidence_fallback_count = 0
+    manual_review_skipped_count = 0
+    filtered_out_count = 0
+    brand_filtered_skipped_count = 0
+    llm_high_accepted_count = 0
+    llm_non_high_skipped_count = 0
+
+    for frame in frames:
+        if frame is None or frame.empty:
+            continue
+        for _, row_series in frame.iterrows():
+            row_dict = row_series.to_dict()
+            if _mail_thread_row_is_empty(row_dict):
+                continue
+            input_row_count += 1
+            if not _mail_thread_matches_target_brand(row_dict, target_brand):
+                brand_filtered_skipped_count += 1
+                continue
+            handle, normalized_stage_override, normalized_confidence_override = _resolve_mail_thread_handle_stage_and_confidence(row_dict)
+            if not handle:
+                skipped_row_count += 1
+                continue
+            if _is_mail_thread_auto_reply_like(row_dict):
+                auto_reply_skipped_count += 1
+                continue
+            apify_gate, normalized_stage, normalized_confidence = _resolve_mail_thread_apify_gate(row_dict)
+            if normalized_stage_override:
+                normalized_stage = normalized_stage_override
+            if normalized_confidence_override:
+                normalized_confidence = normalized_confidence_override
+            if normalized_stage == "llm" and normalized_confidence == "high":
+                apify_gate = "ready_for_apify"
+            if apify_gate == "filtered_out":
+                filtered_out_count += 1
+                continue
+            if apify_gate != "ready_for_apify":
+                manual_review_skipped_count += 1
+                if normalized_stage == "llm":
+                    llm_non_high_skipped_count += 1
+                continue
+            if normalized_stage == "llm" and normalized_confidence == "high":
+                llm_high_accepted_count += 1
+            normalized_handle = backend_app.screening.extract_platform_identifier("tiktok", handle) or _clean_text(handle).lstrip("@")
+            if not normalized_handle:
+                skipped_row_count += 1
+                continue
+
+            platform = "TikTok"
+            tiktok_url = backend_app.screening.build_canonical_profile_url("tiktok", normalized_handle)
+            instagram_url = backend_app.screening.build_canonical_profile_url("instagram", normalized_handle)
+            youtube_url = backend_app.screening.build_canonical_profile_url("youtube", normalized_handle)
+            resolution_stage = normalized_stage or _select_mail_thread_value(row_dict, MAIL_THREAD_STAGE_ALIASES)
+            resolution_confidence = normalized_confidence or _select_mail_thread_value(row_dict, MAIL_THREAD_CONFIDENCE_ALIASES)
+            mail_evidence = _select_mail_thread_value(row_dict, MAIL_THREAD_EVIDENCE_ALIASES)
+            if not mail_evidence:
+                mail_evidence = _clean_mail_thread_value(row_dict.get("latest_external_full_body"))
+                if mail_evidence:
+                    evidence_fallback_count += 1
+            latest_external_sent_at = _clean_mail_thread_value(row_dict.get("latest_external_sent_at"))
+            source_row_number = int(row_dict.get("__source_row_number") or 0)
+            record_key = ("tiktok", normalized_handle)
+            sort_key = (latest_external_sent_at, source_row_number)
+            if record_key in record_sort_key and record_sort_key[record_key] >= sort_key:
+                continue
+            record_sort_key[record_key] = sort_key
+            records_by_key[record_key] = {
+                "Platform": platform,
+                "@username": normalized_handle,
+                "URL": tiktok_url,
+                "nickname": normalized_handle,
+                "Region": "",
+                "email": _clean_mail_thread_value(row_dict.get("latest_external_from")),
+                "tiktok_url": tiktok_url,
+                "instagram_url": instagram_url,
+                "youtube_url": youtube_url,
+                "platform_attempt_order": "tiktok,instagram,youtube",
+                "mail_thread_key": _clean_mail_thread_value(row_dict.get("thread_key")),
+                "mail_resolution_stage": resolution_stage,
+                "mail_resolution_confidence": resolution_confidence,
+                "mail_apify_gate": apify_gate,
+                "mail_evidence": mail_evidence,
+                "mail_raw_path": _clean_mail_thread_value(row_dict.get("raw_path")),
+                "latest_external_from": _clean_mail_thread_value(row_dict.get("latest_external_from")),
+                "latest_external_sent_at": latest_external_sent_at,
+                "subject": _clean_mail_thread_value(row_dict.get("subject")),
+            }
+            converted_row_count += 1
+
+    if not records_by_key:
+        return None, {}
+
+    dataframe = backend_app.pd.DataFrame(list(records_by_key.values()), columns=CANONICAL_UPLOAD_EXPORT_COLUMNS)
+    return dataframe, {
+        "sourceType": "mail_thread_funnel",
+        "sourcePath": str(source_path),
+        "inputRowCount": input_row_count,
+        "recordCount": len(records_by_key),
+        "convertedRowCount": converted_row_count,
+        "skippedRowCount": skipped_row_count,
+        "autoReplySkippedCount": auto_reply_skipped_count,
+        "manualReviewSkippedCount": manual_review_skipped_count,
+        "filteredOutCount": filtered_out_count,
+        "brandFilteredSkippedCount": brand_filtered_skipped_count,
+        "llmHighAcceptedCount": llm_high_accepted_count,
+        "llmNonHighSkippedCount": llm_non_high_skipped_count,
+        "evidenceFallbackCount": evidence_fallback_count,
+    }
 
 
 def _resolve_cli_env_value(
@@ -737,7 +995,7 @@ def write_runtime_prompt_artifacts(
     return payload, output_path
 
 
-def prepare_upload_metadata(source_path: Path) -> dict[str, Any]:
+def prepare_upload_metadata(source_path: Path, *, task_name: str = "") -> dict[str, Any]:
     frames = load_upload_frames(source_path)
     if not frames:
         raise ValueError(f"上传名单为空或无法读取: {source_path}")
@@ -750,9 +1008,20 @@ def prepare_upload_metadata(source_path: Path) -> dict[str, Any]:
 
     resolved_columns, missing = backend_app.resolve_canonical_upload_columns(dataframe.columns)
     if missing:
-        normalized_dataframe, normalized_upload_summary = build_canonical_upload_from_sending_list(source_path, frames)
+        normalized_dataframe = None
+        if _has_mail_thread_funnel_columns(list(dataframe.columns)):
+            normalized_dataframe, normalized_upload_summary = build_canonical_upload_from_mail_thread_funnel(
+                source_path,
+                frames,
+                target_brand=task_name,
+            )
+            if normalized_dataframe is not None:
+                parsed_source_kind = "mail_thread_funnel"
+        if normalized_dataframe is None:
+            normalized_dataframe, normalized_upload_summary = build_canonical_upload_from_sending_list(source_path, frames)
         if normalized_dataframe is not None:
-            parsed_source_kind = "sending_list"
+            if parsed_source_kind != "mail_thread_funnel":
+                parsed_source_kind = "sending_list"
             normalized_upload_source_path = str(
                 persist_normalized_upload_dataframe(source_path, normalized_dataframe)
             )
@@ -986,7 +1255,7 @@ def prepare_screening_inputs(
 
     if resolved_creator_workbook is not None:
         summary["creator_workbook"] = str(resolved_creator_workbook)
-        summary["upload"] = prepare_upload_metadata(resolved_creator_workbook)
+        summary["upload"] = prepare_upload_metadata(resolved_creator_workbook, task_name=normalized_task_name)
         summary["parsed_source_kind"] = summary["upload"].get("parsed_source_kind", "")
         summary["input_row_count"] = int(summary["upload"].get("input_row_count") or 0)
 
