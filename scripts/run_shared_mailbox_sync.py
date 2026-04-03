@@ -6,7 +6,7 @@ import os
 import sqlite3
 import sys
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -94,6 +94,39 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def _load_last_successful_sync_date(summary_path: Path) -> date | None:
+    if not summary_path.exists():
+        return None
+    try:
+        payload = json.loads(summary_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    if str((payload or {}).get("status") or "").strip().lower() != "completed":
+        return None
+    for key in ("finished_at", "started_at"):
+        raw = str((payload or {}).get(key) or "").strip()
+        if not raw:
+            continue
+        try:
+            return datetime.fromisoformat(raw).date()
+        except Exception:
+            continue
+    return None
+
+
+def _resolve_wrapper_sent_since(cli_value: str | None, summary_path: Path, *, today: date | None = None) -> tuple[date, str]:
+    raw = str(cli_value or "").strip()
+    if raw:
+        return resolve_sync_sent_since(raw, today=today), "cli_explicit"
+
+    last_successful_date = _load_last_successful_sync_date(summary_path)
+    if last_successful_date is not None:
+        return last_successful_date - timedelta(days=1), "last_successful_sync_overlap_1d"
+
+    resolved_today = today or date.today()
+    return resolve_sync_sent_since("", today=resolved_today), "default_today_only"
+
+
 @contextmanager
 def _single_instance_lock(lock_path: Path):
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -124,6 +157,11 @@ def run_shared_mailbox_sync(args: argparse.Namespace) -> dict[str, Any]:
     lock_path = (settings.data_dir / DEFAULT_LOCK_NAME).resolve()
 
     before_count = _message_count(settings.db_path)
+    effective_sent_since, sent_since_source = _resolve_wrapper_sent_since(
+        args.sent_since,
+        summary_path,
+        today=datetime.now().astimezone().date(),
+    )
     summary: dict[str, Any] = {
         "started_at": iso_now(),
         "finished_at": "",
@@ -138,7 +176,9 @@ def run_shared_mailbox_sync(args: argparse.Namespace) -> dict[str, Any]:
         "raw_dir": str(settings.raw_dir),
         "summary_json": str(summary_path),
         "lock_path": str(lock_path),
-        "sent_since": str(args.sent_since or "").strip(),
+        "sent_since": effective_sent_since.isoformat(),
+        "sent_since_source": sent_since_source,
+        "sent_since_cli_raw": str(args.sent_since or "").strip(),
         "limit": int(args.limit) if args.limit else 0,
         "reset_state": bool(args.reset_state),
         "workers": int(args.workers),
@@ -162,7 +202,7 @@ def run_shared_mailbox_sync(args: argparse.Namespace) -> dict[str, Any]:
                     limit=args.limit or None,
                     reset_state=bool(args.reset_state),
                     workers=max(1, int(args.workers)),
-                    sent_since=resolve_sync_sent_since(args.sent_since),
+                    sent_since=effective_sent_since,
                 )
             finally:
                 db.close()
