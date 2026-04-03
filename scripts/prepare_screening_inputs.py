@@ -14,6 +14,7 @@ if str(REPO_ROOT) not in sys.path:
 
 
 import backend.app as backend_app
+from backend.timezone_utils import isoformat_shanghai_datetime
 from feishu_screening_bridge import download_task_upload_screening_assets
 from feishu_screening_bridge.feishu_api import DEFAULT_FEISHU_BASE_URL, FeishuOpenClient
 from feishu_screening_bridge.local_env import get_preferred_value, load_local_env
@@ -129,6 +130,10 @@ def _normalize_mail_thread_stage(value: Any) -> str:
 
 def _normalize_mail_thread_confidence(value: Any) -> str:
     return _clean_mail_thread_value(value).strip().lower()
+
+
+def _normalize_mail_thread_sent_at(value: Any) -> str:
+    return isoformat_shanghai_datetime(value) or _clean_mail_thread_value(value)
 
 
 def _normalize_brand_token(value: Any) -> str:
@@ -252,7 +257,7 @@ def build_canonical_upload_from_mail_thread_funnel(
                 mail_evidence = _clean_mail_thread_value(row_dict.get("latest_external_full_body"))
                 if mail_evidence:
                     evidence_fallback_count += 1
-            latest_external_sent_at = _clean_mail_thread_value(row_dict.get("latest_external_sent_at"))
+            latest_external_sent_at = _normalize_mail_thread_sent_at(row_dict.get("latest_external_sent_at"))
             source_row_number = int(row_dict.get("__source_row_number") or 0)
             record_key = ("tiktok", normalized_handle)
             sort_key = (latest_external_sent_at, source_row_number)

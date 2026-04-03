@@ -169,7 +169,7 @@ def build_mail_thread_funnel_workbook(path: Path) -> None:
         "thread-1",
         "Re: Paid collaboration with SKG",
         "manager@example.com",
-        "2026-04-03T05:27:00+08:00",
+        "2026-04-02T19:31:15+02:00",
         "Hello Lilith, interested.",
         "Hello Lilith\n\n> Hi @ livio.official ,",
         "regex_pass1",
@@ -544,6 +544,10 @@ class PrepareScreeningInputsTests(unittest.TestCase):
             self.assertEqual(
                 tiktok_metadata["high.confidence.creator"]["mail_apify_gate"],
                 "ready_for_apify",
+            )
+            self.assertEqual(
+                tiktok_metadata["livio.official"]["latest_external_sent_at"],
+                "2026-04-03T01:31:15+08:00",
             )
             self.assertEqual(
                 tiktok_metadata["llm.upgraded.creator"]["mail_resolution_stage"],

@@ -5,11 +5,11 @@ import math
 import re
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 from backend import creator_cache
+from backend.timezone_utils import format_shanghai_date
 
 
 FINAL_UPLOAD_COLUMNS = (
@@ -34,8 +34,6 @@ _SHARED_ATTACHMENT_PATHS_KEY = "__feishu_shared_attachment_local_paths"
 _LAST_MAIL_RAW_PATH_KEY = "__last_mail_raw_path"
 _ROW_UPDATE_MODE_KEY = "__feishu_update_mode"
 _UPDATE_MODE_CREATE_OR_MAIL_ONLY = "create_or_mail_only_update"
-_SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
-
 _PLATFORM_ALIASES = {
     "tiktok": "tiktok",
     "tik tok": "tiktok",
@@ -171,18 +169,7 @@ def _format_percentage(value: Any) -> str:
 
 
 def _format_date(value: Any) -> str:
-    raw = _clean_text(value)
-    if not raw:
-        return ""
-    try:
-        parsed = pd.to_datetime(raw)
-    except Exception:
-        return ""
-    if pd.isna(parsed):
-        return ""
-    if getattr(parsed, "tzinfo", None) is not None:
-        parsed = parsed.tz_convert(_SHANGHAI_TZ)
-    return parsed.strftime("%Y/%m/%d")
+    return format_shanghai_date(value)
 
 
 def _first_non_blank(*values: Any) -> Any:
@@ -518,18 +505,27 @@ def _normalize_employee_id(value: Any) -> str:
     return ",".join(cleaned)
 
 
-def _build_keep_lookup(keep_workbook: str | Path | None) -> tuple[dict[tuple[str, str], dict[str, Any]], dict[tuple[str, str], dict[str, Any]]]:
+def _build_keep_lookup(
+    keep_workbook: str | Path | None,
+) -> tuple[
+    dict[tuple[str, str], dict[str, Any]],
+    dict[tuple[str, str], dict[str, Any]],
+    dict[str, dict[str, Any]],
+    dict[str, dict[str, Any]],
+]:
     handle_lookup: dict[tuple[str, str], dict[str, Any]] = {}
     url_lookup: dict[tuple[str, str], dict[str, Any]] = {}
+    handle_any_lookup: dict[str, dict[str, Any]] = {}
+    url_any_lookup: dict[str, dict[str, Any]] = {}
     if not keep_workbook:
-        return handle_lookup, url_lookup
+        return handle_lookup, url_lookup, handle_any_lookup, url_any_lookup
     keep_path = Path(str(keep_workbook)).expanduser()
     if not keep_path.exists():
-        return handle_lookup, url_lookup
+        return handle_lookup, url_lookup, handle_any_lookup, url_any_lookup
     try:
         frame = pd.read_excel(keep_path)
     except Exception:
-        return handle_lookup, url_lookup
+        return handle_lookup, url_lookup, handle_any_lookup, url_any_lookup
     for record in frame.to_dict(orient="records"):
         platform = _normalize_platform(record.get("Platform"))
         if not platform:
@@ -542,10 +538,12 @@ def _build_keep_lookup(keep_workbook: str | Path | None) -> tuple[dict[tuple[str
             handle = _extract_handle(candidate)
             if handle:
                 handle_lookup.setdefault((platform, handle), dict(record))
+                handle_any_lookup.setdefault(handle, dict(record))
         url = _normalize_url(record.get("URL"))
         if url:
             url_lookup.setdefault((platform, url), dict(record))
-    return handle_lookup, url_lookup
+            url_any_lookup.setdefault(url, dict(record))
+    return handle_lookup, url_lookup, handle_any_lookup, url_any_lookup
 
 
 def _build_positioning_lookup(positioning_review_path: str | Path | None) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
@@ -643,12 +641,13 @@ def build_all_platforms_final_review_artifacts(
     keep_workbook: str | Path | None = None,
     task_owner: dict[str, Any] | None = None,
     payload_json_path: str | Path | None = None,
+    manual_review_rows: Sequence[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     workbook_path = Path(str(output_path)).expanduser().resolve()
     workbook_path.parent.mkdir(parents=True, exist_ok=True)
     archive_dir = workbook_path.parent / "feishu_upload_local_archive"
     archive_dir.mkdir(parents=True, exist_ok=True)
-    keep_handle_lookup, keep_url_lookup = _build_keep_lookup(keep_workbook)
+    keep_handle_lookup, keep_url_lookup, keep_handle_any_lookup, keep_url_any_lookup = _build_keep_lookup(keep_workbook)
     owner_context = dict(task_owner or {})
     owner_display_name = (
         _clean_text(owner_context.get("responsible_name"))
@@ -660,6 +659,7 @@ def build_all_platforms_final_review_artifacts(
     rows: list[dict[str, Any]] = []
     payload_rows: list[dict[str, Any]] = []
     skipped_payload_rows: list[dict[str, Any]] = []
+    seen_creator_keys: set[tuple[str, str]] = set()
 
     for platform, export_map in final_exports.items():
         final_review_path = Path(_clean_text((export_map or {}).get("final_review"))).expanduser()
@@ -682,7 +682,13 @@ def build_all_platforms_final_review_artifacts(
             )
             profile_url = _clean_text(_first_non_blank(record.get("profile_url"), ""))
             normalized_url = _normalize_url(profile_url)
-            keep_row = keep_handle_lookup.get((platform, handle)) or keep_url_lookup.get((platform, normalized_url)) or {}
+            keep_row = (
+                keep_handle_lookup.get((platform, handle))
+                or keep_url_lookup.get((platform, normalized_url))
+                or keep_handle_any_lookup.get(handle)
+                or keep_url_any_lookup.get(normalized_url)
+                or {}
+            )
             row_owner_context = _extract_row_owner_context(keep_row, owner_context)
             positioning_row = positioning_handle_lookup.get(handle) or positioning_url_lookup.get(normalized_url) or {}
             apify_row = apify_metrics.get(handle) or {}
@@ -800,6 +806,7 @@ def build_all_platforms_final_review_artifacts(
                 "ai评价": screening_comment,
             }
             rows.append(display_row)
+            seen_creator_keys.add((platform, handle))
 
             payload_row = dict(display_row)
             payload_row.update(
@@ -829,6 +836,105 @@ def build_all_platforms_final_review_artifacts(
                 )
             else:
                 payload_rows.append(payload_row)
+
+    for manual_row in list(manual_review_rows or []):
+        platform = _normalize_platform(manual_row.get("platform")) or "tiktok"
+        handle = _extract_handle(
+            _first_non_blank(
+                manual_row.get("identifier"),
+                manual_row.get("profile_url"),
+            )
+        )
+        if not handle:
+            continue
+        if (platform, handle) in seen_creator_keys:
+            continue
+        profile_url = _clean_text(manual_row.get("profile_url"))
+        normalized_url = _normalize_url(profile_url)
+        keep_row = (
+            keep_handle_lookup.get((platform, handle))
+            or keep_url_lookup.get((platform, normalized_url))
+            or keep_handle_any_lookup.get(handle)
+            or keep_url_any_lookup.get(normalized_url)
+            or {}
+        )
+        row_owner_context = _extract_row_owner_context(keep_row, owner_context)
+        manual_reason = _first_non_blank(
+            manual_row.get("reason"),
+            "TikTok / Instagram / YouTube 均未抓取到有效资料，需人工确认。",
+        )
+        last_mail_raw_path = _clean_text(
+            _first_non_blank(
+                keep_row.get("last_mail_raw_path"),
+                keep_row.get("brand_message_raw_path"),
+            )
+        )
+        row_attachment_paths = _resolve_existing_local_paths(
+            last_mail_raw_path,
+            base_dirs=[
+                Path.cwd(),
+                keep_workbook_path.parent if keep_workbook_path else None,
+            ],
+        )
+        display_row = {
+            "达人ID": _clean_text(_first_non_blank(handle, keep_row.get("@username"))),
+            "平台": platform,
+            "主页链接": profile_url or _clean_text(keep_row.get("URL")),
+            "# Followers(K)#": "",
+            "Following": "",
+            "Average Views (K)": "",
+            "互动率": "",
+            "当前网红报价": _build_quote_text(keep_row),
+            "达人最后一次回复邮件时间": _format_date(
+                _first_non_blank(
+                    keep_row.get("last_mail_time"),
+                    keep_row.get("brand_message_sent_at"),
+                )
+            ),
+            "达人回复的最后一封邮件内容": _clean_text(
+                _first_non_blank(
+                    keep_row.get("last_mail_snippet"),
+                    keep_row.get("brand_message_snippet"),
+                )
+            ),
+            "达人对接人": _clean_text(row_owner_context.get("responsible_name"))
+            or _clean_text(row_owner_context.get("employee_name"))
+            or owner_display_name,
+            "ai是否通过": "转人工",
+            "ai筛号反馈理由": manual_reason,
+            "标签(ai)": "",
+            "ai评价": manual_reason,
+        }
+        rows.append(display_row)
+        seen_creator_keys.add((platform, handle))
+        payload_row = dict(display_row)
+        payload_row.update(
+            {
+                "达人对接人_employee_id": _normalize_employee_id(row_owner_context.get("employee_id")),
+                "达人对接人_employee_record_id": _clean_text(row_owner_context.get("employee_record_id")),
+                "达人对接人_employee_email": _clean_text(row_owner_context.get("employee_email")),
+                "达人对接人_owner_name": _clean_text(row_owner_context.get("owner_name")),
+                "linked_bitable_url": _clean_text(row_owner_context.get("linked_bitable_url")),
+                "任务名": _clean_text(row_owner_context.get("task_name")),
+                "creator_emails": _clean_text(keep_row.get("creator_emails")),
+                "matched_contact_email": _clean_text(keep_row.get("matched_contact_email")),
+                "matched_contact_name": _clean_text(keep_row.get("matched_contact_name")),
+                _ROW_UPDATE_MODE_KEY: _UPDATE_MODE_CREATE_OR_MAIL_ONLY,
+                "__brand_message_raw_path": _clean_text(keep_row.get("brand_message_raw_path")),
+                _LAST_MAIL_RAW_PATH_KEY: last_mail_raw_path,
+                _ROW_ATTACHMENT_PATHS_KEY: row_attachment_paths,
+            }
+        )
+        validation_errors = _collect_upload_validation_errors(payload_row)
+        if validation_errors:
+            skipped_payload_rows.append(
+                {
+                    "skip_reasons": validation_errors,
+                    "row": payload_row,
+                }
+            )
+        else:
+            payload_rows.append(payload_row)
 
     combined = pd.DataFrame(rows, columns=FINAL_UPLOAD_COLUMNS)
     with pd.ExcelWriter(workbook_path, engine="openpyxl") as writer:

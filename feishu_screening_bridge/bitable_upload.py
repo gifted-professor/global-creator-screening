@@ -1,17 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
 import json
 import math
 from pathlib import Path
 import re
 from typing import Any
 from urllib import parse
-from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from backend.timezone_utils import shanghai_day_start_ms
 from .bitable_export import ResolvedBitableView, resolve_bitable_view_from_url
 from .feishu_api import FeishuApiError, FeishuOpenClient
 from .task_upload_sync import resolve_task_upload_entry
@@ -52,8 +51,6 @@ _UPLOAD_BASE_KEY_FIELDS = ("达人ID", "平台")
 _OWNER_SCOPE_FIELD_CANDIDATES = ("达人对接人",)
 _PREFERRED_TARGET_TABLE_NAMES = ("AI回信管理", "达人管理")
 _PREFERRED_TARGET_VIEW_NAMES = ("表格", "总视图")
-_SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
-
 
 @dataclass(frozen=True)
 class FieldSchema:
@@ -1042,19 +1039,7 @@ def _coerce_number(value: Any) -> float | int | None:
 
 
 def _coerce_date_to_ms(value: Any) -> int | None:
-    cleaned = _clean_text(value)
-    if not cleaned:
-        return None
-    try:
-        parsed = pd.to_datetime(cleaned)
-    except Exception:
-        return None
-    if pd.isna(parsed):
-        return None
-    if getattr(parsed, "tzinfo", None) is not None:
-        parsed = parsed.tz_convert(_SHANGHAI_TZ)
-    dt = datetime(parsed.year, parsed.month, parsed.day, tzinfo=_SHANGHAI_TZ)
-    return int(dt.timestamp() * 1000)
+    return shanghai_day_start_ms(value)
 
 
 def _resolve_single_select_value(schema: FieldSchema, raw_value: Any) -> str:
