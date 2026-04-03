@@ -685,8 +685,40 @@ def _load_workbook() -> Any:
     return Workbook, load_workbook
 
 
+def _extract_hyperlink_formula_target(formula: Any) -> str:
+    text = str(formula or "").strip()
+    if not text:
+        return ""
+    if text.startswith("="):
+        text = text[1:]
+    match = re.match(r'HYPERLINK\("((?:[^"]|"")*)"(?:,\s*"((?:[^"]|"")*)")?\)', text, re.IGNORECASE)
+    if not match:
+        return ""
+    target = match.group(1).replace('""', '"').strip()
+    label = (match.group(2) or "").replace('""', '"').strip()
+    return target or label
+
+
+def _sheet_cell_effective_value(cell: Any) -> Any:
+    value = getattr(cell, "value", None)
+    data_type = str(getattr(cell, "data_type", "") or "").lower()
+    if data_type == "f":
+        target = _extract_hyperlink_formula_target(value)
+        if target:
+            return target
+    hyperlink = getattr(cell, "hyperlink", None)
+    if hyperlink:
+        target = _stringify(getattr(hyperlink, "target", "") or "")
+        if target:
+            return target
+    return value
+
+
 def _sheet_row_values(sheet: Any, row_number: int, max_col: int) -> list[Any]:
-    return [sheet.cell(row_number, column_number).value for column_number in range(1, max_col + 1)]
+    return [
+        _sheet_cell_effective_value(sheet.cell(row_number, column_number))
+        for column_number in range(1, max_col + 1)
+    ]
 
 
 def _resolve_sheet_header_row(sheet: Any) -> tuple[int, list[str], int, int]:
@@ -706,7 +738,7 @@ def _resolve_sheet_header_row(sheet: Any) -> tuple[int, list[str], int, int]:
 
 def _source_headers(input_path: Path) -> list[str]:
     _, load_workbook = _load_workbook()
-    workbook = load_workbook(filename=input_path, read_only=False, data_only=True)
+    workbook = load_workbook(filename=input_path, read_only=False, data_only=False)
     try:
         ordered_headers: list[str] = []
         seen: set[str] = set()
@@ -724,7 +756,7 @@ def _source_headers(input_path: Path) -> list[str]:
 
 def _iter_sheet_rows(input_path: Path, source_headers: Sequence[str]) -> Iterator[dict[str, Any]]:
     _, load_workbook = _load_workbook()
-    workbook = load_workbook(filename=input_path, read_only=False, data_only=True)
+    workbook = load_workbook(filename=input_path, read_only=False, data_only=False)
     try:
         for sheet in workbook.worksheets:
             header_row_number, headers, max_row, max_col = _resolve_sheet_header_row(sheet)
@@ -841,7 +873,7 @@ def _has_canonical_creator_columns(headers: Sequence[str]) -> bool:
 
 def _iter_sending_list_rows(input_path: Path) -> Iterator[dict[str, Any]]:
     _, load_workbook = _load_workbook()
-    workbook = load_workbook(filename=input_path, read_only=False, data_only=True)
+    workbook = load_workbook(filename=input_path, read_only=False, data_only=False)
     try:
         records_by_key: dict[tuple[str, str], dict[str, Any]] = {}
         sheet_diagnostics: list[dict[str, Any]] = []

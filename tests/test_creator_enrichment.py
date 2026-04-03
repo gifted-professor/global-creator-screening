@@ -119,6 +119,17 @@ class CreatorEnrichmentTests(unittest.TestCase):
         sheet.append(["US", "", "cass-and-home", "https://www.youtube.com/@cass-and-home"])
         workbook.save(self.input_path)
 
+    def _make_formula_sending_list_workbook(self) -> None:
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "SendingList"
+        sheet.append(["地区", "博主用户名", "邮箱", "主页链接"])
+        sheet["A2"] = "US"
+        sheet["B2"] = '=HYPERLINK("https://www.tiktok.com/@creatorx","creatorx")'
+        sheet["C2"] = '=HYPERLINK("mailto:creator@example.com","creator@example.com")'
+        sheet["D2"] = "https://www.tiktok.com/@creatorx"
+        workbook.save(self.input_path)
+
     def test_low_level_header_detection_handles_partial_read_only_rows(self) -> None:
         class FakeSheet:
             def __init__(self) -> None:
@@ -379,6 +390,19 @@ class CreatorEnrichmentTests(unittest.TestCase):
         self.assertEqual(handle_row["Platform"], "YouTube")
         self.assertEqual(handle_row["@username"], "cassandhome")
         self.assertEqual(handle_row["match_confidence"], "high")
+
+    def test_iter_sending_list_rows_extracts_hyperlink_formula_targets(self) -> None:
+        self._make_formula_sending_list_workbook()
+
+        headers = creator_enrichment._source_headers(self.input_path)
+        rows = list(creator_enrichment._iter_sending_list_rows(self.input_path))
+
+        self.assertEqual(headers[:4], ["地区", "博主用户名", "邮箱", "主页链接"])
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["Platform"], "TikTok")
+        self.assertEqual(rows[0]["@username"], "creatorx")
+        self.assertEqual(rows[0]["Email"], "mailto:creator@example.com")
+        self.assertEqual(rows[0]["URL"], "https://www.tiktok.com/@creatorx")
 
 
 if __name__ == "__main__":

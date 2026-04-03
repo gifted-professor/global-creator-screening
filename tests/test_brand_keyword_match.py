@@ -62,6 +62,17 @@ class BrandKeywordMatchTests(unittest.TestCase):
         sheet.append(["US", "alice", "alice@mgmt.com", "https://instagram.com/alice"])
         workbook.save(self.input_path)
 
+    def _make_formula_sending_list_workbook(self) -> None:
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "results"
+        sheet.append(["地区", "博主用户名", "邮箱", "主页链接"])
+        sheet["A2"] = "US"
+        sheet["B2"] = '=HYPERLINK("https://instagram.com/alice","alice")'
+        sheet["C2"] = '=HYPERLINK("mailto:alice@mgmt.com","alice@mgmt.com")'
+        sheet["D2"] = "https://instagram.com/alice"
+        workbook.save(self.input_path)
+
     def _seed_messages(self) -> Database:
         db = Database(self.db_path)
         db.init_schema()
@@ -335,6 +346,36 @@ class BrandKeywordMatchTests(unittest.TestCase):
         self.assertEqual(rows[1][username_index], "alice")
         self.assertEqual(rows[1][url_index], "https://instagram.com/alice")
         self.assertEqual(rows[1][email_index], "alice@mgmt.com")
+
+    def test_match_brand_keyword_accepts_hyperlink_formula_sending_list(self) -> None:
+        self._make_formula_sending_list_workbook()
+        db = self._seed_messages()
+        try:
+            result = match_brand_keyword(
+                db=db,
+                input_path=self.input_path,
+                output_prefix=self.output_prefix,
+                keyword="MINISO",
+                include_from=True,
+            )
+        finally:
+            db.close()
+
+        self.assertEqual(result["source_kind"], "custom_columns")
+        self.assertEqual(result["email_direct_match_row_count"], 1)
+        deduped_path = Path(result["deduped_xlsx_path"])
+        workbook = load_workbook(deduped_path, read_only=True, data_only=True)
+        try:
+            rows = list(workbook.active.iter_rows(values_only=True))
+        finally:
+            workbook.close()
+        headers = list(rows[0])
+        username_index = headers.index("@username")
+        email_index = headers.index("Email")
+        matched_email_index = headers.index("matched_email")
+        self.assertEqual(rows[1][username_index], "alice")
+        self.assertEqual(rows[1][email_index], "mailto:alice@mgmt.com")
+        self.assertEqual(rows[1][matched_email_index], "alice@mgmt.com")
 
 
 if __name__ == "__main__":

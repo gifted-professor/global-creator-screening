@@ -178,10 +178,11 @@ def _load_candidate_rows(
             platform_value = _stringify(row.get(mapping["platform"], "")) if mapping["platform"] else ""
             region_value = _stringify(row.get(mapping["country"], "")) if mapping["country"] else ""
             normalized_platform = _infer_platform_from_value(profile_value) or _normalize_platform(platform_value)
+            normalized_handle = _normalize_handle(handle_value) or _normalize_handle(profile_value) or handle_value
             rows.append(
                 {
                     "Platform": _platform_label(normalized_platform) if normalized_platform else platform_value,
-                    "@username": handle_value or _normalize_handle(profile_value),
+                    "@username": normalized_handle,
                     "URL": profile_value,
                     "nickname": _stringify(row.get(mapping["creator"], "")) if mapping["creator"] else "",
                     "Region": region_value,
