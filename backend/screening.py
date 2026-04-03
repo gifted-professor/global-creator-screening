@@ -3,7 +3,7 @@ import math
 import re
 import statistics
 from datetime import datetime, timezone
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 
 def parse_env_positive_int(name, default):
@@ -223,6 +223,14 @@ def extract_platform_identifier(platform, value):
         match = re.search(r"tiktok\.com/@([^/?#]+)", lowered)
         if match:
             return normalize_identifier(match.group(1))
+        if "tiktok.com/search" in lowered:
+            try:
+                parsed = urlparse(text)
+                query_value = parse_qs(parsed.query or "").get("q", [""])[0]
+            except Exception:
+                query_value = ""
+            if query_value:
+                return normalize_identifier(unquote(query_value))
     elif platform == "youtube":
         patterns = (
             r"youtube\.com/@([^/?#]+)",

@@ -31,6 +31,21 @@ def build_creator_workbook(path: Path) -> None:
     workbook.save(path)
 
 
+def build_creator_workbook_with_tiktok_search_url(path: Path) -> None:
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Creators"
+    sheet.append(["Platform", "@username", "nickname", "Region", "URL"])
+    sheet.append([
+        "TikTok",
+        "httpswww.tiktok.comsearchqtinozacht1773382255532",
+        "tinozach",
+        "US",
+        "https://www.tiktok.com/search?q=tinozach&t=1773382255532",
+    ])
+    workbook.save(path)
+
+
 def build_sending_list_workbook(path: Path) -> None:
     workbook = Workbook()
     first_sheet = workbook.active
@@ -200,6 +215,36 @@ class PrepareScreeningInputsTests(unittest.TestCase):
             )
 
             self.assertTrue(summary_json.exists(), summary_json)
+
+    def test_prepare_screening_inputs_prefers_tiktok_search_query_over_bad_handle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            creator_workbook = tmp_path / "creator_upload_search.xlsx"
+            screening_data_dir = tmp_path / "screening_data"
+            config_dir = tmp_path / "config"
+            temp_dir = tmp_path / "temp"
+            template_output_dir = tmp_path / "parsed_outputs"
+
+            build_creator_workbook_with_tiktok_search_url(creator_workbook)
+
+            summary = prepare_screening_inputs(
+                creator_workbook=creator_workbook,
+                template_workbook=FIXTURE_TEMPLATE,
+                template_output_dir=template_output_dir,
+                screening_data_dir=screening_data_dir,
+                config_dir=config_dir,
+                temp_dir=temp_dir,
+            )
+
+            tiktok_metadata_path = Path(summary["upload"]["upload_metadata_paths"]["tiktok"])
+            tiktok_metadata = json.loads(tiktok_metadata_path.read_text(encoding="utf-8"))
+            self.assertIn("tinozach", tiktok_metadata, tiktok_metadata)
+            self.assertNotIn("httpswww.tiktok.comsearchqtinozacht1773382255532", tiktok_metadata, tiktok_metadata)
+            self.assertEqual(
+                tiktok_metadata["tinozach"]["url"],
+                "https://www.tiktok.com/@tinozach",
+                tiktok_metadata["tinozach"],
+            )
 
     def test_prepare_screening_inputs_normalizes_sending_list_workbook(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

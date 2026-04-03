@@ -5314,20 +5314,26 @@ def parse_canonical_upload_workbook(df, source_filename):
 
         raw_handle = clean_upload_metadata_value(row_dict.get(resolved_columns["handle"]))
         raw_url = clean_upload_metadata_value(row_dict.get(resolved_columns["url"])) if resolved_columns.get("url") else ""
+        raw_url_lower = str(raw_url or "").strip().lower()
+        raw_url_is_search = platform == "tiktok" and "tiktok.com/search" in raw_url_lower
         raw_url_identifier = (
             screening.extract_platform_identifier(platform, raw_url)
-            if raw_url and is_probable_upload_profile_url(raw_url)
+            if raw_url and (is_probable_upload_profile_url(raw_url) or raw_url_is_search)
             else ""
         )
         identifier = (
-            screening.extract_platform_identifier(platform, raw_handle)
-            or raw_url_identifier
+            raw_url_identifier
+            or screening.extract_platform_identifier(platform, raw_handle)
         )
         if not identifier:
             invalid_rows.append(f"{row_location} @username 为空或无法识别：`{raw_handle}`。")
             continue
 
-        canonical_url = raw_url if raw_url_identifier else screening.build_canonical_profile_url(platform, identifier)
+        canonical_url = (
+            raw_url
+            if raw_url and is_probable_upload_profile_url(raw_url) and not raw_url_is_search and raw_url_identifier
+            else screening.build_canonical_profile_url(platform, identifier)
+        )
         metadata = build_upload_metadata_record(row_dict, platform, canonical_url, source_filename)
         metadata_by_platform[platform][identifier] = metadata
         grouped_data[platform].append(canonical_url)

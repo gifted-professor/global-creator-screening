@@ -3,7 +3,12 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import unittest
 
-from backend.screening import check_instagram_profile, filter_scraped_items, has_instagram_allowed_region
+from backend.screening import (
+    check_instagram_profile,
+    extract_platform_identifier,
+    filter_scraped_items,
+    has_instagram_allowed_region,
+)
 
 
 def _active_post() -> dict[str, str]:
@@ -62,6 +67,14 @@ class InstagramRegionDetectionTests(unittest.TestCase):
 
 
 class TikTokScrapeErrorHandlingTests(unittest.TestCase):
+    def test_extract_platform_identifier_uses_search_query_for_tiktok_search_urls(self) -> None:
+        identifier = extract_platform_identifier(
+            "tiktok",
+            "https://www.tiktok.com/search?q=tinozach&t=1773382255532",
+        )
+
+        self.assertEqual(identifier, "tinozach")
+
     def test_tiktok_error_placeholder_is_exported_as_reject_not_missing(self) -> None:
         result = filter_scraped_items(
             "tiktok",
