@@ -742,7 +742,10 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
         def fail_sync_task_upload_mailboxes(**kwargs):
             raise AssertionError("should not call IMAP sync when existing_mail_db_path is provided")
 
-        def fake_match_brand_keyword(*, db, input_path, output_prefix, keyword, include_from):
+        observed: dict[str, object] = {}
+
+        def fake_match_brand_keyword(*, db, input_path, output_prefix, keyword, sent_since, include_from):
+            observed["sent_since"] = sent_since
             all_xlsx = output_prefix.with_suffix(".xlsx")
             deduped_xlsx = output_prefix.with_name(f"{output_prefix.name}_去重").with_suffix(".xlsx")
             unique_xlsx = output_prefix.with_name(f"{output_prefix.name}_唯一邮箱").with_suffix(".xlsx")
@@ -851,6 +854,7 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
         self.assertEqual(summary["steps"]["mail_sync"]["artifacts"]["mail_db_path"], str(existing_db.resolve()))
         self.assertEqual(summary["steps"]["mail_sync"]["artifacts"]["mail_raw_dir"], str(existing_raw.resolve()))
         self.assertEqual(summary["steps"]["mail_sync"]["resume_policy"]["stage_policy"], "reuse_external_shared_mail_db_reference")
+        self.assertEqual(str(observed["sent_since"]), "2026-03-31")
 
     def test_runner_passes_default_mail_credentials_to_mail_sync(self) -> None:
         observed: dict[str, object] = {}
@@ -1484,7 +1488,7 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
                 ],
             }
 
-        def fake_match_brand_keyword(*, db, input_path, output_prefix, keyword, include_from):
+        def fake_match_brand_keyword(*, db, input_path, output_prefix, keyword, sent_since, include_from):
             all_xlsx = output_prefix.with_suffix(".xlsx")
             deduped_xlsx = output_prefix.with_name(f"{output_prefix.name}_deduped").with_suffix(".xlsx")
             unique_xlsx = output_prefix.with_name(f"{output_prefix.name}_unique_email").with_suffix(".xlsx")

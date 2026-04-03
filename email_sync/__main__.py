@@ -162,6 +162,7 @@ def _build_parser() -> argparse.ArgumentParser:
         help="输出文件前缀，默认 exports/brand_keyword_match",
     )
     brand_match.add_argument("--message-limit", type=int, default=0, help="只读取最新 N 封命中邮件；0 表示不截断")
+    brand_match.add_argument("--sent-since", default="", help="只匹配这个日期及之后的邮件，格式 YYYY-MM-DD")
     brand_match.add_argument("--include-from", action="store_true", help="把 from/sender 地址也纳入精确匹配候选")
     brand_match.add_argument("--email-column", default="", help="显式指定邮箱列名")
     brand_match.add_argument("--creator-column", default="", help="显式指定 creator 列名")
@@ -780,6 +781,7 @@ def _cmd_match_brand_keyword(
     output_prefix: str,
     db_path: Optional[str],
     keyword: str,
+    sent_since: Optional[str],
     message_limit: int,
     include_from: bool,
     email_column: str,
@@ -795,6 +797,7 @@ def _cmd_match_brand_keyword(
             input_path=Path(input_path),
             output_prefix=Path(output_prefix),
             keyword=keyword,
+            sent_since=resolve_sync_sent_since(sent_since),
             message_limit=message_limit,
             include_from=include_from,
             email_column=email_column,
@@ -962,6 +965,7 @@ def main() -> int:
                 output_prefix=args.output_prefix,
                 db_path=args.db_path,
                 keyword=args.keyword,
+                sent_since=args.sent_since,
                 message_limit=args.message_limit,
                 include_from=args.include_from,
                 email_column=args.email_column,

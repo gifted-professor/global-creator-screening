@@ -4,6 +4,7 @@ import csv
 import sqlite3
 from collections import defaultdict
 from dataclasses import dataclass
+from datetime import date
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -200,7 +201,13 @@ def _load_candidate_rows(
     raise ValueError("无法识别输入 workbook 的邮箱/主页列；请显式传入 --email-column 与 --profile-column 或 --handle-column。")
 
 
-def _query_keyword_messages(db: Database, keyword: str, limit: int = 0) -> list[sqlite3.Row]:
+def _query_keyword_messages(
+    db: Database,
+    keyword: str,
+    *,
+    sent_since: date | None = None,
+    limit: int = 0,
+) -> list[sqlite3.Row]:
     keyword_like = f"%{keyword.lower()}%"
     params: list[object] = [keyword_like] * 8
     sql = """
@@ -233,8 +240,11 @@ def _query_keyword_messages(db: Database, keyword: str, limit: int = 0) -> list[
                   AND LOWER(COALESCE(a.filename, '')) LIKE ?
             )
         )
-        ORDER BY datetime(m.sent_at) DESC, m.id DESC
     """
+    if sent_since is not None:
+        sql += "\n        AND datetime(COALESCE(m.sent_at, '')) >= datetime(?)"
+        params.append(f"{sent_since.isoformat()} 00:00:00")
+    sql += "\n        ORDER BY datetime(m.sent_at) DESC, m.id DESC"
     if limit > 0:
         sql = f"{sql}\nLIMIT ?"
         params.append(limit)
@@ -442,6 +452,7 @@ def match_brand_keyword(
     input_path: Path,
     output_prefix: Path,
     keyword: str,
+    sent_since: date | None = None,
     message_limit: int = 0,
     include_from: bool = False,
     email_column: str = "",
@@ -463,9 +474,18 @@ def match_brand_keyword(
         handle_column=handle_column,
         platform_column=platform_column,
     )
-    messages = _query_keyword_messages(db, normalized_keyword, limit=max(0, int(message_limit)))
+    messages = _query_keyword_messages(
+        db,
+        normalized_keyword,
+        sent_since=sent_since,
+        limit=max(0, int(message_limit)),
+    )
     address_hits = _collect_address_hits(messages, include_from=include_from)
-    matched_rows = _build_match_rows(candidate_rows, keyword=normalized_keyword, address_hits=address_hits)
+    matched_rows = _build_match_rows(
+        candidate_rows,
+        keyword=normalized_keyword,
+        address_hits=address_hits,
+    )
     deduped_rows = dedupe_brand_match_rows(matched_rows)
     unique_rows, shared_rows, shared_group_count = split_shared_email_rows(deduped_rows)
 
@@ -487,6 +507,7 @@ def match_brand_keyword(
     return {
         "source_kind": source_kind,
         "keyword": normalized_keyword,
+        "sent_since": sent_since.isoformat() if sent_since else "",
         "message_hit_count": len(messages),
         "matched_email_count": len(address_hits),
         "email_direct_match_row_count": len(matched_rows),

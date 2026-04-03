@@ -1332,6 +1332,7 @@ def run_task_upload_to_keep_list_pipeline(
                         input_path=Path(summary["artifacts"]["sending_list_workbook"]),
                         output_prefix=brand_match_prefix,
                         keyword=resolved_brand_keyword,
+                        sent_since=resolve_sync_sent_since(sent_since or None),
                         include_from=bool(brand_match_include_from),
                     )
                 finally:

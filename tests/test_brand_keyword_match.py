@@ -5,6 +5,7 @@ import json
 import shutil
 import tempfile
 import unittest
+from datetime import date
 from pathlib import Path
 
 from openpyxl import Workbook, load_workbook
@@ -243,6 +244,113 @@ class BrandKeywordMatchTests(unittest.TestCase):
         self.assertTrue(all(row[distinct_count_index] == 2 for row in rows[1:]))
         self.assertTrue(all(row[region_index] == "UK" for row in rows[1:]))
 
+    def test_match_brand_keyword_applies_sent_since_to_message_query(self) -> None:
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "results"
+        sheet.append(["Platform", "@username", "URL", "nickname", "Region", "Email"])
+        sheet.append(["Instagram", "alice", "https://instagram.com/alice", "Alice", "US", "alice@mgmt.com"])
+        workbook.save(self.input_path)
+
+        db = Database(self.db_path)
+        db.init_schema()
+        rows = [
+            (
+                "operator@example.com",
+                "INBOX",
+                1,
+                1,
+                "<old-miniso>",
+                "MINISO March outreach",
+                None,
+                None,
+                "2026-03-30T10:00:00+08:00",
+                "2026-03-30T10:00:00+08:00",
+                "2026-03-30T10:00:00+08:00",
+                "2026-03-30T10:00:00+08:00",
+                "[]",
+                100,
+                _addresses(("Brand Manager", "brand@miniso.com")),
+                _addresses(("Alice Manager", "alice@mgmt.com")),
+                "[]",
+                "[]",
+                "[]",
+                "[]",
+                "MINISO old outreach for Alice.",
+                "",
+                "MINISO old outreach for Alice.",
+                "{}",
+                "raw/old.eml",
+                "sha-old",
+                100,
+                0,
+                0,
+                "2026-03-30T10:00:00+08:00",
+                "2026-03-30T10:00:00+08:00",
+            ),
+            (
+                "operator@example.com",
+                "INBOX",
+                2,
+                1,
+                "<new-miniso>",
+                "MINISO April outreach",
+                None,
+                None,
+                "2026-04-02T10:00:00+08:00",
+                "2026-04-02T10:00:00+08:00",
+                "2026-04-02T10:00:00+08:00",
+                "2026-04-02T10:00:00+08:00",
+                "[]",
+                100,
+                _addresses(("Brand Manager", "brand@miniso.com")),
+                _addresses(("Alice Manager", "alice@mgmt.com")),
+                "[]",
+                "[]",
+                "[]",
+                "[]",
+                "MINISO new outreach for Alice.",
+                "",
+                "MINISO new outreach for Alice.",
+                "{}",
+                "raw/new.eml",
+                "sha-new",
+                100,
+                0,
+                0,
+                "2026-04-02T10:00:00+08:00",
+                "2026-04-02T10:00:00+08:00",
+            ),
+        ]
+        db.conn.executemany(
+            """
+            INSERT INTO messages (
+                account_email, folder_name, uid, uidvalidity, message_id, subject, in_reply_to, references_header,
+                sent_at, sent_at_raw, internal_date, internal_date_raw, flags_json, size_bytes,
+                from_json, to_json, cc_json, bcc_json, reply_to_json, sender_json,
+                body_text, body_html, snippet, headers_json, raw_path, raw_sha256, raw_size_bytes,
+                has_attachments, attachment_count, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        db.conn.commit()
+        try:
+            result = match_brand_keyword(
+                db=db,
+                input_path=self.input_path,
+                output_prefix=self.output_prefix,
+                keyword="MINISO",
+                sent_since=date(2026, 4, 1),
+                include_from=True,
+            )
+        finally:
+            db.close()
+
+        self.assertEqual(result["message_hit_count"], 1)
+        self.assertEqual(result["email_direct_match_row_count"], 1)
+        self.assertEqual(result["sent_since"], "2026-04-01")
+
     def test_split_shared_email_can_reprocess_deduped_output(self) -> None:
         self._make_workbook()
         db = self._seed_messages()
@@ -376,7 +484,6 @@ class BrandKeywordMatchTests(unittest.TestCase):
         self.assertEqual(rows[1][username_index], "alice")
         self.assertEqual(rows[1][email_index], "mailto:alice@mgmt.com")
         self.assertEqual(rows[1][matched_email_index], "alice@mgmt.com")
-
 
 if __name__ == "__main__":
     unittest.main()
