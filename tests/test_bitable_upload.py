@@ -14,12 +14,13 @@ from feishu_screening_bridge.task_upload_sync import TaskUploadEntry
 class _FakeBitableUploadClient:
     def __init__(self) -> None:
         self.created_records: list[dict[str, object]] = []
+        self.updated_records: list[dict[str, object]] = []
         self.search_items = [
             {
                 "record_id": "rec_existing",
                 "fields": {
-                    "达人ID": "beta",
-                    "平台": "tiktok",
+                    "达人ID": [{"text": "beta", "type": "text"}],
+                    "平台": [{"text": "tiktok", "type": "text"}],
                 },
             }
         ]
@@ -74,9 +75,23 @@ class _FakeBitableUploadClient:
             return {"data": {"record": {"record_id": record_id, "fields": fields}}}
         raise AssertionError(f"unexpected POST {url_path}")
 
+    def put_api_json(
+        self,
+        url_path: str,
+        *,
+        body: dict[str, object] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, object]:
+        if "/records/" not in url_path:
+            raise AssertionError(f"unexpected PUT {url_path}")
+        fields = dict((body or {}).get("fields") or {})
+        record_id = str(url_path.rsplit("/", 1)[-1] or "").strip()
+        self.updated_records.append({"record_id": record_id, "fields": fields})
+        return {"data": {"record": {"record_id": record_id, "fields": fields}}}
+
 
 class BitableUploadTests(unittest.TestCase):
-    def test_upload_payload_maps_fields_and_skips_existing_rows(self) -> None:
+    def test_upload_payload_maps_fields_and_updates_existing_rows(self) -> None:
         client = _FakeBitableUploadClient()
         resolved_view = ResolvedBitableView(
             source_url="https://example.com/base/app?table=tbl&view=vew",
@@ -142,7 +157,10 @@ class BitableUploadTests(unittest.TestCase):
                     linked_bitable_url="https://example.com/base/app?table=tbl&view=vew",
                 )
 
+            self.assertEqual(result["to_create_count"], 1)
+            self.assertEqual(result["to_update_count"], 1)
             self.assertEqual(result["created_count"], 1)
+            self.assertEqual(result["updated_count"], 0)
             self.assertEqual(result["skipped_existing_count"], 1)
             self.assertEqual(result["failed_count"], 0)
             self.assertTrue(Path(result["result_json_path"]).exists())
@@ -165,6 +183,68 @@ class BitableUploadTests(unittest.TestCase):
             )
             self.assertEqual(created_fields["达人对接人"], [{"id": "ou_alpha"}])
             self.assertIsInstance(created_fields["达人最后一次回复邮件时间"], int)
+            self.assertEqual(client.updated_records, [])
+
+    def test_upload_updates_only_mail_fields_for_existing_rows(self) -> None:
+        client = _FakeBitableUploadClient()
+        resolved_view = ResolvedBitableView(
+            source_url="https://example.com/base/app?table=tbl&view=vew",
+            source_kind="base",
+            source_token="app_token",
+            app_token="app_token",
+            table_id="tbl",
+            view_id="vew",
+            table_name="达人管理",
+            view_name="总视图",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            payload_path = Path(tmpdir) / "payload.json"
+            payload_path.write_text(
+                json.dumps(
+                    {
+                        "rows": [
+                            {
+                                "达人ID": "beta",
+                                "平台": "tiktok",
+                                "主页链接": "https://www.tiktok.com/@beta",
+                                "# Followers(K)#": 999.9,
+                                "互动率": "18.5%",
+                                "当前网红报价": "$500",
+                                "达人最后一次回复邮件时间": "2026/04/03",
+                                "达人回复的最后一封邮件内容": "latest reply",
+                                "达人对接人_employee_id": "ou_beta",
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            with patch(
+                "feishu_screening_bridge.bitable_upload.resolve_bitable_view_from_url",
+                return_value=resolved_view,
+            ):
+                result = upload_final_review_payload_to_bitable(
+                    client,
+                    payload_json_path=payload_path,
+                    linked_bitable_url="https://example.com/base/app?table=tbl&view=vew",
+                )
+
+            self.assertEqual(result["created_count"], 0)
+            self.assertEqual(result["updated_count"], 1)
+            self.assertEqual(result["failed_count"], 0)
+            self.assertEqual(client.created_records, [])
+            self.assertEqual(len(client.updated_records), 1)
+            updated_fields = client.updated_records[0]["fields"]
+            self.assertEqual(
+                set(updated_fields.keys()),
+                {"当前网红报价", "达人最后一次回复邮件时间", "达人回复的最后一封邮件内容"},
+            )
+            self.assertEqual(updated_fields["当前网红报价"], "$500")
+            self.assertEqual(updated_fields["达人回复的最后一封邮件内容"], "latest reply")
+            self.assertIsInstance(updated_fields["达人最后一次回复邮件时间"], int)
 
     def test_upload_prefers_task_upload_resolved_target_over_payload_link(self) -> None:
         client = _FakeBitableUploadClient()

@@ -25,6 +25,11 @@ _FIELD_NAME_ALIASES = {
 }
 
 _UPLOAD_KEY_FIELDS = ("达人ID", "平台")
+_MAIL_ONLY_UPDATE_FIELDS = (
+    "当前网红报价",
+    "达人最后一次回复邮件时间",
+    "达人回复的最后一封邮件内容",
+)
 
 
 @dataclass(frozen=True)
@@ -83,27 +88,29 @@ def upload_final_review_payload_to_bitable(
         rows = rows[: int(limit)]
 
     created_rows: list[dict[str, Any]] = []
+    updated_rows: list[dict[str, Any]] = []
     skipped_existing_rows: list[dict[str, Any]] = []
     failed_rows: list[dict[str, Any]] = []
+    to_create_count = 0
+    to_update_count = 0
 
     for row in rows:
         if not isinstance(row, dict):
             continue
         record_key = _build_record_key(row.get("达人ID"), row.get("平台"))
-        if record_key and record_key in existing_keys:
-            skipped_existing_rows.append(
-                {
-                    "status": "skipped_existing",
-                    "record_key": record_key,
-                    "existing_record_id": existing_keys[record_key],
-                    "row": row,
-                    "reason": "飞书表已存在同达人ID+平台记录",
-                }
-            )
-            continue
+        existing_record_id = existing_keys.get(record_key, "")
+        action = "update" if existing_record_id else "create"
+        if action == "update":
+            to_update_count += 1
+        else:
+            to_create_count += 1
 
         try:
-            fields = _build_feishu_fields(row, field_schemas)
+            fields = _build_feishu_fields(
+                row,
+                field_schemas,
+                allowed_field_names=_MAIL_ONLY_UPDATE_FIELDS if action == "update" else None,
+            )
         except Exception as exc:  # noqa: BLE001
             failed_rows.append(
                 {
@@ -116,15 +123,63 @@ def upload_final_review_payload_to_bitable(
             continue
 
         if dry_run:
-            created_rows.append(
+            destination = updated_rows if action == "update" else created_rows
+            destination.append(
                 {
-                    "status": "dry_run_ready",
+                    "status": "dry_run_update" if action == "update" else "dry_run_create",
                     "record_key": record_key,
+                    "existing_record_id": existing_record_id,
                     "row": row,
                     "fields": fields,
-                    "record_id": "",
+                    "record_id": existing_record_id,
+                    "reason": "飞书表已存在同达人ID+平台记录，将执行邮件字段更新" if action == "update" else "",
                 }
             )
+            continue
+
+        if action == "update":
+            if not fields:
+                skipped_existing_rows.append(
+                    {
+                        "status": "skipped_existing",
+                        "record_key": record_key,
+                        "existing_record_id": existing_record_id,
+                        "row": row,
+                        "reason": "飞书表已存在同达人ID+平台记录，但当前没有可更新的邮件字段",
+                    }
+                )
+                continue
+            try:
+                response = client.put_api_json(
+                    f"/bitable/v1/apps/{resolved_view.app_token}/tables/{resolved_view.table_id}/records/{existing_record_id}",
+                    body={"fields": fields},
+                )
+            except Exception as exc:  # noqa: BLE001
+                failed_rows.append(
+                    {
+                        "status": "failed",
+                        "record_key": record_key,
+                        "existing_record_id": existing_record_id,
+                        "row": row,
+                        "fields": fields,
+                        "error": str(exc) or exc.__class__.__name__,
+                    }
+                )
+                continue
+            record_id = str((((response.get("data") or {}).get("record") or {}).get("record_id")) or existing_record_id).strip()
+            updated_rows.append(
+                {
+                    "status": "updated",
+                    "record_key": record_key,
+                    "record_id": record_id,
+                    "existing_record_id": existing_record_id,
+                    "row": row,
+                    "fields": fields,
+                    "reason": "飞书表已存在同达人ID+平台记录，已执行邮件字段更新",
+                }
+            )
+            if record_key:
+                existing_keys[record_key] = record_id or existing_record_id
             continue
 
         try:
@@ -203,18 +258,23 @@ def upload_final_review_payload_to_bitable(
         "target_table_name": resolved_view.table_name,
         "target_view_id": resolved_view.view_id,
         "target_view_name": resolved_view.view_name,
+        "existing_record_count": len(existing_records),
         "source_row_count": int(payload.get("row_count") or len(payload.get("rows") or [])),
         "selected_row_count": len(rows),
+        "to_create_count": to_create_count,
+        "to_update_count": to_update_count,
         "created_count": len(created_rows),
+        "updated_count": len(updated_rows),
         "skipped_existing_count": len(skipped_existing_rows),
         "failed_count": len(failed_rows),
         "created_rows": created_rows,
+        "updated_rows": updated_rows,
         "skipped_existing_rows": skipped_existing_rows,
         "failed_rows": failed_rows,
     }
     resolved_result_json.parent.mkdir(parents=True, exist_ok=True)
     resolved_result_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    _write_upload_result_xlsx(resolved_result_xlsx, created_rows, skipped_existing_rows, failed_rows)
+    _write_upload_result_xlsx(resolved_result_xlsx, created_rows, updated_rows, skipped_existing_rows, failed_rows)
     return summary
 
 
@@ -288,8 +348,8 @@ def _fetch_existing_records(client: FeishuOpenClient, resolved: ResolvedBitableV
 
 
 def _build_record_key(creator_id: Any, platform: Any) -> str:
-    left = _clean_text(creator_id).casefold()
-    right = _clean_text(platform).casefold()
+    left = _extract_text_like(creator_id).casefold()
+    right = _extract_text_like(platform).casefold()
     if not left or not right:
         return ""
     return f"{left}::{right}"
@@ -301,6 +361,25 @@ def _clean_text(value: Any) -> str:
     if isinstance(value, float) and math.isnan(value):
         return ""
     return str(value).strip()
+
+
+def _extract_text_like(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, dict):
+        for key in ("text", "name", "id", "value"):
+            cleaned = _clean_text(value.get(key))
+            if cleaned:
+                return cleaned
+        return ""
+    if isinstance(value, (list, tuple)):
+        parts: list[str] = []
+        for item in value:
+            cleaned = _extract_text_like(item)
+            if cleaned:
+                parts.append(cleaned)
+        return "".join(parts).strip()
+    return _clean_text(value)
 
 
 def _normalize_field_key(name: str) -> str:
@@ -320,8 +399,14 @@ def _lookup_field_schema(field_schemas: dict[str, FieldSchema], desired_name: st
     return None
 
 
-def _build_feishu_fields(row: dict[str, Any], field_schemas: dict[str, FieldSchema]) -> dict[str, Any]:
+def _build_feishu_fields(
+    row: dict[str, Any],
+    field_schemas: dict[str, FieldSchema],
+    *,
+    allowed_field_names: tuple[str, ...] | None = None,
+) -> dict[str, Any]:
     fields: dict[str, Any] = {}
+    allowed_normalized = {_normalize_field_key(name) for name in (allowed_field_names or ()) if _normalize_field_key(name)}
     for payload_name, raw_value in row.items():
         if payload_name in {
             "达人对接人_employee_id",
@@ -335,13 +420,15 @@ def _build_feishu_fields(row: dict[str, Any], field_schemas: dict[str, FieldSche
         schema = _lookup_field_schema(field_schemas, payload_name)
         if schema is None:
             continue
+        if allowed_normalized and _normalize_field_key(schema.field_name) not in allowed_normalized:
+            continue
         converted, include = _convert_field_value(schema, raw_value, row=row)
         if include:
             fields[schema.field_name] = converted
 
     person_schema = _lookup_field_schema(field_schemas, "达人对接人")
     employee_id = _clean_text(row.get("达人对接人_employee_id")).split(",")[0].strip()
-    if person_schema is not None and employee_id:
+    if not allowed_normalized and person_schema is not None and employee_id:
         fields[person_schema.field_name] = [{"id": employee_id}]
 
     return fields
@@ -454,6 +541,7 @@ def _resolve_url_value(raw_value: Any) -> dict[str, str] | None:
 def _write_upload_result_xlsx(
     output_path: Path,
     created_rows: list[dict[str, Any]],
+    updated_rows: list[dict[str, Any]],
     skipped_existing_rows: list[dict[str, Any]],
     failed_rows: list[dict[str, Any]],
 ) -> None:
@@ -461,6 +549,8 @@ def _write_upload_result_xlsx(
     status_rows: list[dict[str, Any]] = []
     for item in created_rows:
         status_rows.append(_flatten_status_row(item, default_reason=""))
+    for item in updated_rows:
+        status_rows.append(_flatten_status_row(item, default_reason=str(item.get("reason") or "")))
     for item in skipped_existing_rows:
         status_rows.append(_flatten_status_row(item, default_reason=str(item.get("reason") or "")))
     for item in failed_rows:
