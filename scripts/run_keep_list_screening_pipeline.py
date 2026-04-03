@@ -177,24 +177,43 @@ def build_scrape_payload(
     identifiers: list[str],
     *,
     exclude_pinned_posts: bool = True,
+    creator_cache_db_path: str = "",
+    force_refresh_creator_cache: bool = False,
 ) -> dict[str, Any]:
     values = [str(item).strip() for item in identifiers if str(item).strip()]
     if platform == "tiktok":
-        return {
+        payload = {
             "profiles": values,
             "excludePinnedPosts": bool(exclude_pinned_posts),
         }
-    if platform == "instagram":
-        return {"usernames": values}
-    if platform == "youtube":
-        return {"urls": values}
-    raise ValueError(f"不支持的平台: {platform}")
+    elif platform == "instagram":
+        payload = {"usernames": values}
+    elif platform == "youtube":
+        payload = {"urls": values}
+    else:
+        raise ValueError(f"不支持的平台: {platform}")
+    if str(creator_cache_db_path or "").strip():
+        payload["creator_cache_db_path"] = str(creator_cache_db_path).strip()
+    if force_refresh_creator_cache:
+        payload["force_refresh_creator_cache"] = True
+    return payload
 
 
-def build_visual_payload(platform: str, identifiers: list[str]) -> dict[str, Any]:
+def build_visual_payload(
+    platform: str,
+    identifiers: list[str],
+    *,
+    creator_cache_db_path: str = "",
+    force_refresh_creator_cache: bool = False,
+) -> dict[str, Any]:
     values = [str(item).strip() for item in identifiers if str(item).strip()]
     if platform in {"tiktok", "instagram", "youtube"}:
-        return {"identifiers": values}
+        payload = {"identifiers": values}
+        if str(creator_cache_db_path or "").strip():
+            payload["creator_cache_db_path"] = str(creator_cache_db_path).strip()
+        if force_refresh_creator_cache:
+            payload["force_refresh_creator_cache"] = True
+        return payload
     raise ValueError(f"不支持的平台: {platform}")
 
 
@@ -644,6 +663,8 @@ def _run_visual_postcheck_retries(
     platform: str,
     platform_summary: dict[str, Any],
     vision_provider: str,
+    creator_cache_db_path: str,
+    force_refresh_creator_cache: bool,
     poll_job,
     require_success,
     poll_interval: float,
@@ -676,7 +697,12 @@ def _run_visual_postcheck_retries(
 
     remaining = list(failed_identifiers)
     for round_index in range(1, retry_summary["max_rounds"] + 1):
-        visual_payload_body = build_visual_payload(platform, remaining)
+        visual_payload_body = build_visual_payload(
+            platform,
+            remaining,
+            creator_cache_db_path=creator_cache_db_path,
+            force_refresh_creator_cache=force_refresh_creator_cache,
+        )
         if vision_provider:
             visual_payload_body["provider"] = str(vision_provider).strip().lower()
         retry_payload = require_success(
@@ -731,6 +757,8 @@ def run_keep_list_screening_pipeline(
     skip_positioning_card_analysis: bool = False,
     visual_postcheck_max_rounds: int = 3,
     include_pinned_posts: bool = False,
+    creator_cache_db_path: str = "",
+    force_refresh_creator_cache: bool = False,
     task_owner_name: str = "",
     task_owner_employee_id: str = "",
     task_owner_employee_record_id: str = "",
@@ -834,6 +862,8 @@ def run_keep_list_screening_pipeline(
         "skip_visual": bool(skip_visual),
         "skip_positioning_card_analysis": bool(skip_positioning_card_analysis),
         "visual_postcheck_max_rounds": max(0, int(visual_postcheck_max_rounds)),
+        "creator_cache_db_path": str(creator_cache_db_path or "").strip(),
+        "force_refresh_creator_cache": bool(force_refresh_creator_cache),
         "probe_vision_provider_only": bool(probe_vision_provider_only),
         "vision_providers": [],
         "vision_preflight": {},
@@ -872,6 +902,8 @@ def run_keep_list_screening_pipeline(
         skip_scrape=bool(skip_scrape),
         skip_visual=bool(skip_visual),
         skip_positioning_card_analysis=bool(skip_positioning_card_analysis),
+        creator_cache_db_path=str(creator_cache_db_path or "").strip(),
+        force_refresh_creator_cache=bool(force_refresh_creator_cache),
         task_owner_name=str(task_owner_name or "").strip(),
         task_owner_employee_id=str(task_owner_employee_id or "").strip(),
         task_owner_employee_record_id=str(task_owner_employee_record_id or "").strip(),
@@ -1201,6 +1233,8 @@ def run_keep_list_screening_pipeline(
                     platform,
                     requested_identifiers,
                     exclude_pinned_posts=not bool(include_pinned_posts),
+                    creator_cache_db_path=str(creator_cache_db_path or "").strip(),
+                    force_refresh_creator_cache=bool(force_refresh_creator_cache),
                 )
                 scrape_payload = require_success(
                     client.post("/api/jobs/scrape", json={"platform": platform, "payload": scrape_payload_body}),
@@ -1313,7 +1347,12 @@ def run_keep_list_screening_pipeline(
                 elif pass_count <= 0:
                     platform_summary["visual_job"] = {"status": "skipped", "reason": "no Prescreen=Pass targets"}
                 elif backend_app.get_available_vision_provider_names(vision_provider):
-                    visual_payload_body = build_visual_payload(platform, requested_identifiers)
+                    visual_payload_body = build_visual_payload(
+                        platform,
+                        requested_identifiers,
+                        creator_cache_db_path=str(creator_cache_db_path or "").strip(),
+                        force_refresh_creator_cache=bool(force_refresh_creator_cache),
+                    )
                     if vision_provider:
                         visual_payload_body["provider"] = str(vision_provider).strip().lower()
                     _persist_platform_summary(
@@ -1361,6 +1400,8 @@ def run_keep_list_screening_pipeline(
                         platform=platform,
                         platform_summary=platform_summary,
                         vision_provider=vision_provider,
+                        creator_cache_db_path=str(creator_cache_db_path or "").strip(),
+                        force_refresh_creator_cache=bool(force_refresh_creator_cache),
                         poll_job=poll_job,
                         require_success=require_success,
                         poll_interval=poll_interval,
@@ -1391,14 +1432,29 @@ def run_keep_list_screening_pipeline(
                     resolve_targets = getattr(backend_app, "resolve_positioning_card_analysis_targets", None)
                     eligible_targets = []
                     if callable(resolve_targets):
-                        eligible_targets = list(resolve_targets(platform, build_visual_payload(platform, requested_identifiers)))
+                        eligible_targets = list(
+                            resolve_targets(
+                                platform,
+                                build_visual_payload(
+                                    platform,
+                                    requested_identifiers,
+                                    creator_cache_db_path=str(creator_cache_db_path or "").strip(),
+                                    force_refresh_creator_cache=bool(force_refresh_creator_cache),
+                                ),
+                            )
+                        )
                     if not eligible_targets:
                         platform_summary["positioning_card_analysis"] = _build_positioning_stage_payload(
                             "skipped",
                             "no Visual=Pass targets",
                         )
                     else:
-                        positioning_payload_body = build_visual_payload(platform, requested_identifiers)
+                        positioning_payload_body = build_visual_payload(
+                            platform,
+                            requested_identifiers,
+                            creator_cache_db_path=str(creator_cache_db_path or "").strip(),
+                            force_refresh_creator_cache=bool(force_refresh_creator_cache),
+                        )
                         if vision_provider:
                             positioning_payload_body["provider"] = str(vision_provider).strip().lower()
                         try:
@@ -1562,6 +1618,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--skip-visual", action="store_true", help="跑 scrape 和导出，但跳过视觉复核。")
     parser.add_argument("--include-pinned-posts", action="store_true", help="TikTok scrape 时保留置顶内容；默认去掉置顶。")
+    parser.add_argument("--creator-cache-db-path", default="", help="Creator DB SQLite 路径；默认使用仓库内共享缓存库。")
+    parser.add_argument("--force-refresh-creator-cache", action="store_true", help="忽略 Creator DB 历史结果，强制重新抓取和视觉审核。")
     parser.add_argument("--visual-postcheck-max-rounds", type=int, default=3, help="视觉完成后自动补跑失败账号的最大轮数；默认 3。")
     parser.add_argument("--skip-positioning-card-analysis", action="store_true", help="跳过 visual-pass 后的定位卡分析。")
     parser.add_argument("--task-owner-name", default="", help="任务负责人展示名，用于总表 `达人对接人`。")
@@ -1592,6 +1650,8 @@ def main(argv: list[str] | None = None) -> int:
         skip_scrape=bool(args.skip_scrape),
         skip_visual=bool(args.skip_visual),
         include_pinned_posts=bool(args.include_pinned_posts),
+        creator_cache_db_path=args.creator_cache_db_path or "",
+        force_refresh_creator_cache=bool(args.force_refresh_creator_cache),
         visual_postcheck_max_rounds=max(0, int(args.visual_postcheck_max_rounds)),
         skip_positioning_card_analysis=bool(args.skip_positioning_card_analysis),
         task_owner_name=args.task_owner_name or "",

@@ -49,6 +49,8 @@ def build_final_runner_task_spec(
     skip_scrape: bool,
     skip_visual: bool,
     skip_positioning_card_analysis: bool,
+    creator_cache_db_path: str,
+    force_refresh_creator_cache: bool,
 ) -> dict[str, Any]:
     return {
         "spec_version": TASK_SPEC_VERSION,
@@ -92,6 +94,7 @@ def build_final_runner_task_spec(
             "skip_scrape": bool(skip_scrape),
             "skip_visual": bool(skip_visual),
             "skip_positioning_card_analysis": bool(skip_positioning_card_analysis),
+            "force_refresh_creator_cache": bool(force_refresh_creator_cache),
         },
         "paths": {
             "task_download_dir": str(task_download_dir or "").strip(),
@@ -99,6 +102,7 @@ def build_final_runner_task_spec(
             "existing_mail_db_path": str(existing_mail_db_path or "").strip(),
             "existing_mail_raw_dir": str(existing_mail_raw_dir or "").strip(),
             "existing_mail_data_dir": str(existing_mail_data_dir or "").strip(),
+            "creator_cache_db_path": str(creator_cache_db_path or "").strip(),
             "upstream_output_root": str(runner_paths.upstream_output_root),
             "upstream_summary_json": str(runner_paths.upstream_summary_json),
             "upstream_task_spec_json": str(runner_paths.upstream_task_spec_json),
@@ -203,6 +207,8 @@ def build_keep_list_downstream_task_spec(
     skip_scrape: bool,
     skip_visual: bool,
     skip_positioning_card_analysis: bool,
+    creator_cache_db_path: str,
+    force_refresh_creator_cache: bool,
     task_owner_name: str,
     task_owner_employee_id: str,
     task_owner_employee_record_id: str,
@@ -244,6 +250,7 @@ def build_keep_list_downstream_task_spec(
             "skip_scrape": bool(skip_scrape),
             "skip_visual": bool(skip_visual),
             "skip_positioning_card_analysis": bool(skip_positioning_card_analysis),
+            "force_refresh_creator_cache": bool(force_refresh_creator_cache),
         },
         "paths": {
             "staging_summary_json": str(runner_paths.staging_summary_json),
@@ -253,6 +260,7 @@ def build_keep_list_downstream_task_spec(
             "exports_dir": str(runner_paths.exports_dir),
             "downloads_dir": str(runner_paths.downloads_dir),
             "template_output_dir": str(runner_paths.template_output_dir),
+            "creator_cache_db_path": str(creator_cache_db_path or "").strip(),
         },
         "task_owner": {
             "task_owner_name": str(task_owner_name or "").strip(),

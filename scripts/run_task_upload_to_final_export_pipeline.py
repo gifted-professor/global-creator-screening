@@ -111,6 +111,8 @@ def _build_keep_list_resume_command(
     vision_provider: str,
     max_identifiers_per_platform: int,
     poll_interval: float,
+    creator_cache_db_path: str,
+    force_refresh_creator_cache: bool,
     probe_vision_provider_only: bool,
     skip_scrape: bool,
     skip_visual: bool,
@@ -138,6 +140,10 @@ def _build_keep_list_resume_command(
         parts.append(f"--vision-provider {vision_provider}")
     if poll_interval > 1.0:
         parts.append(f"--poll-interval {poll_interval}")
+    if creator_cache_db_path:
+        parts.append(f'--creator-cache-db-path "{creator_cache_db_path}"')
+    if force_refresh_creator_cache:
+        parts.append("--force-refresh-creator-cache")
     if probe_vision_provider_only:
         parts.append("--probe-vision-provider-only")
     if skip_scrape:
@@ -466,6 +472,8 @@ def _run_single_task_upload_to_final_export_pipeline(
     vision_provider: str = "",
     max_identifiers_per_platform: int = 0,
     poll_interval: float = 5.0,
+    creator_cache_db_path: str = "",
+    force_refresh_creator_cache: bool = False,
     probe_vision_provider_only: bool = False,
     skip_scrape: bool = False,
     skip_visual: bool = False,
@@ -552,6 +560,8 @@ def _run_single_task_upload_to_final_export_pipeline(
         vision_provider=str(vision_provider or "").strip().lower(),
         max_identifiers_per_platform=int(max(0, int(max_identifiers_per_platform))),
         poll_interval=max(1.0, float(poll_interval)),
+        creator_cache_db_path=str(creator_cache_db_path or "").strip(),
+        force_refresh_creator_cache=bool(force_refresh_creator_cache),
         probe_vision_provider_only=bool(probe_vision_provider_only),
         skip_scrape=bool(skip_scrape),
         skip_visual=bool(skip_visual),
@@ -588,6 +598,8 @@ def _run_single_task_upload_to_final_export_pipeline(
             "sent_since": str(sent_since or "").strip(),
             "reset_state": bool(reset_state),
             "reuse_existing": bool(reuse_existing),
+            "creator_cache_db_path": str(creator_cache_db_path or "").strip(),
+            "force_refresh_creator_cache": bool(force_refresh_creator_cache),
         },
         "resolved_inputs": {
             "env_file": {
@@ -612,6 +624,8 @@ def _run_single_task_upload_to_final_export_pipeline(
                 "vision_provider": str(vision_provider or "").strip().lower(),
                 "max_identifiers_per_platform": int(max(0, int(max_identifiers_per_platform))),
                 "poll_interval": max(1.0, float(poll_interval)),
+                "creator_cache_db_path": str(creator_cache_db_path or "").strip(),
+                "force_refresh_creator_cache": bool(force_refresh_creator_cache),
                 "probe_vision_provider_only": bool(probe_vision_provider_only),
                 "skip_scrape": bool(skip_scrape),
                 "skip_visual": bool(skip_visual),
@@ -838,6 +852,8 @@ def _run_single_task_upload_to_final_export_pipeline(
             vision_provider=str(vision_provider or "").strip().lower(),
             max_identifiers_per_platform=int(max(0, int(max_identifiers_per_platform))),
             poll_interval=max(1.0, float(poll_interval)),
+            creator_cache_db_path=str(creator_cache_db_path or "").strip(),
+            force_refresh_creator_cache=bool(force_refresh_creator_cache),
             probe_vision_provider_only=bool(probe_vision_provider_only),
             skip_scrape=bool(skip_scrape),
             skip_visual=bool(skip_visual),
@@ -882,6 +898,8 @@ def _run_single_task_upload_to_final_export_pipeline(
             vision_provider=str(vision_provider or "").strip().lower(),
             max_identifiers_per_platform=int(max(0, int(max_identifiers_per_platform))),
             poll_interval=max(1.0, float(poll_interval)),
+            creator_cache_db_path=str(creator_cache_db_path or "").strip(),
+            force_refresh_creator_cache=bool(force_refresh_creator_cache),
             probe_vision_provider_only=bool(probe_vision_provider_only),
             skip_scrape=bool(skip_scrape),
             skip_visual=bool(skip_visual),
@@ -1005,6 +1023,8 @@ def run_task_upload_to_final_export_pipeline(
     vision_provider: str = "",
     max_identifiers_per_platform: int = 0,
     poll_interval: float = 5.0,
+    creator_cache_db_path: str = "",
+    force_refresh_creator_cache: bool = False,
     probe_vision_provider_only: bool = False,
     skip_scrape: bool = False,
     skip_visual: bool = False,
@@ -1049,6 +1069,8 @@ def run_task_upload_to_final_export_pipeline(
             vision_provider=vision_provider,
             max_identifiers_per_platform=max_identifiers_per_platform,
             poll_interval=poll_interval,
+            creator_cache_db_path=creator_cache_db_path,
+            force_refresh_creator_cache=force_refresh_creator_cache,
             probe_vision_provider_only=probe_vision_provider_only,
             skip_scrape=skip_scrape,
             skip_visual=skip_visual,
@@ -1136,6 +1158,8 @@ def run_task_upload_to_final_export_pipeline(
             vision_provider=vision_provider,
             max_identifiers_per_platform=max_identifiers_per_platform,
             poll_interval=poll_interval,
+            creator_cache_db_path=creator_cache_db_path,
+            force_refresh_creator_cache=force_refresh_creator_cache,
             probe_vision_provider_only=probe_vision_provider_only,
             skip_scrape=skip_scrape,
             skip_visual=skip_visual,
@@ -1184,6 +1208,8 @@ def run_task_upload_to_final_export_pipeline(
                 vision_provider=vision_provider,
                 max_identifiers_per_platform=max_identifiers_per_platform,
                 poll_interval=poll_interval,
+                creator_cache_db_path=creator_cache_db_path,
+                force_refresh_creator_cache=force_refresh_creator_cache,
                 probe_vision_provider_only=probe_vision_provider_only,
                 skip_scrape=skip_scrape,
                 skip_visual=skip_visual,
@@ -1236,6 +1262,8 @@ def run_task_upload_to_final_export_pipeline(
             vision_provider=vision_provider,
             max_identifiers_per_platform=max_identifiers_per_platform,
             poll_interval=poll_interval,
+            creator_cache_db_path=creator_cache_db_path,
+            force_refresh_creator_cache=force_refresh_creator_cache,
             probe_vision_provider_only=probe_vision_provider_only,
             skip_scrape=skip_scrape,
             skip_visual=skip_visual,
@@ -1276,6 +1304,8 @@ def run_task_upload_to_final_export_pipeline(
         vision_provider=str(vision_provider or "").strip().lower(),
         max_identifiers_per_platform=int(max(0, int(max_identifiers_per_platform))),
         poll_interval=max(1.0, float(poll_interval)),
+        creator_cache_db_path=str(creator_cache_db_path or "").strip(),
+        force_refresh_creator_cache=bool(force_refresh_creator_cache),
         probe_vision_provider_only=bool(probe_vision_provider_only),
         skip_scrape=bool(skip_scrape),
         skip_visual=bool(skip_visual),
@@ -1311,6 +1341,8 @@ def run_task_upload_to_final_export_pipeline(
             "sent_since": str(sent_since or "").strip(),
             "reset_state": bool(reset_state),
             "reuse_existing": bool(reuse_existing),
+            "creator_cache_db_path": str(creator_cache_db_path or "").strip(),
+            "force_refresh_creator_cache": bool(force_refresh_creator_cache),
         },
         "resolved_inputs": {
             "env_file": {
@@ -1474,6 +1506,8 @@ def run_task_upload_to_final_export_pipeline(
             vision_provider=vision_provider,
             max_identifiers_per_platform=max_identifiers_per_platform,
             poll_interval=poll_interval,
+            creator_cache_db_path=creator_cache_db_path,
+            force_refresh_creator_cache=force_refresh_creator_cache,
             probe_vision_provider_only=probe_vision_provider_only,
             skip_scrape=skip_scrape,
             skip_visual=skip_visual,
@@ -1567,6 +1601,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vision-provider", default="", help="指定视觉 provider，例如 openai / reelx。")
     parser.add_argument("--max-identifiers-per-platform", type=int, default=0, help="每个平台最多跑多少个账号；0 表示不截断。")
     parser.add_argument("--poll-interval", type=float, default=5.0, help="轮询 job 状态的秒数。")
+    parser.add_argument("--creator-cache-db-path", default="", help="Creator DB SQLite 路径；默认使用仓库内共享缓存库。")
+    parser.add_argument("--force-refresh-creator-cache", action="store_true", help="忽略 Creator DB 历史结果，强制重新抓取和视觉审核。")
     parser.add_argument("--probe-vision-provider-only", action="store_true", help="只做视觉 provider live probe，不继续 scrape/visual/export。")
     parser.add_argument("--skip-scrape", action="store_true", help="只做 staging，不触发 scrape/visual/export。")
     parser.add_argument("--skip-visual", action="store_true", help="跑 scrape 和导出，但跳过视觉复核。")
@@ -1622,6 +1658,8 @@ def main(argv: list[str] | None = None) -> int:
         vision_provider=args.vision_provider,
         max_identifiers_per_platform=max(0, int(args.max_identifiers_per_platform)),
         poll_interval=max(1.0, float(args.poll_interval)),
+        creator_cache_db_path=args.creator_cache_db_path or "",
+        force_refresh_creator_cache=bool(args.force_refresh_creator_cache),
         probe_vision_provider_only=bool(args.probe_vision_provider_only),
         skip_scrape=bool(args.skip_scrape),
         skip_visual=bool(args.skip_visual),

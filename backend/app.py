@@ -28,6 +28,7 @@ if str(REPO_ROOT) not in sys.path:
 import pandas as pd
 import requests
 from flask import Flask, jsonify, render_template, request, send_file
+from backend import creator_cache
 from harness.config import (
     load_env_file_snapshot,
     resolve_operator_launch_config,
@@ -5531,6 +5532,117 @@ def build_target_preview(identifiers, max_items=5):
     }
 
 
+def build_visual_review_cache_prompt_descriptor(prompt_selection):
+    if not isinstance(prompt_selection, dict):
+        return {}
+    prompt_text = str(prompt_selection.get("prompt") or "").strip()
+    return {
+        "platform": normalize_visual_prompt_lookup_key(prompt_selection.get("platform")),
+        "provider": normalize_vision_provider_name(prompt_selection.get("provider")),
+        "model": normalize_visual_prompt_lookup_key(prompt_selection.get("model")),
+        "source": str(prompt_selection.get("source") or "").strip(),
+        "visual_contract_source": str(prompt_selection.get("visual_contract_source") or "").strip(),
+        "resolved_cover_limit": screening.coerce_positive_int(prompt_selection.get("resolved_cover_limit")) or 0,
+        "prompt_key": creator_cache.stable_cache_key(prompt_text),
+        "visual_runtime_contract_key": creator_cache.stable_cache_key(
+            prompt_selection.get("visual_runtime_contract") or {}
+        ),
+    }
+
+
+def build_visual_review_cache_context(
+    platform,
+    *,
+    requested_provider="",
+    routing_strategy="",
+    providers=None,
+    active_rulespec=None,
+    active_visual_prompts=None,
+):
+    normalized_platform = str(platform or "").strip().lower()
+    normalized_requested_provider = normalize_vision_provider_name(requested_provider)
+    normalized_routing_strategy = normalize_visual_review_routing_strategy(routing_strategy)
+    resolved_active_rulespec = load_active_rulespec() if active_rulespec is None else active_rulespec
+    resolved_active_visual_prompts = (
+        load_active_visual_prompts() if active_visual_prompts is None else active_visual_prompts
+    )
+    resolved_providers = list(providers or get_available_vision_providers(normalized_requested_provider))
+
+    provider_descriptors = []
+    for provider in resolved_providers:
+        provider_name = normalize_vision_provider_name((provider or {}).get("name"))
+        configured_model = str(resolve_vision_provider_model(provider) or "").strip()
+        prompt_selection = resolve_visual_review_prompt_selection(
+            provider_name,
+            normalized_platform,
+            model_name=configured_model,
+            active_visual_prompts=resolved_active_visual_prompts,
+            active_rulespec=resolved_active_rulespec,
+        )
+        provider_descriptors.append(
+            {
+                "name": provider_name,
+                "api_style": str((provider or {}).get("api_style") or "").strip().lower(),
+                "model": configured_model,
+                "model_candidates": dedupe_non_empty_strings(resolve_vision_provider_model_candidates(provider)),
+                "base_urls": dedupe_non_empty_strings(
+                    (provider or {}).get("base_url_candidates") or resolve_vision_provider_base_urls(provider)
+                ),
+                "request_timeout_seconds": resolve_vision_provider_request_timeout(provider),
+                "prompt": build_visual_review_cache_prompt_descriptor(prompt_selection),
+            }
+        )
+    provider_descriptors.sort(
+        key=lambda item: (
+            str(item.get("name") or ""),
+            str(item.get("model") or ""),
+            str(item.get("api_style") or ""),
+        )
+    )
+
+    stage_descriptors = []
+    raw_stage_plan = []
+    if normalized_routing_strategy == VISUAL_REVIEW_ROUTING_TIERED:
+        raw_stage_plan = build_visual_review_routing_plan()
+    elif normalized_routing_strategy == VISUAL_REVIEW_ROUTING_PROBE_RANKED:
+        raw_stage_plan = build_visual_review_probe_ranked_plan()
+    for stage in raw_stage_plan:
+        provider_name = normalize_vision_provider_name((stage or {}).get("provider"))
+        configured_model = str((stage or {}).get("model") or "").strip()
+        prompt_selection = resolve_visual_review_prompt_selection(
+            provider_name,
+            normalized_platform,
+            model_name=configured_model,
+            active_visual_prompts=resolved_active_visual_prompts,
+            active_rulespec=resolved_active_rulespec,
+        )
+        stage_descriptors.append(
+            {
+                "stage": str((stage or {}).get("stage") or "").strip(),
+                "group": str((stage or {}).get("group") or "").strip(),
+                "provider": provider_name,
+                "model": configured_model,
+                "timeout_seconds": screening.coerce_positive_int((stage or {}).get("timeout_seconds")) or 0,
+                "prompt": build_visual_review_cache_prompt_descriptor(prompt_selection),
+            }
+        )
+
+    context_payload = {
+        "version": "visual_review_cache_v1",
+        "platform": normalized_platform,
+        "requested_provider": normalized_requested_provider,
+        "routing_strategy": normalized_routing_strategy or "direct",
+        "active_rulespec_key": creator_cache.stable_cache_key(resolved_active_rulespec or {}),
+        "active_visual_prompts_key": creator_cache.stable_cache_key(resolved_active_visual_prompts or {}),
+        "providers": provider_descriptors,
+        "routing_plan": stage_descriptors,
+    }
+    return {
+        "context_key": creator_cache.stable_cache_key(context_payload),
+        "context_payload": context_payload,
+    }
+
+
 def get_requested_visual_identifiers(platform, payload):
     candidates = []
     for key in ("identifiers", "usernames", "profiles", "urls"):
@@ -5589,6 +5701,8 @@ def perform_visual_review(platform, payload, progress_callback=None, cancel_chec
     providers = get_available_vision_providers(requested_provider)
     if not providers:
         return build_vision_preflight_error_payload(requested_provider)
+    active_rulespec = load_active_rulespec()
+    active_visual_prompts = load_active_visual_prompts()
 
     targets = resolve_visual_review_targets(platform, payload)
     if not targets:
@@ -5597,8 +5711,62 @@ def perform_visual_review(platform, payload, progress_callback=None, cancel_chec
             "error": "没有可复核的账号：请先完成抓取，并确保至少有一个 Prescreen=Pass 的账号。",
         }
 
-    results = load_visual_results(platform)
     target_identifiers = [screening.resolve_profile_review_identifier(platform, item) for item in targets]
+    results = load_visual_results(platform)
+    for identifier in target_identifiers:
+        if identifier:
+            results.pop(identifier, None)
+    creator_cache_enabled = creator_cache.creator_cache_enabled(payload)
+    force_refresh_creator_cache = creator_cache.creator_cache_force_refresh(payload)
+    creator_cache_db_path = creator_cache.resolve_creator_cache_db_path(payload)
+    visual_cache_context = build_visual_review_cache_context(
+        platform,
+        requested_provider=requested_provider,
+        routing_strategy=routing_strategy,
+        providers=providers,
+        active_rulespec=active_rulespec,
+        active_visual_prompts=active_visual_prompts,
+    )
+    creator_cache_hit_identifiers: list[str] = []
+    if creator_cache_enabled and not force_refresh_creator_cache:
+        cached_visual_results = creator_cache.load_visual_cache_entries(
+            platform,
+            target_identifiers,
+            creator_cache_db_path,
+            visual_cache_context["context_key"],
+        )
+        for identifier, cached_visual_result in cached_visual_results.items():
+            if creator_cache.is_cacheable_visual_result(cached_visual_result):
+                results[identifier] = dict(cached_visual_result)
+                creator_cache_hit_identifiers.append(identifier)
+        if cached_visual_results:
+            save_visual_results(platform, results)
+
+    pending_targets = []
+    completed_identifiers = []
+    completed_identifier_set = {identifier for identifier in creator_cache_hit_identifiers if identifier}
+    seen_pending_identifiers = set()
+    for item in targets:
+        identifier = screening.resolve_profile_review_identifier(platform, item)
+        if identifier in completed_identifier_set:
+            completed_identifiers.append(identifier)
+            continue
+        if identifier and identifier in seen_pending_identifiers:
+            continue
+        if identifier:
+            seen_pending_identifiers.add(identifier)
+        pending_targets.append(item)
+
+    creator_cache_summary = {
+        "enabled": bool(creator_cache_enabled),
+        "db_path": str(creator_cache_db_path),
+        "force_refresh": bool(force_refresh_creator_cache),
+        "scrape_hit_count": 0,
+        "visual_hit_count": len(creator_cache_hit_identifiers),
+        "visual_hit_preview": creator_cache_hit_identifiers[:10],
+        "visual_miss_count": len(pending_targets),
+        "visual_context_key": str(visual_cache_context.get("context_key") or ""),
+    }
     routing_context = {}
     selected_provider_name = preflight.get("preferred_provider")
     selected_model_name = ""
@@ -5626,7 +5794,7 @@ def perform_visual_review(platform, payload, progress_callback=None, cancel_chec
         channel_race = {}
     max_workers = resolve_visual_review_max_workers(
         payload,
-        len(targets),
+        len(pending_targets) or len(targets),
         requested_provider=selected_provider_name or requested_provider,
         requested_model=selected_model_name,
         routing_strategy=routing_strategy,
@@ -5638,7 +5806,7 @@ def perform_visual_review(platform, payload, progress_callback=None, cancel_chec
             progress_callback(
                 "preparing",
                 "正在准备视觉复核任务",
-            done=0,
+            done=len(completed_identifiers),
             total=len(targets),
             providers=provider_candidates,
                 selected_provider=selected_provider_name,
@@ -5646,12 +5814,36 @@ def perform_visual_review(platform, payload, progress_callback=None, cancel_chec
                 routing_strategy=routing_strategy or "direct",
                 max_workers=max_workers,
                 item_timeout_seconds=item_timeout_seconds,
+                creator_cache=creator_cache_summary,
                 channel_race=snapshot_probe_ranked_channel_race(routing_context) if routing_strategy == VISUAL_REVIEW_ROUTING_PROBE_RANKED else sanitize_json_compatible(channel_race) if channel_race else None,
                 **build_target_preview(target_identifiers),
             )
 
-    completed = 0
-    target_iter = iter(targets)
+    completed = len(completed_identifiers)
+    if not pending_targets:
+        final_result = build_visual_review_partial_result(
+            platform,
+            results,
+            targets,
+            channel_race=snapshot_probe_ranked_channel_race(routing_context) if routing_strategy == VISUAL_REVIEW_ROUTING_PROBE_RANKED else channel_race,
+        )
+        final_result.update({
+            "success": True,
+            "message": (
+                f"{UPLOAD_PLATFORM_RESPONSE_LABELS.get(platform, platform)} 视觉复核完成，"
+                f"共处理 {len(targets)} 个账号。"
+            ),
+            "visual_results": results,
+            "max_workers": max_workers,
+            "selected_provider": selected_provider_name,
+            "selected_model": selected_model_name,
+            "channel_race": snapshot_probe_ranked_channel_race(routing_context) if routing_strategy == VISUAL_REVIEW_ROUTING_PROBE_RANKED else channel_race,
+            "elapsed_seconds": round(time.monotonic() - started_at, 3),
+            "creator_cache": creator_cache_summary,
+        })
+        return final_result
+
+    target_iter = iter(pending_targets)
     future_map = {}
 
     def finalize_review(identifier, result=None, error_text=None):
@@ -5688,6 +5880,16 @@ def perform_visual_review(platform, payload, progress_callback=None, cancel_chec
                 "attempt_count": result.get("attempt_count"),
                 "channel_race": result.get("channel_race") or {},
             }
+            if creator_cache_enabled:
+                creator_cache.persist_visual_cache_entry(
+                    platform,
+                    identifier,
+                    results[identifier],
+                    creator_cache_db_path,
+                    updated_at=str(results[identifier].get("reviewed_at") or iso_now()),
+                    context_key=str(visual_cache_context.get("context_key") or ""),
+                    context_payload=visual_cache_context.get("context_payload") or {},
+                )
 
         completed += 1
         save_visual_results(platform, results)
@@ -5813,6 +6015,7 @@ def perform_visual_review(platform, payload, progress_callback=None, cancel_chec
         "selected_model": selected_model_name,
         "channel_race": snapshot_probe_ranked_channel_race(routing_context) if routing_strategy == VISUAL_REVIEW_ROUTING_PROBE_RANKED else channel_race,
         "elapsed_seconds": round(time.monotonic() - started_at, 3),
+        "creator_cache": creator_cache_summary,
     })
     return final_result
 
@@ -6763,16 +6966,55 @@ def perform_scrape(platform, payload, progress_callback=None, cancel_check=None)
     if not identifiers:
         return {"success": False, "error": "没有可抓取的账号，请先上传名单或在 payload 中传 identifiers"}
 
-    batches = chunk_list(identifiers, PLATFORM_BATCH_SIZES.get(platform, 20))
     aggregated_items = []
     apify_runs = []
     requested_lookup = build_requested_identifier_lookup(platform, identifiers)
+    creator_cache_enabled = creator_cache.creator_cache_enabled(payload)
+    force_refresh_creator_cache = creator_cache.creator_cache_force_refresh(payload)
+    creator_cache_db_path = creator_cache.resolve_creator_cache_db_path(payload)
+    cached_scrape_entries: dict[str, list[dict[str, Any]]] = {}
+    cache_hit_requested_identifiers: list[str] = []
+    identifiers_to_fetch: list[str] = []
+    for requested in identifiers:
+        identifier = screening.extract_platform_identifier(platform, requested)
+        if identifier and creator_cache_enabled and not force_refresh_creator_cache:
+            if not cached_scrape_entries:
+                cached_scrape_entries = creator_cache.load_scrape_cache_entries(
+                    platform,
+                    identifiers,
+                    creator_cache_db_path,
+                )
+            cached_items = cached_scrape_entries.get(identifier) or []
+            if cached_items:
+                aggregated_items = merge_scrape_items(platform, aggregated_items, cached_items)
+                cache_hit_requested_identifiers.append(requested)
+                continue
+        identifiers_to_fetch.append(requested)
+
+    batches = chunk_list(identifiers_to_fetch, PLATFORM_BATCH_SIZES.get(platform, 20))
     max_missing_retry_attempts = resolve_scrape_missing_retry_attempts(payload)
     retry_history = []
     batch_failures = []
+    completed_requested_identifiers = list(cache_hit_requested_identifiers)
+    creator_cache_summary = {
+        "enabled": bool(creator_cache_enabled),
+        "db_path": str(creator_cache_db_path),
+        "force_refresh": bool(force_refresh_creator_cache),
+        "scrape_hit_count": len(cache_hit_requested_identifiers),
+        "scrape_miss_count": len(identifiers_to_fetch),
+        "scrape_hit_preview": cache_hit_requested_identifiers[:10],
+        "visual_hit_count": 0,
+    }
 
     if progress_callback:
-        progress_callback("preparing", "正在准备抓取任务", done=0, total=len(batches), **build_target_preview(identifiers))
+        progress_callback(
+            "preparing",
+            "正在准备抓取任务",
+            done=0,
+            total=len(batches),
+            creator_cache=creator_cache_summary,
+            **build_target_preview(identifiers),
+        )
 
     for index, batch in enumerate(batches, start=1):
         if cancel_check and cancel_check():
@@ -6803,7 +7045,7 @@ def perform_scrape(platform, payload, progress_callback=None, cancel_check=None)
             partial_result = build_partial_scrape_result(
                 platform,
                 aggregated_items,
-                identifiers[: index * PLATFORM_BATCH_SIZES.get(platform, 20)],
+                completed_requested_identifiers,
             )
             if progress_callback:
                 progress_callback(
@@ -6823,7 +7065,8 @@ def perform_scrape(platform, payload, progress_callback=None, cancel_check=None)
         aggregated_items = merge_scrape_items(platform, aggregated_items, batch_result.get("raw_items") or [])
         apify_runs.append(batch_result.get("apify") or {})
         write_json_file(get_raw_data_path(platform), aggregated_items)
-        partial_result = build_partial_scrape_result(platform, aggregated_items, identifiers[: index * PLATFORM_BATCH_SIZES.get(platform, 20)])
+        completed_requested_identifiers.extend(batch)
+        partial_result = build_partial_scrape_result(platform, aggregated_items, completed_requested_identifiers)
         if progress_callback:
             progress_callback(
                 "batch_completed",
@@ -6932,6 +7175,13 @@ def perform_scrape(platform, payload, progress_callback=None, cancel_check=None)
         if not remaining_missing_identifiers:
             break
     save_profile_reviews(platform, filtered.get("profile_reviews") or [])
+    if creator_cache_enabled:
+        creator_cache_summary["persisted_scrape_entry_count"] = creator_cache.persist_scrape_cache_entries(
+            platform,
+            aggregated_items,
+            creator_cache_db_path,
+            updated_at=iso_now(),
+        )
     remaining_missing_count = len(filtered.get("missing_profiles") or [])
     retried_identifier_count = len({
         item
@@ -6988,6 +7238,7 @@ def perform_scrape(platform, payload, progress_callback=None, cancel_check=None)
             ),
             "history": retry_history,
         },
+        "creator_cache": creator_cache_summary,
         "message": message,
     }
     return result

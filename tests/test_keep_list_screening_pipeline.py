@@ -896,6 +896,88 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             backend_app.app.test_client().scrape_start_calls[0]["payload"]["excludePinnedPosts"]
         )
 
+    def test_runner_forwards_creator_cache_controls_to_scrape_and_visual_payloads(self) -> None:
+        preflight = {
+            "status": "configured",
+            "error_code": "",
+            "message": "视觉模型已就绪：openai",
+            "configured_provider_names": ["openai"],
+            "runnable_provider_names": ["openai"],
+            "preferred_provider": "openai",
+            "providers": [{"name": "openai", "runnable": True}],
+        }
+        backend_app = FakeBackendApp(preflight, metadata={"instagram": {"alpha": {"handle": "alpha"}}})
+
+        def fake_prepare_screening_inputs(**kwargs):
+            return {
+                "prepared_at": "2026-03-28T01:02:03Z",
+                "upload": {"stats": {"Instagram": 1}},
+            }
+
+        def fake_poll_job(client, job_id, label, interval):
+            if job_id == "scrape-job-1":
+                return {
+                    "id": job_id,
+                    "status": "completed",
+                    "result": {
+                        "profile_reviews": [{"status": "Pass", "username": "alpha"}],
+                        "successful_identifiers": ["alpha"],
+                    },
+                }
+            return {
+                "id": job_id,
+                "status": "completed",
+                "result": {
+                    "visual_results": {
+                        "alpha": {"decision": "Pass", "reviewed_at": "2026-03-28T01:02:03Z"}
+                    }
+                },
+            }
+
+        keep_list_runner._load_runtime_dependencies = lambda: {
+            "backend_app": backend_app,
+            "prepare_screening_inputs": fake_prepare_screening_inputs,
+            "count_passed_profiles": lambda scrape_job: 1,
+            "export_platform_artifacts": lambda client, platform, export_dir: {},
+            "poll_job": fake_poll_job,
+            "require_success": lambda response, label: response.get_json(),
+            "reset_backend_runtime_state": lambda: None,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            keep_path = temp_root / "keep.xlsx"
+            template_path = temp_root / "template.xlsx"
+            keep_path.touch()
+            template_path.touch()
+            env_path = self._write_env_file(temp_root)
+
+            summary = keep_list_runner.run_keep_list_screening_pipeline(
+                keep_workbook=keep_path,
+                template_workbook=template_path,
+                env_file=env_path,
+                output_root=temp_root / "run",
+                platform_filters=["instagram"],
+                creator_cache_db_path="/tmp/creator-cache.db",
+                force_refresh_creator_cache=True,
+            )
+
+        self.assertEqual(summary["status"], "completed")
+        self.assertEqual(
+            backend_app.app.test_client().scrape_start_calls[0]["payload"]["creator_cache_db_path"],
+            "/tmp/creator-cache.db",
+        )
+        self.assertTrue(
+            backend_app.app.test_client().scrape_start_calls[0]["payload"]["force_refresh_creator_cache"]
+        )
+        self.assertEqual(
+            backend_app.app.test_client().visual_start_calls[0]["payload"]["creator_cache_db_path"],
+            "/tmp/creator-cache.db",
+        )
+        self.assertTrue(
+            backend_app.app.test_client().visual_start_calls[0]["payload"]["force_refresh_creator_cache"]
+        )
+
     def test_runner_blocks_visual_and_export_when_scrape_contains_missing_profiles(self) -> None:
         preflight = {
             "status": "configured",

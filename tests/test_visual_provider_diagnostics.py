@@ -9,9 +9,11 @@ import struct
 import tempfile
 import time
 import unittest
+from concurrent.futures import Future
 from pathlib import Path
 from unittest import mock
 
+import backend.creator_cache as creator_cache_module
 import backend.app as backend_app
 import pandas as pd
 import requests
@@ -40,6 +42,9 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
         "VISION_PROVIDER_PREFERENCE",
         "VISION_VISUAL_REVIEW_PROBE_RANKED_RETRY_ATTEMPTS",
         "VISUAL_REVIEW_ITEM_TIMEOUT_SECONDS",
+        "CREATOR_CACHE_DB_PATH",
+        "CREATOR_CACHE_ENABLED",
+        "FORCE_REFRESH_CREATOR_CACHE",
     }
 
     def setUp(self) -> None:
@@ -49,6 +54,7 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
         self.original_env = {key: os.environ.get(key) for key in self.ENV_KEYS}
         for key in self.ENV_KEYS:
             os.environ.pop(key, None)
+        os.environ["CREATOR_CACHE_ENABLED"] = "0"
         backend_app.DOTENV_LOCAL_VALUES = {}
         backend_app.DOTENV_LOCAL_LOADED_KEYS = set()
         backend_app.VISION_PROVIDER_CONFIGS = (
@@ -546,6 +552,481 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
         self.assertEqual(result["retry_summary"]["remaining_missing_count"], 0)
         self.assertEqual(result["retry_summary"]["history"][0]["batch_size"], 10)
         self.assertEqual(set(result["successful_identifiers"]), set(identifiers))
+
+    def test_perform_scrape_reuses_creator_cache_and_only_fetches_missing_identifiers(self) -> None:
+        alpha_item = {
+            "url": "https://instagram.com/alpha",
+            "username": "alpha",
+            "biography": "NYC creator",
+            "latestPosts": [{"timestamp": "2026-03-29T00:00:00+00:00", "displayUrl": "https://example.com/a.jpg"}],
+        }
+        beta_item = {
+            "url": "https://instagram.com/beta",
+            "username": "beta",
+            "biography": "LA CA lifestyle",
+            "latestPosts": [{"timestamp": "2026-03-29T00:00:00+00:00", "displayUrl": "https://example.com/b.jpg"}],
+        }
+        batch_calls = []
+
+        def fake_run_apify_batch(platform, batch, payload, progress_callback=None, cancel_check=None):
+            batch_calls.append(list(batch))
+            return {
+                "success": True,
+                "raw_items": [beta_item],
+                "apify": {"usage_total_usd": 0.05},
+            }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "creator_cache.db"
+            creator_cache_module.persist_scrape_cache_entries(
+                "instagram",
+                [alpha_item],
+                db_path,
+                updated_at="2026-04-03T00:00:00+00:00",
+            )
+            with mock.patch.object(
+                backend_app,
+                "run_apify_batch",
+                side_effect=fake_run_apify_batch,
+            ), mock.patch.object(
+                backend_app,
+                "load_upload_metadata",
+                return_value={
+                    "alpha": {"handle": "alpha", "region": "US"},
+                    "beta": {"handle": "beta", "region": "US"},
+                },
+            ), mock.patch.object(
+                backend_app,
+                "load_active_rulespec",
+                return_value={},
+            ), mock.patch.object(
+                backend_app,
+                "write_json_file",
+            ), mock.patch.object(
+                backend_app,
+                "save_profile_reviews",
+            ):
+                result = backend_app.perform_scrape(
+                    "instagram",
+                    {
+                        "usernames": ["alpha", "beta"],
+                        "creator_cache_db_path": str(db_path),
+                        "use_creator_cache": True,
+                    },
+                )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(batch_calls, [["beta"]])
+        self.assertEqual(result["creator_cache"]["scrape_hit_count"], 1)
+        self.assertEqual(result["creator_cache"]["scrape_miss_count"], 1)
+        self.assertEqual(sorted(result["successful_identifiers"]), ["alpha", "beta"])
+
+    def test_perform_visual_review_reuses_creator_cache_without_spawning_workers(self) -> None:
+        cached_visual_result = {
+            "username": "alpha",
+            "decision": "Pass",
+            "reason": "cached visual review",
+            "provider": "openai",
+            "effective_model": "gpt-5.4",
+            "reviewed_at": "2026-04-03T00:00:00+00:00",
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "creator_cache.db"
+            creator_cache_module.persist_visual_cache_entry(
+                "instagram",
+                "alpha",
+                cached_visual_result,
+                db_path,
+                updated_at="2026-04-03T00:00:00+00:00",
+                context_key="ctx-visual-a",
+                context_payload={"version": "test"},
+            )
+            with mock.patch.object(
+                backend_app,
+                "build_vision_preflight",
+                return_value={"preferred_provider": "openai"},
+            ), mock.patch.object(
+                backend_app,
+                "get_available_vision_providers",
+                return_value=[{"name": "openai"}],
+            ), mock.patch.object(
+                backend_app,
+                "get_available_vision_provider_names",
+                return_value=["openai"],
+            ), mock.patch.object(
+                backend_app,
+                "resolve_visual_review_targets",
+                return_value=[{"username": "alpha", "status": "Pass"}],
+            ), mock.patch.object(
+                backend_app,
+                "load_visual_results",
+                return_value={},
+            ), mock.patch.object(
+                backend_app,
+                "build_visual_review_cache_context",
+                return_value={
+                    "context_key": "ctx-visual-a",
+                    "context_payload": {"version": "test"},
+                },
+            ), mock.patch.object(
+                backend_app,
+                "save_visual_results",
+            ) as mocked_save, mock.patch.object(
+                backend_app,
+                "DaemonThreadPoolExecutor",
+                side_effect=AssertionError("executor should not run when all targets are cached"),
+            ):
+                result = backend_app.perform_visual_review(
+                    "instagram",
+                    {
+                        "provider": "openai",
+                        "creator_cache_db_path": str(db_path),
+                        "use_creator_cache": True,
+                    },
+                )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["creator_cache"]["visual_hit_count"], 1)
+        self.assertEqual(result["visual_results"]["alpha"]["reason"], "cached visual review")
+        mocked_save.assert_called()
+
+    def test_perform_visual_review_does_not_reuse_saved_visual_results_on_rerun(self) -> None:
+        class ImmediateExecutor:
+            def __init__(self, *args, **kwargs) -> None:
+                self.submissions = []
+
+            def submit(self, fn, *args, **kwargs):
+                future = Future()
+                future.set_result(fn(*args, **kwargs))
+                self.submissions.append((fn, args, kwargs))
+                return future
+
+            def shutdown(self, wait=False, cancel_futures=False) -> None:
+                return None
+
+        fresh_result = {
+            "decision": "Pass",
+            "reason": "fresh rerun result",
+            "provider": "openai",
+            "effective_model": "gpt-5.4",
+            "reviewed_at": "2026-04-03T01:00:00+00:00",
+        }
+        stale_saved_result = {
+            "username": "alpha",
+            "decision": "Reject",
+            "reason": "stale disk result",
+            "provider": "openai",
+            "effective_model": "gpt-5.4",
+            "reviewed_at": "2026-04-03T00:00:00+00:00",
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "creator_cache.db"
+            with mock.patch.object(
+                backend_app,
+                "build_vision_preflight",
+                return_value={"preferred_provider": "openai"},
+            ), mock.patch.object(
+                backend_app,
+                "get_available_vision_providers",
+                return_value=[{"name": "openai"}],
+            ), mock.patch.object(
+                backend_app,
+                "get_available_vision_provider_names",
+                return_value=["openai"],
+            ), mock.patch.object(
+                backend_app,
+                "resolve_visual_review_targets",
+                return_value=[{"username": "alpha", "status": "Pass"}],
+            ), mock.patch.object(
+                backend_app,
+                "load_visual_results",
+                return_value={"alpha": stale_saved_result},
+            ), mock.patch.object(
+                backend_app,
+                "build_visual_review_cache_context",
+                return_value={
+                    "context_key": "ctx-rerun",
+                    "context_payload": {"version": "test"},
+                },
+            ), mock.patch.object(
+                backend_app,
+                "evaluate_profile_visual_review",
+                return_value=fresh_result,
+            ) as mocked_evaluate, mock.patch.object(
+                backend_app,
+                "save_visual_results",
+            ), mock.patch.object(
+                backend_app,
+                "DaemonThreadPoolExecutor",
+                ImmediateExecutor,
+            ):
+                result = backend_app.perform_visual_review(
+                    "instagram",
+                    {
+                        "provider": "openai",
+                        "creator_cache_db_path": str(db_path),
+                        "use_creator_cache": True,
+                    },
+                )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(mocked_evaluate.call_count, 1)
+        self.assertEqual(result["creator_cache"]["visual_hit_count"], 0)
+        self.assertEqual(result["visual_results"]["alpha"]["reason"], "fresh rerun result")
+
+    def test_perform_visual_review_does_not_reuse_creator_cache_from_different_context(self) -> None:
+        class ImmediateExecutor:
+            def __init__(self, *args, **kwargs) -> None:
+                self.submissions = []
+
+            def submit(self, fn, *args, **kwargs):
+                future = Future()
+                future.set_result(fn(*args, **kwargs))
+                self.submissions.append((fn, args, kwargs))
+                return future
+
+            def shutdown(self, wait=False, cancel_futures=False) -> None:
+                return None
+
+        cached_visual_result = {
+            "username": "alpha",
+            "decision": "Pass",
+            "reason": "cached old-context review",
+            "provider": "openai",
+            "effective_model": "gpt-5.4",
+            "reviewed_at": "2026-04-03T00:00:00+00:00",
+        }
+        fresh_result = {
+            "decision": "Reject",
+            "reason": "fresh new-context review",
+            "provider": "openai",
+            "effective_model": "gpt-5.4-mini",
+            "reviewed_at": "2026-04-03T02:00:00+00:00",
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "creator_cache.db"
+            creator_cache_module.persist_visual_cache_entry(
+                "instagram",
+                "alpha",
+                cached_visual_result,
+                db_path,
+                updated_at="2026-04-03T00:00:00+00:00",
+                context_key="ctx-old",
+                context_payload={"version": "old"},
+            )
+            with mock.patch.object(
+                backend_app,
+                "build_vision_preflight",
+                return_value={"preferred_provider": "openai"},
+            ), mock.patch.object(
+                backend_app,
+                "get_available_vision_providers",
+                return_value=[{"name": "openai"}],
+            ), mock.patch.object(
+                backend_app,
+                "get_available_vision_provider_names",
+                return_value=["openai"],
+            ), mock.patch.object(
+                backend_app,
+                "resolve_visual_review_targets",
+                return_value=[{"username": "alpha", "status": "Pass"}],
+            ), mock.patch.object(
+                backend_app,
+                "load_visual_results",
+                return_value={},
+            ), mock.patch.object(
+                backend_app,
+                "build_visual_review_cache_context",
+                return_value={
+                    "context_key": "ctx-new",
+                    "context_payload": {"version": "new"},
+                },
+            ), mock.patch.object(
+                backend_app,
+                "evaluate_profile_visual_review",
+                return_value=fresh_result,
+            ) as mocked_evaluate, mock.patch.object(
+                backend_app,
+                "save_visual_results",
+            ), mock.patch.object(
+                backend_app,
+                "DaemonThreadPoolExecutor",
+                ImmediateExecutor,
+            ):
+                result = backend_app.perform_visual_review(
+                    "instagram",
+                    {
+                        "provider": "openai",
+                        "creator_cache_db_path": str(db_path),
+                        "use_creator_cache": True,
+                    },
+                )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(mocked_evaluate.call_count, 1)
+        self.assertEqual(result["creator_cache"]["visual_hit_count"], 0)
+        self.assertEqual(result["visual_results"]["alpha"]["reason"], "fresh new-context review")
+
+    def test_creator_visual_cache_entries_are_scoped_by_context_key(self) -> None:
+        cached_old_context = {
+            "username": "alpha",
+            "decision": "Pass",
+            "reason": "old context",
+            "provider": "openai",
+            "effective_model": "gpt-5.4",
+            "reviewed_at": "2026-04-03T00:00:00+00:00",
+        }
+        cached_new_context = {
+            "username": "alpha",
+            "decision": "Reject",
+            "reason": "new context",
+            "provider": "openai",
+            "effective_model": "gpt-5.4-mini",
+            "reviewed_at": "2026-04-03T01:00:00+00:00",
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "creator_cache.db"
+            creator_cache_module.persist_visual_cache_entry(
+                "instagram",
+                "alpha",
+                cached_old_context,
+                db_path,
+                updated_at="2026-04-03T00:00:00+00:00",
+                context_key="ctx-old",
+                context_payload={"version": "old"},
+            )
+            creator_cache_module.persist_visual_cache_entry(
+                "instagram",
+                "alpha",
+                cached_new_context,
+                db_path,
+                updated_at="2026-04-03T01:00:00+00:00",
+                context_key="ctx-new",
+                context_payload={"version": "new"},
+            )
+
+            old_entries = creator_cache_module.load_visual_cache_entries(
+                "instagram",
+                ["alpha"],
+                db_path,
+                "ctx-old",
+            )
+            new_entries = creator_cache_module.load_visual_cache_entries(
+                "instagram",
+                ["alpha"],
+                db_path,
+                "ctx-new",
+            )
+
+        self.assertEqual(old_entries["alpha"]["reason"], "old context")
+        self.assertEqual(new_entries["alpha"]["reason"], "new context")
+
+    def test_force_refresh_creator_cache_bypasses_sqlite_and_saved_visual_results(self) -> None:
+        class ImmediateExecutor:
+            def __init__(self, *args, **kwargs) -> None:
+                self.submissions = []
+
+            def submit(self, fn, *args, **kwargs):
+                future = Future()
+                future.set_result(fn(*args, **kwargs))
+                self.submissions.append((fn, args, kwargs))
+                return future
+
+            def shutdown(self, wait=False, cancel_futures=False) -> None:
+                return None
+
+        cached_visual_result = {
+            "username": "alpha",
+            "decision": "Pass",
+            "reason": "cached result",
+            "provider": "openai",
+            "effective_model": "gpt-5.4",
+            "reviewed_at": "2026-04-03T00:00:00+00:00",
+        }
+        stale_saved_result = {
+            "username": "alpha",
+            "decision": "Reject",
+            "reason": "stale disk result",
+            "provider": "openai",
+            "effective_model": "gpt-5.4",
+            "reviewed_at": "2026-04-03T00:30:00+00:00",
+        }
+        fresh_result = {
+            "decision": "Reject",
+            "reason": "fresh forced rerun",
+            "provider": "openai",
+            "effective_model": "gpt-5.4",
+            "reviewed_at": "2026-04-03T03:00:00+00:00",
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "creator_cache.db"
+            creator_cache_module.persist_visual_cache_entry(
+                "instagram",
+                "alpha",
+                cached_visual_result,
+                db_path,
+                updated_at="2026-04-03T00:00:00+00:00",
+                context_key="ctx-force",
+                context_payload={"version": "force"},
+            )
+            with mock.patch.object(
+                backend_app,
+                "build_vision_preflight",
+                return_value={"preferred_provider": "openai"},
+            ), mock.patch.object(
+                backend_app,
+                "get_available_vision_providers",
+                return_value=[{"name": "openai"}],
+            ), mock.patch.object(
+                backend_app,
+                "get_available_vision_provider_names",
+                return_value=["openai"],
+            ), mock.patch.object(
+                backend_app,
+                "resolve_visual_review_targets",
+                return_value=[{"username": "alpha", "status": "Pass"}],
+            ), mock.patch.object(
+                backend_app,
+                "load_visual_results",
+                return_value={"alpha": stale_saved_result},
+            ), mock.patch.object(
+                backend_app,
+                "build_visual_review_cache_context",
+                return_value={
+                    "context_key": "ctx-force",
+                    "context_payload": {"version": "force"},
+                },
+            ), mock.patch.object(
+                backend_app,
+                "evaluate_profile_visual_review",
+                return_value=fresh_result,
+            ) as mocked_evaluate, mock.patch.object(
+                backend_app,
+                "save_visual_results",
+            ), mock.patch.object(
+                backend_app,
+                "DaemonThreadPoolExecutor",
+                ImmediateExecutor,
+            ):
+                result = backend_app.perform_visual_review(
+                    "instagram",
+                    {
+                        "provider": "openai",
+                        "creator_cache_db_path": str(db_path),
+                        "use_creator_cache": True,
+                        "force_refresh_creator_cache": True,
+                    },
+                )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(mocked_evaluate.call_count, 1)
+        self.assertEqual(result["creator_cache"]["visual_hit_count"], 0)
+        self.assertEqual(result["visual_results"]["alpha"]["reason"], "fresh forced rerun")
 
     def test_probe_endpoint_returns_success_payload_for_selected_provider(self) -> None:
         os.environ["OPENAI_API_KEY"] = "sk-live-12345678"

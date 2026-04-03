@@ -105,6 +105,8 @@ class TaskUploadToFinalExportRunnerTests(unittest.TestCase):
                 platform_filters=["instagram"],
                 vision_provider="openai",
                 max_identifiers_per_platform=1,
+                creator_cache_db_path="/tmp/creator-cache.db",
+                force_refresh_creator_cache=True,
             )
             persisted_summary = json.loads(summary_path.read_text(encoding="utf-8"))
             task_spec = json.loads(Path(summary["task_spec_json"]).read_text(encoding="utf-8"))
@@ -130,9 +132,11 @@ class TaskUploadToFinalExportRunnerTests(unittest.TestCase):
         self.assertEqual(task_spec["intent"]["task_name"], "MINISO")
         self.assertEqual(task_spec["intent"]["task_upload_url"], "https://example.com/task")
         self.assertEqual(task_spec["controls"]["requested_platforms"], ["instagram"])
+        self.assertTrue(task_spec["controls"]["force_refresh_creator_cache"])
         self.assertEqual(task_spec["paths"]["existing_mail_db_path"], "/tmp/shared/email_sync.db")
         self.assertEqual(task_spec["paths"]["existing_mail_raw_dir"], "/tmp/shared/raw")
         self.assertEqual(task_spec["paths"]["existing_mail_data_dir"], "/tmp/shared")
+        self.assertEqual(task_spec["paths"]["creator_cache_db_path"], "/tmp/creator-cache.db")
         self.assertEqual(task_spec["run"]["workflow_handoff_json"], summary["workflow_handoff_json"])
         self.assertTrue(task_spec["paths"]["upstream_task_spec_json"].endswith("/upstream/task_spec.json"))
         self.assertTrue(task_spec["paths"]["upstream_workflow_handoff_json"].endswith("/upstream/workflow_handoff.json"))
@@ -155,6 +159,8 @@ class TaskUploadToFinalExportRunnerTests(unittest.TestCase):
         self.assertEqual(summary["inputs"]["existing_mail_db_path"], "/tmp/shared/email_sync.db")
         self.assertEqual(summary["inputs"]["existing_mail_raw_dir"], "/tmp/shared/raw")
         self.assertEqual(summary["inputs"]["existing_mail_data_dir"], "/tmp/shared")
+        self.assertEqual(summary["inputs"]["creator_cache_db_path"], "/tmp/creator-cache.db")
+        self.assertTrue(summary["inputs"]["force_refresh_creator_cache"])
         self.assertTrue(summary["artifacts"]["keep_workbook"].endswith("MINISO_final_keep.xlsx"))
         self.assertIn("instagram", summary["artifacts"]["final_exports"])
         self.assertTrue(summary["artifacts"]["all_platforms_final_review"].endswith("all_platforms_final_review.xlsx"))
@@ -172,6 +178,8 @@ class TaskUploadToFinalExportRunnerTests(unittest.TestCase):
         self.assertEqual(observed["downstream_kwargs"]["vision_provider"], "openai")
         self.assertEqual(observed["downstream_kwargs"]["platform_filters"], ["instagram"])
         self.assertEqual(observed["downstream_kwargs"]["max_identifiers_per_platform"], 1)
+        self.assertEqual(observed["downstream_kwargs"]["creator_cache_db_path"], "/tmp/creator-cache.db")
+        self.assertTrue(observed["downstream_kwargs"]["force_refresh_creator_cache"])
         self.assertEqual(observed["downstream_kwargs"]["task_owner_name"], "")
         self.assertEqual(
             persisted_summary["steps"]["downstream"]["final_exports"]["instagram"]["final_review"],
