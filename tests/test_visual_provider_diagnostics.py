@@ -1413,7 +1413,7 @@ data: [DONE]
         self.assertTrue(race["success"])
         self.assertEqual(race["selected_stage"], "preferred")
         self.assertEqual(race["selected_provider"], "openai")
-        self.assertEqual(race["selected_model"], "gpt-5.4")
+        self.assertEqual(race["selected_model"], "gpt-5.4-mini")
         self.assertFalse(race["dual_active_enabled"])
         self.assertEqual(
             [item["stage"] for item in race["active_preferred_candidates"]],
@@ -1423,12 +1423,12 @@ data: [DONE]
             [item["stage"] for item in race["candidates"]],
             ["preferred", "preferred_parallel", "secondary", "tertiary"],
         )
-        self.assertEqual(race["candidates"][0]["configured_model"], "gpt-5.4")
-        self.assertEqual(race["candidates"][0]["requested_model"], "gpt-5.4")
-        self.assertEqual(race["candidates"][0]["effective_model"], "gpt-5.4")
-        self.assertEqual(race["active_preferred_candidates"][0]["configured_model"], "gpt-5.4")
-        self.assertEqual(race["active_preferred_candidates"][0]["requested_model"], "gpt-5.4")
-        self.assertEqual(race["active_preferred_candidates"][0]["effective_model"], "gpt-5.4")
+        self.assertEqual(race["candidates"][0]["configured_model"], "gpt-5.4-mini")
+        self.assertEqual(race["candidates"][0]["requested_model"], "gpt-5.4-mini")
+        self.assertEqual(race["candidates"][0]["effective_model"], "gpt-5.4-mini")
+        self.assertEqual(race["active_preferred_candidates"][0]["configured_model"], "gpt-5.4-mini")
+        self.assertEqual(race["active_preferred_candidates"][0]["requested_model"], "gpt-5.4-mini")
+        self.assertEqual(race["active_preferred_candidates"][0]["effective_model"], "gpt-5.4-mini")
         self.assertEqual(race["candidates"][1]["configured_model"], "qwen-vl-max")
         self.assertEqual(race["candidates"][1]["requested_model"], "qwen-vl-max")
         self.assertEqual(race["candidates"][1]["effective_model"], "qwen-vl-max")
@@ -1515,13 +1515,13 @@ data: [DONE]
             "success": True,
             "selected_stage": "preferred",
             "selected_provider": "openai",
-            "selected_model": "gpt-5.4",
+            "selected_model": "gpt-5.4-mini",
             "candidates": [
                 {
                     "stage": "preferred",
                     "group": backend_app.VISUAL_REVIEW_PROBE_RANKED_GROUP_PREFERRED,
                     "provider": "openai",
-                    "model": "gpt-5.4",
+                    "model": "gpt-5.4-mini",
                     "timeout_seconds": 30,
                     "ok": True,
                 },
@@ -1556,13 +1556,13 @@ data: [DONE]
             "success": True,
             "selected_stage": backend_app.VISUAL_REVIEW_PROBE_RANKED_SELECTED_STAGE_PREFERRED_POOL,
             "selected_provider": "openai",
-            "selected_model": "gpt-5.4",
+            "selected_model": "gpt-5.4-mini",
             "candidates": [
                 {
                     "stage": "preferred",
                     "group": backend_app.VISUAL_REVIEW_PROBE_RANKED_GROUP_PREFERRED,
                     "provider": "openai",
-                    "model": "gpt-5.4",
+                    "model": "gpt-5.4-mini",
                     "timeout_seconds": 30,
                     "ok": True,
                     "selected": True,
@@ -1634,8 +1634,8 @@ data: [DONE]
         self.assertEqual(result["route"], "preferred_parallel")
         self.assertEqual(result["provider"], "reelx")
         self.assertEqual(result["model"], "qwen-vl-max")
-        self.assertEqual(result["trace"][0]["configured_model"], "gpt-5.4")
-        self.assertEqual(result["trace"][0]["requested_model"], "gpt-5.4")
+        self.assertEqual(result["trace"][0]["configured_model"], "gpt-5.4-mini")
+        self.assertEqual(result["trace"][0]["requested_model"], "gpt-5.4-mini")
         self.assertEqual([item["stage"] for item in result["trace"]], ["preferred", "preferred_parallel"])
         self.assertEqual(result["channel_race"]["selected_provider"], "openai")
         self.assertEqual(result["decision"], "Pass")
@@ -1645,13 +1645,13 @@ data: [DONE]
             "success": True,
             "selected_stage": "preferred",
             "selected_provider": "openai",
-            "selected_model": "gpt-5.4",
+            "selected_model": "gpt-5.4-mini",
             "candidates": [
                 {
                     "stage": "preferred",
                     "group": backend_app.VISUAL_REVIEW_PROBE_RANKED_GROUP_PREFERRED,
                     "provider": "openai",
-                    "model": "gpt-5.4",
+                    "model": "gpt-5.4-mini",
                     "timeout_seconds": 30,
                     "ok": True,
                 },
@@ -1740,7 +1740,7 @@ data: [DONE]
         self.assertTrue(result["trace"][0]["retryable"])
         self.assertTrue(result["trace"][1]["retryable"])
         self.assertTrue(result["trace"][2]["retryable"])
-        self.assertEqual(result["trace"][3]["effective_model"], "gpt-5.4")
+        self.assertEqual(result["trace"][3]["effective_model"], "gpt-5.4-mini")
 
     def test_probe_ranked_runtime_disables_unhealthy_stage_after_threshold(self) -> None:
         runtime_context = backend_app.build_probe_ranked_runtime_context(
