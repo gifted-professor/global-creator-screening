@@ -43,6 +43,9 @@ DEFAULT_PLATFORM_ORDER = ("tiktok", "instagram", "youtube")
 def _load_runtime_dependencies():
     import backend.app as backend_app
     from backend.final_export_merge import build_all_platforms_final_review_artifacts, collect_final_exports
+    from feishu_screening_bridge.bitable_upload import upload_final_review_payload_to_bitable
+    from feishu_screening_bridge.feishu_api import DEFAULT_FEISHU_BASE_URL, FeishuOpenClient
+    from feishu_screening_bridge.local_env import get_preferred_value, load_local_env
     from scripts.prepare_screening_inputs import (
         prepare_screening_inputs,
         restore_backend_runtime_state,
@@ -60,6 +63,10 @@ def _load_runtime_dependencies():
         "backend_app": backend_app,
         "build_all_platforms_final_review_artifacts": build_all_platforms_final_review_artifacts,
         "collect_final_exports": collect_final_exports,
+        "DEFAULT_FEISHU_BASE_URL": DEFAULT_FEISHU_BASE_URL,
+        "FeishuOpenClient": FeishuOpenClient,
+        "get_preferred_value": get_preferred_value,
+        "load_local_env": load_local_env,
         "prepare_screening_inputs": prepare_screening_inputs,
         "restore_backend_runtime_state": restore_backend_runtime_state,
         "snapshot_backend_runtime_state": snapshot_backend_runtime_state,
@@ -68,6 +75,7 @@ def _load_runtime_dependencies():
         "poll_job": poll_job,
         "require_success": require_success,
         "reset_backend_runtime_state": reset_backend_runtime_state,
+        "upload_final_review_payload_to_bitable": upload_final_review_payload_to_bitable,
     }
 
 
@@ -246,6 +254,34 @@ def _first_non_empty_text(*values: Any) -> str:
         if text:
             return text
     return ""
+
+
+def _build_feishu_open_client(
+    *,
+    runtime: dict[str, Any],
+    env_file: str | Path,
+):
+    load_local_env = runtime["load_local_env"]
+    get_preferred_value = runtime["get_preferred_value"]
+    FeishuOpenClient = runtime["FeishuOpenClient"]
+    default_base_url = runtime["DEFAULT_FEISHU_BASE_URL"]
+
+    env_values = load_local_env(env_file)
+    app_id = get_preferred_value("", env_values, "FEISHU_APP_ID")
+    app_secret = get_preferred_value("", env_values, "FEISHU_APP_SECRET")
+    if not app_id:
+        raise ValueError("缺少 FEISHU_APP_ID，请在本地 .env 或 shell 环境里填写。")
+    if not app_secret:
+        raise ValueError("缺少 FEISHU_APP_SECRET，请在本地 .env 或 shell 环境里填写。")
+    timeout_raw = get_preferred_value("", env_values, "TIMEOUT_SECONDS", "30")
+    timeout_seconds = float(timeout_raw or "30")
+    base_url = get_preferred_value("", env_values, "FEISHU_OPEN_BASE_URL", default_base_url)
+    return FeishuOpenClient(
+        app_id=app_id,
+        app_secret=app_secret,
+        base_url=base_url,
+        timeout_seconds=timeout_seconds,
+    )
 
 
 def _build_platform_quality_report(platform: str, platform_summary: dict[str, Any]) -> dict[str, Any]:
@@ -799,6 +835,25 @@ def run_keep_list_screening_pipeline(
     )
     resolved_keep_workbook = keep_workbook.expanduser()
     resolved_template_workbook = template_workbook.expanduser() if template_workbook else None
+    inferred_task_owner = _infer_task_owner_from_adjacent_task_spec(keep_workbook=resolved_keep_workbook.resolve())
+    normalized_task_owner_name = str(task_owner_name or inferred_task_owner.get("task_owner_name") or "").strip()
+    normalized_task_owner_employee_id = str(
+        task_owner_employee_id or inferred_task_owner.get("task_owner_employee_id") or ""
+    ).strip()
+    normalized_task_owner_employee_record_id = str(
+        task_owner_employee_record_id or inferred_task_owner.get("task_owner_employee_record_id") or ""
+    ).strip()
+    normalized_task_owner_employee_email = str(
+        task_owner_employee_email or inferred_task_owner.get("task_owner_employee_email") or ""
+    ).strip()
+    normalized_task_owner_owner_name = str(
+        task_owner_owner_name or inferred_task_owner.get("task_owner_owner_name") or ""
+    ).strip()
+    normalized_linked_bitable_url = str(linked_bitable_url or inferred_task_owner.get("linked_bitable_url") or "").strip()
+    if not normalized_task_name:
+        normalized_task_name = str(inferred_task_owner.get("task_name") or "").strip()
+    if not task_upload_url:
+        task_upload_url = str(inferred_task_owner.get("task_upload_url") or "").strip()
     preflight = _build_downstream_preflight(
         keep_workbook=resolved_keep_workbook,
         template_workbook=resolved_template_workbook,
@@ -864,6 +919,15 @@ def run_keep_list_screening_pipeline(
         "visual_postcheck_max_rounds": max(0, int(visual_postcheck_max_rounds)),
         "creator_cache_db_path": str(creator_cache_db_path or "").strip(),
         "force_refresh_creator_cache": bool(force_refresh_creator_cache),
+        "resolved_task_owner": {
+            "task_owner_name": normalized_task_owner_name,
+            "task_owner_employee_id": normalized_task_owner_employee_id,
+            "task_owner_employee_record_id": normalized_task_owner_employee_record_id,
+            "task_owner_employee_email": normalized_task_owner_employee_email,
+            "task_owner_owner_name": normalized_task_owner_owner_name,
+            "linked_bitable_url": normalized_linked_bitable_url,
+            "inferred_from_task_spec": str(inferred_task_owner.get("task_spec_path") or ""),
+        },
         "probe_vision_provider_only": bool(probe_vision_provider_only),
         "vision_providers": [],
         "vision_preflight": {},
@@ -904,12 +968,12 @@ def run_keep_list_screening_pipeline(
         skip_positioning_card_analysis=bool(skip_positioning_card_analysis),
         creator_cache_db_path=str(creator_cache_db_path or "").strip(),
         force_refresh_creator_cache=bool(force_refresh_creator_cache),
-        task_owner_name=str(task_owner_name or "").strip(),
-        task_owner_employee_id=str(task_owner_employee_id or "").strip(),
-        task_owner_employee_record_id=str(task_owner_employee_record_id or "").strip(),
-        task_owner_employee_email=str(task_owner_employee_email or "").strip(),
-        task_owner_owner_name=str(task_owner_owner_name or "").strip(),
-        linked_bitable_url=str(linked_bitable_url or "").strip(),
+        task_owner_name=normalized_task_owner_name,
+        task_owner_employee_id=normalized_task_owner_employee_id,
+        task_owner_employee_record_id=normalized_task_owner_employee_record_id,
+        task_owner_employee_email=normalized_task_owner_employee_email,
+        task_owner_owner_name=normalized_task_owner_owner_name,
+        linked_bitable_url=normalized_linked_bitable_url,
     )
 
     def persist_summary(payload: dict[str, Any]) -> None:
@@ -1053,6 +1117,9 @@ def run_keep_list_screening_pipeline(
     poll_job = runtime["poll_job"]
     require_success = runtime["require_success"]
     reset_backend_runtime_state = runtime["reset_backend_runtime_state"]
+    upload_final_review_payload_to_bitable = runtime.get("upload_final_review_payload_to_bitable")
+    if upload_final_review_payload_to_bitable is None:
+        from feishu_screening_bridge.bitable_upload import upload_final_review_payload_to_bitable
     runtime_snapshot = snapshot_backend_runtime_state()
 
     try:
@@ -1542,14 +1609,14 @@ def run_keep_list_screening_pipeline(
             final_exports=combined_exports,
             keep_workbook=resolved_keep_workbook,
             task_owner={
-                "responsible_name": str(task_owner_name or "").strip(),
-                "employee_name": str(task_owner_name or "").strip(),
-                "employee_id": str(task_owner_employee_id or "").strip(),
-                "employee_record_id": str(task_owner_employee_record_id or "").strip(),
-                "employee_email": str(task_owner_employee_email or "").strip(),
-                "owner_name": str(task_owner_owner_name or "").strip(),
-                "linked_bitable_url": str(linked_bitable_url or "").strip(),
-                "task_name": str(task_name or "").strip(),
+                "responsible_name": normalized_task_owner_name,
+                "employee_name": normalized_task_owner_name,
+                "employee_id": normalized_task_owner_employee_id,
+                "employee_record_id": normalized_task_owner_employee_record_id,
+                "employee_email": normalized_task_owner_employee_email,
+                "owner_name": normalized_task_owner_owner_name,
+                "linked_bitable_url": normalized_linked_bitable_url,
+                "task_name": normalized_task_name,
             },
         )
         summary["artifacts"]["final_exports"] = combined_exports
@@ -1561,6 +1628,89 @@ def run_keep_list_screening_pipeline(
         summary["artifacts"]["all_platforms_upload_row_count"] = combined_artifacts["row_count"]
         summary["artifacts"]["all_platforms_upload_source_row_count"] = combined_artifacts["source_row_count"]
         summary["artifacts"]["all_platforms_upload_skipped_row_count"] = combined_artifacts["skipped_row_count"]
+        summary["artifacts"]["feishu_upload_result_json"] = ""
+        summary["artifacts"]["feishu_upload_result_xlsx"] = ""
+        summary["artifacts"]["feishu_upload_target_url"] = ""
+        summary["artifacts"]["feishu_upload_target_table_id"] = ""
+        summary["artifacts"]["feishu_upload_target_table_name"] = ""
+        summary["artifacts"]["feishu_upload_created_count"] = 0
+        summary["artifacts"]["feishu_upload_updated_count"] = 0
+        summary["artifacts"]["feishu_upload_failed_count"] = 0
+        summary["artifacts"]["feishu_upload_skipped_existing_count"] = 0
+        if combined_artifacts["source_row_count"] > 0 and combined_artifacts["row_count"] <= 0:
+            skip_archive = summary["artifacts"]["all_platforms_upload_skipped_archive_json"]
+            failure = _build_failure_payload(
+                stage="feishu_upload",
+                error_code="FEISHU_UPLOAD_PAYLOAD_EMPTY",
+                message="导出已生成，但所有行都在上传前校验阶段被本地归档，未产生可上传 payload。",
+                remediation="先检查 skipped_from_feishu_upload.json 里的缺字段原因，修正后重新生成并上传。",
+                details={
+                    "source_row_count": int(combined_artifacts["source_row_count"]),
+                    "skipped_row_count": int(combined_artifacts["skipped_row_count"]),
+                    "skipped_archive_json": str(skip_archive),
+                },
+            )
+            return _finalize_failure(
+                failure=failure,
+                finished_at=backend_app.iso_now(),
+            )
+        if combined_artifacts["row_count"] > 0:
+            try:
+                feishu_client = _build_feishu_open_client(
+                    runtime=runtime,
+                    env_file=env_file,
+                )
+                upload_summary = upload_final_review_payload_to_bitable(
+                    feishu_client,
+                    payload_json_path=combined_artifacts["all_platforms_upload_payload_json"],
+                    linked_bitable_url=normalized_linked_bitable_url,
+                    task_name=normalized_task_name,
+                    task_upload_url=str(task_upload_url or "").strip(),
+                )
+            except Exception as exc:  # noqa: BLE001
+                failure = _build_failure_payload(
+                    stage="feishu_upload",
+                    error_code="FEISHU_UPLOAD_RUNTIME_FAILED",
+                    message=str(exc) or exc.__class__.__name__,
+                    remediation="检查飞书 app 配置、目标表链接以及 payload 内容后重试。",
+                    details={"exception_type": exc.__class__.__name__},
+                )
+                return _finalize_failure(
+                    failure=failure,
+                    finished_at=backend_app.iso_now(),
+                )
+            summary["upload_summary"] = dict(upload_summary)
+            summary["artifacts"]["feishu_upload_result_json"] = str(upload_summary.get("result_json_path") or "").strip()
+            summary["artifacts"]["feishu_upload_result_xlsx"] = str(upload_summary.get("result_xlsx_path") or "").strip()
+            summary["artifacts"]["feishu_upload_target_url"] = str(upload_summary.get("target_url") or "").strip()
+            summary["artifacts"]["feishu_upload_target_table_id"] = str(upload_summary.get("target_table_id") or "").strip()
+            summary["artifacts"]["feishu_upload_target_table_name"] = str(upload_summary.get("target_table_name") or "").strip()
+            summary["artifacts"]["feishu_upload_created_count"] = int(upload_summary.get("created_count") or 0)
+            summary["artifacts"]["feishu_upload_updated_count"] = int(upload_summary.get("updated_count") or 0)
+            summary["artifacts"]["feishu_upload_failed_count"] = int(upload_summary.get("failed_count") or 0)
+            summary["artifacts"]["feishu_upload_skipped_existing_count"] = int(upload_summary.get("skipped_existing_count") or 0)
+            if not bool(upload_summary.get("ok", True)) or int(upload_summary.get("failed_count") or 0) > 0:
+                failure = _build_failure_payload(
+                    stage="feishu_upload",
+                    error_code="FEISHU_UPLOAD_FAILED",
+                    message=_first_non_empty_text(
+                        upload_summary.get("error"),
+                        upload_summary.get("message"),
+                        "飞书上传未完整成功。",
+                    ),
+                    remediation="检查飞书返回的 failed_rows、目标表去重状态和负责人字段后重试。",
+                    details={
+                        "result_json_path": str(upload_summary.get("result_json_path") or "").strip(),
+                        "created_count": int(upload_summary.get("created_count") or 0),
+                        "updated_count": int(upload_summary.get("updated_count") or 0),
+                        "failed_count": int(upload_summary.get("failed_count") or 0),
+                        "skipped_existing_count": int(upload_summary.get("skipped_existing_count") or 0),
+                    },
+                )
+                return _finalize_failure(
+                    failure=failure,
+                    finished_at=backend_app.iso_now(),
+                )
         summary["quality_report"] = build_quality_report(summary["platforms"])
         summary["status"] = summarize_platform_statuses(summary["platforms"])
         if summary["status"] == "completed" and str((summary.get("quality_report") or {}).get("status") or "") == "warning":
@@ -1593,6 +1743,58 @@ def run_keep_list_screening_pipeline(
         return summary
     finally:
         restore_backend_runtime_state(runtime_snapshot)
+
+
+def _load_json_if_exists(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _infer_task_owner_from_adjacent_task_spec(
+    *,
+    keep_workbook: Path,
+) -> dict[str, str]:
+    candidate_specs: list[Path] = []
+    for ancestor in [keep_workbook.parent, *keep_workbook.parents]:
+        candidate_specs.append(ancestor / "downstream" / "task_spec.json")
+        candidate_specs.append(ancestor / "task_spec.json")
+
+    seen: set[Path] = set()
+    for candidate in candidate_specs:
+        resolved_candidate = candidate.resolve(strict=False)
+        if resolved_candidate in seen:
+            continue
+        seen.add(resolved_candidate)
+        payload = _load_json_if_exists(candidate)
+        owner = payload.get("task_owner") if isinstance(payload, dict) else None
+        if not isinstance(owner, dict):
+            continue
+        employee_id = str(owner.get("task_owner_employee_id") or owner.get("employee_id") or "").strip()
+        linked_url = str(owner.get("linked_bitable_url") or "").strip()
+        owner_name = str(owner.get("task_owner_name") or owner.get("responsible_name") or "").strip()
+        if not any([employee_id, linked_url, owner_name]):
+            continue
+        return {
+            "task_owner_name": owner_name,
+            "task_owner_employee_id": employee_id,
+            "task_owner_employee_record_id": str(
+                owner.get("task_owner_employee_record_id") or owner.get("employee_record_id") or ""
+            ).strip(),
+            "task_owner_employee_email": str(
+                owner.get("task_owner_employee_email") or owner.get("employee_email") or ""
+            ).strip(),
+            "task_owner_owner_name": str(owner.get("task_owner_owner_name") or owner.get("owner_name") or "").strip(),
+            "linked_bitable_url": linked_url,
+            "task_name": str(owner.get("task_name") or payload.get("intent", {}).get("task_name") or "").strip(),
+            "task_upload_url": str(payload.get("intent", {}).get("task_upload_url") or "").strip(),
+            "task_spec_path": str(candidate.resolve()),
+        }
+    return {}
 
 
 def build_parser() -> argparse.ArgumentParser:
