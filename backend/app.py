@@ -280,6 +280,10 @@ VISION_API_STYLE_RESPONSES = "responses"
 VISION_API_STYLE_CHAT_COMPLETIONS = "chat_completions"
 VISION_API_STYLE_GENERATE_CONTENT = "generate_content"
 VISUAL_REVIEW_REQUEST_COVER_LIMIT = max(1, int(os.getenv("VISUAL_REVIEW_REQUEST_COVER_LIMIT", "9")))
+INLINE_TIKTOK_VISUAL_REVIEW_REQUEST_COVER_LIMIT = max(
+    1,
+    int(os.getenv("INLINE_TIKTOK_VISUAL_REVIEW_REQUEST_COVER_LIMIT", "5")),
+)
 VISUAL_REVIEW_CANDIDATE_COVER_LIMIT_FLOOR = max(
     VISUAL_REVIEW_REQUEST_COVER_LIMIT,
     int(os.getenv("VISUAL_REVIEW_CANDIDATE_COVER_LIMIT_FLOOR", "12")),
@@ -384,16 +388,16 @@ DEFAULT_VISUAL_REVIEW_ROUTING_JUDGE_MODEL = "gpt-5.4"
 DEFAULT_VISUAL_REVIEW_ROUTING_JUDGE_TIMEOUT_SECONDS = 30
 DEFAULT_VISUAL_REVIEW_PROBE_RANKED_PREFERRED_PROVIDER = "openai"
 DEFAULT_VISUAL_REVIEW_PROBE_RANKED_PREFERRED_MODEL = "gpt-5.4"
-DEFAULT_VISUAL_REVIEW_PROBE_RANKED_PREFERRED_TIMEOUT_SECONDS = 30
+DEFAULT_VISUAL_REVIEW_PROBE_RANKED_PREFERRED_TIMEOUT_SECONDS = 60
 DEFAULT_VISUAL_REVIEW_PROBE_RANKED_PREFERRED_PARALLEL_PROVIDER = "reelx"
 DEFAULT_VISUAL_REVIEW_PROBE_RANKED_PREFERRED_PARALLEL_MODEL = DEFAULT_QWEN_VISION_MODEL
-DEFAULT_VISUAL_REVIEW_PROBE_RANKED_PREFERRED_PARALLEL_TIMEOUT_SECONDS = 30
+DEFAULT_VISUAL_REVIEW_PROBE_RANKED_PREFERRED_PARALLEL_TIMEOUT_SECONDS = 45
 DEFAULT_VISUAL_REVIEW_PROBE_RANKED_SECONDARY_PROVIDER = "reelx"
 DEFAULT_VISUAL_REVIEW_PROBE_RANKED_SECONDARY_MODEL = "gemini-3-pro-preview"
-DEFAULT_VISUAL_REVIEW_PROBE_RANKED_SECONDARY_TIMEOUT_SECONDS = 25
+DEFAULT_VISUAL_REVIEW_PROBE_RANKED_SECONDARY_TIMEOUT_SECONDS = 35
 DEFAULT_VISUAL_REVIEW_PROBE_RANKED_TERTIARY_PROVIDER = "reelx"
 DEFAULT_VISUAL_REVIEW_PROBE_RANKED_TERTIARY_MODEL = "gemini-3-flash-preview"
-DEFAULT_VISUAL_REVIEW_PROBE_RANKED_TERTIARY_TIMEOUT_SECONDS = 20
+DEFAULT_VISUAL_REVIEW_PROBE_RANKED_TERTIARY_TIMEOUT_SECONDS = 30
 DEFAULT_VISUAL_REVIEW_PROBE_RANKED_DISABLE_AFTER_FAILURES = 2
 DEFAULT_VISUAL_REVIEW_PROBE_RANKED_RETRY_ATTEMPTS = max(
     0,
@@ -4129,13 +4133,49 @@ def build_data_url_from_remote_image(platform, image_url):
     raise RuntimeError("下载封面失败")
 
 
-def normalize_visual_image_source(platform, image_url):
+def normalize_visual_image_source(platform, image_url, *, force_data_url=False):
     image_url = str(image_url or "").strip()
     if not image_url:
         return ""
     if image_url.startswith("data:"):
         return image_url
+    if not force_data_url:
+        return image_url
     return build_data_url_from_remote_image(platform, image_url)
+
+
+def reduce_visual_review_cover_limit(selected_cover_count):
+    try:
+        current_limit = max(1, int(selected_cover_count or 0))
+    except (TypeError, ValueError):
+        return None
+    if current_limit <= 1:
+        return None
+    if current_limit <= 3:
+        return current_limit - 1
+    return max(1, (current_limit + 1) // 2)
+
+
+def resolve_inline_visual_retry_cover_limit(selected_cover_count):
+    reduced_limit = reduce_visual_review_cover_limit(selected_cover_count)
+    if reduced_limit is None:
+        try:
+            reduced_limit = max(1, int(selected_cover_count or 1))
+        except (TypeError, ValueError):
+            reduced_limit = 1
+    return max(1, min(5, int(reduced_limit)))
+
+
+def resolve_visual_transport_cover_limit(platform, api_style, request_cover_limit):
+    try:
+        resolved_limit = max(1, int(request_cover_limit or VISUAL_REVIEW_REQUEST_COVER_LIMIT))
+    except (TypeError, ValueError):
+        resolved_limit = VISUAL_REVIEW_REQUEST_COVER_LIMIT
+    normalized_style = str(api_style or "").strip().lower()
+    if normalized_style in {VISION_API_STYLE_RESPONSES, VISION_API_STYLE_CHAT_COMPLETIONS}:
+        if str(platform or "").strip().lower() == "tiktok":
+            return min(resolved_limit, INLINE_TIKTOK_VISUAL_REVIEW_REQUEST_COVER_LIMIT)
+    return resolved_limit
 
 
 def data_url_to_inline_part(image_source):
@@ -4244,6 +4284,8 @@ def build_multimodal_prompt_input(
     prompt_text,
     cover_urls,
     *,
+    api_style=VISION_API_STYLE_RESPONSES,
+    force_data_url_override=False,
     request_cover_limit=VISUAL_REVIEW_REQUEST_COVER_LIMIT,
     prompt_source="",
     prompt_selection=None,
@@ -4253,7 +4295,19 @@ def build_multimodal_prompt_input(
     skipped_cover_count = 0
     for cover_url in candidate_cover_urls:
         try:
-            image_source = normalize_visual_image_source(platform, cover_url)
+            image_source = normalize_visual_image_source(
+                platform,
+                cover_url,
+                force_data_url=(
+                    bool(force_data_url_override)
+                    or str(api_style or "").strip().lower()
+                    in {
+                        VISION_API_STYLE_GENERATE_CONTENT,
+                        VISION_API_STYLE_RESPONSES,
+                        VISION_API_STYLE_CHAT_COMPLETIONS,
+                    }
+                ),
+            )
         except Exception:
             skipped_cover_count += 1
             continue
@@ -4261,7 +4315,11 @@ def build_multimodal_prompt_input(
             skipped_cover_count += 1
             continue
         normalized_image_sources.append(image_source)
-        if len(normalized_image_sources) >= max(1, int(request_cover_limit or VISUAL_REVIEW_REQUEST_COVER_LIMIT)):
+        if len(normalized_image_sources) >= resolve_visual_transport_cover_limit(
+            platform,
+            api_style,
+            request_cover_limit,
+        ):
             break
     if not normalized_image_sources:
         raise ValueError("没有可送审的有效图片")
@@ -4275,15 +4333,9 @@ def build_multimodal_prompt_input(
         {"type": "image_url", "image_url": {"url": image_source}}
         for image_source in normalized_image_sources
     )
-    generate_content_parts = [{"text": prompt_text}]
-    generate_content_parts.extend(
-        data_url_to_inline_part(image_source)
-        for image_source in normalized_image_sources
-    )
-    return {
+    payload = {
         "responses": [{"role": "user", "content": response_content}],
         "chat": [{"role": "user", "content": chat_content}],
-        "generate_content": build_vision_provider_generate_content_body(generate_content_parts),
         "selected_cover_count": len(normalized_image_sources),
         "candidate_cover_count": len(candidate_cover_urls),
         "skipped_cover_count": skipped_cover_count,
@@ -4291,37 +4343,79 @@ def build_multimodal_prompt_input(
         "prompt_source": str(prompt_source or "").strip(),
         "request_cover_limit": max(1, int(request_cover_limit or VISUAL_REVIEW_REQUEST_COVER_LIMIT)),
     }
+    if str(api_style or "").strip().lower() == VISION_API_STYLE_GENERATE_CONTENT:
+        generate_content_parts = [{"text": prompt_text}]
+        generate_content_parts.extend(
+            data_url_to_inline_part(image_source)
+            for image_source in normalized_image_sources
+        )
+        payload["generate_content"] = build_vision_provider_generate_content_body(generate_content_parts)
+    return payload
 
 
-def build_visual_review_input(provider_name, platform, username, cover_urls, model_name=""):
+def build_visual_review_input(
+    provider_name,
+    platform,
+    username,
+    cover_urls,
+    model_name="",
+    api_style=VISION_API_STYLE_RESPONSES,
+    force_data_url_override=False,
+    request_cover_limit_override=None,
+):
     prompt_selection = resolve_visual_review_prompt_selection(provider_name, platform, model_name=model_name)
     header = (
         f"平台：{UPLOAD_PLATFORM_RESPONSE_LABELS.get(platform, platform)}\n"
         f"达人：{username or 'unknown'}\n"
         f"{prompt_selection['prompt']}"
     )
+    resolved_cover_limit = prompt_selection.get("resolved_cover_limit") or VISUAL_REVIEW_REQUEST_COVER_LIMIT
+    if request_cover_limit_override not in (None, ""):
+        try:
+            resolved_cover_limit = max(1, int(request_cover_limit_override))
+        except (TypeError, ValueError):
+            pass
     return build_multimodal_prompt_input(
         platform,
         header,
         cover_urls,
-        request_cover_limit=prompt_selection.get("resolved_cover_limit") or VISUAL_REVIEW_REQUEST_COVER_LIMIT,
+        api_style=api_style,
+        force_data_url_override=force_data_url_override,
+        request_cover_limit=resolved_cover_limit,
         prompt_source=prompt_selection.get("source"),
         prompt_selection=prompt_selection,
     )
 
 
-def build_positioning_card_input(provider_name, platform, username, cover_urls, model_name=""):
+def build_positioning_card_input(
+    provider_name,
+    platform,
+    username,
+    cover_urls,
+    model_name="",
+    api_style=VISION_API_STYLE_RESPONSES,
+    force_data_url_override=False,
+    request_cover_limit_override=None,
+):
     prompt_selection = resolve_positioning_card_prompt_selection(provider_name, platform, model_name=model_name)
     header = (
         f"平台：{UPLOAD_PLATFORM_RESPONSE_LABELS.get(platform, platform)}\n"
         f"达人：{username or 'unknown'}\n"
         f"{prompt_selection['prompt']}"
     )
+    resolved_cover_limit = prompt_selection.get("resolved_cover_limit") or VISUAL_REVIEW_REQUEST_COVER_LIMIT
+    if request_cover_limit_override not in (None, ""):
+        try:
+            resolved_cover_limit = max(1, int(request_cover_limit_override))
+        except (TypeError, ValueError):
+            pass
     return build_multimodal_prompt_input(
         platform,
         header,
         cover_urls,
-        request_cover_limit=prompt_selection.get("resolved_cover_limit") or VISUAL_REVIEW_REQUEST_COVER_LIMIT,
+        api_style=api_style,
+        force_data_url_override=force_data_url_override,
+        request_cover_limit=resolved_cover_limit,
         prompt_source=prompt_selection.get("source"),
         prompt_selection=prompt_selection,
     )
@@ -4373,6 +4467,20 @@ def compute_visual_retry_delay_seconds(attempt_index):
     delay = min(delay, VISUAL_REVIEW_RETRY_MAX_DELAY_SECONDS)
     jitter = random.uniform(0, min(0.5, delay * 0.2))
     return round(delay + jitter, 3)
+
+
+def should_retry_visual_provider_with_inline_images(api_style, error_message):
+    normalized_style = str(api_style or "").strip().lower()
+    if normalized_style not in {VISION_API_STYLE_RESPONSES, VISION_API_STYLE_CHAT_COMPLETIONS}:
+        return False
+    lowered = str(error_message or "").strip().lower()
+    if not lowered:
+        return False
+    return (
+        "error while downloading" in lowered
+        or "upstream status code: 403" in lowered
+        or "下载图片失败" in lowered
+    )
 
 
 def is_local_cliproxyapi_base_url(base_url):
@@ -4549,109 +4657,128 @@ def call_vision_provider_with_json_contract(
         else [resolve_vision_provider_model(provider)]
     )
     for model_name in model_candidates:
-        try:
-            input_payload = build_input_fn(
-                provider_name,
-                platform,
-                username,
-                cover_urls,
-                model_name=model_name or configured_model,
-            )
-        except requests.exceptions.RequestException as exc:
-            raise VisionProviderError(
-                provider_name,
-                sanitize_vision_provider_exception_message(exc),
-                retryable=True,
-            ) from exc
         for candidate_index, candidate_base_url in enumerate(base_urls):
+            request_cover_limit_override = None
+            force_data_url_override = False
+            input_payload = None
             is_last_candidate = (
                 model_name == model_candidates[-1] and candidate_index == len(base_urls) - 1
             )
-            if api_style == VISION_API_STYLE_CHAT_COMPLETIONS:
-                url = f"{candidate_base_url}/chat/completions"
-                body = build_vision_provider_chat_body(provider, input_payload["chat"], model_override=model_name)
-            elif api_style == VISION_API_STYLE_GENERATE_CONTENT:
-                url = f"{candidate_base_url}/models/{quote(str(model_name or '').strip(), safe='')}:generateContent"
-                body = input_payload["generate_content"]
-            else:
-                url = f"{candidate_base_url}/responses"
-                body = {
-                    "model": model_name,
-                    "input": input_payload["responses"],
-                }
+            while True:
+                try:
+                    input_payload = build_input_fn(
+                        provider_name,
+                        platform,
+                        username,
+                        cover_urls,
+                        model_name=model_name or configured_model,
+                        api_style=api_style,
+                        force_data_url_override=force_data_url_override,
+                        request_cover_limit_override=request_cover_limit_override,
+                    )
+                except requests.exceptions.RequestException as exc:
+                    raise VisionProviderError(
+                        provider_name,
+                        sanitize_vision_provider_exception_message(exc),
+                        retryable=True,
+                    ) from exc
+                if api_style == VISION_API_STYLE_CHAT_COMPLETIONS:
+                    url = f"{candidate_base_url}/chat/completions"
+                    body = build_vision_provider_chat_body(provider, input_payload["chat"], model_override=model_name)
+                elif api_style == VISION_API_STYLE_GENERATE_CONTENT:
+                    url = f"{candidate_base_url}/models/{quote(str(model_name or '').strip(), safe='')}:generateContent"
+                    body = input_payload["generate_content"]
+                else:
+                    url = f"{candidate_base_url}/responses"
+                    body = {
+                        "model": model_name,
+                        "input": input_payload["responses"],
+                    }
 
-            try:
-                with acquire_vision_provider_request_slot(provider, candidate_base_url, request_timeout):
-                    response = requests.post(url, headers=headers, json=body, timeout=request_timeout)
-            except requests.exceptions.RequestException as exc:
-                last_error = VisionProviderError(
-                    provider_name,
-                    sanitize_vision_provider_exception_message(exc),
-                    retryable=True,
-                )
-                if not is_last_candidate:
-                    continue
-                raise last_error from exc
-            if response.status_code >= 400:
-                last_error = VisionProviderError(
-                    provider_name,
-                    build_vision_provider_http_error_message(response),
-                    status_code=response.status_code,
-                    retryable=response.status_code in VISUAL_REVIEW_RETRYABLE_STATUS_CODES,
-                )
-                if not is_last_candidate:
-                    continue
-                raise last_error
-            payload = parse_vision_provider_response_payload(response)
-            if should_retry_vision_payload(provider_name, payload):
-                last_error = VisionProviderError(
-                    provider_name,
-                    "模型输出被截断，未返回最终 JSON",
-                    retryable=True,
-                )
-                if not is_last_candidate:
-                    continue
-                raise last_error
-            raw_text = extract_vision_response_text(payload)
-            text_error = extract_vision_provider_text_error(raw_text)
-            if text_error:
-                last_error = VisionProviderError(
-                    provider_name,
-                    text_error["message"],
-                    status_code=text_error.get("status_code"),
-                    retryable=text_error.get("retryable", False),
-                )
-                if not is_last_candidate:
-                    continue
-                raise last_error
-            _cleaned_contract_text, contract_payload = parse_json_contract_payload(raw_text)
-            if not validate_payload_fn(contract_payload):
-                last_error = VisionProviderError(
-                    provider_name,
-                    f"模型未返回合法的{contract_label} JSON contract",
-                    retryable=True,
-                )
-                if not is_last_candidate:
-                    continue
-                raise last_error
-            response_model = extract_vision_response_model(payload)
-            effective_model = str(response_model or model_name or configured_model).strip()
-            parsed = parse_result_fn(raw_text)
-            parsed["provider"] = provider_name
-            parsed["model"] = effective_model
-            parsed["configured_model"] = configured_model
-            parsed["requested_model"] = str(model_name or "").strip()
-            parsed["response_model"] = response_model
-            parsed["effective_model"] = effective_model
-            parsed["raw_text"] = raw_text
-            parsed["usage"] = extract_vision_usage(payload)
-            parsed["cover_count"] = input_payload.get("selected_cover_count")
-            parsed["candidate_cover_count"] = input_payload.get("candidate_cover_count")
-            parsed["skipped_cover_count"] = input_payload.get("skipped_cover_count")
-            parsed["prompt_source"] = input_payload.get("prompt_source")
-            parsed["prompt_selection"] = dict(input_payload.get("prompt_selection") or {})
-            parsed["base_url"] = candidate_base_url
-            return parsed
+                try:
+                    with acquire_vision_provider_request_slot(provider, candidate_base_url, request_timeout):
+                        response = requests.post(url, headers=headers, json=body, timeout=request_timeout)
+                except requests.exceptions.RequestException as exc:
+                    last_error = VisionProviderError(
+                        provider_name,
+                        sanitize_vision_provider_exception_message(exc),
+                        retryable=True,
+                    )
+                    if not is_last_candidate:
+                        break
+                    raise last_error from exc
+                if response.status_code >= 400:
+                    error_message = build_vision_provider_http_error_message(response)
+                    if should_retry_visual_provider_with_inline_images(api_style, error_message) and not force_data_url_override:
+                        force_data_url_override = True
+                        request_cover_limit_override = resolve_inline_visual_retry_cover_limit(
+                            input_payload.get("selected_cover_count")
+                        )
+                        continue
+                    if api_style == VISION_API_STYLE_GENERATE_CONTENT and response.status_code == 413:
+                        reduced_cover_limit = reduce_visual_review_cover_limit(input_payload.get("selected_cover_count"))
+                        if reduced_cover_limit and reduced_cover_limit != request_cover_limit_override:
+                            request_cover_limit_override = reduced_cover_limit
+                            continue
+                    last_error = VisionProviderError(
+                        provider_name,
+                        error_message,
+                        status_code=response.status_code,
+                        retryable=response.status_code in VISUAL_REVIEW_RETRYABLE_STATUS_CODES,
+                    )
+                    if not is_last_candidate:
+                        break
+                    raise last_error
+                payload = parse_vision_provider_response_payload(response)
+                if should_retry_vision_payload(provider_name, payload):
+                    last_error = VisionProviderError(
+                        provider_name,
+                        "模型输出被截断，未返回最终 JSON",
+                        retryable=True,
+                    )
+                    if not is_last_candidate:
+                        break
+                    raise last_error
+                raw_text = extract_vision_response_text(payload)
+                text_error = extract_vision_provider_text_error(raw_text)
+                if text_error:
+                    last_error = VisionProviderError(
+                        provider_name,
+                        text_error["message"],
+                        status_code=text_error.get("status_code"),
+                        retryable=text_error.get("retryable", False),
+                    )
+                    if not is_last_candidate:
+                        break
+                    raise last_error
+                _cleaned_contract_text, contract_payload = parse_json_contract_payload(raw_text)
+                if not validate_payload_fn(contract_payload):
+                    last_error = VisionProviderError(
+                        provider_name,
+                        f"模型未返回合法的{contract_label} JSON contract",
+                        retryable=True,
+                    )
+                    if not is_last_candidate:
+                        break
+                    raise last_error
+                response_model = extract_vision_response_model(payload)
+                effective_model = str(response_model or model_name or configured_model).strip()
+                parsed = parse_result_fn(raw_text)
+                parsed["provider"] = provider_name
+                parsed["model"] = effective_model
+                parsed["configured_model"] = configured_model
+                parsed["requested_model"] = str(model_name or "").strip()
+                parsed["response_model"] = response_model
+                parsed["effective_model"] = effective_model
+                parsed["raw_text"] = raw_text
+                parsed["usage"] = extract_vision_usage(payload)
+                parsed["cover_count"] = input_payload.get("selected_cover_count")
+                parsed["candidate_cover_count"] = input_payload.get("candidate_cover_count")
+                parsed["skipped_cover_count"] = input_payload.get("skipped_cover_count")
+                parsed["prompt_source"] = input_payload.get("prompt_source")
+                parsed["prompt_selection"] = dict(input_payload.get("prompt_selection") or {})
+                parsed["base_url"] = candidate_base_url
+                return parsed
     if last_error is not None:
         raise last_error
     raise VisionProviderError(provider_name, "视觉模型调用失败")

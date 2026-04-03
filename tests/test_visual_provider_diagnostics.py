@@ -1340,6 +1340,63 @@ data: [DONE]
             "https://llmxapi.com/v1beta/models/qwen-vl-max:generateContent",
         )
 
+    def test_build_multimodal_prompt_input_converts_remote_urls_for_openai_compatible_styles(self) -> None:
+        with mock.patch.object(
+            backend_app,
+            "build_data_url_from_remote_image",
+            return_value="data:image/jpeg;base64,ZmFrZQ==",
+        ) as mocked_download:
+            payload = backend_app.build_multimodal_prompt_input(
+                "tiktok",
+                "hello",
+                ["https://cdn.example.com/covers/alpha.jpg"],
+                api_style=backend_app.VISION_API_STYLE_RESPONSES,
+            )
+
+        self.assertEqual(
+            payload["responses"][0]["content"][1]["image_url"],
+            "data:image/jpeg;base64,ZmFrZQ==",
+        )
+        self.assertEqual(
+            payload["chat"][0]["content"][1]["image_url"]["url"],
+            "data:image/jpeg;base64,ZmFrZQ==",
+        )
+        self.assertNotIn("generate_content", payload)
+        mocked_download.assert_called_once()
+
+    def test_build_multimodal_prompt_input_caps_tiktok_openai_transport_cover_count(self) -> None:
+        with mock.patch.object(
+            backend_app,
+            "build_data_url_from_remote_image",
+            side_effect=lambda platform, image_url: f"data:image/jpeg;base64,{image_url.rsplit('/', 1)[-1]}",
+        ) as mocked_download:
+            payload = backend_app.build_multimodal_prompt_input(
+                "tiktok",
+                "hello",
+                [f"https://cdn.example.com/covers/{index}.jpg" for index in range(8)],
+                api_style=backend_app.VISION_API_STYLE_RESPONSES,
+                request_cover_limit=8,
+            )
+
+        self.assertEqual(payload["selected_cover_count"], 5)
+        self.assertEqual(mocked_download.call_count, 5)
+
+    def test_probe_ranked_plan_defaults_gpt54_stage_to_sixty_seconds(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {
+                "VISION_VISUAL_REVIEW_PROBE_RANKED_PREFERRED_TIMEOUT_SECONDS": "",
+                "VISION_VISUAL_REVIEW_PROBE_RANKED_PREFERRED_PARALLEL_TIMEOUT_SECONDS": "",
+            },
+            clear=False,
+        ):
+            plan = backend_app.build_visual_review_probe_ranked_plan()
+            preferred = next(item for item in plan if item["stage"] == "preferred")
+            preferred_parallel = next(item for item in plan if item["stage"] == "preferred_parallel")
+
+        self.assertEqual(preferred["timeout_seconds"], 60)
+        self.assertEqual(preferred_parallel["timeout_seconds"], 45)
+
     def test_call_vision_provider_retries_reelx_across_base_urls_before_fallback_model(self) -> None:
         provider = {
             "name": "reelx",
@@ -1492,6 +1549,113 @@ data: [DONE]
         self.assertIn("HTML 错误页", message)
         self.assertNotIn("https://hk.reelxai.com/v1beta", message)
         self.assertNotIn("<html>", message)
+
+    def test_call_vision_provider_retries_413_with_fewer_generate_content_images(self) -> None:
+        provider = {
+            "name": "reelx",
+            "base_url": "https://hk.reelxai.com/v1beta",
+            "api_key": "reelx-test-key",
+            "api_style": backend_app.VISION_API_STYLE_GENERATE_CONTENT,
+            "default_model": "qwen-vl-max",
+            "default_fallback_model": "gemini-3-flash-preview",
+        }
+        first_response = DummyProviderResponse(
+            ValueError("not json"),
+            status_code=413,
+            text="<html><head><title>413 Request Entity Too Large</title></head></html>",
+            headers={"Content-Type": "text/html"},
+        )
+        second_response = DummyProviderResponse(
+            {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": '{"decision":"Pass","reason":"画面正常","signals":["无高风险信号"]}'
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+            status_code=200,
+        )
+
+        with mock.patch.object(
+            backend_app.requests,
+            "post",
+            side_effect=[first_response, second_response],
+        ) as mocked_post:
+            parsed = backend_app.call_vision_provider(
+                provider,
+                "tiktok",
+                "alpha",
+                [
+                    "data:image/jpeg;base64,ZmFrZQ==",
+                    "data:image/jpeg;base64,YmFy",
+                    "data:image/jpeg;base64,YmF6",
+                ],
+            )
+
+        first_parts = mocked_post.call_args_list[0].kwargs["json"]["contents"][0]["parts"]
+        second_parts = mocked_post.call_args_list[1].kwargs["json"]["contents"][0]["parts"]
+        self.assertEqual(parsed["decision"], "Pass")
+        self.assertEqual(parsed["cover_count"], 2)
+        self.assertEqual(len(first_parts), 4)
+        self.assertEqual(len(second_parts), 3)
+        self.assertGreater(len(first_parts), len(second_parts))
+
+    def test_call_vision_provider_uses_local_data_urls_for_openai_tiktok_requests(self) -> None:
+        provider = {
+            "name": "openai",
+            "base_url": "http://127.0.0.1:8317/v1",
+            "api_key": "openai-test-key",
+            "api_style": backend_app.VISION_API_STYLE_RESPONSES,
+            "default_model": "gpt-5.4",
+        }
+        response = DummyProviderResponse(
+            {
+                "output": [
+                    {
+                        "content": [
+                            {
+                                "text": '{"decision":"Pass","reason":"画面正常","signals":["无高风险信号"]}'
+                            }
+                        ]
+                    }
+                ],
+                "model": "gpt-5.4",
+            },
+            status_code=200,
+        )
+
+        with mock.patch.object(
+            backend_app,
+            "build_data_url_from_remote_image",
+            side_effect=lambda platform, image_url: f"data:image/jpeg;base64,{image_url.rsplit('/', 1)[-1]}",
+        ) as mocked_download, mock.patch.object(
+            backend_app.requests,
+            "post",
+            return_value=response,
+        ) as mocked_post:
+            parsed = backend_app.call_vision_provider(
+                provider,
+                "tiktok",
+                "alpha",
+                [
+                    "https://cdn.example.com/a.jpg",
+                    "https://cdn.example.com/b.jpg",
+                    "https://cdn.example.com/c.jpg",
+                ],
+            )
+
+        request_content = mocked_post.call_args.kwargs["json"]["input"][0]["content"]
+        self.assertEqual(parsed["decision"], "Pass")
+        self.assertEqual(parsed["cover_count"], 3)
+        self.assertTrue(request_content[1]["image_url"].startswith("data:image/jpeg;base64,"))
+        self.assertEqual(len([item for item in request_content if item["type"] == "input_image"]), 3)
+        self.assertEqual(mocked_download.call_count, 3)
 
     def test_call_vision_provider_falls_back_to_secondary_qiandao_model(self) -> None:
         provider = {
