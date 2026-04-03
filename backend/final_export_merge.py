@@ -8,12 +8,15 @@ from typing import Any
 
 import pandas as pd
 
+from backend import creator_cache
+
 
 FINAL_UPLOAD_COLUMNS = (
     "达人ID",
     "平台",
     "主页链接",
     "# Followers(K)#",
+    "Following",
     "Average Views (K)",
     "互动率",
     "当前网红报价",
@@ -373,21 +376,7 @@ def _resolve_existing_local_paths(*values: Any, base_dirs: list[Path | None] | N
     return _dedupe_preserve_order(candidates)
 
 
-def _build_apify_metric_lookup(platform: str, final_review_path: str | Path | None) -> dict[str, dict[str, float | None]]:
-    if not final_review_path:
-        return {}
-    export_path = Path(str(final_review_path)).expanduser()
-    run_root = _resolve_run_root_from_export(export_path)
-    if run_root is None:
-        return {}
-    data_path = run_root / "data" / platform / f"{platform}_data.json"
-    if not data_path.exists():
-        return {}
-    try:
-        data = json.loads(data_path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
+def _build_metrics_from_raw_platform_data(platform: str, data: Any) -> dict[str, dict[str, float | None]]:
     metrics: dict[str, dict[str, float | None]] = {}
     if platform == "instagram" and isinstance(data, list):
         for item in data:
@@ -411,6 +400,7 @@ def _build_apify_metric_lookup(platform: str, final_review_path: str | Path | No
             avg_likes = _average([value for value in like_values if value is not None])
             metrics[handle] = {
                 "followers": _coerce_number(item.get("followersCount")),
+                "following": _coerce_number(item.get("followsCount")),
                 "avg_views": avg_views,
                 "avg_likes": avg_likes,
             }
@@ -429,10 +419,18 @@ def _build_apify_metric_lookup(platform: str, final_review_path: str | Path | No
             )
             if not handle:
                 continue
-            bucket = grouped.setdefault(handle, {"followers": None, "views": [], "likes": []})
+            bucket = grouped.setdefault(handle, {"followers": None, "following": None, "views": [], "likes": []})
             followers = _coerce_number((author_meta or {}).get("fans"))
             if followers is not None:
                 bucket["followers"] = followers
+            following = _coerce_number(
+                (author_meta or {}).get("following")
+                or (author_meta or {}).get("followingCount")
+                or (author_meta or {}).get("friends")
+                or (author_meta or {}).get("friendsCount")
+            )
+            if following is not None:
+                bucket["following"] = following
             play_count = _coerce_number(item.get("playCount"))
             digg_count = _coerce_number(item.get("diggCount"))
             if play_count is not None:
@@ -442,10 +440,66 @@ def _build_apify_metric_lookup(platform: str, final_review_path: str | Path | No
         for handle, bucket in grouped.items():
             metrics[handle] = {
                 "followers": bucket.get("followers"),
+                "following": bucket.get("following"),
                 "avg_views": _average(bucket.get("views") or []),
                 "avg_likes": _average(bucket.get("likes") or []),
             }
-    return metrics
+        return metrics
+    return {}
+
+
+def _load_creator_cache_metric_rows(platform: str, final_review_path: Path) -> list[dict[str, Any]]:
+    try:
+        frame = pd.read_excel(final_review_path)
+    except Exception:
+        return []
+    identifiers: list[str] = []
+    seen: set[str] = set()
+    for record in frame.to_dict(orient="records"):
+        handle = _extract_handle(
+            _first_non_blank(
+                record.get("upload_handle"),
+                record.get("username"),
+                record.get("identifier"),
+                record.get("profile_url"),
+            )
+        )
+        if not handle or handle in seen:
+            continue
+        seen.add(handle)
+        identifiers.append(handle)
+    if not identifiers:
+        return []
+    try:
+        rows = creator_cache.load_scrape_cache_entries(
+            platform,
+            identifiers,
+            creator_cache.resolve_creator_cache_db_path(),
+        )
+    except Exception:
+        return []
+    merged: list[dict[str, Any]] = []
+    for items in rows.values():
+        merged.extend([item for item in items if isinstance(item, dict)])
+    return merged
+
+
+def _build_apify_metric_lookup(platform: str, final_review_path: str | Path | None) -> dict[str, dict[str, float | None]]:
+    if not final_review_path:
+        return {}
+    export_path = Path(str(final_review_path)).expanduser()
+    run_root = _resolve_run_root_from_export(export_path)
+    data: Any = []
+    if run_root is not None:
+        data_path = run_root / "data" / platform / f"{platform}_data.json"
+        if data_path.exists():
+            try:
+                data = json.loads(data_path.read_text(encoding="utf-8"))
+            except Exception:
+                data = []
+    if not data:
+        data = _load_creator_cache_metric_rows(platform, export_path)
+    return _build_metrics_from_raw_platform_data(platform, data)
 
 
 def _normalize_employee_id(value: Any) -> str:
@@ -717,6 +771,7 @@ def build_all_platforms_final_review_artifacts(
                 "平台": platform,
                 "主页链接": profile_url or _clean_text(keep_row.get("URL")),
                 "# Followers(K)#": _format_k_value(_first_non_blank(apify_row.get("followers"), record.get("upload_followers"), "")),
+                "Following": _format_k_value(_first_non_blank(apify_row.get("following"), record.get("upload_following"), "")),
                 "Average Views (K)": _format_k_value(avg_views),
                 "互动率": engagement_rate,
                 "当前网红报价": _build_quote_text(keep_row),

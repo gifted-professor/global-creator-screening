@@ -60,27 +60,28 @@ class _FakeBitableUploadClient:
                 {"field_id": "fld2", "field_name": "平台", "type": 1, "property": None},
                 {"field_id": "fld3", "field_name": "主页链接", "type": 15, "property": None},
                 {"field_id": "fld4", "field_name": "Followers(K)", "type": 2, "property": {"formatter": "0"}},
-                {"field_id": "fld5", "field_name": "Average Views (K)", "type": 2, "property": {"formatter": "0"}},
-                {"field_id": "fld6", "field_name": "互动率", "type": 1, "property": None},
-                {"field_id": "fld7", "field_name": "当前网红报价", "type": 1, "property": None},
-                {"field_id": "fld8", "field_name": "达人最后一次回复邮件时间", "type": 5, "property": {"date_formatter": "yyyy/MM/dd"}},
-                {"field_id": "fld9", "field_name": "达人回复的最后一封邮件内容", "type": 1, "property": None},
-                {"field_id": "fld10", "field_name": "达人对接人", "type": 11, "property": {"multiple": False}},
+                {"field_id": "fld5", "field_name": "Following", "type": 2, "property": {"formatter": "0"}},
+                {"field_id": "fld6", "field_name": "Average Views (K)", "type": 2, "property": {"formatter": "0"}},
+                {"field_id": "fld7", "field_name": "互动率", "type": 1, "property": None},
+                {"field_id": "fld8", "field_name": "当前网红报价", "type": 1, "property": None},
+                {"field_id": "fld9", "field_name": "达人最后一次回复邮件时间", "type": 5, "property": {"date_formatter": "yyyy/MM/dd"}},
+                {"field_id": "fld10", "field_name": "达人回复的最后一封邮件内容", "type": 1, "property": None},
+                {"field_id": "fld11", "field_name": "达人对接人", "type": 11, "property": {"multiple": False}},
                 {
-                    "field_id": "fld11",
+                    "field_id": "fld12",
                     "field_name": "ai 是否通过",
                     "type": 3,
                     "property": {"options": [{"name": "是"}, {"name": "否"}, {"name": "转人工"}]},
                 },
-                {"field_id": "fld12", "field_name": "ai筛号反馈理由", "type": 1, "property": None},
+                {"field_id": "fld13", "field_name": "ai筛号反馈理由", "type": 1, "property": None},
                 {
-                    "field_id": "fld13",
+                    "field_id": "fld14",
                     "field_name": "标签（ai）",
                     "type": 4,
                     "property": {"options": [{"name": "母婴用品-家庭/宝妈"}, {"name": "家庭用品和家电-家庭博主"}]},
                 },
-                {"field_id": "fld14", "field_name": "ai 评价", "type": 1, "property": None},
-                {"field_id": "fld15", "field_name": "文本 12", "type": 17, "property": None},
+                {"field_id": "fld15", "field_name": "ai 评价", "type": 1, "property": None},
+                {"field_id": "fld16", "field_name": "文本 12", "type": 17, "property": None},
             ]
             if self.include_task_name_field:
                 items.insert(0, {"field_id": "fld0", "field_name": "任务名", "type": 1, "property": None})
@@ -181,6 +182,7 @@ class BitableUploadTests(unittest.TestCase):
                                 "平台": "instagram",
                                 "主页链接": "https://www.instagram.com/alpha",
                                 "# Followers(K)#": 123.4,
+                                "Following": 321.9,
                                 "Average Views (K)": 56.7,
                                 "互动率": "12.3%",
                                 "当前网红报价": "$100",
@@ -229,6 +231,7 @@ class BitableUploadTests(unittest.TestCase):
             self.assertEqual(created_fields["达人ID"], "alpha")
             self.assertEqual(created_fields["平台"], "instagram")
             self.assertEqual(created_fields["Followers(K)"], 123.4)
+            self.assertEqual(created_fields["Following"], 321.9)
             self.assertEqual(created_fields["Average Views (K)"], 56.7)
             self.assertEqual(created_fields["ai 是否通过"], "是")
             self.assertEqual(created_fields["标签（ai）"], ["家庭用品和家电-家庭博主"])

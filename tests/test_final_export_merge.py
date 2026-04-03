@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 
@@ -312,6 +313,7 @@ class FinalExportMergeTests(unittest.TestCase):
                             "username": "good_creator",
                             "url": "https://www.instagram.com/good_creator",
                             "followersCount": 52300,
+                            "followsCount": 1200,
                             "latestPosts": [{"videoViewCount": 22100, "likesCount": 1600}],
                         },
                         {
@@ -355,6 +357,7 @@ class FinalExportMergeTests(unittest.TestCase):
             self.assertEqual(payload["row_count"], 2)
             self.assertEqual(payload["skipped_row_count"], 0)
             self.assertEqual(payload["rows"][0]["达人ID"], "good_creator")
+            self.assertEqual(payload["rows"][0]["Following"], 1.2)
             self.assertEqual(payload["rows"][1]["达人ID"], "bad_creator")
             self.assertEqual(payload["rows"][1]["ai是否通过"], "转人工")
             self.assertEqual(archive_payload["skipped_row_count"], 0)
@@ -445,6 +448,61 @@ class FinalExportMergeTests(unittest.TestCase):
             self.assertEqual(tiktok_row["Average Views (K)"], "")
             self.assertIn("无抓取数据，需人工确认", tiktok_row["ai筛号反馈理由"])
             self.assertIn("无抓取数据，需人工确认", tiktok_row["ai评价"])
+
+    def test_final_export_falls_back_to_creator_cache_for_metrics_when_run_data_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            exports_dir = root / "exports"
+            instagram_export = exports_dir / "instagram" / "instagram_final_review.xlsx"
+            instagram_export.parent.mkdir(parents=True, exist_ok=True)
+
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "andrealopez",
+                        "username": "andrealopez",
+                        "profile_url": "https://www.instagram.com/andrealopez",
+                        "upload_handle": "andrealopez",
+                        "final_status": "Reject",
+                        "final_reason": "数据表现一般",
+                    }
+                ]
+            ).to_excel(instagram_export, index=False)
+
+            cached_rows = {
+                "andrealopez": [
+                    {
+                        "username": "andrealopez",
+                        "url": "https://www.instagram.com/andrealopez",
+                        "followersCount": 1376339,
+                        "followsCount": 2319,
+                        "latestPosts": [
+                            {"videoViewCount": 242700, "likesCount": 39100},
+                            {"videoViewCount": 242700, "likesCount": 39100},
+                        ],
+                    }
+                ]
+            }
+
+            output_path = exports_dir / "all_platforms_final_review.xlsx"
+            payload_path = exports_dir / "all_platforms_final_review_payload.json"
+            with patch(
+                "backend.final_export_merge.creator_cache.load_scrape_cache_entries",
+                return_value=cached_rows,
+            ):
+                build_all_platforms_final_review_artifacts(
+                    output_path=output_path,
+                    payload_json_path=payload_path,
+                    final_exports={"instagram": {"final_review": str(instagram_export)}},
+                    task_owner={"responsible_name": "陈俊仁"},
+                )
+
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+            row = payload["rows"][0]
+            self.assertEqual(row["# Followers(K)#"], 1376.3)
+            self.assertEqual(row["Following"], 2.3)
+            self.assertEqual(row["Average Views (K)"], 242.7)
+            self.assertEqual(row["互动率"], "16.1%")
 
     def test_processing_failures_and_positioning_errors_are_explicit_in_combined_sheet(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -19,6 +19,7 @@ from .task_upload_sync import resolve_task_upload_entry
 _FIELD_NAME_ALIASES = {
     "# followers(k)#": "Followers(K)",
     "followers(k)": "Followers(K)",
+    "following": "Following",
     "ai是否通过": "ai 是否通过",
     "标签(ai)": "标签（ai）",
     "标签（ai）": "标签（ai）",
