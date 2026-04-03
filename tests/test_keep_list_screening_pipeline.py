@@ -20,12 +20,13 @@ class FakeResponse:
 
 
 class FakeClient:
-    def __init__(self, preflight=None):
+    def __init__(self, preflight=None, artifact_status_by_platform=None):
         self.probe_calls = []
         self.scrape_start_calls = []
         self.visual_start_calls = []
         self.positioning_start_calls = []
         self.preflight = json.loads(json.dumps(preflight or {}))
+        self.artifact_status_by_platform = json.loads(json.dumps(artifact_status_by_platform or {}))
 
     def post(self, url, json=None):
         if url == "/api/vision/providers/probe":
@@ -56,11 +57,14 @@ class FakeClient:
 
     def get(self, url):
         if url.endswith("/status"):
-            return FakeResponse({
+            platform = str(url).split("/api/artifacts/", 1)[-1].split("/", 1)[0]
+            payload = {
                 "success": True,
                 "available": {"final_review": False},
                 "saved_positioning_card_artifacts_available": False,
-            })
+            }
+            payload.update(self.artifact_status_by_platform.get(platform, {}))
+            return FakeResponse(payload)
         raise AssertionError(f"unexpected GET {url}")
 
 
@@ -76,10 +80,10 @@ class FakeFlaskApp:
 class FakeBackendApp:
     PLATFORM_ACTORS = {"instagram": "actor", "tiktok": "actor", "youtube": "actor"}
 
-    def __init__(self, preflight, routing_strategy="", channel_race=None, metadata=None):
+    def __init__(self, preflight, routing_strategy="", channel_race=None, metadata=None, artifact_status_by_platform=None):
         self._preflight = json.loads(json.dumps(preflight))
         self._metadata = json.loads(json.dumps(metadata or {"instagram": {"alpha": {"handle": "alpha"}}}))
-        self._client = FakeClient(preflight=preflight)
+        self._client = FakeClient(preflight=preflight, artifact_status_by_platform=artifact_status_by_platform)
         self.app = FakeFlaskApp(self._client)
         self.DATA_DIR = "/original/data"
         self.CONFIG_DIR = "/original/config"
@@ -1385,6 +1389,141 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         self.assertEqual(platform_summary["status"], "completed")
         self.assertEqual(platform_summary["positioning_card_analysis"]["status"], "failed")
         self.assertTrue(platform_summary["positioning_card_analysis"]["non_blocking"])
+
+    def test_runner_marks_completed_with_quality_warnings_when_visual_coverage_is_missing(self) -> None:
+        preflight = {
+            "status": "configured",
+            "error_code": "",
+            "message": "视觉模型已就绪：openai",
+            "configured_provider_names": ["openai"],
+            "runnable_provider_names": ["openai"],
+            "preferred_provider": "openai",
+            "providers": [{"name": "openai", "runnable": True}],
+        }
+        backend_app = FakeBackendApp(
+            preflight,
+            artifact_status_by_platform={
+                "instagram": {
+                    "profile_review_count": 2,
+                    "visual_review_count": 0,
+                    "missing_profile_count": 0,
+                }
+            },
+        )
+
+        def fake_prepare_screening_inputs(**kwargs):
+            return {"prepared_at": "2026-03-28T01:02:03Z", "upload": {"stats": {"Instagram": 2}}}
+
+        def fake_poll_job(client, job_id, label, interval):
+            if job_id == "scrape-job-1":
+                return {
+                    "id": job_id,
+                    "status": "completed",
+                    "result": {"profile_reviews": [{"status": "Pass", "username": "alpha"}]},
+                }
+            if job_id == "visual-job-1":
+                return {"id": job_id, "status": "failed", "error": "openai timeout"}
+            raise AssertionError(f"unexpected job id: {job_id}")
+
+        keep_list_runner._load_runtime_dependencies = lambda: {
+            "backend_app": backend_app,
+            "prepare_screening_inputs": fake_prepare_screening_inputs,
+            "count_passed_profiles": lambda scrape_job: 1,
+            "export_platform_artifacts": lambda client, platform, export_dir: {},
+            "poll_job": fake_poll_job,
+            "require_success": lambda response, label: response.get_json(),
+            "reset_backend_runtime_state": lambda: None,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            keep_path = temp_root / "keep.xlsx"
+            template_path = temp_root / "template.xlsx"
+            keep_path.touch()
+            template_path.touch()
+            env_path = self._write_env_file(temp_root)
+
+            summary = keep_list_runner.run_keep_list_screening_pipeline(
+                keep_workbook=keep_path,
+                template_workbook=template_path,
+                env_file=env_path,
+                output_root=temp_root / "run",
+                platform_filters=["instagram"],
+                vision_provider="openai",
+            )
+
+        self.assertEqual(summary["status"], "completed_with_quality_warnings")
+        self.assertEqual(summary["verdict"]["outcome"], "completed")
+        self.assertEqual(summary["verdict"]["recommended_action"], "inspect_summary")
+        self.assertEqual(summary["quality_report"]["status"], "warning")
+        self.assertEqual(summary["quality_report"]["warning_count"], 1)
+        self.assertEqual(summary["quality_report"]["warnings"][0]["code"], "visual_coverage_gap")
+        self.assertEqual(summary["quality_report"]["warnings"][0]["platform"], "instagram")
+        self.assertEqual(summary["quality_report"]["warnings"][0]["count"], 1)
+
+    def test_runner_does_not_emit_quality_warning_when_visual_is_explicitly_skipped(self) -> None:
+        preflight = {
+            "status": "configured",
+            "error_code": "",
+            "message": "视觉模型已就绪：openai",
+            "configured_provider_names": ["openai"],
+            "runnable_provider_names": ["openai"],
+            "preferred_provider": "openai",
+            "providers": [{"name": "openai", "runnable": True}],
+        }
+        backend_app = FakeBackendApp(
+            preflight,
+            artifact_status_by_platform={
+                "instagram": {
+                    "profile_review_count": 1,
+                    "visual_review_count": 0,
+                    "missing_profile_count": 0,
+                }
+            },
+        )
+
+        def fake_prepare_screening_inputs(**kwargs):
+            return {"prepared_at": "2026-03-28T01:02:03Z", "upload": {"stats": {"Instagram": 1}}}
+
+        def fake_poll_job(client, job_id, label, interval):
+            if job_id == "scrape-job-1":
+                return {
+                    "id": job_id,
+                    "status": "completed",
+                    "result": {"profile_reviews": [{"status": "Pass", "username": "alpha"}]},
+                }
+            raise AssertionError(f"unexpected job id: {job_id}")
+
+        keep_list_runner._load_runtime_dependencies = lambda: {
+            "backend_app": backend_app,
+            "prepare_screening_inputs": fake_prepare_screening_inputs,
+            "count_passed_profiles": lambda scrape_job: 1,
+            "export_platform_artifacts": lambda client, platform, export_dir: {},
+            "poll_job": fake_poll_job,
+            "require_success": lambda response, label: response.get_json(),
+            "reset_backend_runtime_state": lambda: None,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            keep_path = temp_root / "keep.xlsx"
+            template_path = temp_root / "template.xlsx"
+            keep_path.touch()
+            template_path.touch()
+            env_path = self._write_env_file(temp_root)
+
+            summary = keep_list_runner.run_keep_list_screening_pipeline(
+                keep_workbook=keep_path,
+                template_workbook=template_path,
+                env_file=env_path,
+                output_root=temp_root / "run",
+                platform_filters=["instagram"],
+                skip_visual=True,
+            )
+
+        self.assertEqual(summary["status"], "completed")
+        self.assertEqual(summary["quality_report"]["status"], "ok")
+        self.assertEqual(summary["quality_report"]["warning_count"], 0)
 
     def test_runner_marks_top_level_scrape_failure_when_platform_scrape_fails(self) -> None:
         preflight = {

@@ -213,6 +213,130 @@ def summarize_platform_statuses(platforms: dict[str, dict[str, Any]]) -> str:
     return "completed"
 
 
+def _coerce_non_negative_int(value: Any) -> int | None:
+    try:
+        resolved = int(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0, resolved)
+
+
+def _first_non_empty_text(*values: Any) -> str:
+    for value in values:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _build_platform_quality_report(platform: str, platform_summary: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(platform_summary or {})
+    artifact_status = dict(payload.get("artifact_status") or {})
+    visual_job = dict(payload.get("visual_job") or {})
+    visual_gate = dict(payload.get("visual_gate") or {})
+
+    staged_identifier_count = _coerce_non_negative_int(payload.get("staged_identifier_count")) or 0
+    requested_identifier_count = _coerce_non_negative_int(payload.get("requested_identifier_count")) or 0
+    profile_review_count = _coerce_non_negative_int(payload.get("profile_review_count"))
+    if profile_review_count is None:
+        profile_review_count = _coerce_non_negative_int(artifact_status.get("profile_review_count"))
+    prescreen_pass_count = _coerce_non_negative_int(payload.get("prescreen_pass_count")) or 0
+    missing_profile_count = _coerce_non_negative_int(payload.get("missing_profile_count"))
+    if missing_profile_count is None:
+        missing_profile_count = _coerce_non_negative_int(artifact_status.get("missing_profile_count")) or 0
+
+    has_visual_review_count = artifact_status.get("visual_review_count") is not None
+    visual_review_count = _coerce_non_negative_int(artifact_status.get("visual_review_count"))
+    if visual_review_count is None and has_visual_review_count:
+        visual_review_count = 0
+
+    platform_report: dict[str, Any] = {
+        "platform": platform,
+        "platform_status": str(payload.get("status") or "").strip(),
+        "staged_identifier_count": staged_identifier_count,
+        "requested_identifier_count": requested_identifier_count,
+        "profile_review_count": profile_review_count,
+        "prescreen_pass_count": prescreen_pass_count,
+        "missing_profile_count": missing_profile_count,
+        "visual_review_count": visual_review_count,
+        "visual_job_status": str(visual_job.get("status") or "").strip(),
+        "issues": [],
+        "status": "ok",
+    }
+
+    if missing_profile_count > 0:
+        platform_report["issues"].append(
+            {
+                "code": "missing_profiles",
+                "severity": "warning",
+                "count": missing_profile_count,
+                "message": f"{platform} 抓取结果缺少 {missing_profile_count} 个名单账号。",
+                "reason": _first_non_empty_text(
+                    payload.get("reason"),
+                    visual_gate.get("reason"),
+                    (payload.get("scrape_job") or {}).get("message"),
+                    (payload.get("scrape_job") or {}).get("error"),
+                ),
+            }
+        )
+
+    visual_required = (
+        prescreen_pass_count > 0
+        and not bool(visual_gate.get("skip_visual_flag"))
+        and missing_profile_count == 0
+    )
+    if visual_required and has_visual_review_count:
+        visual_gap_count = max(0, prescreen_pass_count - (visual_review_count or 0))
+        platform_report["visual_expected_count"] = prescreen_pass_count
+        platform_report["visual_gap_count"] = visual_gap_count
+        if visual_gap_count > 0:
+            platform_report["issues"].append(
+                {
+                    "code": "visual_coverage_gap",
+                    "severity": "warning",
+                    "count": visual_gap_count,
+                    "expected_count": prescreen_pass_count,
+                    "actual_count": visual_review_count or 0,
+                    "message": (
+                        f"{platform} 视觉复核缺少 {visual_gap_count}/{prescreen_pass_count} 个 Pass 账号结果。"
+                    ),
+                    "reason": _first_non_empty_text(
+                        visual_job.get("error"),
+                        visual_job.get("message"),
+                        visual_job.get("reason"),
+                        ((payload.get("visual_retry") or {}).get("reason")),
+                    ),
+                }
+            )
+
+    if platform_report["issues"]:
+        platform_report["status"] = "warning"
+    return platform_report
+
+
+def build_quality_report(platforms: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "status": "ok",
+        "warning_count": 0,
+        "warnings": [],
+        "platforms": {},
+    }
+    for platform, platform_summary in (platforms or {}).items():
+        platform_report = _build_platform_quality_report(platform, platform_summary)
+        report["platforms"][platform] = platform_report
+        for issue in platform_report.get("issues") or []:
+            report["warnings"].append(
+                {
+                    "platform": platform,
+                    **issue,
+                }
+            )
+    report["warning_count"] = len(report["warnings"])
+    if report["warning_count"] > 0:
+        report["status"] = "warning"
+    return report
+
+
 def _extract_scrape_partial_result(scrape_job: dict[str, Any] | None) -> dict[str, Any]:
     payload = dict(scrape_job or {})
     result = payload.get("result")
@@ -1381,7 +1505,10 @@ def run_keep_list_screening_pipeline(
         summary["artifacts"]["all_platforms_upload_row_count"] = combined_artifacts["row_count"]
         summary["artifacts"]["all_platforms_upload_source_row_count"] = combined_artifacts["source_row_count"]
         summary["artifacts"]["all_platforms_upload_skipped_row_count"] = combined_artifacts["skipped_row_count"]
+        summary["quality_report"] = build_quality_report(summary["platforms"])
         summary["status"] = summarize_platform_statuses(summary["platforms"])
+        if summary["status"] == "completed" and str((summary.get("quality_report") or {}).get("status") or "") == "warning":
+            summary["status"] = "completed_with_quality_warnings"
         summary["finished_at"] = backend_app.iso_now()
         if summary["status"] == "scrape_failed":
             attach_failure_to_summary(

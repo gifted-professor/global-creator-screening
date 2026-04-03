@@ -494,7 +494,13 @@ OPERATOR_RUN_LOG_HANDLES: dict[str, Any] = {}
 VISION_PROVIDER_REQUEST_GATES_LOCK = threading.Lock()
 VISION_PROVIDER_REQUEST_GATES: dict[tuple[str, str, int], threading.BoundedSemaphore] = {}
 OPERATOR_RUNS_ROOT = BASE_DIR / "temp" / "operator_runs"
-OPERATOR_RUN_TERMINAL_STATUSES = {"completed", "completed_with_partial_scrape", "failed", "cancelled"}
+OPERATOR_RUN_TERMINAL_STATUSES = {
+    "completed",
+    "completed_with_quality_warnings",
+    "completed_with_partial_scrape",
+    "failed",
+    "cancelled",
+}
 
 app = Flask(__name__)
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
