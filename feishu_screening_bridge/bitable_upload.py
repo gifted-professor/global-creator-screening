@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 from typing import Any
 from urllib import parse
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -51,6 +52,7 @@ _UPLOAD_BASE_KEY_FIELDS = ("达人ID", "平台")
 _OWNER_SCOPE_FIELD_CANDIDATES = ("达人对接人",)
 _PREFERRED_TARGET_TABLE_NAMES = ("AI回信管理", "达人管理")
 _PREFERRED_TARGET_VIEW_NAMES = ("表格", "总视图")
+_SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 
 @dataclass(frozen=True)
@@ -1049,7 +1051,9 @@ def _coerce_date_to_ms(value: Any) -> int | None:
         return None
     if pd.isna(parsed):
         return None
-    dt = datetime(parsed.year, parsed.month, parsed.day)
+    if getattr(parsed, "tzinfo", None) is not None:
+        parsed = parsed.tz_convert(_SHANGHAI_TZ)
+    dt = datetime(parsed.year, parsed.month, parsed.day, tzinfo=_SHANGHAI_TZ)
     return int(dt.timestamp() * 1000)
 
 

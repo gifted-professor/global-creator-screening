@@ -3,8 +3,10 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
+from zoneinfo import ZoneInfo
 
 from feishu_screening_bridge.bitable_export import ResolvedBitableView
 from feishu_screening_bridge.bitable_upload import upload_final_review_payload_to_bitable
@@ -249,6 +251,56 @@ class BitableUploadTests(unittest.TestCase):
             self.assertEqual(client.uploaded_local_files[0]["local_path"], str(raw_mail_path))
             self.assertEqual(client.uploaded_local_files[0]["parent_type"], "bitable_file")
             self.assertEqual(client.uploaded_local_files[0]["parent_node"], "app_token")
+
+    def test_upload_payload_normalizes_reply_date_to_shanghai_day_before_feishu_write(self) -> None:
+        client = _FakeBitableUploadClient()
+        client.search_items = []
+        resolved_view = ResolvedBitableView(
+            source_url="https://example.com/base/app?table=tbl&view=vew",
+            source_kind="base",
+            source_token="app_token",
+            app_token="app_token",
+            table_id="tbl",
+            view_id="vew",
+            table_name="达人管理",
+            view_name="总视图",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            payload_path = root / "payload.json"
+            payload_path.write_text(
+                json.dumps(
+                    {
+                        "rows": [
+                            {
+                                "达人ID": "alpha",
+                                "平台": "instagram",
+                                "达人对接人": "陈俊仁",
+                                "达人对接人_employee_id": "ou_alpha",
+                                "达人最后一次回复邮件时间": "2026-04-02T15:26:24-06:00",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            with patch(
+                "feishu_screening_bridge.bitable_upload.resolve_bitable_view_from_url",
+                return_value=resolved_view,
+            ):
+                result = upload_final_review_payload_to_bitable(
+                    client,
+                    payload_json_path=payload_path,
+                    linked_bitable_url="https://example.com/base/app?table=tbl&view=vew",
+                )
+
+            self.assertEqual(result["created_count"], 1)
+            created_fields = client.created_records[0]["fields"]
+            expected = int(datetime(2026, 4, 3, 0, 0, 0, tzinfo=ZoneInfo("Asia/Shanghai")).timestamp() * 1000)
+            self.assertEqual(created_fields["达人最后一次回复邮件时间"], expected)
 
     def test_upload_payload_updates_existing_records_for_create_or_update_and_mail_only_modes(self) -> None:
         client = _FakeBitableUploadClient()

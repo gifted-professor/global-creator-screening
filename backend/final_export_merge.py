@@ -5,6 +5,7 @@ import math
 import re
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
@@ -33,6 +34,7 @@ _SHARED_ATTACHMENT_PATHS_KEY = "__feishu_shared_attachment_local_paths"
 _LAST_MAIL_RAW_PATH_KEY = "__last_mail_raw_path"
 _ROW_UPDATE_MODE_KEY = "__feishu_update_mode"
 _UPDATE_MODE_CREATE_OR_MAIL_ONLY = "create_or_mail_only_update"
+_SHANGHAI_TZ = ZoneInfo("Asia/Shanghai")
 
 _PLATFORM_ALIASES = {
     "tiktok": "tiktok",
@@ -178,6 +180,8 @@ def _format_date(value: Any) -> str:
         return ""
     if pd.isna(parsed):
         return ""
+    if getattr(parsed, "tzinfo", None) is not None:
+        parsed = parsed.tz_convert(_SHANGHAI_TZ)
     return parsed.strftime("%Y/%m/%d")
 
 

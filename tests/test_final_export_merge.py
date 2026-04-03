@@ -86,7 +86,7 @@ class FinalExportMergeTests(unittest.TestCase):
             workbook = pd.read_excel(output_path)
             payload = json.loads(payload_path.read_text(encoding="utf-8"))
             self.assertEqual(workbook.loc[0, "当前网红报价"], "$300 per video")
-            self.assertEqual(workbook.loc[0, "达人最后一次回复邮件时间"], "2026/03/30")
+            self.assertEqual(workbook.loc[0, "达人最后一次回复邮件时间"], "2026/03/31")
             self.assertEqual(workbook.loc[0, "达人回复的最后一封邮件内容"], "Hi team, rate is $300 per video.")
             self.assertEqual(payload["rows"][0]["__feishu_update_mode"], "create_or_mail_only_update")
             self.assertEqual(payload["rows"][0]["creator_emails"], "alpha@example.com | manager@example.com")
