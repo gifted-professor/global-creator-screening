@@ -76,6 +76,7 @@ STOP_AFTER_CHOICES = (
     "keep-list",
 )
 MATCHING_STRATEGIES = ("legacy-enrichment", "brand-keyword-fast-path")
+DEFAULT_MATCHING_STRATEGY = "brand-keyword-fast-path"
 CONTRACT_VERSION = "phase16.keep-list.v2"
 
 
@@ -589,7 +590,7 @@ def run_task_upload_to_keep_list_pipeline(
     reset_state: bool = False,
     stop_after: str = "",
     reuse_existing: bool = True,
-    matching_strategy: str = "legacy-enrichment",
+    matching_strategy: str = DEFAULT_MATCHING_STRATEGY,
     brand_keyword: str = "",
     brand_match_include_from: bool = False,
     base_url: str = "",
@@ -598,7 +599,7 @@ def run_task_upload_to_keep_list_pipeline(
     wire_api: str = "",
 ) -> dict[str, Any]:
     normalized_task_name = str(task_name or "").strip()
-    normalized_matching_strategy = str(matching_strategy or "").strip().lower() or MATCHING_STRATEGIES[0]
+    normalized_matching_strategy = str(matching_strategy or "").strip().lower() or DEFAULT_MATCHING_STRATEGY
     resolved_brand_keyword = str(brand_keyword or "").strip() or normalized_task_name
     normalized_stop_after = str(stop_after or "").strip().lower()
     runner_paths = resolve_keep_list_upstream_paths(
@@ -614,7 +615,7 @@ def run_task_upload_to_keep_list_pipeline(
     existing_summary = _load_existing_summary(run_summary_path) if reuse_existing else None
     resume_reset_reason = ""
     if reuse_existing:
-        if existing_summary and str(existing_summary.get("matching_strategy") or MATCHING_STRATEGIES[0]).strip().lower() != normalized_matching_strategy:
+        if existing_summary and str(existing_summary.get("matching_strategy") or DEFAULT_MATCHING_STRATEGY).strip().lower() != normalized_matching_strategy:
             existing_summary = None
             resume_reset_reason = "matching_strategy_changed"
         elif existing_summary:
@@ -1792,9 +1793,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--reset-state", action="store_true", help="mail sync 忽略本地游标，重新全量扫描。")
     parser.add_argument(
         "--matching-strategy",
-        default=MATCHING_STRATEGIES[0],
+        default=DEFAULT_MATCHING_STRATEGY,
         choices=MATCHING_STRATEGIES,
-        help="上游匹配策略；默认 legacy-enrichment，也可选 brand-keyword-fast-path。",
+        help="上游匹配策略；默认 brand-keyword-fast-path，也可选 legacy-enrichment。",
     )
     parser.add_argument("--brand-keyword", default="", help="fast path 的品牌关键词；默认复用 task-name。")
     parser.add_argument(

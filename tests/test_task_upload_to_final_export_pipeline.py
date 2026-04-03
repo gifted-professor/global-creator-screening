@@ -18,6 +18,11 @@ class TaskUploadToFinalExportRunnerTests(unittest.TestCase):
     def tearDown(self) -> None:
         final_runner._load_runtime_dependencies = self.original_loader
 
+    def test_parser_defaults_to_brand_keyword_fast_path(self) -> None:
+        parser = final_runner.build_parser()
+        args = parser.parse_args(["--task-name", "MINISO"])
+        self.assertEqual(args.matching_strategy, "brand-keyword-fast-path")
+
     def test_runner_links_upstream_and_downstream_with_keep_list_resume_point(self) -> None:
         observed: dict[str, object] = {}
 

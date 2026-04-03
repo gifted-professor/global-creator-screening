@@ -89,6 +89,11 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
         self.assertTrue(args.brand_match_include_from)
         self.assertEqual(args.stop_after, "shared-resolution")
 
+    def test_parser_defaults_to_brand_keyword_fast_path(self) -> None:
+        parser = task_runner.build_parser()
+        args = parser.parse_args(["--task-name", "MINISO"])
+        self.assertEqual(args.matching_strategy, "brand-keyword-fast-path")
+
     def test_parser_accepts_existing_mail_db_options(self) -> None:
         parser = task_runner.build_parser()
         args = parser.parse_args(
@@ -387,6 +392,7 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
                 output_root=temp_root / "run",
                 summary_json=summary_path,
                 stop_after="keep-list",
+                matching_strategy="legacy-enrichment",
             )
             persisted = json.loads(summary_path.read_text(encoding="utf-8"))
             task_spec = json.loads(Path(summary["task_spec_json"]).read_text(encoding="utf-8"))
@@ -1176,6 +1182,7 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
                 summary_json=summary_path,
                 stop_after="keep-list",
                 reuse_existing=True,
+                matching_strategy="legacy-enrichment",
             )
 
         self.assertEqual(summary["steps"]["task_assets"]["status"], "reused")
@@ -1399,6 +1406,7 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
                 summary_json=summary_path,
                 stop_after="keep-list",
                 reuse_existing=True,
+                matching_strategy="legacy-enrichment",
             )
 
         self.assertEqual(summary["steps"]["task_assets"]["status"], "reused")
