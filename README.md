@@ -100,6 +100,42 @@ repo-local 可观察面如下：
 - `data/`：邮件、筛号和本地运行产物
 - `temp/`：样本、benchmark 和临时导出
 
+## 分支使用约定
+
+这个仓库后续建议按 `main -> develop -> feature/*` 三层来管理，而不是把每一轮章节或底层改造都直接堆在同一条长期分支上。
+
+- `main`
+  用来保留当前最稳定、最敢直接跑真实任务的版本。
+- `develop`
+  用来做日常集成和联调。可以同时挂在多个 worktree 或机器上，但语义上它仍然是一条开发总线。
+- `feature/<topic>`
+  用来承接一次明确范围的施工，完成后先合回 `develop`，等 `develop` 经过真实 run 验证后再进入 `main`。
+
+对当前仓库，推荐把 feature 分成两类理解：
+
+- `feature/honest-ch2`
+  表示“第二章本身”的工作，适合放 chapter-specific 的 prompt、规则、输出结构和本章专属流程。
+- `feature/harness-refactor`
+  表示“底层 harness / 执行骨架”的工作，适合放执行器、调度方式、运行边界、控制面、日志与状态结构这类会被多个 chapter 共用的改造。
+
+最简单的判断规则：
+
+- 如果改动只服务某一章，就开 `feature/<chapter>`
+- 如果改动会影响多个 chapter 共用的 runtime / harness 骨架，就开 `feature/harness-*`
+- 每次新工作默认都从 `develop` 切新分支，不继续在旧 chapter 分支上叠下一章
+
+当前仓库里的 Chapter 1 更适合被理解成“基础层基线”而不是“长期章节开发线”：
+
+- 这轮工作主要是在收口 single-run harness baseline
+- 核心主题是配置控制面、run-scoped layout、task_spec、preflight/setup/runtime 分层、failure contract 和 top-level verdict
+- canonical note 见 `docs/standards/harness-chapter-1-baseline.md`
+
+所以后续推荐流程是：
+
+1. 把 Chapter 1 当作当前基础层 baseline
+2. 后续章节例如 Honest Chapter 2 从 `develop` 单独开新分支
+3. 如果中途需要继续动执行器、调度和控制面，再单开 `feature/harness-*`
+
 ## 开发接手最短路径
 
 如果新开发要快速接手这个仓库，建议按下面顺序看：

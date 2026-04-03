@@ -718,6 +718,45 @@ Current fix:
 | final export merge | `backend/final_export_merge.py` |
 | Feishu upload semantics | `feishu_screening_bridge/bitable_upload.py` |
 
+## Execution-Machine Handoff Standard
+
+When code is developed locally but production-like task runs happen on an execution machine, do not hand off the entire repo working tree blindly.
+
+Use the following transfer contract instead.
+
+| category | source | note |
+| --- | --- | --- |
+| code | `git pull origin main` | do not manually copy repo directories |
+| config | `.env` + `.env.local` + shared-mailbox runner credentials | sensitive files, send separately |
+| task inputs | sending list + template workbook + keep workbook | the keep workbook is the direct downstream resume boundary |
+| caches | `creator_cache.db` + `email_sync.db` + `raw/` + `last_summary.json` | mailbox cache artifacts should come from the same sync run; do not omit `raw/` |
+| results | `all_platforms_final_review_payload.json` + `.xlsx` + `feishu_bitable_upload_result.json` | used for inspection, verification, and emergency re-upload |
+
+Practical interpretation:
+
+- code should move through git, not through copied source folders
+- task-specific reruns should be driven from the keep workbook, not from re-downloading Feishu assets unless necessary
+- mailbox reuse is safest when `email_sync.db`, `raw/`, and `last_summary.json` are transferred together
+- `creator_cache.db` is the preferred long-lived scrape / visual reuse layer
+- historical `MINISO` / `DUET` run directories do not need to be copied wholesale once the keep workbook, final payload, upload result, and cache DB are preserved
+
+For `MINISO` / `DUET` style handoff, the minimal high-value bundle is usually:
+
+- keep workbook
+- template workbook
+- `creator_cache.db`
+- `email_sync.db`
+- `raw/`
+- `last_summary.json`
+- final payload JSON
+- final workbook
+- Feishu upload result JSON
+
+Avoid handing off:
+
+- the whole repo directory as a zip
+- unrelated historical run roots
+- secrets mixed into normal artifact bundles
 ## Operator Checklist
 
 Before a run:
@@ -748,4 +787,3 @@ These behavior changes are now intentional and should be preserved unless there 
 - `达人对接人` is re-resolved from task upload + employee info during rewrite
 - `F.人工判断项/合规提醒` enters the visual prompt
 - reminder-only rulespecs fall back to the generic prompt instead of replacing it
-
