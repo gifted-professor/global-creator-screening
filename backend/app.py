@@ -5697,6 +5697,7 @@ def perform_visual_review(platform, payload, progress_callback=None, cancel_chec
     routing_strategy = resolve_visual_review_routing_strategy(payload)
     if requested_provider and requested_provider in {item["name"] for item in VISION_PROVIDER_CONFIGS}:
         routing_strategy = ""
+    started_at = time.monotonic()
     preflight = build_vision_preflight(requested_provider)
     providers = get_available_vision_providers(requested_provider)
     if not providers:
@@ -5767,6 +5768,29 @@ def perform_visual_review(platform, payload, progress_callback=None, cancel_chec
         "visual_miss_count": len(pending_targets),
         "visual_context_key": str(visual_cache_context.get("context_key") or ""),
     }
+    if not pending_targets:
+        final_result = build_visual_review_partial_result(
+            platform,
+            results,
+            targets,
+            channel_race={},
+        )
+        final_result.update({
+            "success": True,
+            "message": (
+                f"{UPLOAD_PLATFORM_RESPONSE_LABELS.get(platform, platform)} 视觉复核完成，"
+                f"共处理 {len(targets)} 个账号。"
+            ),
+            "visual_results": results,
+            "max_workers": 0,
+            "selected_provider": preflight.get("preferred_provider"),
+            "selected_model": "",
+            "channel_race": {},
+            "elapsed_seconds": round(time.monotonic() - started_at, 3),
+            "creator_cache": creator_cache_summary,
+        })
+        return final_result
+
     routing_context = {}
     selected_provider_name = preflight.get("preferred_provider")
     selected_model_name = ""
@@ -5800,7 +5824,6 @@ def perform_visual_review(platform, payload, progress_callback=None, cancel_chec
         routing_strategy=routing_strategy,
     )
     item_timeout_seconds = resolve_visual_review_item_timeout_seconds(payload)
-    started_at = time.monotonic()
     future_poll_timeout_seconds = min(0.5, max(0.05, item_timeout_seconds / 4.0))
     if progress_callback:
             progress_callback(
@@ -5820,29 +5843,6 @@ def perform_visual_review(platform, payload, progress_callback=None, cancel_chec
             )
 
     completed = len(completed_identifiers)
-    if not pending_targets:
-        final_result = build_visual_review_partial_result(
-            platform,
-            results,
-            targets,
-            channel_race=snapshot_probe_ranked_channel_race(routing_context) if routing_strategy == VISUAL_REVIEW_ROUTING_PROBE_RANKED else channel_race,
-        )
-        final_result.update({
-            "success": True,
-            "message": (
-                f"{UPLOAD_PLATFORM_RESPONSE_LABELS.get(platform, platform)} 视觉复核完成，"
-                f"共处理 {len(targets)} 个账号。"
-            ),
-            "visual_results": results,
-            "max_workers": max_workers,
-            "selected_provider": selected_provider_name,
-            "selected_model": selected_model_name,
-            "channel_race": snapshot_probe_ranked_channel_race(routing_context) if routing_strategy == VISUAL_REVIEW_ROUTING_PROBE_RANKED else channel_race,
-            "elapsed_seconds": round(time.monotonic() - started_at, 3),
-            "creator_cache": creator_cache_summary,
-        })
-        return final_result
-
     target_iter = iter(pending_targets)
     future_map = {}
 

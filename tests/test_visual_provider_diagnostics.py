@@ -691,6 +691,84 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
         self.assertEqual(result["visual_results"]["alpha"]["reason"], "cached visual review")
         mocked_save.assert_called()
 
+    def test_perform_visual_review_all_cache_hits_skip_probe_ranked_channel_race(self) -> None:
+        cached_visual_result = {
+            "username": "alpha",
+            "decision": "Pass",
+            "reason": "cached visual review",
+            "provider": "openai",
+            "effective_model": "gpt-5.4",
+            "reviewed_at": "2026-04-03T00:00:00+00:00",
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "creator_cache.db"
+            creator_cache_module.persist_visual_cache_entry(
+                "instagram",
+                "alpha",
+                cached_visual_result,
+                db_path,
+                updated_at="2026-04-03T00:00:00+00:00",
+                context_key="ctx-probe-cache",
+                context_payload={"version": "test"},
+            )
+            with mock.patch.object(
+                backend_app,
+                "build_vision_preflight",
+                return_value={"preferred_provider": "openai"},
+            ), mock.patch.object(
+                backend_app,
+                "get_available_vision_providers",
+                return_value=[{"name": "openai"}],
+            ), mock.patch.object(
+                backend_app,
+                "get_available_vision_provider_names",
+                return_value=["openai"],
+            ), mock.patch.object(
+                backend_app,
+                "resolve_visual_review_targets",
+                return_value=[{"username": "alpha", "status": "Pass"}],
+            ), mock.patch.object(
+                backend_app,
+                "load_visual_results",
+                return_value={},
+            ), mock.patch.object(
+                backend_app,
+                "build_visual_review_cache_context",
+                return_value={
+                    "context_key": "ctx-probe-cache",
+                    "context_payload": {"version": "test"},
+                },
+            ), mock.patch.object(
+                backend_app,
+                "resolve_visual_review_routing_strategy",
+                return_value=backend_app.VISUAL_REVIEW_ROUTING_PROBE_RANKED,
+            ), mock.patch.object(
+                backend_app,
+                "run_probe_ranked_visual_provider_race",
+                side_effect=AssertionError("probe-ranked race should not run when all targets are cached"),
+            ), mock.patch.object(
+                backend_app,
+                "save_visual_results",
+            ) as mocked_save, mock.patch.object(
+                backend_app,
+                "DaemonThreadPoolExecutor",
+                side_effect=AssertionError("executor should not run when all targets are cached"),
+            ):
+                result = backend_app.perform_visual_review(
+                    "instagram",
+                    {
+                        "creator_cache_db_path": str(db_path),
+                        "use_creator_cache": True,
+                    },
+                )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["creator_cache"]["visual_hit_count"], 1)
+        self.assertEqual(result["visual_results"]["alpha"]["reason"], "cached visual review")
+        self.assertEqual(result["channel_race"], {})
+        mocked_save.assert_called()
+
     def test_perform_visual_review_does_not_reuse_saved_visual_results_on_rerun(self) -> None:
         class ImmediateExecutor:
             def __init__(self, *args, **kwargs) -> None:
