@@ -6,7 +6,7 @@ import os
 import sqlite3
 import sys
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -94,6 +94,34 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def _parse_iso_datetime(value: str | None) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.astimezone() if parsed.tzinfo is not None else parsed
+
+
+def resolve_shared_mailbox_sent_since(
+    raw_value: str | None,
+    *,
+    today: date | None = None,
+    last_sync_completed_at: str | None = None,
+) -> tuple[date, str]:
+    explicit = str(raw_value or "").strip()
+    if explicit:
+        return resolve_sync_sent_since(explicit, today=today), "cli"
+
+    last_completed = _parse_iso_datetime(last_sync_completed_at)
+    if last_completed is not None:
+        return last_completed.date() - timedelta(days=1), "last_successful_sync_backfill"
+
+    return resolve_sync_sent_since(None, today=today), "default_today_only"
+
+
 @contextmanager
 def _single_instance_lock(lock_path: Path):
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -155,6 +183,14 @@ def run_shared_mailbox_sync(args: argparse.Namespace) -> dict[str, Any]:
             db = Database(settings.db_path)
             try:
                 db.init_schema()
+                state = db.get_sync_state(settings.account_email, settings.mail_folders[0])
+                resolved_sent_since, sent_since_source = resolve_shared_mailbox_sent_since(
+                    args.sent_since,
+                    last_sync_completed_at=str(state["last_sync_completed_at"] or "") if state else "",
+                )
+                summary["resolved_sent_since"] = resolved_sent_since.isoformat()
+                summary["sent_since_source"] = sent_since_source
+                _write_json(summary_path, summary)
                 results = sync_mailboxes(
                     settings,
                     db,
@@ -162,7 +198,7 @@ def run_shared_mailbox_sync(args: argparse.Namespace) -> dict[str, Any]:
                     limit=args.limit or None,
                     reset_state=bool(args.reset_state),
                     workers=max(1, int(args.workers)),
-                    sent_since=resolve_sync_sent_since(args.sent_since),
+                    sent_since=resolved_sent_since,
                 )
             finally:
                 db.close()
@@ -209,7 +245,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--db-path", default="", help="SQLite 路径；默认 <data-dir>/email_sync.db")
     parser.add_argument("--raw-dir", default="", help="raw 邮件目录；默认 <data-dir>/raw")
     parser.add_argument("--summary-json", default="", help="summary 输出路径；默认 <data-dir>/summary.json")
-    parser.add_argument("--sent-since", default="", help="只抓这个日期及之后的邮件，格式 YYYY-MM-DD")
+    parser.add_argument(
+        "--sent-since",
+        default="",
+        help="只抓这个日期及之后的邮件，格式 YYYY-MM-DD；不传时优先按上次成功同步时间自动回补 1 天。",
+    )
     parser.add_argument("--limit", type=int, default=0, help="只抓最新 N 封用于测试，不推进游标")
     parser.add_argument("--reset-state", action="store_true", help="忽略本地游标，重新扫描")
     parser.add_argument("--workers", type=int, default=1, help="并发抓取 worker 数，默认 1")
