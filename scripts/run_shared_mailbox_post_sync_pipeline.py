@@ -110,6 +110,10 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def _emit_runtime_progress(scope: str, message: str) -> None:
+    print(f"[{iso_now()}] [{scope}] {message}", flush=True)
+
+
 def _normalize_email(value: Any) -> str:
     return _clean_text(value).lower()
 
@@ -1773,7 +1777,9 @@ def run_shared_mailbox_post_sync_pipeline(
         "local_archive_path": str(aggregate_archive_dir),
         "task_results": [],
     }
+    progress_scope = "shared-mailbox-post-sync"
     _write_json(run_summary_path, summary)
+    _emit_runtime_progress(progress_scope, f"starting output_root={resolved_output_root}")
 
     client, env_values, feishu_resolution = _build_feishu_client(
         env_file=env_file,
@@ -1793,6 +1799,7 @@ def run_shared_mailbox_post_sync_pipeline(
     if not resolved_employee_info_url:
         raise ValueError("缺少 EMPLOYEE_INFO_URL，请在本地 .env 或参数里填写。")
 
+    _emit_runtime_progress(progress_scope, "inspection=running")
     inspection = inspect_task_upload_assignments(
         client=client,
         task_upload_url=resolved_task_upload_url,
@@ -1826,6 +1833,7 @@ def run_shared_mailbox_post_sync_pipeline(
         "timeout_seconds": feishu_resolution["timeout_seconds"],
     }
     _write_json(run_summary_path, summary)
+    _emit_runtime_progress(progress_scope, f"inspection=completed task_count={len(inspection_items)}")
 
     aggregate_failed_rows: list[dict[str, Any]] = []
     aggregate_existing_skip_rows: list[dict[str, Any]] = []
@@ -1833,6 +1841,7 @@ def run_shared_mailbox_post_sync_pipeline(
 
     for item in inspection_items:
         task_name = _clean_text(item.get("taskName"))
+        task_scope = f"{progress_scope}:{task_name or 'unknown-task'}"
         task_slug = f"{_safe_name(task_name)}_{_safe_name(_clean_text(item.get('recordId')))}"
         task_root = resolved_output_root / task_slug
         task_root.mkdir(parents=True, exist_ok=True)
@@ -1857,6 +1866,7 @@ def run_shared_mailbox_post_sync_pipeline(
             "upstream_summary_json": "",
             "downstream_summary_json": "",
         }
+        _emit_runtime_progress(task_scope, "task=running")
         try:
             if bool(item.get("ownerMatchAmbiguous")) and not bool(item.get("rowLevelOwnerRouting")):
                 matched_entries = [
@@ -1898,6 +1908,7 @@ def run_shared_mailbox_post_sync_pipeline(
             upstream_task_name = _clean_text(item.get("representativeTaskName")) or task_name
             upstream_output_root = task_root / "upstream"
             upstream_summary_path = upstream_output_root / "summary.json"
+            _emit_runtime_progress(task_scope, "upstream=running")
             upstream_summary = run_task_upload_to_keep_list_pipeline(
                 task_name=upstream_task_name,
                 env_file=env_file,
@@ -1924,6 +1935,10 @@ def run_shared_mailbox_post_sync_pipeline(
                 brand_match_include_from=bool(brand_match_include_from),
             )
             task_result["upstream_summary_json"] = str(upstream_summary_path)
+            _emit_runtime_progress(
+                task_scope,
+                f"upstream=completed status={str(upstream_summary.get('status') or '').strip() or 'unknown'}",
+            )
             keep_workbook = Path(
                 str(
                     ((upstream_summary.get("resume_points") or {}).get("keep_list") or {}).get("keep_workbook")
@@ -2118,6 +2133,7 @@ def run_shared_mailbox_post_sync_pipeline(
                 _write_keep_subset(filtered_keep_workbook, full_screening_frame)
                 downstream_output_root = task_root / "downstream"
                 downstream_summary_path = downstream_output_root / "summary.json"
+                _emit_runtime_progress(task_scope, f"downstream=running row_count={len(full_screening_frame.index)}")
                 downstream_summary = run_keep_list_screening_pipeline(
                     keep_workbook=filtered_keep_workbook,
                     template_workbook=Path(template_workbook_value).expanduser() if template_workbook_value else None,
@@ -2143,6 +2159,7 @@ def run_shared_mailbox_post_sync_pipeline(
                 downstream_summary_json = str(downstream_summary_path)
                 task_result["downstream_summary_json"] = downstream_summary_json
                 downstream_status = str(downstream_summary.get("status") or "")
+                _emit_runtime_progress(task_scope, f"downstream=completed status={downstream_status or 'unknown'}")
                 if downstream_status in SUCCESSFUL_DOWNSTREAM_STATUSES:
                     final_review_path = Path(
                         str((downstream_summary.get("artifacts") or {}).get("all_platforms_final_review") or "")
@@ -2213,6 +2230,10 @@ def run_shared_mailbox_post_sync_pipeline(
                 payload_rows=combined_payload_rows,
                 skipped_rows=combined_skipped_rows,
             )
+            _emit_runtime_progress(
+                task_scope,
+                f"feishu_upload=running row_count={len(combined_payload_rows)} skipped={len(combined_skipped_rows)}",
+            )
             upload_summary = upload_final_review_payload_to_bitable(
                 client,
                 payload_json_path=combined_payload_artifacts["payload_json_path"],
@@ -2273,6 +2294,13 @@ def run_shared_mailbox_post_sync_pipeline(
                         "row": dict(skipped.get("row") or {}),
                     }
                 )
+            _emit_runtime_progress(
+                task_scope,
+                "feishu_upload=completed "
+                f"created={int(upload_summary.get('created_count') or 0)} "
+                f"updated={int(upload_summary.get('updated_count') or 0)} "
+                f"failed={int(upload_summary.get('failed_count') or 0)}",
+            )
 
             summary["matched_mail_count"] += int(matched_mail_count)
             summary["new_creator_count"] += int(new_creator_count)
@@ -2301,6 +2329,11 @@ def run_shared_mailbox_post_sync_pipeline(
         summary["task_results"].append(task_result)
         _write_json(task_summary_path, task_result)
         _write_json(run_summary_path, summary)
+        _emit_runtime_progress(
+            task_scope,
+            f"task=completed status={str(task_result.get('status') or '').strip() or 'unknown'} "
+            f"failed={int(task_result.get('failed_count') or 0)}",
+        )
 
     aggregate_json_path = aggregate_archive_dir / "failed_or_skipped_records.json"
     aggregate_xlsx_path = aggregate_archive_dir / "failed_or_skipped_records.xlsx"
@@ -2361,6 +2394,7 @@ def run_shared_mailbox_post_sync_pipeline(
     summary["aggregate_existing_skip_json"] = str(aggregate_existing_skip_json_path)
     summary["aggregate_existing_skip_xlsx"] = str(aggregate_existing_skip_xlsx_path)
     _write_json(run_summary_path, summary)
+    _emit_runtime_progress(progress_scope, f"run=completed status={summary['status']}")
     return summary
 
 

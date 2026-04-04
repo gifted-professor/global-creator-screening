@@ -138,6 +138,10 @@ def _write_summary(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def _emit_runtime_progress(scope: str, message: str) -> None:
+    print(f"[{iso_now()}] [{scope}] {message}", flush=True)
+
+
 def _build_failure_payload(
     *,
     stage: str,
@@ -829,8 +833,49 @@ def run_task_upload_to_keep_list_pipeline(
         owner_email_overrides=dict(owner_email_overrides or {}),
         folder_overrides=dict(folder_overrides or {}),
     )
+    progress_scope = f"keep-upstream:{normalized_task_name or runner_paths.run_id}"
+    progress_state: dict[str, Any] = {
+        "status": "",
+        "step_signatures": {},
+    }
 
     def persist_summary(payload: dict[str, Any]) -> None:
+        current_status = str(payload.get("status") or "").strip()
+        if current_status and current_status != progress_state["status"]:
+            progress_state["status"] = current_status
+            _emit_runtime_progress(progress_scope, f"run_status={current_status}")
+
+        step_signatures = progress_state["step_signatures"]
+        for step_name, step_payload in (payload.get("steps") or {}).items():
+            if not isinstance(step_payload, dict):
+                continue
+            signature = (
+                str(step_payload.get("status") or "").strip(),
+                str(step_payload.get("execution_mode") or "").strip(),
+                bool(step_payload.get("reused")),
+            )
+            if step_signatures.get(step_name) == signature:
+                continue
+            step_signatures[step_name] = signature
+            detail_parts = []
+            if signature[0]:
+                detail_parts.append(f"status={signature[0]}")
+            if signature[1]:
+                detail_parts.append(f"mode={signature[1]}")
+            stats = step_payload.get("stats")
+            if isinstance(stats, dict):
+                for key in (
+                    "matched_email_count",
+                    "keep_row_count",
+                    "review_group_count",
+                    "high_confidence_rows",
+                    "llm_candidate_group_count",
+                ):
+                    value = stats.get(key)
+                    if value not in (None, "", 0):
+                        detail_parts.append(f"{key}={value}")
+            _emit_runtime_progress(progress_scope, f"{step_name} " + " ".join(detail_parts or ["updated"]))
+
         _write_summary(run_summary_path, payload)
         write_workflow_handoff(
             runner_paths.workflow_handoff_json,
@@ -862,6 +907,8 @@ def run_task_upload_to_keep_list_pipeline(
             "failed",
             failure={**failure, "failure_layer": "preflight"},
         )
+
+    _emit_runtime_progress(progress_scope, f"starting task={normalized_task_name or 'unknown'}")
 
     setup = materialize_setup(
         scope="task-upload-to-keep-list",
@@ -1064,6 +1111,7 @@ def run_task_upload_to_keep_list_pipeline(
             task_assets["status"] = "reused"
             task_assets["reused"] = True
         else:
+            _emit_runtime_progress(progress_scope, "task_assets=running")
             task_assets_result = download_task_upload_screening_assets(
                 client=client,
                 task_upload_url=resolved_task_upload_url,
@@ -1260,6 +1308,7 @@ def run_task_upload_to_keep_list_pipeline(
                 "items": [mail_item],
             }
         else:
+            _emit_runtime_progress(progress_scope, "mail_sync=running")
             mail_sync_result = sync_task_upload_mailboxes(
                 client=client,
                 task_upload_url=resolved_task_upload_url,
@@ -1375,6 +1424,7 @@ def run_task_upload_to_keep_list_pipeline(
                 brand_match_step["status"] = "reused"
                 brand_match_step["reused"] = True
             else:
+                _emit_runtime_progress(progress_scope, "brand_match=running")
                 db = Database(Path(mail_sync_step["artifacts"]["mail_db_path"]))
                 try:
                     brand_match_result = match_brand_keyword(
@@ -1453,6 +1503,7 @@ def run_task_upload_to_keep_list_pipeline(
                     mail_funnel_step["status"] = "reused"
                     mail_funnel_step["reused"] = True
                 else:
+                    _emit_runtime_progress(progress_scope, "mail_funnel=running")
                     db = Database(Path(mail_sync_step["artifacts"]["mail_db_path"]))
                     try:
                         mail_funnel_result = build_mail_thread_funnel_keep_workbook(
@@ -1538,6 +1589,7 @@ def run_task_upload_to_keep_list_pipeline(
                     shared_resolution_step["status"] = "reused"
                     shared_resolution_step["reused"] = True
                 else:
+                    _emit_runtime_progress(progress_scope, "shared_resolution=running")
                     db = Database(Path(mail_sync_step["artifacts"]["mail_db_path"]))
                     try:
                         shared_resolution_result = resolve_shared_email_candidates(
@@ -1609,6 +1661,7 @@ def run_task_upload_to_keep_list_pipeline(
                     final_review_step["status"] = "reused"
                     final_review_step["reused"] = True
                 else:
+                    _emit_runtime_progress(progress_scope, "final_review=running")
                     final_review_result = run_shared_email_final_review(
                         input_prefix=shared_resolution_prefix,
                         env_path=env_file,
@@ -1680,6 +1733,7 @@ def run_task_upload_to_keep_list_pipeline(
                 enrichment_step["status"] = "reused"
                 enrichment_step["reused"] = True
             else:
+                _emit_runtime_progress(progress_scope, "enrichment=running")
                 db = Database(Path(mail_sync_step["artifacts"]["mail_db_path"]))
                 try:
                     enrichment_result = enrich_creator_workbook(
@@ -1747,6 +1801,7 @@ def run_task_upload_to_keep_list_pipeline(
                 llm_candidates_step["status"] = "reused"
                 llm_candidates_step["reused"] = True
             else:
+                _emit_runtime_progress(progress_scope, "llm_candidates=running")
                 db = Database(Path(mail_sync_step["artifacts"]["mail_db_path"]))
                 try:
                     llm_candidates_result = prepare_llm_review_candidates(
@@ -1815,6 +1870,7 @@ def run_task_upload_to_keep_list_pipeline(
                 llm_review_step["status"] = "reused"
                 llm_review_step["reused"] = True
             else:
+                _emit_runtime_progress(progress_scope, "llm_review=running")
                 llm_review_result = run_and_apply_llm_review(
                     input_prefix=llm_prefix,
                     env_path=env_file,
