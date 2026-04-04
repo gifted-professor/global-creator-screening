@@ -19,6 +19,16 @@ def _active_post() -> dict[str, str]:
 
 
 class InstagramRegionDetectionTests(unittest.TestCase):
+    def test_region_detection_is_disabled_when_allowed_regions_empty(self) -> None:
+        profile = {
+            "biography": "Travel creator based in Madrid",
+            "latestPosts": [_active_post()],
+        }
+
+        review = check_instagram_profile(profile, upload_metadata={}, runtime_rules={"allowed_regions": []})
+
+        self.assertEqual(review["status"], "Pass")
+
     def test_region_detection_accepts_nyc_bio(self) -> None:
         profile = {
             "biography": "NYC creator\ncollabs@example.com",

@@ -32,7 +32,7 @@ DEFAULT_RULES = {
         "visual_review_cover_limit": 9,
     },
     "instagram": {
-        "allowed_regions": ["US"],
+        "allowed_regions": [],
     },
     "tiktok": {
         "min_avg_views": 10000,

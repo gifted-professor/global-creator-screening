@@ -7,11 +7,7 @@
       "active_days_max": 30,
       "visual_review_cover_limit": 9
     },
-    "instagram": {
-      "allowed_regions": [
-        "US"
-      ]
-    },
+    "instagram": {},
     "tiktok": {
       "min_avg_views": 10000,
       "min_median_views": 8000

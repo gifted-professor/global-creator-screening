@@ -51,15 +51,6 @@ def compile_rulespec_from_text(text):
     }
     matched_rules = []
 
-    if re.search(r"(美国|us|united states|america)", raw_text, re.IGNORECASE):
-        platform_overrides["instagram"]["allowed_regions"] = ["US"]
-        matched_rules.append({
-            "platform": "instagram",
-            "field": "allowed_regions",
-            "value": ["US"],
-            "status": "supported",
-        })
-
     active_days = _extract_int(
         raw_text,
         (
