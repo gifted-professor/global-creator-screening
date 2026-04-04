@@ -858,6 +858,7 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
                                 "linked_bitable_url": "https://bitable.example/duet",
                                 "任务名": "Duet1",
                                 "达人最后一次回复邮件时间": "2026/04/01",
+                                "full body": "Initial outreach only",
                                 "达人回复的最后一封邮件内容": "Initial outreach only",
                                 "__last_mail_raw_path": "raw/outbound-only.eml",
                             },
@@ -871,6 +872,7 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
                                 "linked_bitable_url": "https://bitable.example/duet",
                                 "任务名": "Duet1",
                                 "达人最后一次回复邮件时间": "2026/04/01",
+                                "full body": "Outbound follow up",
                                 "达人回复的最后一封邮件内容": "Outbound follow up",
                                 "__last_mail_raw_path": "raw/outbound-2.eml",
                             },
@@ -920,12 +922,75 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
             self.assertEqual(len(uploaded_payloads), 1)
             self.assertEqual(len(uploaded_payloads[0]["rows"]), 1)
             self.assertEqual(uploaded_payloads[0]["rows"][0]["达人ID"], "beta")
+            self.assertEqual(uploaded_payloads[0]["rows"][0]["full body"], "Creator reply")
             self.assertEqual(uploaded_payloads[0]["rows"][0]["达人回复的最后一封邮件内容"], "Creator reply")
             self.assertEqual(uploaded_payloads[0]["rows"][0]["__last_mail_raw_path"], "raw/inbound-1.eml")
 
             removed_rows = json.loads((output_root / "exports" / "removed_no_reply_rows.json").read_text(encoding="utf-8"))
             self.assertEqual(removed_rows["removed_count"], 1)
             self.assertEqual(removed_rows["removed_rows"][0]["达人ID"], "alpha")
+
+    def test_apply_row_owner_overrides_backfills_mail_fields_from_keep_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            db_path = temp_path / "email_sync.db"
+            db_path.touch()
+            raw_dir = temp_path / "raw"
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            (raw_dir / "alpha.eml").write_text("Subject: alpha\n\nInterested, my rate is $100", encoding="utf-8")
+
+            keep_row = {
+                "Platform": "TikTok",
+                "@username": "alpha",
+                "URL": "https://www.tiktok.com/@alpha",
+                "brand_message_sent_at": "2026-03-31T10:00:00+08:00",
+                "brand_message_snippet": "Interested, my rate is $100",
+                "brand_message_raw_path": "raw/alpha.eml",
+            }
+            keep_frame = pd.DataFrame([keep_row])
+            keep_workbook = temp_path / "keep.xlsx"
+            keep_frame.to_excel(keep_workbook, index=False)
+
+            overridden_rows = pipeline._apply_row_owner_overrides(
+                [
+                    {
+                        "达人ID": "alpha",
+                        "平台": "tiktok",
+                        "主页链接": "https://www.tiktok.com/@alpha",
+                        "当前网红报价": "",
+                        "达人最后一次回复邮件时间": "",
+                        "full body": "",
+                        "达人回复的最后一封邮件内容": "",
+                        "__last_mail_raw_path": "",
+                        "__feishu_attachment_local_paths": [],
+                    }
+                ],
+                keep_frame=keep_frame,
+                fallback_owner_context={
+                    "task_name": "MINISO",
+                    "linked_bitable_url": "https://bitable.example/miniso",
+                    "responsible_name": "Rhea",
+                    "employee_name": "Rhea",
+                    "employee_english_name": "Rhea",
+                    "employee_id": "ou_rhea",
+                    "employee_record_id": "rec_rhea",
+                    "employee_email": "rhea@amagency.biz",
+                    "owner_name": "rhea@amagency.biz",
+                },
+                shared_mail_db_path=db_path,
+                shared_mail_raw_dir=raw_dir,
+                shared_mail_data_dir=temp_path,
+                keep_workbook=keep_workbook,
+            )
+
+            self.assertEqual(len(overridden_rows), 1)
+            row = overridden_rows[0]
+            self.assertEqual(row["当前网红报价"], "$100")
+            self.assertEqual(row["达人最后一次回复邮件时间"], "2026/03/31")
+            self.assertEqual(row["full body"], "Interested, my rate is $100")
+            self.assertEqual(row["达人回复的最后一封邮件内容"], "Interested, my rate is $100")
+            self.assertEqual(row["__last_mail_raw_path"], "raw/alpha.eml")
+            self.assertTrue(row["__feishu_attachment_local_paths"])
 
     def test_rewrite_existing_final_payload_re_resolves_row_level_owner_for_group_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

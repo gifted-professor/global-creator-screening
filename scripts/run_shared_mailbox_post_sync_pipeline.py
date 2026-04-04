@@ -327,6 +327,27 @@ def _build_mail_attachment_paths(
     )
 
 
+def _resolve_keep_row_mail_fields(
+    keep_row: dict[str, Any],
+    *,
+    existing_row: dict[str, Any] | None = None,
+) -> dict[str, str]:
+    existing = dict(existing_row or {})
+    allow_brand_message_fallback = not _clean_text(keep_row.get("evidence_thread_key"))
+    quote_text = _build_quote_text(keep_row) or _clean_text(existing.get("当前网红报价"))
+    last_mail_time = _format_date(keep_row.get("last_mail_time")) or (
+        _format_date(keep_row.get("brand_message_sent_at")) if allow_brand_message_fallback else ""
+    ) or _clean_text(existing.get("达人最后一次回复邮件时间"))
+    last_mail_content = _clean_text(keep_row.get("last_mail_snippet")) or (
+        _clean_text(keep_row.get("brand_message_snippet")) if allow_brand_message_fallback else ""
+    ) or _clean_text(existing.get("full body")) or _clean_text(existing.get("达人回复的最后一封邮件内容"))
+    return {
+        "quote_text": quote_text,
+        "last_mail_time": last_mail_time,
+        "last_mail_content": last_mail_content,
+    }
+
+
 def _build_mail_only_rows(
     *,
     keep_row: dict[str, Any],
@@ -341,18 +362,10 @@ def _build_mail_only_rows(
     creator_id = _extract_creator_id(keep_row) or _flatten_field_value(_get_field_value(existing_fields, "达人ID"))
     platform = _extract_platform(keep_row) or _flatten_field_value(_get_field_value(existing_fields, "平台"))
     profile_url = _clean_text(keep_row.get("URL")) or _flatten_field_value(_get_field_value(existing_fields, "主页链接"))
-    quote_text = _build_quote_text(keep_row) or _flatten_field_value(_get_field_value(existing_fields, "当前网红报价"))
-    allow_brand_message_fallback = not _clean_text(keep_row.get("evidence_thread_key"))
-    last_mail_time = _format_date(keep_row.get("last_mail_time")) or (
-        _format_date(keep_row.get("brand_message_sent_at")) if allow_brand_message_fallback else ""
-    ) or _flatten_field_value(
-        _get_field_value(existing_fields, "达人最后一次回复邮件时间")
-    )
-    last_mail_content = _clean_text(keep_row.get("last_mail_snippet")) or (
-        _clean_text(keep_row.get("brand_message_snippet")) if allow_brand_message_fallback else ""
-    ) or _flatten_field_value(
-        _get_field_value(existing_fields, "达人回复的最后一封邮件内容")
-    )
+    mail_fields = _resolve_keep_row_mail_fields(keep_row, existing_row=existing_fields)
+    quote_text = mail_fields["quote_text"]
+    last_mail_time = mail_fields["last_mail_time"]
+    last_mail_content = mail_fields["last_mail_content"]
     owner_display_name = (
         _clean_text(owner_context.get("responsible_name"))
         or _clean_text(owner_context.get("employee_name"))
@@ -367,6 +380,7 @@ def _build_mail_only_rows(
         "互动率": _flatten_field_value(_get_field_value(existing_fields, "互动率")),
         "当前网红报价": quote_text,
         "达人最后一次回复邮件时间": last_mail_time,
+        "full body": last_mail_content,
         "达人回复的最后一封邮件内容": last_mail_content,
         "达人对接人": owner_display_name,
         "ai是否通过": _extract_ai_status(existing_fields),
@@ -1174,6 +1188,10 @@ def _apply_creator_reply_context_to_export_row(
     shared_mail_db_path: Path,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     updated = dict(row)
+    existing_mail_content = _clean_text(updated.get("full body")) or _clean_text(updated.get("达人回复的最后一封邮件内容"))
+    if existing_mail_content:
+        updated.setdefault("full body", existing_mail_content)
+        updated.setdefault("达人回复的最后一封邮件内容", existing_mail_content)
     thread_key = _clean_text(updated.get("evidence_thread_key")) or _lookup_thread_key_for_raw_path(
         shared_mail_db_path,
         updated.get("__last_mail_raw_path"),
@@ -1188,6 +1206,7 @@ def _apply_creator_reply_context_to_export_row(
     latest_creator_reply = _resolve_latest_creator_reply(snapshot, creator_target_emails=creator_target_emails)
     if latest_creator_reply:
         updated["达人最后一次回复邮件时间"] = _format_date(latest_creator_reply.get("sent_sort_at"))
+        updated["full body"] = _clean_text(latest_creator_reply.get("snippet"))
         updated["达人回复的最后一封邮件内容"] = _clean_text(latest_creator_reply.get("snippet"))
         updated["__last_mail_raw_path"] = _clean_text(latest_creator_reply.get("raw_path"))
         return updated, {
@@ -1207,6 +1226,7 @@ def _apply_creator_reply_context_to_export_row(
             "creator_target_emails": [],
         }
     updated["达人最后一次回复邮件时间"] = ""
+    updated["full body"] = ""
     updated["达人回复的最后一封邮件内容"] = ""
     updated["__last_mail_raw_path"] = ""
     return updated, {
@@ -1562,17 +1582,31 @@ def _apply_row_owner_overrides(
                 shared_mail_data_dir=shared_mail_data_dir,
                 keep_workbook=keep_workbook,
             )
+            mail_fields = _resolve_keep_row_mail_fields(keep_row, existing_row=updated)
+            if mail_fields["quote_text"] and not _clean_text(updated.get("当前网红报价")):
+                updated["当前网红报价"] = mail_fields["quote_text"]
+            if mail_fields["last_mail_time"] and not _clean_text(updated.get("达人最后一次回复邮件时间")):
+                updated["达人最后一次回复邮件时间"] = mail_fields["last_mail_time"]
+            resolved_mail_content = mail_fields["last_mail_content"] or _clean_text(updated.get("full body")) or _clean_text(
+                updated.get("达人回复的最后一封邮件内容")
+            )
+            if resolved_mail_content:
+                if not _clean_text(updated.get("full body")):
+                    updated["full body"] = resolved_mail_content
+                if not _clean_text(updated.get("达人回复的最后一封邮件内容")):
+                    updated["达人回复的最后一封邮件内容"] = resolved_mail_content
             updated[_KEEP_OWNER_EMPLOYEE_ID_FIELD] = _clean_text(row_owner_context.get("employee_id")).split(",")[0].strip()
             updated[_KEEP_OWNER_EMPLOYEE_RECORD_ID_FIELD] = _clean_text(row_owner_context.get("employee_record_id"))
             updated[_KEEP_OWNER_EMPLOYEE_EMAIL_FIELD] = _clean_text(row_owner_context.get("employee_email"))
             updated[_KEEP_OWNER_OWNER_NAME_FIELD] = _clean_text(row_owner_context.get("owner_name"))
             updated["linked_bitable_url"] = _clean_text(row_owner_context.get("linked_bitable_url"))
             updated["任务名"] = _clean_text(row_owner_context.get("task_name"))
-            updated.setdefault(
-                "__last_mail_raw_path",
-                _clean_text(keep_row.get("brand_message_raw_path") or keep_row.get("last_mail_raw_path")),
-            )
-            updated.setdefault("__feishu_attachment_local_paths", attachment_paths)
+            if not _clean_text(updated.get("__last_mail_raw_path")):
+                updated["__last_mail_raw_path"] = _clean_text(
+                    keep_row.get("brand_message_raw_path") or keep_row.get("last_mail_raw_path")
+                )
+            if not list(updated.get("__feishu_attachment_local_paths") or []):
+                updated["__feishu_attachment_local_paths"] = attachment_paths
         overridden_rows.append(updated)
     return overridden_rows
 
@@ -1595,18 +1629,15 @@ def _build_skipped_row_from_keep_record(
         keep_workbook=keep_workbook,
     )
     display_name = _clean_text(owner_context.get("responsible_name")) or _clean_text(owner_context.get("employee_name"))
-    allow_brand_message_fallback = not _clean_text(keep_row.get("evidence_thread_key"))
+    mail_fields = _resolve_keep_row_mail_fields(keep_row)
     return {
         "达人ID": _extract_creator_id(keep_row),
         "平台": _extract_platform(keep_row),
         "主页链接": _clean_text(keep_row.get("URL") or keep_row.get("主页链接")),
-        "当前网红报价": _build_quote_text(keep_row),
-        "达人最后一次回复邮件时间": _format_date(keep_row.get("last_mail_time")) or (
-            _format_date(keep_row.get("brand_message_sent_at")) if allow_brand_message_fallback else ""
-        ),
-        "达人回复的最后一封邮件内容": _clean_text(keep_row.get("last_mail_snippet")) or (
-            _clean_text(keep_row.get("brand_message_snippet")) if allow_brand_message_fallback else ""
-        ),
+        "当前网红报价": mail_fields["quote_text"],
+        "达人最后一次回复邮件时间": mail_fields["last_mail_time"],
+        "full body": mail_fields["last_mail_content"],
+        "达人回复的最后一封邮件内容": mail_fields["last_mail_content"],
         "达人对接人": display_name,
         "达人对接人_employee_id": _clean_text(owner_context.get("employee_id")).split(",")[0].strip(),
         "达人对接人_employee_record_id": _clean_text(owner_context.get("employee_record_id")),
