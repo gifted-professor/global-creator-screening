@@ -7190,6 +7190,16 @@ def perform_scrape(platform, payload, progress_callback=None, cancel_check=None)
         "visual_hit_count": 0,
     }
 
+    def persist_incremental_scrape_cache() -> None:
+        if not creator_cache_enabled:
+            return
+        creator_cache_summary["persisted_scrape_entry_count"] = creator_cache.persist_scrape_cache_entries(
+            platform,
+            aggregated_items,
+            creator_cache_db_path,
+            updated_at=iso_now(),
+        )
+
     if progress_callback:
         progress_callback(
             "preparing",
@@ -7309,6 +7319,7 @@ def perform_scrape(platform, payload, progress_callback=None, cancel_check=None)
         aggregated_items = merge_scrape_items(platform, aggregated_items, batch_result.get("raw_items") or [])
         apify_runs.append(batch_result.get("apify") or {})
         write_json_file(get_raw_data_path(platform), aggregated_items)
+        persist_incremental_scrape_cache()
         completed_requested_identifiers.extend(batch)
         partial_result = build_partial_scrape_result(platform, aggregated_items, completed_requested_identifiers)
         if progress_callback:
@@ -7392,6 +7403,7 @@ def perform_scrape(platform, payload, progress_callback=None, cancel_check=None)
             aggregated_items = merge_scrape_items(platform, aggregated_items, batch_result.get("raw_items") or [])
             apify_runs.append(batch_result.get("apify") or {})
             write_json_file(get_raw_data_path(platform), aggregated_items)
+            persist_incremental_scrape_cache()
             partial_result = build_partial_scrape_result(platform, aggregated_items, identifiers)
             if progress_callback:
                 progress_callback(
@@ -7419,13 +7431,7 @@ def perform_scrape(platform, payload, progress_callback=None, cancel_check=None)
         if not remaining_missing_identifiers:
             break
     save_profile_reviews(platform, filtered.get("profile_reviews") or [])
-    if creator_cache_enabled:
-        creator_cache_summary["persisted_scrape_entry_count"] = creator_cache.persist_scrape_cache_entries(
-            platform,
-            aggregated_items,
-            creator_cache_db_path,
-            updated_at=iso_now(),
-        )
+    persist_incremental_scrape_cache()
     remaining_missing_count = len(filtered.get("missing_profiles") or [])
     retried_identifier_count = len({
         item

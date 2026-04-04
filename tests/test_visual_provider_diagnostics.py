@@ -772,6 +772,73 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
         mocked_write.assert_called()
         mocked_save.assert_called()
 
+    def test_perform_scrape_persists_scrape_cache_after_each_successful_batch(self) -> None:
+        alpha_item = {
+            "url": "https://instagram.com/alpha",
+            "username": "alpha",
+            "biography": "NYC creator",
+            "latestPosts": [{"timestamp": "2026-03-29T00:00:00+00:00", "displayUrl": "https://example.com/a.jpg"}],
+        }
+        beta_item = {
+            "url": "https://instagram.com/beta",
+            "username": "beta",
+            "biography": "LA CA lifestyle",
+            "latestPosts": [{"timestamp": "2026-03-29T00:00:00+00:00", "displayUrl": "https://example.com/b.jpg"}],
+        }
+        batch_calls = []
+
+        def fake_run_apify_batch(platform, batch, payload, progress_callback=None, cancel_check=None):
+            batch_calls.append(list(batch))
+            if batch == ["alpha"]:
+                return {
+                    "success": True,
+                    "raw_items": [alpha_item],
+                    "apify": {"usage_total_usd": 0.05},
+                }
+            return {
+                "success": True,
+                "raw_items": [beta_item],
+                "apify": {"usage_total_usd": 0.05},
+            }
+
+        def crash_after_first_batch(stage, message, **kwargs):
+            if stage == "batch_completed":
+                raise RuntimeError("simulated crash after first batch")
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "creator_cache.db"
+            with mock.patch.dict(backend_app.PLATFORM_BATCH_SIZES, {"instagram": 1}, clear=False), mock.patch.object(
+                backend_app,
+                "run_apify_batch",
+                side_effect=fake_run_apify_batch,
+            ), mock.patch.object(
+                backend_app,
+                "write_json_file",
+            ), mock.patch.object(
+                backend_app,
+                "save_profile_reviews",
+            ):
+                with self.assertRaisesRegex(RuntimeError, "simulated crash after first batch"):
+                    backend_app.perform_scrape(
+                        "instagram",
+                        {
+                            "usernames": ["alpha", "beta"],
+                            "creator_cache_db_path": str(db_path),
+                            "use_creator_cache": True,
+                        },
+                        progress_callback=crash_after_first_batch,
+                    )
+
+            cached_entries = creator_cache_module.load_scrape_cache_entries(
+                "instagram",
+                ["alpha", "beta"],
+                db_path,
+            )
+
+        self.assertEqual(batch_calls, [["alpha"]])
+        self.assertEqual(set(cached_entries.keys()), {"alpha"})
+        self.assertEqual(cached_entries["alpha"][0]["username"], "alpha")
+
     def test_perform_visual_review_reuses_creator_cache_without_spawning_workers(self) -> None:
         cached_visual_result = {
             "username": "alpha",
