@@ -8,7 +8,7 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from backend.final_export_merge import build_all_platforms_final_review_artifacts
+from backend.final_export_merge import _compute_engagement_rate, build_all_platforms_final_review_artifacts
 
 
 class FinalExportMergeTests(unittest.TestCase):
@@ -556,6 +556,17 @@ class FinalExportMergeTests(unittest.TestCase):
             self.assertEqual(row["Following"], 2.3)
             self.assertEqual(row["Median Views (K)"], 242.7)
             self.assertEqual(row["互动率"], "16.1%")
+
+    def test_engagement_rate_falls_back_to_likes_over_views_from_upload_fields(self) -> None:
+        self.assertEqual(
+            _compute_engagement_rate(
+                {
+                    "upload_avg_likes": 100,
+                    "upload_avg_views": 1000,
+                }
+            ),
+            "10.0%",
+        )
 
     def test_processing_failures_and_positioning_errors_are_explicit_in_combined_sheet(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

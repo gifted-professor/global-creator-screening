@@ -221,20 +221,20 @@ def _build_quote_text(keep_row: dict[str, Any]) -> str:
 
 
 def _compute_engagement_rate(final_row: dict[str, Any]) -> str:
-    followers = _coerce_number(final_row.get("upload_followers"))
-    if followers is None or followers <= 0:
+    likes = _coerce_number(final_row.get("upload_avg_likes"))
+    if likes is None:
         return ""
-    total = 0.0
-    found_signal = False
-    for key in ("upload_avg_likes", "upload_avg_comments", "upload_avg_collects"):
-        numeric = _coerce_number(final_row.get(key))
-        if numeric is None:
-            continue
-        total += numeric
-        found_signal = True
-    if not found_signal:
+    views = _coerce_number(
+        _first_non_blank(
+            final_row.get("upload_median_views"),
+            final_row.get("runtime_median_views"),
+            final_row.get("upload_avg_views"),
+            final_row.get("runtime_avg_views"),
+        )
+    )
+    if views is None or views <= 0:
         return ""
-    return _format_percentage(total / followers)
+    return _format_percentage(likes / views)
 
 
 def _average(values: list[float]) -> float | None:
