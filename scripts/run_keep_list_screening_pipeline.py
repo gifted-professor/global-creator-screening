@@ -1788,7 +1788,17 @@ def run_keep_list_screening_pipeline(
                     client.get(f"/api/artifacts/{platform}/status"),
                     f"{platform} artifact status",
                 )
-                platform_summary["exports"] = export_platform_artifacts(client, platform, exports_dir / platform)
+                fallback_stage_count = int(((platform_summary.get("fallback") or {}).get("staged_count") or 0))
+                final_review_export_blocked = bool((platform_summary.get("artifact_status") or {}).get("final_review_export_blocked"))
+                if final_review_export_blocked and fallback_stage_count > 0:
+                    platform_summary["exports"] = {}
+                    platform_summary["final_review_export"] = {
+                        "status": "deferred",
+                        "reason": "missing profiles already staged to fallback platform; defer final review export until fallback platforms finish",
+                        "fallback_staged_count": fallback_stage_count,
+                    }
+                else:
+                    platform_summary["exports"] = export_platform_artifacts(client, platform, exports_dir / platform)
                 platform_summary["status"] = "completed_with_partial_scrape" if scrape_was_salvaged else "completed"
                 _persist_platform_summary(
                     summary=summary,
