@@ -2121,6 +2121,43 @@ def run_keep_list_screening_pipeline(
                 ),
                 expose_top_level=False,
             )
+        elif summary["status"] == "failed":
+            failed_platforms: dict[str, dict[str, Any]] = {}
+            skipped_platforms: list[str] = []
+            for platform_name, payload in (summary.get("platforms") or {}).items():
+                normalized_payload = dict(payload or {})
+                platform_status = str(normalized_payload.get("status") or "").strip()
+                if platform_status == "failed":
+                    failed_platforms[str(platform_name)] = {
+                        "status": platform_status,
+                        "error_code": str(normalized_payload.get("error_code") or "").strip(),
+                        "error": str(normalized_payload.get("error") or "").strip(),
+                        "current_stage": str(normalized_payload.get("current_stage") or "").strip(),
+                    }
+                elif platform_status == "skipped":
+                    skipped_platforms.append(str(platform_name))
+            attach_failure_to_summary(
+                summary,
+                _build_failure_payload(
+                    stage="platform_runtime",
+                    error_code="NO_SUCCESSFUL_PLATFORMS",
+                    message="本次 run 没有任何平台成功完成，未产生可消费产物。",
+                    remediation="检查各平台 summary 里的 error_code/error 和 backend/runtime 日志后重试。",
+                    details={
+                        "failed_platform_count": len(failed_platforms),
+                        "failed_platforms": failed_platforms,
+                        "skipped_platform_count": len(skipped_platforms),
+                        "skipped_platforms": skipped_platforms,
+                        "all_platforms_upload_source_row_count": int(
+                            (summary.get("artifacts") or {}).get("all_platforms_upload_source_row_count") or 0
+                        ),
+                        "all_platforms_upload_row_count": int(
+                            (summary.get("artifacts") or {}).get("all_platforms_upload_row_count") or 0
+                        ),
+                    },
+                ),
+                expose_top_level=True,
+            )
         elif summary["status"] == "missing_profiles_blocked":
             attach_failure_to_summary(
                 summary,

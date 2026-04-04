@@ -73,6 +73,13 @@ _VISUAL_MANUAL_REVIEW_PATTERNS = (
     re.compile(r"\bvisual\b", re.IGNORECASE),
     re.compile(r"\bimage review\b", re.IGNORECASE),
 )
+_INSTAGRAM_REEL_MARKER_PATTERNS = (
+    re.compile(r"/reels?/", re.IGNORECASE),
+    re.compile(r"\b(?:clips|reels?|igtv)\b", re.IGNORECASE),
+)
+_INSTAGRAM_VIDEO_MARKER_PATTERNS = (
+    re.compile(r"\b(?:video|graphvideo|clips|reels?|igtv)\b", re.IGNORECASE),
+)
 _REQUIRED_UPLOAD_FIELDS = (
     "达人ID",
     "平台",
@@ -260,6 +267,82 @@ def _average_post_engagement_rate(post_pairs: list[tuple[float, float]]) -> floa
     if not rates:
         return None
     return sum(rates) / len(rates)
+
+
+def _is_truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    normalized = _clean_text(value).casefold()
+    return normalized in {"1", "true", "yes", "y"}
+
+
+def _build_instagram_post_marker_text(post: dict[str, Any]) -> str:
+    marker_parts: list[str] = []
+    for key in (
+        "url",
+        "permalink",
+        "shortCodeUrl",
+        "postUrl",
+        "type",
+        "typeName",
+        "__typename",
+        "productType",
+        "mediaType",
+        "postType",
+    ):
+        value = _clean_text(post.get(key))
+        if value:
+            marker_parts.append(value.casefold())
+    return " ".join(marker_parts)
+
+
+def _is_instagram_reel_post(post: dict[str, Any]) -> bool:
+    marker_text = _build_instagram_post_marker_text(post)
+    return any(pattern.search(marker_text) for pattern in _INSTAGRAM_REEL_MARKER_PATTERNS)
+
+
+def _extract_instagram_play_count(post: dict[str, Any]) -> float | None:
+    for key in ("videoPlayCount", "videoViewCount", "playCount", "viewCount"):
+        value = _coerce_number(post.get(key))
+        if value is not None:
+            return value
+    return None
+
+
+def _is_instagram_video_post(post: dict[str, Any]) -> bool:
+    if _is_instagram_reel_post(post):
+        return True
+    if _extract_instagram_play_count(post) is not None:
+        return True
+    if _coerce_number(post.get("videoDuration")) is not None:
+        return True
+    if _clean_text(post.get("videoUrl")):
+        return True
+    if _is_truthy(post.get("isVideo")):
+        return True
+    marker_text = _build_instagram_post_marker_text(post)
+    return any(pattern.search(marker_text) for pattern in _INSTAGRAM_VIDEO_MARKER_PATTERNS)
+
+
+def _select_instagram_metric_posts(posts: Any) -> list[dict[str, Any]]:
+    normalized_posts = [dict(post) for post in (posts or []) if isinstance(post, dict)]
+    if not normalized_posts:
+        return []
+    reel_posts = [
+        post
+        for post in normalized_posts
+        if _is_instagram_reel_post(post) and _extract_instagram_play_count(post) is not None
+    ]
+    if reel_posts:
+        return reel_posts
+    video_posts = [
+        post
+        for post in normalized_posts
+        if _is_instagram_video_post(post) and _extract_instagram_play_count(post) is not None
+    ]
+    if video_posts:
+        return video_posts
+    return [post for post in normalized_posts if _extract_instagram_play_count(post) is not None]
 
 
 def _resolve_metric_note(apify_row: dict[str, Any], avg_views: Any) -> str:
@@ -467,14 +550,14 @@ def _build_metrics_from_raw_platform_data(platform: str, data: Any) -> dict[str,
             handle = _extract_handle(item.get("username") or item.get("url"))
             if not handle:
                 continue
-            posts = item.get("latestPosts") or []
+            posts = _select_instagram_metric_posts(item.get("latestPosts") or [])
             view_values: list[float] = []
             like_values: list[float] = []
             engagement_pairs: list[tuple[float, float]] = []
             for post in posts:
                 if not isinstance(post, dict):
                     continue
-                views = _coerce_number(post.get("videoViewCount"))
+                views = _extract_instagram_play_count(post)
                 likes = _coerce_number(post.get("likesCount"))
                 if views is not None:
                     view_values.append(views)

@@ -647,6 +647,88 @@ class FinalExportMergeTests(unittest.TestCase):
             self.assertEqual(row["Median Views (K)"], 242.7)
             self.assertEqual(row["互动率"], "16.1%")
 
+    def test_instagram_metrics_accept_play_count_without_video_view_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            exports_dir = root / "exports"
+            instagram_export = exports_dir / "instagram" / "instagram_final_review.xlsx"
+            instagram_positioning = exports_dir / "instagram" / "instagram_positioning_card_review.xlsx"
+            instagram_export.parent.mkdir(parents=True, exist_ok=True)
+
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "alpha",
+                        "username": "alpha",
+                        "profile_url": "https://www.instagram.com/alpha",
+                        "upload_handle": "alpha",
+                        "final_status": "Pass",
+                        "final_reason": "内容契合",
+                    }
+                ]
+            ).to_excel(instagram_export, index=False)
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "alpha",
+                        "username": "alpha",
+                        "profile_url": "https://www.instagram.com/alpha",
+                        "upload_handle": "alpha",
+                        "positioning_stage_status": "Completed",
+                        "positioning_labels": "家庭用品和家电-家庭博主",
+                        "fit_summary": "内容契合",
+                    }
+                ]
+            ).to_excel(instagram_positioning, index=False)
+
+            cached_rows = {
+                "alpha": [
+                    {
+                        "username": "alpha",
+                        "url": "https://www.instagram.com/alpha",
+                        "followersCount": 50000,
+                        "followsCount": 1000,
+                        "latestPosts": [
+                            {
+                                "url": "https://www.instagram.com/reel/first/",
+                                "productType": "clips",
+                                "videoPlayCount": 1200000,
+                                "likesCount": 60000,
+                            },
+                            {
+                                "url": "https://www.instagram.com/reel/second/",
+                                "productType": "clips",
+                                "videoPlayCount": 1800000,
+                                "likesCount": 90000,
+                            },
+                        ],
+                    }
+                ]
+            }
+
+            output_path = exports_dir / "all_platforms_final_review.xlsx"
+            payload_path = exports_dir / "all_platforms_final_review_payload.json"
+            with patch(
+                "backend.final_export_merge.creator_cache.load_scrape_cache_entries",
+                return_value=cached_rows,
+            ):
+                build_all_platforms_final_review_artifacts(
+                    output_path=output_path,
+                    payload_json_path=payload_path,
+                    final_exports={
+                        "instagram": {
+                            "final_review": str(instagram_export),
+                            "positioning_card_review": str(instagram_positioning),
+                        }
+                    },
+                    task_owner={"responsible_name": "陈俊仁"},
+                )
+
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+            row = payload["rows"][0]
+            self.assertEqual(row["Median Views (K)"], 1500)
+            self.assertEqual(row["互动率"], "5.0%")
+
     def test_engagement_rate_falls_back_to_likes_over_views_from_upload_fields(self) -> None:
         self.assertEqual(
             _compute_engagement_rate(
