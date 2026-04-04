@@ -336,6 +336,10 @@ def _stage_missing_profiles_for_fallback(
 
 def summarize_platform_statuses(platforms: dict[str, dict[str, Any]]) -> str:
     statuses = [str((payload or {}).get("status") or "").strip() for payload in (platforms or {}).values()]
+    failure_statuses = {"failed", "scrape_failed", "missing_profiles_blocked"}
+    successful_statuses = {"completed", "completed_with_partial_scrape", "fallback_staged", "staged_only"}
+    if any(status in failure_statuses for status in statuses) and any(status in successful_statuses for status in statuses):
+        return "completed_with_platform_failures"
     if any(status == "failed" for status in statuses):
         return "failed"
     if any(status == "scrape_failed" for status in statuses):
@@ -650,6 +654,32 @@ def _build_positioning_stage_payload(status: str, reason: str = "", **extra: Any
     }
     payload.update({key: value for key, value in extra.items() if value not in (None, "")})
     return payload
+
+
+def _mark_platform_runtime_failure(
+    *,
+    summary: dict[str, Any],
+    run_summary_path: Path,
+    backend_app,
+    platform: str,
+    platform_summary: dict[str, Any],
+    exc: Exception,
+    current_stage: str,
+    summary_writer: Callable[[dict[str, Any]], None] | None = None,
+) -> None:
+    platform_summary["status"] = "failed"
+    platform_summary["error_code"] = "PLATFORM_RUNTIME_FAILED"
+    platform_summary["error"] = str(exc) or exc.__class__.__name__
+    platform_summary["exception_type"] = exc.__class__.__name__
+    _persist_platform_summary(
+        summary=summary,
+        run_summary_path=run_summary_path,
+        backend_app=backend_app,
+        platform=platform,
+        platform_summary=platform_summary,
+        current_stage=current_stage,
+        summary_writer=summary_writer,
+    )
 
 
 def _build_resolved_config_sources(
@@ -1365,11 +1395,10 @@ def run_keep_list_screening_pipeline(
                 return summary
 
             for platform in execution_platforms:
-                requested_identifiers = select_platform_identifiers(platform, max(0, int(max_identifiers_per_platform)))
                 platform_summary: dict[str, Any] = {
                     "staged_identifier_count": len(backend_app.load_upload_metadata(platform)),
-                    "requested_identifier_count": len(requested_identifiers),
-                    "requested_identifier_preview": requested_identifiers[:10],
+                    "requested_identifier_count": 0,
+                    "requested_identifier_preview": [],
                     "requested_vision_provider": str(vision_provider or "").strip().lower(),
                     "vision_preflight": backend_app.build_vision_preflight(vision_provider),
                     "status": "running",
@@ -1383,6 +1412,22 @@ def run_keep_list_screening_pipeline(
                     platform_summary=platform_summary,
                     summary_writer=persist_summary,
                 )
+                try:
+                    requested_identifiers = select_platform_identifiers(platform, max(0, int(max_identifiers_per_platform)))
+                    platform_summary["requested_identifier_count"] = len(requested_identifiers)
+                    platform_summary["requested_identifier_preview"] = requested_identifiers[:10]
+                except Exception as exc:  # noqa: BLE001
+                    _mark_platform_runtime_failure(
+                        summary=summary,
+                        run_summary_path=run_summary_path,
+                        backend_app=backend_app,
+                        platform=platform,
+                        platform_summary=platform_summary,
+                        exc=exc,
+                        current_stage="platform_preparing_failed",
+                        summary_writer=persist_summary,
+                    )
+                    continue
 
                 if not requested_identifiers:
                     platform_summary["status"] = "skipped"
@@ -1439,21 +1484,39 @@ def run_keep_list_screening_pipeline(
                     creator_cache_db_path=str(creator_cache_db_path or "").strip(),
                     force_refresh_creator_cache=bool(force_refresh_creator_cache),
                 )
-                scrape_payload = require_success(
-                    client.post("/api/jobs/scrape", json={"platform": platform, "payload": scrape_payload_body}),
-                    f"{platform} scrape start",
-                )
-                platform_summary["scrape_job"] = dict(scrape_payload.get("job") or {})
-                _persist_platform_summary(
-                    summary=summary,
-                    run_summary_path=run_summary_path,
-                    backend_app=backend_app,
-                    platform=platform,
-                    platform_summary=platform_summary,
-                    current_stage="scrape_running",
-                    summary_writer=persist_summary,
-                )
-                scrape_job = poll_job(client, scrape_payload["job"]["id"], f"{platform} scrape poll", max(1.0, float(poll_interval)))
+                try:
+                    scrape_payload = require_success(
+                        client.post("/api/jobs/scrape", json={"platform": platform, "payload": scrape_payload_body}),
+                        f"{platform} scrape start",
+                    )
+                    platform_summary["scrape_job"] = dict(scrape_payload.get("job") or {})
+                    _persist_platform_summary(
+                        summary=summary,
+                        run_summary_path=run_summary_path,
+                        backend_app=backend_app,
+                        platform=platform,
+                        platform_summary=platform_summary,
+                        current_stage="scrape_running",
+                        summary_writer=persist_summary,
+                    )
+                    scrape_job = poll_job(
+                        client,
+                        scrape_payload["job"]["id"],
+                        f"{platform} scrape poll",
+                        max(1.0, float(poll_interval)),
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    _mark_platform_runtime_failure(
+                        summary=summary,
+                        run_summary_path=run_summary_path,
+                        backend_app=backend_app,
+                        platform=platform,
+                        platform_summary=platform_summary,
+                        exc=exc,
+                        current_stage="scrape_runtime_failed",
+                        summary_writer=persist_summary,
+                    )
+                    continue
                 platform_summary["scrape_job"] = scrape_job
                 scrape_apify = _extract_scrape_apify_metadata(scrape_job)
                 if scrape_apify:
@@ -1549,12 +1612,25 @@ def run_keep_list_screening_pipeline(
                         )
                     )
                     if fallback_supported and next_platform:
-                        fallback_result = _stage_missing_profiles_for_fallback(
-                            backend_app=backend_app,
-                            current_platform=platform,
-                            next_platform=next_platform,
-                            missing_profiles=fallback_profiles,
-                        )
+                        try:
+                            fallback_result = _stage_missing_profiles_for_fallback(
+                                backend_app=backend_app,
+                                current_platform=platform,
+                                next_platform=next_platform,
+                                missing_profiles=fallback_profiles,
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            _mark_platform_runtime_failure(
+                                summary=summary,
+                                run_summary_path=run_summary_path,
+                                backend_app=backend_app,
+                                platform=platform,
+                                platform_summary=platform_summary,
+                                exc=exc,
+                                current_stage="fallback_staging_failed",
+                                summary_writer=persist_summary,
+                            )
+                            continue
                         platform_summary["fallback"] = {
                             "status": "staged" if int(fallback_result.get("staged_count") or 0) > 0 else "unavailable",
                             "next_platform": next_platform,
@@ -1578,10 +1654,23 @@ def run_keep_list_screening_pipeline(
                                     "skipped",
                                     "missing profiles blocked downstream stages",
                                 )
-                                platform_summary["artifact_status"] = require_success(
-                                    client.get(f"/api/artifacts/{platform}/status"),
-                                    f"{platform} artifact status",
-                                )
+                                try:
+                                    platform_summary["artifact_status"] = require_success(
+                                        client.get(f"/api/artifacts/{platform}/status"),
+                                        f"{platform} artifact status",
+                                    )
+                                except Exception as exc:  # noqa: BLE001
+                                    _mark_platform_runtime_failure(
+                                        summary=summary,
+                                        run_summary_path=run_summary_path,
+                                        backend_app=backend_app,
+                                        platform=platform,
+                                        platform_summary=platform_summary,
+                                        exc=exc,
+                                        current_stage="artifact_status_failed",
+                                        summary_writer=persist_summary,
+                                    )
+                                    continue
                                 platform_summary["exports"] = {}
                                 platform_summary["status"] = "missing_profiles_blocked"
                                 _persist_platform_summary(
@@ -1635,10 +1724,23 @@ def run_keep_list_screening_pipeline(
                             "skipped",
                             "no successful scrape rows remain after fallback staging",
                         )
-                        platform_summary["artifact_status"] = require_success(
-                            client.get(f"/api/artifacts/{platform}/status"),
-                            f"{platform} artifact status",
-                        )
+                        try:
+                            platform_summary["artifact_status"] = require_success(
+                                client.get(f"/api/artifacts/{platform}/status"),
+                                f"{platform} artifact status",
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            _mark_platform_runtime_failure(
+                                summary=summary,
+                                run_summary_path=run_summary_path,
+                                backend_app=backend_app,
+                                platform=platform,
+                                platform_summary=platform_summary,
+                                exc=exc,
+                                current_stage="artifact_status_failed",
+                                summary_writer=persist_summary,
+                            )
+                            continue
                         platform_summary["exports"] = {}
                         platform_summary["status"] = "fallback_staged"
                         _persist_platform_summary(
@@ -1673,27 +1775,40 @@ def run_keep_list_screening_pipeline(
                         current_stage="visual_starting",
                         summary_writer=persist_summary,
                     )
-                    visual_payload = require_success(
-                        client.post("/api/jobs/visual-review", json={"platform": platform, "payload": visual_payload_body}),
-                        f"{platform} visual start",
-                    )
-                    platform_summary["visual_job"] = dict(visual_payload.get("job") or {})
-                    _persist_platform_summary(
-                        summary=summary,
-                        run_summary_path=run_summary_path,
-                        backend_app=backend_app,
-                        platform=platform,
-                        platform_summary=platform_summary,
-                        current_stage="visual_running",
-                        summary_writer=persist_summary,
-                    )
-                    platform_summary["visual_job"] = poll_job(
-                        client,
-                        visual_payload["job"]["id"],
-                        f"{platform} visual poll",
-                        max(1.0, float(poll_interval)),
-                    )
-                    platform_summary["visual_gate"]["executed"] = True
+                    try:
+                        visual_payload = require_success(
+                            client.post("/api/jobs/visual-review", json={"platform": platform, "payload": visual_payload_body}),
+                            f"{platform} visual start",
+                        )
+                        platform_summary["visual_job"] = dict(visual_payload.get("job") or {})
+                        _persist_platform_summary(
+                            summary=summary,
+                            run_summary_path=run_summary_path,
+                            backend_app=backend_app,
+                            platform=platform,
+                            platform_summary=platform_summary,
+                            current_stage="visual_running",
+                            summary_writer=persist_summary,
+                        )
+                        platform_summary["visual_job"] = poll_job(
+                            client,
+                            visual_payload["job"]["id"],
+                            f"{platform} visual poll",
+                            max(1.0, float(poll_interval)),
+                        )
+                        platform_summary["visual_gate"]["executed"] = True
+                    except Exception as exc:  # noqa: BLE001
+                        _mark_platform_runtime_failure(
+                            summary=summary,
+                            run_summary_path=run_summary_path,
+                            backend_app=backend_app,
+                            platform=platform,
+                            platform_summary=platform_summary,
+                            exc=exc,
+                            current_stage="visual_runtime_failed",
+                            summary_writer=persist_summary,
+                        )
+                        continue
                 else:
                     platform_summary["visual_job"] = {
                         "status": "skipped",
@@ -1703,19 +1818,32 @@ def run_keep_list_screening_pipeline(
                     }
 
                 if not skip_visual and pass_count > 0:
-                    platform_summary["visual_retry"] = _run_visual_postcheck_retries(
-                        client=client,
-                        backend_app=backend_app,
-                        platform=platform,
-                        platform_summary=platform_summary,
-                        vision_provider=vision_provider,
-                        creator_cache_db_path=str(creator_cache_db_path or "").strip(),
-                        force_refresh_creator_cache=bool(force_refresh_creator_cache),
-                        poll_job=poll_job,
-                        require_success=require_success,
-                        poll_interval=poll_interval,
-                        max_rounds=visual_postcheck_max_rounds,
-                    )
+                    try:
+                        platform_summary["visual_retry"] = _run_visual_postcheck_retries(
+                            client=client,
+                            backend_app=backend_app,
+                            platform=platform,
+                            platform_summary=platform_summary,
+                            vision_provider=vision_provider,
+                            creator_cache_db_path=str(creator_cache_db_path or "").strip(),
+                            force_refresh_creator_cache=bool(force_refresh_creator_cache),
+                            poll_job=poll_job,
+                            require_success=require_success,
+                            poll_interval=poll_interval,
+                            max_rounds=visual_postcheck_max_rounds,
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        _mark_platform_runtime_failure(
+                            summary=summary,
+                            run_summary_path=run_summary_path,
+                            backend_app=backend_app,
+                            platform=platform,
+                            platform_summary=platform_summary,
+                            exc=exc,
+                            current_stage="visual_retry_failed",
+                            summary_writer=persist_summary,
+                        )
+                        continue
                 else:
                     platform_summary["visual_retry"] = {
                         "enabled": True,
@@ -1816,31 +1944,44 @@ def run_keep_list_screening_pipeline(
                     current_stage="exporting_artifacts",
                     summary_writer=persist_summary,
                 )
-                platform_summary["artifact_status"] = require_success(
-                    client.get(f"/api/artifacts/{platform}/status"),
-                    f"{platform} artifact status",
-                )
-                fallback_stage_count = int(((platform_summary.get("fallback") or {}).get("staged_count") or 0))
-                final_review_export_blocked = bool((platform_summary.get("artifact_status") or {}).get("final_review_export_blocked"))
-                if final_review_export_blocked and fallback_stage_count > 0:
-                    platform_summary["exports"] = {}
-                    platform_summary["final_review_export"] = {
-                        "status": "deferred",
-                        "reason": "missing profiles already staged to fallback platform; defer final review export until fallback platforms finish",
-                        "fallback_staged_count": fallback_stage_count,
-                    }
-                else:
-                    platform_summary["exports"] = export_platform_artifacts(client, platform, exports_dir / platform)
-                platform_summary["status"] = "completed_with_partial_scrape" if scrape_was_salvaged else "completed"
-                _persist_platform_summary(
-                    summary=summary,
-                    run_summary_path=run_summary_path,
-                    backend_app=backend_app,
-                    platform=platform,
-                    platform_summary=platform_summary,
-                    current_stage="completed",
-                    summary_writer=persist_summary,
-                )
+                try:
+                    platform_summary["artifact_status"] = require_success(
+                        client.get(f"/api/artifacts/{platform}/status"),
+                        f"{platform} artifact status",
+                    )
+                    fallback_stage_count = int(((platform_summary.get("fallback") or {}).get("staged_count") or 0))
+                    final_review_export_blocked = bool((platform_summary.get("artifact_status") or {}).get("final_review_export_blocked"))
+                    if final_review_export_blocked and fallback_stage_count > 0:
+                        platform_summary["exports"] = {}
+                        platform_summary["final_review_export"] = {
+                            "status": "deferred",
+                            "reason": "missing profiles already staged to fallback platform; defer final review export until fallback platforms finish",
+                            "fallback_staged_count": fallback_stage_count,
+                        }
+                    else:
+                        platform_summary["exports"] = export_platform_artifacts(client, platform, exports_dir / platform)
+                    platform_summary["status"] = "completed_with_partial_scrape" if scrape_was_salvaged else "completed"
+                    _persist_platform_summary(
+                        summary=summary,
+                        run_summary_path=run_summary_path,
+                        backend_app=backend_app,
+                        platform=platform,
+                        platform_summary=platform_summary,
+                        current_stage="completed",
+                        summary_writer=persist_summary,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    _mark_platform_runtime_failure(
+                        summary=summary,
+                        run_summary_path=run_summary_path,
+                        backend_app=backend_app,
+                        platform=platform,
+                        platform_summary=platform_summary,
+                        exc=exc,
+                        current_stage="artifact_export_failed",
+                        summary_writer=persist_summary,
+                    )
+                    continue
         except Exception as exc:  # noqa: BLE001
             failure = _build_failure_payload(
                 stage="downstream",

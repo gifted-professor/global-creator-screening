@@ -245,7 +245,7 @@ class BitableUploadTests(unittest.TestCase):
                     "type": "url",
                 },
             )
-            self.assertEqual(created_fields["达人对接人"], [{"id": "ou_alpha"}])
+            self.assertNotIn("达人对接人", created_fields)
             self.assertIsInstance(created_fields["达人最后一次回复邮件时间"], int)
             self.assertEqual(created_fields["full body"], "hi")
             self.assertEqual(created_fields["文本 12"], [{"file_token": "boxcn-upload-1", "name": "alpha-last.eml"}])
@@ -598,7 +598,7 @@ class BitableUploadTests(unittest.TestCase):
         self.assertEqual(result["updated_count"], 1)
         self.assertEqual(client.updated_records[0]["record_id"], "rec_rich_existing")
 
-    def test_upload_uses_owner_scope_to_allow_cross_project_same_creator(self) -> None:
+    def test_upload_skips_cross_project_same_creator_without_owner_scope(self) -> None:
         client = _FakeBitableUploadClient()
         client.include_task_name_field = True
         client.search_items = [
@@ -654,12 +654,12 @@ class BitableUploadTests(unittest.TestCase):
                 )
 
         self.assertTrue(result["ok"])
-        self.assertEqual(result["created_count"], 1)
+        self.assertEqual(result["created_count"], 0)
         self.assertEqual(result["updated_count"], 0)
-        self.assertEqual(result["skipped_existing_count"], 0)
-        self.assertEqual(client.created_records[0]["fields"]["达人对接人"], [{"id": "ou_7ed60ea94d265816ffcd02ae262c8030"}])
+        self.assertEqual(result["skipped_existing_count"], 1)
+        self.assertEqual(len(client.created_records), 0)
 
-    def test_upload_blocks_when_existing_records_missing_owner_scope(self) -> None:
+    def test_upload_allows_existing_records_missing_owner_scope(self) -> None:
         client = _FakeBitableUploadClient()
         client.search_items = [
             {
@@ -711,11 +711,11 @@ class BitableUploadTests(unittest.TestCase):
                     linked_bitable_url="https://example.com/base/app?table=tbl&view=vew",
                 )
 
-        self.assertFalse(result["ok"])
-        self.assertTrue(result["guard_blocked"])
+        self.assertTrue(result["ok"])
+        self.assertNotIn("guard_blocked", result)
         self.assertEqual(result["created_count"], 0)
         self.assertEqual(result["updated_count"], 0)
-        self.assertIn("未填写 `达人对接人`", result["error"])
+        self.assertEqual(result["skipped_existing_count"], 1)
 
     def test_upload_payload_blocks_when_target_table_contains_duplicate_record_keys(self) -> None:
         client = _FakeBitableUploadClient()

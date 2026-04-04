@@ -56,7 +56,7 @@ _MAIL_ONLY_FIELD_NAMES = (
 )
 
 _UPLOAD_BASE_KEY_FIELDS = ("达人ID", "平台")
-_OWNER_SCOPE_FIELD_CANDIDATES = ("达人对接人",)
+_OWNER_SCOPE_FIELD_CANDIDATES: tuple[str, ...] = ()
 _PREFERRED_TARGET_TABLE_NAMES = ("AI回信管理", "达人管理")
 _PREFERRED_TARGET_VIEW_NAMES = ("表格", "总视图")
 
@@ -131,7 +131,7 @@ def upload_final_review_payload_to_bitable(
     )
     existing_records = existing_record_analysis.index
     key_field_names = existing_record_analysis.key_field_names
-    key_display_name = existing_record_analysis.key_display_name or "达人对接人+达人ID+平台"
+    key_display_name = existing_record_analysis.key_display_name or "达人ID+平台"
 
     rows = list(payload.get("rows") or [])
     if limit > 0:
@@ -844,23 +844,11 @@ def _build_payload_record_key(row: dict[str, Any], *, key_field_names: tuple[str
 
 
 def _extract_payload_owner_scopes(rows: list[dict[str, Any]]) -> set[str]:
-    owner_scopes: set[str] = set()
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        owner_scope = _extract_payload_owner_scope(row)
-        if owner_scope:
-            owner_scopes.add(owner_scope)
-    return owner_scopes
+    return set()
 
 
 def _extract_payload_owner_scope(row: dict[str, Any]) -> str:
-    return (
-        _clean_text(row.get("达人对接人_employee_id"))
-        or _clean_text(row.get("达人对接人"))
-        or _clean_text(row.get("达人对接人_owner_name"))
-        or _clean_text(row.get("达人对接人_employee_email"))
-    )
+    return ""
 
 
 def _extract_existing_owner_scope(fields: dict[str, Any], owner_scope_field_name: str) -> str:
@@ -914,11 +902,6 @@ def _build_feishu_fields(
         converted, include = _convert_field_value(schema, raw_value, row=row)
         if include:
             fields[schema.field_name] = converted
-
-    person_schema = _lookup_field_schema(field_schemas, "达人对接人")
-    employee_id = _clean_text(row.get("达人对接人_employee_id")).split(",")[0].strip()
-    if person_schema is not None and employee_id:
-        fields[person_schema.field_name] = [{"id": employee_id}]
 
     return fields
 

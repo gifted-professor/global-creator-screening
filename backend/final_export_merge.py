@@ -77,7 +77,6 @@ _REQUIRED_UPLOAD_FIELDS = (
     "达人ID",
     "平台",
     "主页链接",
-    "达人对接人",
     "ai是否通过",
 )
 
@@ -909,12 +908,9 @@ def build_all_platforms_final_review_artifacts(
             seen_creator_keys.add((platform, handle))
 
             payload_row = dict(display_row)
+            payload_row.pop("达人对接人", None)
             payload_row.update(
                 {
-                    "达人对接人_employee_id": _normalize_employee_id(row_owner_context.get("employee_id")),
-                    "达人对接人_employee_record_id": _clean_text(row_owner_context.get("employee_record_id")),
-                    "达人对接人_employee_email": _clean_text(row_owner_context.get("employee_email")),
-                    "达人对接人_owner_name": _clean_text(row_owner_context.get("owner_name")),
                     "linked_bitable_url": _clean_text(row_owner_context.get("linked_bitable_url")),
                     "任务名": _clean_text(row_owner_context.get("task_name")),
                     "creator_emails": _clean_text(keep_row.get("creator_emails")),
@@ -1013,12 +1009,9 @@ def build_all_platforms_final_review_artifacts(
         rows.append(display_row)
         seen_creator_keys.add((platform, handle))
         payload_row = dict(display_row)
+        payload_row.pop("达人对接人", None)
         payload_row.update(
             {
-                "达人对接人_employee_id": _normalize_employee_id(row_owner_context.get("employee_id")),
-                "达人对接人_employee_record_id": _clean_text(row_owner_context.get("employee_record_id")),
-                "达人对接人_employee_email": _clean_text(row_owner_context.get("employee_email")),
-                "达人对接人_owner_name": _clean_text(row_owner_context.get("owner_name")),
                 "linked_bitable_url": _clean_text(row_owner_context.get("linked_bitable_url")),
                 "任务名": _clean_text(row_owner_context.get("task_name")),
                 "creator_emails": _clean_text(keep_row.get("creator_emails")),
@@ -1052,11 +1045,6 @@ def build_all_platforms_final_review_artifacts(
     skipped_archive_xlsx_path = archive_dir / "skipped_from_feishu_upload.xlsx"
     payload = {
         "task_owner": {
-            "responsible_name": owner_display_name,
-            "employee_id": _normalize_employee_id(owner_context.get("employee_id")),
-            "employee_record_id": _clean_text(owner_context.get("employee_record_id")),
-            "employee_email": _clean_text(owner_context.get("employee_email")),
-            "owner_name": _clean_text(owner_context.get("owner_name")),
             "linked_bitable_url": _clean_text(owner_context.get("linked_bitable_url")),
             "task_name": _clean_text(owner_context.get("task_name")),
         },

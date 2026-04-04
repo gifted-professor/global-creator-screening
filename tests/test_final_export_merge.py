@@ -305,9 +305,9 @@ class FinalExportMergeTests(unittest.TestCase):
             workbook = pd.read_excel(output_path)
             payload = json.loads(payload_path.read_text(encoding="utf-8"))
             self.assertEqual(workbook.loc[0, "达人对接人"], "Sherry97")
-            self.assertEqual(payload["rows"][0]["达人对接人"], "Sherry97")
             self.assertEqual(payload["rows"][0]["__feishu_update_mode"], "create_or_mail_only_update")
-            self.assertEqual(payload["rows"][0]["达人对接人_employee_id"], "ou_lilith")
+            self.assertNotIn("达人对接人", payload["rows"][0])
+            self.assertNotIn("达人对接人_employee_id", payload["rows"][0])
             self.assertEqual(payload["rows"][0]["linked_bitable_url"], "https://bitable.example/skg")
 
     def test_payload_skips_processing_failures_and_preserves_uploadable_rows(self) -> None:

@@ -425,6 +425,8 @@ def _aggregate_fan_out_status(child_runs: list[dict[str, Any]]) -> str:
         return "failed"
     if len(set(statuses)) == 1:
         return statuses[0]
+    if "completed_with_platform_failures" in statuses:
+        return "completed_with_platform_failures"
     if "completed_with_partial_scrape" in statuses:
         return "completed_with_partial_scrape"
     if "completed" in statuses:

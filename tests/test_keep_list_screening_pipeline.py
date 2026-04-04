@@ -2518,6 +2518,94 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         self.assertEqual(summary["failure_decision"]["resolution_mode"], "auto_retry")
         self.assertTrue(summary["failure_decision"]["retryable"])
 
+    def test_runner_continues_to_next_platform_after_platform_runtime_failure(self) -> None:
+        preflight = {
+            "status": "configured",
+            "error_code": "",
+            "message": "视觉模型已就绪：openai",
+            "configured_provider_names": ["openai"],
+            "runnable_provider_names": ["openai"],
+            "preferred_provider": "openai",
+            "providers": [{"name": "openai", "runnable": True}],
+        }
+        backend_app = FakeBackendApp(
+            preflight,
+            metadata={
+                "tiktok": {
+                    "alpha": {
+                        "url": "https://www.tiktok.com/@alpha",
+                    }
+                },
+                "instagram": {
+                    "beta": {
+                        "handle": "beta",
+                    }
+                },
+            },
+        )
+
+        def fake_prepare_screening_inputs(**kwargs):
+            return {
+                "prepared_at": "2026-03-28T01:02:03Z",
+                "upload": {"stats": {"TikTok": 1, "Instagram": 1}},
+            }
+
+        def fake_poll_job(client, job_id, label, interval):
+            return {
+                "id": job_id,
+                "status": "completed",
+                "result": {
+                    "profile_reviews": [{"status": "Pass", "username": "beta"}],
+                },
+            }
+
+        export_calls: list[str] = []
+
+        def fake_export_platform_artifacts(client, platform, export_dir):
+            export_calls.append(str(platform))
+            return {"final_review": str(export_dir / f"{platform}_final_review.xlsx")}
+
+        def fake_require_success(response, label):
+            if label == "tiktok scrape start":
+                raise RuntimeError("tiktok scrape start timeout")
+            return response.get_json()
+
+        keep_list_runner._load_runtime_dependencies = lambda: {
+            "backend_app": backend_app,
+            "prepare_screening_inputs": fake_prepare_screening_inputs,
+            "count_passed_profiles": lambda scrape_job: 1 if "Pass" in json.dumps(scrape_job) else 0,
+            "export_platform_artifacts": fake_export_platform_artifacts,
+            "poll_job": fake_poll_job,
+            "require_success": fake_require_success,
+            "reset_backend_runtime_state": lambda: None,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            keep_path = temp_root / "keep.xlsx"
+            template_path = temp_root / "template.xlsx"
+            keep_path.touch()
+            template_path.touch()
+            env_path = self._write_env_file(temp_root)
+            summary = keep_list_runner.run_keep_list_screening_pipeline(
+                keep_workbook=keep_path,
+                template_workbook=template_path,
+                env_file=env_path,
+                output_root=temp_root / "run",
+                platform_filters=["tiktok", "instagram"],
+                skip_visual=True,
+                skip_positioning_card_analysis=True,
+            )
+
+        self.assertEqual(summary["status"], "completed_with_platform_failures")
+        self.assertEqual(summary["verdict"]["outcome"], "completed")
+        self.assertEqual(summary["verdict"]["recommended_action"], "inspect_summary")
+        self.assertEqual(summary["platforms"]["tiktok"]["status"], "failed")
+        self.assertEqual(summary["platforms"]["tiktok"]["error_code"], "PLATFORM_RUNTIME_FAILED")
+        self.assertIn("timeout", summary["platforms"]["tiktok"]["error"])
+        self.assertEqual(summary["platforms"]["instagram"]["status"], "completed")
+        self.assertEqual(export_calls, ["instagram"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -10,6 +10,7 @@ SUCCESSFUL_TERMINAL_STATUSES = {
     "completed",
     "completed_with_quality_warnings",
     "completed_with_partial_scrape",
+    "completed_with_platform_failures",
     "staged_only",
     "vision_probe_only",
 }
@@ -55,6 +56,18 @@ def build_run_verdict(
             "requires_manual_intervention": False,
             "recommended_action": "inspect_summary",
             "conclusion": "本次 run 已完成，但存在质量告警，请先检查 summary 中的质量报告再消费产物。",
+        }
+    if normalized_status == "completed_with_platform_failures":
+        return {
+            "outcome": "completed",
+            "status": normalized_status,
+            "failure_layer": "",
+            "category": "",
+            "resolution_mode": "",
+            "retryable": False,
+            "requires_manual_intervention": False,
+            "recommended_action": "inspect_summary",
+            "conclusion": "本次 run 已完成，但至少一个平台在执行中失败，请先检查 summary 里的平台失败详情再消费产物。",
         }
     if normalized_status in SUCCESSFUL_TERMINAL_STATUSES:
         return {

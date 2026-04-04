@@ -24,6 +24,14 @@ class HarnessContractTests(unittest.TestCase):
         self.assertFalse(verdict["retryable"])
         self.assertFalse(verdict["requires_manual_intervention"])
 
+    def test_build_run_verdict_marks_completed_with_platform_failures_as_completed(self) -> None:
+        verdict = build_run_verdict(status="completed_with_platform_failures")
+
+        self.assertEqual(verdict["outcome"], "completed")
+        self.assertEqual(verdict["recommended_action"], "inspect_summary")
+        self.assertFalse(verdict["retryable"])
+        self.assertFalse(verdict["requires_manual_intervention"])
+
     def test_build_run_verdict_uses_structured_failure(self) -> None:
         verdict = build_run_verdict(
             status="failed",
