@@ -7035,6 +7035,66 @@ def perform_scrape(platform, payload, progress_callback=None, cancel_check=None)
             **build_target_preview(identifiers),
         )
 
+    if not identifiers_to_fetch:
+        write_json_file(get_raw_data_path(platform), aggregated_items)
+        filtered = screening.filter_scraped_items(
+            platform,
+            aggregated_items,
+            expected_profiles=identifiers,
+            upload_metadata_lookup=load_upload_metadata(platform),
+            active_rulespec=load_active_rulespec(),
+        )
+        save_profile_reviews(platform, filtered.get("profile_reviews") or [])
+        if progress_callback:
+            progress_callback(
+                "cache_reused",
+                f"{UPLOAD_PLATFORM_RESPONSE_LABELS.get(platform, platform)} 全部命中 scrape cache，跳过 Apify 抓取",
+                done=0,
+                total=0,
+                creator_cache=creator_cache_summary,
+                partial_result=build_partial_scrape_result(platform, aggregated_items, identifiers),
+                **build_target_preview(identifiers),
+            )
+        return {
+            "success": True,
+            "platform": platform,
+            "requested_total": len(identifiers),
+            "raw_count": len(aggregated_items),
+            "profile_reviews": filtered.get("profile_reviews") or [],
+            "successful_identifiers": filtered.get("successful_identifiers") or [],
+            "profile_reviews_path": get_profile_reviews_path(platform),
+            "raw_data_path": get_raw_data_path(platform),
+            "apify": {
+                "runs": [],
+                "execution_method": "cache-only",
+                "actor_id": PLATFORM_ACTORS[platform],
+                "usage_total_usd": 0.0,
+                "cache_reused": True,
+            },
+            "retry_summary": {
+                "enabled": bool(max_missing_retry_attempts > 0),
+                "initial_batch_failure_count": 0,
+                "initial_batch_failures": [],
+                "max_attempts": max_missing_retry_attempts,
+                "attempt_count": 0,
+                "retried_identifier_count": 0,
+                "remaining_missing_count": len(filtered.get("missing_profiles") or []),
+                "remaining_missing_identifiers": extract_missing_profile_review_identifiers(
+                    platform,
+                    filtered.get("missing_profiles") or [],
+                ),
+                "history": [],
+            },
+            "creator_cache": {
+                **creator_cache_summary,
+                "persisted_scrape_entry_count": 0,
+            },
+            "message": (
+                f"{UPLOAD_PLATFORM_RESPONSE_LABELS.get(platform, platform)} 抓取完成，"
+                f"全部 {len(identifiers)} 个账号命中 scrape cache，未触发新的 Apify 抓取。"
+            ),
+        }
+
     for index, batch in enumerate(batches, start=1):
         if cancel_check and cancel_check():
             return build_cancelled_result()

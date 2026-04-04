@@ -621,6 +621,70 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
         self.assertEqual(result["creator_cache"]["scrape_miss_count"], 1)
         self.assertEqual(sorted(result["successful_identifiers"]), ["alpha", "beta"])
 
+    def test_perform_scrape_skips_apify_when_all_identifiers_hit_creator_cache(self) -> None:
+        alpha_item = {
+            "url": "https://instagram.com/alpha",
+            "username": "alpha",
+            "biography": "NYC creator",
+            "latestPosts": [{"timestamp": "2026-03-29T00:00:00+00:00", "displayUrl": "https://example.com/a.jpg"}],
+        }
+        beta_item = {
+            "url": "https://instagram.com/beta",
+            "username": "beta",
+            "biography": "LA CA lifestyle",
+            "latestPosts": [{"timestamp": "2026-03-29T00:00:00+00:00", "displayUrl": "https://example.com/b.jpg"}],
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "creator_cache.db"
+            creator_cache_module.persist_scrape_cache_entries(
+                "instagram",
+                [alpha_item, beta_item],
+                db_path,
+                updated_at="2026-04-03T00:00:00+00:00",
+            )
+            with mock.patch.object(
+                backend_app,
+                "run_apify_batch",
+                side_effect=AssertionError("run_apify_batch should not run when all identifiers are cached"),
+            ), mock.patch.object(
+                backend_app,
+                "load_upload_metadata",
+                return_value={
+                    "alpha": {"handle": "alpha", "region": "US"},
+                    "beta": {"handle": "beta", "region": "US"},
+                },
+            ), mock.patch.object(
+                backend_app,
+                "load_active_rulespec",
+                return_value={},
+            ), mock.patch.object(
+                backend_app,
+                "write_json_file",
+            ) as mocked_write, mock.patch.object(
+                backend_app,
+                "save_profile_reviews",
+            ) as mocked_save:
+                result = backend_app.perform_scrape(
+                    "instagram",
+                    {
+                        "usernames": ["alpha", "beta"],
+                        "creator_cache_db_path": str(db_path),
+                        "use_creator_cache": True,
+                    },
+                )
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["creator_cache"]["scrape_hit_count"], 2)
+        self.assertEqual(result["creator_cache"]["scrape_miss_count"], 0)
+        self.assertEqual(result["apify"]["execution_method"], "cache-only")
+        self.assertEqual(result["apify"]["runs"], [])
+        self.assertEqual(result["apify"]["usage_total_usd"], 0.0)
+        self.assertTrue(result["apify"]["cache_reused"])
+        self.assertEqual(sorted(result["successful_identifiers"]), ["alpha", "beta"])
+        mocked_write.assert_called()
+        mocked_save.assert_called()
+
     def test_perform_visual_review_reuses_creator_cache_without_spawning_workers(self) -> None:
         cached_visual_result = {
             "username": "alpha",
