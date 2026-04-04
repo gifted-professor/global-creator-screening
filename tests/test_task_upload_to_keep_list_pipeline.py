@@ -856,6 +856,167 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
         self.assertEqual(summary["steps"]["mail_sync"]["resume_policy"]["stage_policy"], "reuse_external_shared_mail_db_reference")
         self.assertEqual(str(observed["sent_since"]), "2026-03-31")
 
+    def test_runner_matches_task_name_case_insensitively_when_reusing_existing_shared_mail_db(self) -> None:
+        class FakeClient:
+            pass
+
+        class FakeDb:
+            def __init__(self, db_path):
+                self.db_path = Path(db_path)
+
+            def close(self):
+                return None
+
+        def fake_load_local_env(env_file):
+            return {
+                "FEISHU_APP_ID": "app-id",
+                "FEISHU_APP_SECRET": "app-secret",
+                "TASK_UPLOAD_URL": "https://env.example/task",
+                "EMPLOYEE_INFO_URL": "https://env.example/employee",
+                "TIMEOUT_SECONDS": "30",
+                "EMAIL_ACCOUNT": "partnerships@amagency.biz",
+                "EMAIL_AUTH_CODE": "secret",
+            }
+
+        def fake_get_preferred_value(cli_value, env_values, env_key, default=""):
+            return str(cli_value or "").strip() or str(env_values.get(env_key, default) or "").strip()
+
+        def fake_download_task_upload_screening_assets(**kwargs):
+            download_dir = Path(kwargs["download_dir"])
+            template_path = download_dir / "duet_template.xlsx"
+            sending_list_path = download_dir / "duet_sending_list.xlsx"
+            template_path.parent.mkdir(parents=True, exist_ok=True)
+            template_path.touch()
+            sending_list_path.touch()
+            return {
+                "recordId": "recDuet",
+                "taskName": "Duet",
+                "taskStartDate": "2026-04-01",
+                "linkedBitableUrl": "https://bitable.example/duet",
+                "templateDownloadedPath": str(template_path),
+                "sendingListDownloadedPath": str(sending_list_path),
+            }
+
+        def fake_inspect_task_upload_assignments(**kwargs):
+            return {
+                "items": [
+                    {
+                        "recordId": "recDuet",
+                        "taskName": "Duet",
+                        "employeeId": "ou_alpha",
+                        "employeeRecordId": "rec_emp",
+                        "employeeName": "陈俊仁",
+                        "employeeEmail": "chenjunren@amagency.biz",
+                        "responsibleName": "陈俊仁",
+                        "ownerName": "陈俊仁",
+                        "linkedBitableUrl": "https://bitable.example/duet",
+                    }
+                ]
+            }
+
+        def fail_sync_task_upload_mailboxes(**kwargs):
+            raise AssertionError("should not call IMAP sync when existing_mail_db_path is provided")
+
+        observed: dict[str, object] = {}
+
+        def fake_match_brand_keyword(*, db, input_path, output_prefix, keyword, sent_since, include_from):
+            observed["sent_since"] = sent_since
+            all_xlsx = output_prefix.with_suffix(".xlsx")
+            deduped_xlsx = output_prefix.with_name(f"{output_prefix.name}_去重").with_suffix(".xlsx")
+            unique_xlsx = output_prefix.with_name(f"{output_prefix.name}_唯一邮箱").with_suffix(".xlsx")
+            shared_xlsx = output_prefix.with_name(f"{output_prefix.name}_共享邮箱").with_suffix(".xlsx")
+            for path in (all_xlsx, deduped_xlsx, unique_xlsx, shared_xlsx):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+            return {
+                "source_kind": "sending_list",
+                "message_hit_count": 3,
+                "matched_email_count": 1,
+                "email_direct_match_row_count": 1,
+                "profile_deduped_row_count": 1,
+                "unique_email_row_count": 1,
+                "shared_email_row_count": 0,
+                "shared_email_group_count": 0,
+                "xlsx_path": str(all_xlsx),
+                "deduped_xlsx_path": str(deduped_xlsx),
+                "unique_xlsx_path": str(unique_xlsx),
+                "shared_xlsx_path": str(shared_xlsx),
+            }
+
+        def fake_build_mail_thread_funnel_keep_workbook(*, db, input_path, output_prefix, keyword, sent_since, include_from, env_path, base_url, api_key, model, wire_api):
+            observed["mail_funnel_sent_since"] = str(sent_since)
+            review_xlsx = output_prefix.with_suffix(".xlsx")
+            keep_xlsx = output_prefix.with_name(f"{output_prefix.name}_keep").with_suffix(".xlsx")
+            manual_tail_xlsx = output_prefix.with_name(f"{output_prefix.name}_manual_tail").with_suffix(".xlsx")
+            for path in (review_xlsx, keep_xlsx, manual_tail_xlsx):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+            return {
+                "message_hit_count": 3,
+                "external_message_count": 2,
+                "pass0_sending_list_email_count": 1,
+                "regex_pass1_count": 1,
+                "regex_pass2_count": 0,
+                "llm_high_count": 0,
+                "manual_row_count": 0,
+                "filtered_auto_reply_count": 0,
+                "no_match_count": 0,
+                "keep_row_count": 2,
+                "review_xlsx_path": str(review_xlsx),
+                "keep_xlsx_path": str(keep_xlsx),
+                "manual_tail_xlsx_path": str(manual_tail_xlsx),
+            }
+
+        task_runner._load_runtime_dependencies = lambda: {
+            "Settings": object,
+            "Database": FakeDb,
+            "FeishuOpenClient": lambda **kwargs: FakeClient(),
+            "DEFAULT_FEISHU_BASE_URL": "https://open.feishu.cn",
+            "download_task_upload_screening_assets": fake_download_task_upload_screening_assets,
+            "inspect_task_upload_assignments": fake_inspect_task_upload_assignments,
+            "sync_task_upload_mailboxes": fail_sync_task_upload_mailboxes,
+            "match_brand_keyword": fake_match_brand_keyword,
+            "resolve_shared_email_candidates": lambda **kwargs: (_ for _ in ()).throw(AssertionError("shared resolution should not run when mail funnel is available")),
+            "run_shared_email_final_review": lambda **kwargs: (_ for _ in ()).throw(AssertionError("final review should not run when mail funnel is available")),
+            "build_mail_thread_funnel_keep_workbook": fake_build_mail_thread_funnel_keep_workbook,
+            "enrich_creator_workbook": lambda **kwargs: (_ for _ in ()).throw(AssertionError("legacy enrichment should not run")),
+            "prepare_llm_review_candidates": lambda **kwargs: (_ for _ in ()).throw(AssertionError("llm candidates should not run")),
+            "run_and_apply_llm_review": lambda **kwargs: (_ for _ in ()).throw(AssertionError("llm review should not run")),
+            "resolve_sync_sent_since": lambda value: __import__("datetime").date(2026, 4, 1),
+            "load_local_env": fake_load_local_env,
+            "get_preferred_value": fake_get_preferred_value,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            existing_db = root / "shared" / "email_sync.db"
+            existing_raw = root / "shared" / "raw"
+            existing_db.parent.mkdir(parents=True, exist_ok=True)
+            existing_db.touch()
+            existing_raw.mkdir(parents=True, exist_ok=True)
+            summary = task_runner.run_task_upload_to_keep_list_pipeline(
+                task_name="DUET",
+                env_file=".env",
+                output_root=root / "run",
+                summary_json=root / "run" / "summary.json",
+                matching_strategy="brand-keyword-fast-path",
+                stop_after="keep-list",
+                task_upload_url="https://cli.example/task",
+                employee_info_url="https://cli.example/employee",
+                feishu_app_id="app-id",
+                feishu_app_secret="app-secret",
+                existing_mail_db_path=existing_db,
+                existing_mail_raw_dir=existing_raw,
+                existing_mail_data_dir=existing_db.parent,
+            )
+
+        self.assertEqual(summary["status"], "stopped_after_keep-list")
+        self.assertEqual(summary["steps"]["mail_sync"]["task"]["task_name"], "Duet")
+        self.assertEqual(summary["resolved_inputs"]["mail_sync"]["source_mode"], "pre_synced_mail_db")
+        self.assertEqual(summary["steps"]["mail_funnel"]["status"], "completed")
+        self.assertEqual(str(observed["sent_since"]), "2026-04-01")
+        self.assertEqual(str(observed["mail_funnel_sent_since"]), "2026-04-01")
+
     def test_runner_passes_default_mail_credentials_to_mail_sync(self) -> None:
         observed: dict[str, object] = {}
 

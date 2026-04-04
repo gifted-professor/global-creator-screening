@@ -106,6 +106,10 @@ def _safe_name(value: str) -> str:
     return normalized or "task"
 
 
+def _normalize_task_lookup_key(value: str) -> str:
+    return str(value or "").strip().casefold()
+
+
 def _parse_mapping_overrides(values: Sequence[str] | str | None) -> dict[str, str]:
     if isinstance(values, str):
         chunks = [values]
@@ -1216,7 +1220,7 @@ def run_task_upload_to_keep_list_pipeline(
                 (
                     item
                     for item in (inspection.get("items") or [])
-                    if str(item.get("taskName") or "").strip() == normalized_task_name
+                    if _normalize_task_lookup_key(item.get("taskName") or "") == _normalize_task_lookup_key(normalized_task_name)
                 ),
                 {},
             )
