@@ -843,20 +843,32 @@ def _build_keep_lookup(
     except Exception:
         return handle_lookup, url_lookup, handle_any_lookup, url_any_lookup
     for record in frame.to_dict(orient="records"):
-        platform = _normalize_platform(record.get("Platform"))
+        platform = _normalize_platform(record.get("Platform") or record.get("平台"))
         if not platform:
             continue
         for candidate in (
             record.get("@username"),
+            record.get("达人ID"),
+            record.get("identifier"),
+            record.get("username"),
+            record.get("upload_handle"),
             record.get("derived_handle"),
             record.get("URL"),
+            record.get("主页链接"),
+            record.get("profile_url"),
         ):
             handle = _extract_handle(candidate)
             if handle:
                 handle_lookup.setdefault((platform, handle), dict(record))
                 handle_any_lookup.setdefault(handle, dict(record))
-        url = _normalize_url(record.get("URL"))
-        if url:
+        for candidate in (
+            record.get("URL"),
+            record.get("主页链接"),
+            record.get("profile_url"),
+        ):
+            url = _normalize_url(candidate)
+            if not url:
+                continue
             url_lookup.setdefault((platform, url), dict(record))
             url_any_lookup.setdefault(url, dict(record))
     return handle_lookup, url_lookup, handle_any_lookup, url_any_lookup

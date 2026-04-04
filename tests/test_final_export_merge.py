@@ -163,6 +163,76 @@ class FinalExportMergeTests(unittest.TestCase):
             self.assertEqual(payload["rows"][0]["__last_mail_raw_path"], str(raw_mail_path))
             self.assertEqual(payload["rows"][0]["__feishu_attachment_local_paths"], [str(raw_mail_path.resolve())])
 
+    def test_mail_context_can_match_keep_row_by_creator_id_when_username_is_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            exports_dir = root / "exports"
+            tiktok_export = exports_dir / "tiktok" / "tiktok_final_review.xlsx"
+            tiktok_positioning = exports_dir / "tiktok" / "tiktok_positioning_card_review.xlsx"
+            tiktok_export.parent.mkdir(parents=True, exist_ok=True)
+
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "alpha",
+                        "username": "",
+                        "profile_url": "",
+                        "upload_handle": "",
+                        "final_status": "Pass",
+                        "final_reason": "内容契合",
+                    }
+                ]
+            ).to_excel(tiktok_export, index=False)
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "alpha",
+                        "username": "",
+                        "profile_url": "",
+                        "upload_handle": "",
+                        "positioning_stage_status": "Completed",
+                        "positioning_labels": "家庭用品和家电-家庭博主",
+                        "fit_summary": "适合家庭类合作",
+                    }
+                ]
+            ).to_excel(tiktok_positioning, index=False)
+
+            keep_workbook = root / "upstream" / "exports" / "keep.xlsx"
+            keep_workbook.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(
+                [
+                    {
+                        "Platform": "TikTok",
+                        "达人ID": "alpha",
+                        "URL": "https://www.tiktok.com/@not-alpha",
+                        "brand_message_sent_at": "2026-03-30T21:55:31+00:00",
+                        "brand_message_snippet": "My rate is $500 per video.",
+                    }
+                ]
+            ).to_excel(keep_workbook, index=False)
+
+            output_path = exports_dir / "all_platforms_final_review.xlsx"
+            payload_path = exports_dir / "all_platforms_final_review_payload.json"
+            build_all_platforms_final_review_artifacts(
+                output_path=output_path,
+                payload_json_path=payload_path,
+                final_exports={
+                    "tiktok": {
+                        "final_review": str(tiktok_export),
+                        "positioning_card_review": str(tiktok_positioning),
+                    }
+                },
+                keep_workbook=keep_workbook,
+                task_owner={"responsible_name": "陈俊仁"},
+            )
+
+            workbook = pd.read_excel(output_path).fillna("")
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+            self.assertEqual(workbook.loc[0, "当前网红报价"], "$500 per video")
+            self.assertEqual(workbook.loc[0, "达人最后一次回复邮件时间"], "2026/03/31")
+            self.assertEqual(workbook.loc[0, "full body"], "My rate is $500 per video.")
+            self.assertEqual(payload["rows"][0]["达人回复的最后一封邮件内容"], "My rate is $500 per video.")
+
     def test_quote_text_falls_back_to_resolved_full_body_when_snippet_has_no_quote(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
