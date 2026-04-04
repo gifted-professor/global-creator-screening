@@ -264,8 +264,6 @@ def _build_fallback_metadata_record(backend_app, metadata: dict[str, Any], next_
     if not handle:
         return {}
     explicit_next_url = str(metadata.get(f"{normalized_platform}_url") or "").strip()
-    if not explicit_next_url and not str(metadata.get("platform_attempt_order") or "").strip():
-        return {}
     next_url = explicit_next_url
     if not next_url and hasattr(backend_app, "screening") and hasattr(backend_app.screening, "build_canonical_profile_url"):
         next_url = str(backend_app.screening.build_canonical_profile_url(normalized_platform, handle) or "").strip()
@@ -1481,6 +1479,9 @@ def run_keep_list_screening_pipeline(
                     next_platform = _resolve_next_fallback_platform(platform, requested_platforms)
                     current_has_fallback_contract = any(
                         (
+                            str((current_lookup.get(str(item.get("identifier") or "").strip()) or {}).get("handle") or "").strip()
+                            or str((current_lookup.get(str(item.get("identifier") or "").strip()) or {}).get("url") or "").strip()
+                            or
                             str((current_lookup.get(str(item.get("identifier") or "").strip()) or {}).get("platform_attempt_order") or "").strip()
                             or str((current_lookup.get(str(item.get("identifier") or "").strip()) or {}).get("instagram_url") or "").strip()
                             or str((current_lookup.get(str(item.get("identifier") or "").strip()) or {}).get("youtube_url") or "").strip()
@@ -1490,6 +1491,8 @@ def run_keep_list_screening_pipeline(
                     fallback_supported = bool(
                         next_platform
                         and any(
+                            str((current_lookup.get(str(item.get("identifier") or "").strip()) or {}).get("handle") or "").strip()
+                            or
                             str((current_lookup.get(str(item.get("identifier") or "").strip()) or {}).get("platform_attempt_order") or "").strip()
                             or str((current_lookup.get(str(item.get("identifier") or "").strip()) or {}).get(f"{next_platform}_url") or "").strip()
                             for item in missing_profiles
