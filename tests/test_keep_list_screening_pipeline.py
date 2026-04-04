@@ -107,6 +107,13 @@ class FakeBackendApp:
     def load_upload_metadata(self, platform):
         return self._metadata.get(platform, {})
 
+    def save_upload_metadata(self, platform, payload, replace=False):
+        normalized_platform = str(platform or "").strip().lower()
+        existing = {} if replace else json.loads(json.dumps(self._metadata.get(normalized_platform, {})))
+        for key, value in dict(payload or {}).items():
+            existing[str(key or "").strip()] = json.loads(json.dumps(value))
+        self._metadata[normalized_platform] = existing
+
     def get_available_vision_provider_names(self, provider_name=None):
         names = list(self._preflight.get("runnable_provider_names") or [])
         requested = str(provider_name or "").strip().lower()
@@ -1265,6 +1272,84 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         )
         self.assertTrue(
             backend_app.app.test_client().scrape_start_calls[0]["payload"]["excludePinnedPosts"]
+        )
+
+    def test_runner_stages_missing_tiktok_profiles_to_instagram_fallback(self) -> None:
+        backend_app = FakeBackendApp(
+            {"status": "configured", "runnable_provider_names": [], "configured_provider_names": []},
+            metadata={
+                "tiktok": {
+                    "alpha": {
+                        "handle": "alpha",
+                        "url": "https://www.tiktok.com/@alpha",
+                        "instagram_url": "https://www.instagram.com/alpha/",
+                        "youtube_url": "https://www.youtube.com/@alpha",
+                        "platform_attempt_order": "tiktok,instagram,youtube",
+                    }
+                },
+                "instagram": {},
+                "youtube": {},
+            },
+        )
+
+        def fake_prepare_screening_inputs(**kwargs):
+            return {
+                "prepared_at": "2026-03-28T01:02:03Z",
+                "upload": {"stats": {"TikTok": 1, "Instagram": 0, "YouTube": 0}},
+            }
+
+        def fake_poll_job(client, job_id, label, interval):
+            if label.startswith("tiktok scrape"):
+                return {
+                    "id": job_id,
+                    "status": "completed",
+                    "result": {
+                        "profile_reviews": [{"status": "Missing", "username": "alpha", "reason": "not found"}],
+                    },
+                }
+            if label.startswith("instagram scrape"):
+                return {
+                    "id": job_id,
+                    "status": "completed",
+                    "result": {
+                        "profile_reviews": [{"status": "Pass", "username": "alpha"}],
+                    },
+                }
+            return {"id": job_id, "status": "completed", "result": {}}
+
+        keep_list_runner._load_runtime_dependencies = lambda: {
+            "backend_app": backend_app,
+            "prepare_screening_inputs": fake_prepare_screening_inputs,
+            "count_passed_profiles": lambda scrape_job: 1 if "instagram" in json.dumps(scrape_job) else 0,
+            "export_platform_artifacts": lambda client, platform, export_dir: {},
+            "poll_job": fake_poll_job,
+            "require_success": lambda response, label: response.get_json(),
+            "reset_backend_runtime_state": lambda: None,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            keep_path = temp_root / "keep.xlsx"
+            template_path = temp_root / "template.xlsx"
+            keep_path.touch()
+            template_path.touch()
+            env_path = self._write_env_file(temp_root)
+
+            summary = keep_list_runner.run_keep_list_screening_pipeline(
+                keep_workbook=keep_path,
+                template_workbook=template_path,
+                env_file=env_path,
+                output_root=temp_root / "run",
+                platform_filters=["tiktok", "instagram", "youtube"],
+                skip_visual=True,
+                skip_positioning_card_analysis=True,
+            )
+
+        self.assertEqual(summary["platforms"]["tiktok"]["fallback"]["staged_count"], 1)
+        self.assertEqual(summary["platforms"]["instagram"]["requested_identifier_preview"], ["alpha"])
+        self.assertEqual(
+            backend_app.app.test_client().scrape_start_calls[1]["platform"],
+            "instagram",
         )
 
     def test_runner_forwards_creator_cache_controls_to_scrape_and_visual_payloads(self) -> None:
