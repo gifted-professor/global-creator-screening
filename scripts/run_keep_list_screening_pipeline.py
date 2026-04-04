@@ -560,6 +560,14 @@ def _extract_missing_profile_reviews(scrape_job: dict[str, Any] | None) -> list[
     ]
 
 
+def _extract_fallback_profile_reviews(scrape_job: dict[str, Any] | None) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in _extract_scrape_profile_reviews(scrape_job)
+        if str((item or {}).get("status") or "").strip() in {"Missing", "Reject"}
+    ]
+
+
 def _build_missing_profile_summary(profile_reviews: list[dict[str, Any]]) -> list[dict[str, Any]]:
     summaries: list[dict[str, Any]] = []
     for item in profile_reviews:
@@ -570,6 +578,22 @@ def _build_missing_profile_summary(profile_reviews: list[dict[str, Any]]) -> lis
             "profile_url": str(item.get("profile_url") or upload_metadata.get("url") or "").strip(),
             "reason": str(item.get("reason") or "").strip(),
         })
+    return summaries
+
+
+def _build_fallback_profile_summary(profile_reviews: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    for item in profile_reviews:
+        upload_metadata = dict(item.get("upload_metadata") or {})
+        identifier = str(item.get("username") or upload_metadata.get("handle") or "").strip()
+        summaries.append(
+            {
+                "identifier": identifier,
+                "profile_url": str(item.get("profile_url") or upload_metadata.get("url") or "").strip(),
+                "reason": str(item.get("reason") or "").strip(),
+                "status": str(item.get("status") or "").strip(),
+            }
+        )
     return summaries
 
 
@@ -1481,12 +1505,17 @@ def run_keep_list_screening_pipeline(
                 pass_count = _resolve_scrape_pass_count(scrape_job, count_passed_profiles)
                 missing_reviews = _extract_missing_profile_reviews(scrape_job)
                 missing_profiles = _build_missing_profile_summary(missing_reviews)
+                fallback_reviews = _extract_fallback_profile_reviews(scrape_job)
+                fallback_profiles = _build_fallback_profile_summary(fallback_reviews)
                 available_identifiers = _extract_available_profile_identifiers(scrape_profile_reviews)
                 platform_summary["profile_review_count"] = len(scrape_profile_reviews)
                 platform_summary["prescreen_pass_count"] = pass_count
                 platform_summary["missing_profile_count"] = len(missing_profiles)
                 if missing_profiles:
                     platform_summary["missing_profiles"] = missing_profiles
+                platform_summary["fallback_candidate_count"] = len(fallback_profiles)
+                if fallback_profiles and len(fallback_profiles) != len(missing_profiles):
+                    platform_summary["fallback_candidates_preview"] = fallback_profiles[:10]
                 platform_summary["visual_gate"] = {
                     "executed": False,
                     "skip_visual_flag": bool(skip_visual),
@@ -1495,7 +1524,7 @@ def run_keep_list_screening_pipeline(
                     "configured_provider_names": platform_summary["vision_preflight"]["configured_provider_names"],
                     "selected_provider": platform_summary["vision_preflight"].get("preferred_provider") or "",
                 }
-                if missing_profiles:
+                if fallback_profiles:
                     current_lookup = dict(backend_app.load_upload_metadata(platform) or {})
                     next_platform = _resolve_next_fallback_platform(platform, execution_platforms)
                     current_has_fallback_contract = any(
@@ -1507,7 +1536,7 @@ def run_keep_list_screening_pipeline(
                             or str((current_lookup.get(str(item.get("identifier") or "").strip()) or {}).get("instagram_url") or "").strip()
                             or str((current_lookup.get(str(item.get("identifier") or "").strip()) or {}).get("youtube_url") or "").strip()
                         )
-                        for item in missing_profiles
+                        for item in fallback_profiles
                     )
                     fallback_supported = bool(
                         next_platform
@@ -1516,7 +1545,7 @@ def run_keep_list_screening_pipeline(
                             or
                             str((current_lookup.get(str(item.get("identifier") or "").strip()) or {}).get("platform_attempt_order") or "").strip()
                             or str((current_lookup.get(str(item.get("identifier") or "").strip()) or {}).get(f"{next_platform}_url") or "").strip()
-                            for item in missing_profiles
+                            for item in fallback_profiles
                         )
                     )
                     if fallback_supported and next_platform:
@@ -1524,7 +1553,7 @@ def run_keep_list_screening_pipeline(
                             backend_app=backend_app,
                             current_platform=platform,
                             next_platform=next_platform,
-                            missing_profiles=missing_profiles,
+                            missing_profiles=fallback_profiles,
                         )
                         platform_summary["fallback"] = {
                             "status": "staged" if int(fallback_result.get("staged_count") or 0) > 0 else "unavailable",
@@ -1536,33 +1565,36 @@ def run_keep_list_screening_pipeline(
                         unresolved_missing = list(fallback_result.get("unresolved_missing") or [])
                     else:
                         if not current_has_fallback_contract:
-                            platform_summary["visual_gate"]["blocked"] = True
-                            platform_summary["visual_gate"]["reason"] = "prescreen contains Missing targets"
-                            platform_summary["visual_job"] = {
-                                "status": "skipped",
-                                "reason": "名单账号未在本次抓取结果中返回，已阻断视觉复核和最终导出",
-                            }
-                            platform_summary["positioning_card_analysis"] = _build_positioning_stage_payload(
-                                "skipped",
-                                "missing profiles blocked downstream stages",
-                            )
-                            platform_summary["artifact_status"] = require_success(
-                                client.get(f"/api/artifacts/{platform}/status"),
-                                f"{platform} artifact status",
-                            )
-                            platform_summary["exports"] = {}
-                            platform_summary["status"] = "missing_profiles_blocked"
-                            _persist_platform_summary(
-                                summary=summary,
-                                run_summary_path=run_summary_path,
-                                backend_app=backend_app,
-                                platform=platform,
-                                platform_summary=platform_summary,
-                                current_stage="missing_profiles_blocked",
-                                summary_writer=persist_summary,
-                            )
-                            continue
-                        unresolved_missing = list(missing_profiles)
+                            if not missing_profiles:
+                                unresolved_missing = []
+                            else:
+                                platform_summary["visual_gate"]["blocked"] = True
+                                platform_summary["visual_gate"]["reason"] = "prescreen contains Missing targets"
+                                platform_summary["visual_job"] = {
+                                    "status": "skipped",
+                                    "reason": "名单账号未在本次抓取结果中返回，已阻断视觉复核和最终导出",
+                                }
+                                platform_summary["positioning_card_analysis"] = _build_positioning_stage_payload(
+                                    "skipped",
+                                    "missing profiles blocked downstream stages",
+                                )
+                                platform_summary["artifact_status"] = require_success(
+                                    client.get(f"/api/artifacts/{platform}/status"),
+                                    f"{platform} artifact status",
+                                )
+                                platform_summary["exports"] = {}
+                                platform_summary["status"] = "missing_profiles_blocked"
+                                _persist_platform_summary(
+                                    summary=summary,
+                                    run_summary_path=run_summary_path,
+                                    backend_app=backend_app,
+                                    platform=platform,
+                                    platform_summary=platform_summary,
+                                    current_stage="missing_profiles_blocked",
+                                    summary_writer=persist_summary,
+                                )
+                                continue
+                        unresolved_missing = list(fallback_profiles)
                     if unresolved_missing:
                         manual_rows = []
                         for item in unresolved_missing:
