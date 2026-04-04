@@ -213,6 +213,7 @@ def _query_keyword_messages(
     sql = """
         SELECT
             m.id,
+            COALESCE(mi.thread_key, '') AS thread_key,
             m.folder_name,
             m.subject,
             m.sent_at,
@@ -223,8 +224,11 @@ def _query_keyword_messages(
             m.reply_to_json,
             m.sender_json,
             m.snippet,
+            m.body_text,
+            m.body_html,
             m.raw_path
         FROM messages m
+        LEFT JOIN message_index mi ON mi.message_row_id = m.id
         WHERE (
             LOWER(COALESCE(m.subject, '')) LIKE ?
             OR LOWER(COALESCE(m.snippet, '')) LIKE ?

@@ -36,6 +36,7 @@ def _load_runtime_dependencies():
     from email_sync.creator_enrichment import enrich_creator_workbook
     from email_sync.db import Database
     from email_sync.llm_review import prepare_llm_review_candidates, run_and_apply_llm_review
+    from email_sync.mail_thread_funnel import build_mail_thread_funnel_keep_workbook
     from email_sync.date_windows import resolve_sync_sent_since
     from email_sync.shared_email_resolution import resolve_shared_email_candidates, run_shared_email_final_review
     from feishu_screening_bridge.feishu_api import DEFAULT_FEISHU_BASE_URL, FeishuOpenClient
@@ -62,6 +63,7 @@ def _load_runtime_dependencies():
         "enrich_creator_workbook": enrich_creator_workbook,
         "prepare_llm_review_candidates": prepare_llm_review_candidates,
         "run_and_apply_llm_review": run_and_apply_llm_review,
+        "build_mail_thread_funnel_keep_workbook": build_mail_thread_funnel_keep_workbook,
         "resolve_sync_sent_since": resolve_sync_sent_since,
         "load_local_env": load_local_env,
         "get_preferred_value": get_preferred_value,
@@ -692,8 +694,9 @@ def run_task_upload_to_keep_list_pipeline(
     llm_prefix = exports_dir / f"{task_slug}_匹配结果_高置信_按我们去重"
     brand_match_prefix = exports_dir / f"{task_slug}_brand_keyword_match"
     shared_resolution_prefix = exports_dir / f"{task_slug}_shared_email_resolution"
+    mail_funnel_prefix = exports_dir / f"{task_slug}_mail_thread_funnel"
     step_order = (
-        ["task_assets", "mail_sync", "brand_match", "shared_resolution", "final_review"]
+        ["task_assets", "mail_sync", "brand_match", "mail_funnel"]
         if normalized_matching_strategy == "brand-keyword-fast-path"
         else ["task_assets", "mail_sync", "enrichment", "llm_candidates", "llm_review"]
     )
@@ -921,6 +924,7 @@ def run_task_upload_to_keep_list_pipeline(
         sync_task_upload_mailboxes = runtime["sync_task_upload_mailboxes"]
         Database = runtime["Database"]
         match_brand_keyword = runtime["match_brand_keyword"]
+        build_mail_thread_funnel_keep_workbook = runtime.get("build_mail_thread_funnel_keep_workbook")
         resolve_shared_email_candidates = runtime["resolve_shared_email_candidates"]
         run_shared_email_final_review = runtime["run_shared_email_final_review"]
         enrich_creator_workbook = runtime["enrich_creator_workbook"]
@@ -1374,7 +1378,7 @@ def run_task_upload_to_keep_list_pipeline(
                         input_path=Path(summary["artifacts"]["sending_list_workbook"]),
                         output_prefix=brand_match_prefix,
                         keyword=resolved_brand_keyword,
-                        sent_since=resolve_sync_sent_since(sent_since or None),
+                        sent_since=resolve_sync_sent_since(resolved_sent_since or None),
                         include_from=bool(brand_match_include_from),
                     )
                 finally:
@@ -1429,149 +1433,234 @@ def run_task_upload_to_keep_list_pipeline(
             persist_summary(summary)
             if normalized_stop_after == "brand-match":
                 return mark_stop("brand-match")
-
-            shared_resolution_existing = existing_summary.get("steps", {}).get("shared_resolution", {}) if existing_summary else {}
-            shared_resolution_reused = bool(
-                reuse_existing
-                and downstream_reuse_allowed
-                and brand_match_reused
-                and _step_artifacts_exist(
-                    shared_resolution_existing,
-                    ("resolved_xlsx", "unresolved_xlsx", "llm_candidates_jsonl"),
-                )
-            )
-            if shared_resolution_reused:
-                shared_resolution_step = _json_clone(shared_resolution_existing)
-                shared_resolution_step["status"] = "reused"
-                shared_resolution_step["reused"] = True
-            else:
-                db = Database(Path(mail_sync_step["artifacts"]["mail_db_path"]))
-                try:
-                    shared_resolution_result = resolve_shared_email_candidates(
-                        db=db,
-                        input_path=Path(brand_match_step["artifacts"]["shared_xlsx"]),
-                        output_prefix=shared_resolution_prefix,
+            if build_mail_thread_funnel_keep_workbook is not None:
+                mail_funnel_existing = existing_summary.get("steps", {}).get("mail_funnel", {}) if existing_summary else {}
+                mail_funnel_reused = bool(
+                    reuse_existing
+                    and downstream_reuse_allowed
+                    and brand_match_reused
+                    and _step_artifacts_exist(
+                        mail_funnel_existing,
+                        ("review_xlsx", "keep_xlsx", "manual_tail_xlsx"),
                     )
-                finally:
-                    db.close()
-                shared_resolution_step = {
-                    "status": "completed",
-                    "reused": False,
-                    "stats": {
-                        "resolved_group_count": shared_resolution_result.get("resolved_group_count", 0),
-                        "resolved_row_count": shared_resolution_result.get("resolved_row_count", 0),
-                        "unresolved_group_count": shared_resolution_result.get("unresolved_group_count", 0),
-                        "unresolved_row_count": shared_resolution_result.get("unresolved_row_count", 0),
-                        "llm_candidate_group_count": shared_resolution_result.get("llm_candidate_group_count", 0),
-                    },
-                    "artifacts": {
-                        "resolved_xlsx": str(shared_resolution_result.get("resolved_xlsx_path") or ""),
-                        "unresolved_xlsx": str(shared_resolution_result.get("unresolved_xlsx_path") or ""),
-                        "llm_candidates_jsonl": str(shared_resolution_result.get("llm_candidates_jsonl_path") or ""),
-                    },
-                }
-            shared_resolution_mode, shared_resolution_reason = _resolve_execution_details(
-                reused=shared_resolution_reused,
-                existing_summary_accepted=existing_summary_accepted,
-                rerun_reason="shared_resolution_inputs_changed_or_resume_artifacts_missing",
-            )
-            shared_resolution_step = _annotate_step_payload(
-                shared_resolution_step,
-                execution_mode=shared_resolution_mode,
-                execution_reason=shared_resolution_reason,
-                input_refs={
-                    "mail_db_path": mail_sync_step["artifacts"]["mail_db_path"],
-                    "shared_email_workbook": brand_match_step["artifacts"]["shared_xlsx"],
-                },
-                owned_artifact_keys=("resolved_xlsx", "unresolved_xlsx", "llm_candidates_jsonl"),
-                resume_point_key="shared_resolution",
-                reuse_supported=True,
-                stage_policy="reuse_only_if_brand_match_reused",
-            )
-            summary["steps"]["shared_resolution"] = shared_resolution_step
-            summary["artifacts"]["content_resolved_xlsx"] = shared_resolution_step["artifacts"]["resolved_xlsx"]
-            summary["artifacts"]["content_unresolved_xlsx"] = shared_resolution_step["artifacts"]["unresolved_xlsx"]
-            summary["resume_points"]["shared_resolution"] = {
-                "resolved_workbook": shared_resolution_step["artifacts"]["resolved_xlsx"],
-                "unresolved_workbook": shared_resolution_step["artifacts"]["unresolved_xlsx"],
-                "llm_candidates_jsonl": shared_resolution_step["artifacts"]["llm_candidates_jsonl"],
-            }
-            persist_summary(summary)
-            if normalized_stop_after == "shared-resolution":
-                return mark_stop("shared-resolution")
-
-            final_review_existing = existing_summary.get("steps", {}).get("final_review", {}) if existing_summary else {}
-            final_review_reused = bool(
-                reuse_existing
-                and downstream_reuse_allowed
-                and brand_match_reused
-                and shared_resolution_reused
-                and _step_artifacts_exist(
-                    final_review_existing,
-                    ("llm_review_jsonl", "manual_tail_xlsx", "keep_xlsx"),
                 )
-            )
-            if final_review_reused:
-                final_review_step = _json_clone(final_review_existing)
-                final_review_step["status"] = "reused"
-                final_review_step["reused"] = True
+                if mail_funnel_reused:
+                    mail_funnel_step = _json_clone(mail_funnel_existing)
+                    mail_funnel_step["status"] = "reused"
+                    mail_funnel_step["reused"] = True
+                else:
+                    db = Database(Path(mail_sync_step["artifacts"]["mail_db_path"]))
+                    try:
+                        mail_funnel_result = build_mail_thread_funnel_keep_workbook(
+                            db=db,
+                            input_path=Path(summary["artifacts"]["sending_list_workbook"]),
+                            output_prefix=mail_funnel_prefix,
+                            keyword=resolved_brand_keyword,
+                            sent_since=resolve_sync_sent_since(resolved_sent_since or None),
+                            include_from=bool(brand_match_include_from),
+                            env_path=env_file,
+                            base_url=str(base_url or "").strip() or None,
+                            api_key=str(api_key or "").strip() or None,
+                            model=str(model or "").strip() or None,
+                            wire_api=str(wire_api or "").strip() or None,
+                        )
+                    finally:
+                        db.close()
+                    mail_funnel_step = {
+                        "status": "completed",
+                        "reused": False,
+                        "stats": {
+                            "message_hit_count": mail_funnel_result.get("message_hit_count", 0),
+                            "external_message_count": mail_funnel_result.get("external_message_count", 0),
+                            "pass0_sending_list_email_count": mail_funnel_result.get("pass0_sending_list_email_count", 0),
+                            "regex_pass1_count": mail_funnel_result.get("regex_pass1_count", 0),
+                            "regex_pass2_count": mail_funnel_result.get("regex_pass2_count", 0),
+                            "llm_high_count": mail_funnel_result.get("llm_high_count", 0),
+                            "manual_row_count": mail_funnel_result.get("manual_row_count", 0),
+                            "filtered_auto_reply_count": mail_funnel_result.get("filtered_auto_reply_count", 0),
+                            "no_match_count": mail_funnel_result.get("no_match_count", 0),
+                            "keep_row_count": mail_funnel_result.get("keep_row_count", 0),
+                        },
+                        "artifacts": {
+                            "review_xlsx": str(mail_funnel_result.get("review_xlsx_path") or ""),
+                            "keep_xlsx": str(mail_funnel_result.get("keep_xlsx_path") or ""),
+                            "manual_tail_xlsx": str(mail_funnel_result.get("manual_tail_xlsx_path") or ""),
+                        },
+                    }
+                mail_funnel_mode, mail_funnel_reason = _resolve_execution_details(
+                    reused=mail_funnel_reused,
+                    existing_summary_accepted=existing_summary_accepted,
+                    rerun_reason="mail_funnel_inputs_changed_or_resume_artifacts_missing",
+                )
+                mail_funnel_step = _annotate_step_payload(
+                    mail_funnel_step,
+                    execution_mode=mail_funnel_mode,
+                    execution_reason=mail_funnel_reason,
+                    input_refs={
+                        "mail_db_path": mail_sync_step["artifacts"]["mail_db_path"],
+                        "sending_list_workbook": summary["artifacts"]["sending_list_workbook"],
+                        "brand_match_workbook": brand_match_step["artifacts"]["all_xlsx"],
+                    },
+                    owned_artifact_keys=("review_xlsx", "keep_xlsx", "manual_tail_xlsx"),
+                    resume_point_key="keep_list",
+                    reuse_supported=True,
+                    stage_policy="reuse_only_if_brand_match_reused",
+                )
+                summary["steps"]["mail_funnel"] = mail_funnel_step
+                summary["artifacts"]["mail_funnel_review_xlsx"] = mail_funnel_step["artifacts"]["review_xlsx"]
+                summary["artifacts"]["manual_tail_xlsx"] = mail_funnel_step["artifacts"]["manual_tail_xlsx"]
+                summary["artifacts"]["keep_workbook"] = mail_funnel_step["artifacts"]["keep_xlsx"]
+                summary["resume_points"]["keep_list"] = {
+                    "keep_workbook": mail_funnel_step["artifacts"]["keep_xlsx"],
+                    "manual_tail_xlsx": mail_funnel_step["artifacts"]["manual_tail_xlsx"],
+                    "mail_funnel_review_xlsx": mail_funnel_step["artifacts"]["review_xlsx"],
+                }
+                persist_summary(summary)
+                if normalized_stop_after == "shared-resolution":
+                    return mark_stop("shared-resolution")
             else:
-                final_review_result = run_shared_email_final_review(
-                    input_prefix=shared_resolution_prefix,
-                    env_path=env_file,
-                    auto_keep_paths=[
-                        Path(brand_match_step["artifacts"]["unique_xlsx"]),
-                        Path(shared_resolution_step["artifacts"]["resolved_xlsx"]),
-                    ],
-                    base_url=str(base_url or "").strip() or None,
-                    api_key=str(api_key or "").strip() or None,
-                    model=str(model or "").strip() or None,
-                    wire_api=str(wire_api or "").strip() or None,
+                shared_resolution_existing = existing_summary.get("steps", {}).get("shared_resolution", {}) if existing_summary else {}
+                shared_resolution_reused = bool(
+                    reuse_existing
+                    and downstream_reuse_allowed
+                    and brand_match_reused
+                    and _step_artifacts_exist(
+                        shared_resolution_existing,
+                        ("resolved_xlsx", "unresolved_xlsx", "llm_candidates_jsonl"),
+                    )
                 )
-                final_review_step = {
-                    "status": "completed",
-                    "reused": False,
-                    "stats": {
-                        "review_group_count": final_review_result.get("review_group_count", 0),
-                        "llm_resolved_row_count": final_review_result.get("llm_resolved_row_count", 0),
-                        "manual_row_count": final_review_result.get("manual_row_count", 0),
-                        "final_keep_row_count": final_review_result.get("final_keep_row_count", 0),
-                        "retryable_failure_count": final_review_result.get("retryable_failure_count", 0),
+                if shared_resolution_reused:
+                    shared_resolution_step = _json_clone(shared_resolution_existing)
+                    shared_resolution_step["status"] = "reused"
+                    shared_resolution_step["reused"] = True
+                else:
+                    db = Database(Path(mail_sync_step["artifacts"]["mail_db_path"]))
+                    try:
+                        shared_resolution_result = resolve_shared_email_candidates(
+                            db=db,
+                            input_path=Path(brand_match_step["artifacts"]["shared_xlsx"]),
+                            output_prefix=shared_resolution_prefix,
+                        )
+                    finally:
+                        db.close()
+                    shared_resolution_step = {
+                        "status": "completed",
+                        "reused": False,
+                        "stats": {
+                            "resolved_group_count": shared_resolution_result.get("resolved_group_count", 0),
+                            "resolved_row_count": shared_resolution_result.get("resolved_row_count", 0),
+                            "unresolved_group_count": shared_resolution_result.get("unresolved_group_count", 0),
+                            "unresolved_row_count": shared_resolution_result.get("unresolved_row_count", 0),
+                            "llm_candidate_group_count": shared_resolution_result.get("llm_candidate_group_count", 0),
+                        },
+                        "artifacts": {
+                            "resolved_xlsx": str(shared_resolution_result.get("resolved_xlsx_path") or ""),
+                            "unresolved_xlsx": str(shared_resolution_result.get("unresolved_xlsx_path") or ""),
+                            "llm_candidates_jsonl": str(shared_resolution_result.get("llm_candidates_jsonl_path") or ""),
+                        },
+                    }
+                shared_resolution_mode, shared_resolution_reason = _resolve_execution_details(
+                    reused=shared_resolution_reused,
+                    existing_summary_accepted=existing_summary_accepted,
+                    rerun_reason="shared_resolution_inputs_changed_or_resume_artifacts_missing",
+                )
+                shared_resolution_step = _annotate_step_payload(
+                    shared_resolution_step,
+                    execution_mode=shared_resolution_mode,
+                    execution_reason=shared_resolution_reason,
+                    input_refs={
+                        "mail_db_path": mail_sync_step["artifacts"]["mail_db_path"],
+                        "shared_email_workbook": brand_match_step["artifacts"]["shared_xlsx"],
                     },
-                    "selected_provider": str(final_review_result.get("selected_provider") or ""),
-                    "selected_model": str(final_review_result.get("selected_model") or ""),
-                    "selected_wire_api": str(final_review_result.get("selected_wire_api") or ""),
-                    "provider_attempts": list(final_review_result.get("provider_attempts") or []),
-                    "absorbed_failures": list(final_review_result.get("absorbed_failures") or []),
-                    "artifacts": {
-                        "llm_review_jsonl": str(final_review_result.get("llm_review_jsonl_path") or ""),
-                        "llm_resolved_xlsx": str(final_review_result.get("llm_resolved_xlsx_path") or ""),
-                        "manual_tail_xlsx": str(final_review_result.get("manual_tail_xlsx_path") or ""),
-                        "keep_xlsx": str(final_review_result.get("final_keep_xlsx_path") or ""),
-                    },
-                }
-            final_review_mode, final_review_reason = _resolve_execution_details(
-                reused=final_review_reused,
-                existing_summary_accepted=existing_summary_accepted,
-                rerun_reason="final_review_inputs_changed_or_resume_artifacts_missing",
-            )
-            final_review_step = _annotate_step_payload(
-                final_review_step,
-                execution_mode=final_review_mode,
-                execution_reason=final_review_reason,
-                input_refs={
-                    "unique_email_workbook": brand_match_step["artifacts"]["unique_xlsx"],
+                    owned_artifact_keys=("resolved_xlsx", "unresolved_xlsx", "llm_candidates_jsonl"),
+                    resume_point_key="shared_resolution",
+                    reuse_supported=True,
+                    stage_policy="reuse_only_if_brand_match_reused",
+                )
+                summary["steps"]["shared_resolution"] = shared_resolution_step
+                summary["artifacts"]["content_resolved_xlsx"] = shared_resolution_step["artifacts"]["resolved_xlsx"]
+                summary["artifacts"]["content_unresolved_xlsx"] = shared_resolution_step["artifacts"]["unresolved_xlsx"]
+                summary["resume_points"]["shared_resolution"] = {
                     "resolved_workbook": shared_resolution_step["artifacts"]["resolved_xlsx"],
+                    "unresolved_workbook": shared_resolution_step["artifacts"]["unresolved_xlsx"],
                     "llm_candidates_jsonl": shared_resolution_step["artifacts"]["llm_candidates_jsonl"],
-                },
-                owned_artifact_keys=("llm_review_jsonl", "llm_resolved_xlsx", "manual_tail_xlsx", "keep_xlsx"),
-                resume_point_key="keep_list",
-                reuse_supported=True,
-                stage_policy="reuse_only_if_shared_resolution_reused",
-            )
-            summary["steps"]["final_review"] = final_review_step
-            summary["artifacts"]["manual_tail_xlsx"] = final_review_step["artifacts"]["manual_tail_xlsx"]
-            summary["artifacts"]["keep_workbook"] = final_review_step["artifacts"]["keep_xlsx"]
+                }
+                persist_summary(summary)
+                if normalized_stop_after == "shared-resolution":
+                    return mark_stop("shared-resolution")
+
+                final_review_existing = existing_summary.get("steps", {}).get("final_review", {}) if existing_summary else {}
+                final_review_reused = bool(
+                    reuse_existing
+                    and downstream_reuse_allowed
+                    and brand_match_reused
+                    and shared_resolution_reused
+                    and _step_artifacts_exist(
+                        final_review_existing,
+                        ("llm_review_jsonl", "manual_tail_xlsx", "keep_xlsx"),
+                    )
+                )
+                if final_review_reused:
+                    final_review_step = _json_clone(final_review_existing)
+                    final_review_step["status"] = "reused"
+                    final_review_step["reused"] = True
+                else:
+                    final_review_result = run_shared_email_final_review(
+                        input_prefix=shared_resolution_prefix,
+                        env_path=env_file,
+                        auto_keep_paths=[
+                            Path(brand_match_step["artifacts"]["unique_xlsx"]),
+                            Path(shared_resolution_step["artifacts"]["resolved_xlsx"]),
+                        ],
+                        base_url=str(base_url or "").strip() or None,
+                        api_key=str(api_key or "").strip() or None,
+                        model=str(model or "").strip() or None,
+                        wire_api=str(wire_api or "").strip() or None,
+                    )
+                    final_review_step = {
+                        "status": "completed",
+                        "reused": False,
+                        "stats": {
+                            "review_group_count": final_review_result.get("review_group_count", 0),
+                            "llm_resolved_row_count": final_review_result.get("llm_resolved_row_count", 0),
+                            "manual_row_count": final_review_result.get("manual_row_count", 0),
+                            "final_keep_row_count": final_review_result.get("final_keep_row_count", 0),
+                            "retryable_failure_count": final_review_result.get("retryable_failure_count", 0),
+                        },
+                        "selected_provider": str(final_review_result.get("selected_provider") or ""),
+                        "selected_model": str(final_review_result.get("selected_model") or ""),
+                        "selected_wire_api": str(final_review_result.get("selected_wire_api") or ""),
+                        "provider_attempts": list(final_review_result.get("provider_attempts") or []),
+                        "absorbed_failures": list(final_review_result.get("absorbed_failures") or []),
+                        "artifacts": {
+                            "llm_review_jsonl": str(final_review_result.get("llm_review_jsonl_path") or ""),
+                            "llm_resolved_xlsx": str(final_review_result.get("llm_resolved_xlsx_path") or ""),
+                            "manual_tail_xlsx": str(final_review_result.get("manual_tail_xlsx_path") or ""),
+                            "keep_xlsx": str(final_review_result.get("final_keep_xlsx_path") or ""),
+                        },
+                    }
+                final_review_mode, final_review_reason = _resolve_execution_details(
+                    reused=final_review_reused,
+                    existing_summary_accepted=existing_summary_accepted,
+                    rerun_reason="final_review_inputs_changed_or_resume_artifacts_missing",
+                )
+                final_review_step = _annotate_step_payload(
+                    final_review_step,
+                    execution_mode=final_review_mode,
+                    execution_reason=final_review_reason,
+                    input_refs={
+                        "unique_email_workbook": brand_match_step["artifacts"]["unique_xlsx"],
+                        "resolved_workbook": shared_resolution_step["artifacts"]["resolved_xlsx"],
+                        "llm_candidates_jsonl": shared_resolution_step["artifacts"]["llm_candidates_jsonl"],
+                    },
+                    owned_artifact_keys=("llm_review_jsonl", "llm_resolved_xlsx", "manual_tail_xlsx", "keep_xlsx"),
+                    resume_point_key="keep_list",
+                    reuse_supported=True,
+                    stage_policy="reuse_only_if_shared_resolution_reused",
+                )
+                summary["steps"]["final_review"] = final_review_step
+                summary["artifacts"]["manual_tail_xlsx"] = final_review_step["artifacts"]["manual_tail_xlsx"]
+                summary["artifacts"]["keep_workbook"] = final_review_step["artifacts"]["keep_xlsx"]
         else:
             enrichment_existing = existing_summary.get("steps", {}).get("enrichment", {}) if existing_summary else {}
             enrichment_reused = bool(
@@ -1765,10 +1854,14 @@ def run_task_upload_to_keep_list_pipeline(
             summary["steps"]["llm_review"] = llm_review_step
             summary["artifacts"]["keep_workbook"] = llm_review_step["artifacts"]["keep_xlsx"]
 
-        summary["resume_points"]["keep_list"] = {
-            "keep_workbook": summary["artifacts"]["keep_workbook"],
-            "template_workbook": summary["artifacts"]["template_workbook"],
-        }
+        keep_list_resume_point = dict(summary["resume_points"].get("keep_list") or {})
+        keep_list_resume_point.update(
+            {
+                "keep_workbook": summary["artifacts"]["keep_workbook"],
+                "template_workbook": summary["artifacts"]["template_workbook"],
+            }
+        )
+        summary["resume_points"]["keep_list"] = keep_list_resume_point
         summary["canonical_artifacts"]["keep_list"] = _json_clone(summary["resume_points"]["keep_list"])
         summary["downstream_handoff"] = {
             "boundary_step": "keep-list",

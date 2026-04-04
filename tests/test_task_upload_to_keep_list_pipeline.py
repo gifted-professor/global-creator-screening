@@ -1115,6 +1115,161 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
         self.assertEqual(summary["resolved_inputs"]["mail_sync"]["task_start_date"], "2026-04-01")
         self.assertEqual(observed["sent_since"], "2026-04-01")
 
+    def test_runner_passes_task_start_date_sent_since_into_mail_funnel_fast_path(self) -> None:
+        observed: dict[str, object] = {}
+
+        class FakeDb:
+            def __init__(self, db_path):
+                self.db_path = Path(db_path)
+
+            def close(self):
+                return None
+
+        def fake_download_task_upload_screening_assets(**kwargs):
+            download_dir = Path(kwargs["download_dir"])
+            template_path = download_dir / "template.xlsx"
+            sending_list_path = download_dir / "sending_list.xlsx"
+            template_path.parent.mkdir(parents=True, exist_ok=True)
+            template_path.touch()
+            sending_list_path.touch()
+            return {
+                "recordId": "rec123",
+                "taskName": "MINISO",
+                "taskStartDate": "2026-04-01",
+                "linkedBitableUrl": "https://bitable.example/miniso",
+                "templateDownloadedPath": str(template_path),
+                "sendingListDownloadedPath": str(sending_list_path),
+            }
+
+        def fake_sync_task_upload_mailboxes(**kwargs):
+            observed["mail_sync_sent_since"] = kwargs["sent_since"]
+            mail_root = Path(kwargs["mail_data_dir"])
+            db_path = mail_root / "MINISO" / "email_sync.db"
+            raw_dir = mail_root / "MINISO" / "raw"
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            db_path.touch()
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            return {
+                "selectedCount": 1,
+                "syncedCount": 1,
+                "failedCount": 0,
+                "items": [
+                    {
+                        "taskName": "MINISO",
+                        "employeeName": "Alice",
+                        "resolvedFolder": "其他文件夹/MINISO",
+                        "mailFetchedCount": 3,
+                        "mailSyncOk": True,
+                        "mailSyncError": "",
+                        "mailDbPath": str(db_path),
+                        "mailRawDir": str(raw_dir),
+                        "mailDataDir": str(db_path.parent),
+                    }
+                ],
+            }
+
+        def fake_match_brand_keyword(*, db, input_path, output_prefix, keyword, sent_since, include_from):
+            observed["brand_match_sent_since"] = str(sent_since)
+            all_xlsx = output_prefix.with_suffix(".xlsx")
+            deduped_xlsx = output_prefix.with_name(f"{output_prefix.name}_deduped").with_suffix(".xlsx")
+            unique_xlsx = output_prefix.with_name(f"{output_prefix.name}_unique").with_suffix(".xlsx")
+            shared_xlsx = output_prefix.with_name(f"{output_prefix.name}_shared").with_suffix(".xlsx")
+            for path in (all_xlsx, deduped_xlsx, unique_xlsx, shared_xlsx):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+            return {
+                "source_kind": "sending_list",
+                "message_hit_count": 3,
+                "matched_email_count": 1,
+                "email_direct_match_row_count": 1,
+                "profile_deduped_row_count": 1,
+                "unique_email_row_count": 1,
+                "shared_email_row_count": 0,
+                "shared_email_group_count": 0,
+                "xlsx_path": str(all_xlsx),
+                "deduped_xlsx_path": str(deduped_xlsx),
+                "unique_xlsx_path": str(unique_xlsx),
+                "shared_xlsx_path": str(shared_xlsx),
+            }
+
+        def fake_build_mail_thread_funnel_keep_workbook(
+            *,
+            db,
+            input_path,
+            output_prefix,
+            keyword,
+            sent_since,
+            include_from,
+            env_path,
+            base_url,
+            api_key,
+            model,
+            wire_api,
+        ):
+            observed["mail_funnel_sent_since"] = str(sent_since)
+            review_xlsx = output_prefix.with_suffix(".xlsx")
+            keep_xlsx = output_prefix.with_name(f"{output_prefix.name}_keep").with_suffix(".xlsx")
+            manual_tail_xlsx = output_prefix.with_name(f"{output_prefix.name}_manual_tail").with_suffix(".xlsx")
+            for path in (review_xlsx, keep_xlsx, manual_tail_xlsx):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+            return {
+                "message_hit_count": 3,
+                "external_message_count": 2,
+                "pass0_sending_list_email_count": 1,
+                "regex_pass1_count": 1,
+                "regex_pass2_count": 0,
+                "llm_high_count": 0,
+                "manual_row_count": 0,
+                "filtered_auto_reply_count": 0,
+                "no_match_count": 0,
+                "keep_row_count": 2,
+                "review_xlsx_path": str(review_xlsx),
+                "keep_xlsx_path": str(keep_xlsx),
+                "manual_tail_xlsx_path": str(manual_tail_xlsx),
+            }
+
+        task_runner._load_runtime_dependencies = lambda: {
+            "Settings": object,
+            "Database": FakeDb,
+            "FeishuOpenClient": lambda **kwargs: object(),
+            "DEFAULT_FEISHU_BASE_URL": "https://open.feishu.cn",
+            "download_task_upload_screening_assets": fake_download_task_upload_screening_assets,
+            "sync_task_upload_mailboxes": fake_sync_task_upload_mailboxes,
+            "match_brand_keyword": fake_match_brand_keyword,
+            "build_mail_thread_funnel_keep_workbook": fake_build_mail_thread_funnel_keep_workbook,
+            "resolve_shared_email_candidates": lambda **kwargs: (_ for _ in ()).throw(AssertionError("shared resolution should not run")),
+            "run_shared_email_final_review": lambda **kwargs: (_ for _ in ()).throw(AssertionError("final review should not run")),
+            "enrich_creator_workbook": lambda **kwargs: (_ for _ in ()).throw(AssertionError("legacy enrichment should not run")),
+            "prepare_llm_review_candidates": lambda **kwargs: (_ for _ in ()).throw(AssertionError("legacy llm candidates should not run")),
+            "run_and_apply_llm_review": lambda **kwargs: (_ for _ in ()).throw(AssertionError("legacy llm review should not run")),
+            "resolve_sync_sent_since": lambda value: __import__("datetime").date.fromisoformat(value) if value else __import__("datetime").date(2025, 12, 27),
+            "load_local_env": lambda env_file: {},
+            "get_preferred_value": lambda cli_value, env_values, env_key, default="": str(cli_value or "").strip() or str(env_values.get(env_key, default) or "").strip(),
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            env_path = self._write_env_file(temp_root)
+            summary = task_runner.run_task_upload_to_keep_list_pipeline(
+                task_name="MINISO",
+                env_file=env_path,
+                output_root=temp_root / "run",
+                summary_json=temp_root / "run" / "summary.json",
+                stop_after="keep-list",
+                matching_strategy="brand-keyword-fast-path",
+                task_upload_url="https://example.com/task",
+                employee_info_url="https://example.com/employee",
+                feishu_app_id="app-id",
+                feishu_app_secret="app-secret",
+            )
+
+        self.assertEqual(summary["status"], "stopped_after_keep-list")
+        self.assertEqual(summary["resolved_inputs"]["mail_sync"]["sent_since"], "2026-04-01")
+        self.assertEqual(observed["mail_sync_sent_since"], "2026-04-01")
+        self.assertEqual(observed["brand_match_sent_since"], "2026-04-01")
+        self.assertEqual(observed["mail_funnel_sent_since"], "2026-04-01")
+
     def test_runner_prefers_cli_sent_since_over_task_upload_start_date(self) -> None:
         observed: dict[str, object] = {}
 
@@ -1696,81 +1851,41 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
                 "shared_xlsx_path": str(shared_xlsx),
             }
 
-        def fake_resolve_shared_email_candidates(*, db, input_path, output_prefix):
-            resolved_xlsx = output_prefix.with_name(f"{output_prefix.name}_resolved").with_suffix(".xlsx")
-            unresolved_xlsx = output_prefix.with_name(f"{output_prefix.name}_unresolved").with_suffix(".xlsx")
-            llm_candidates = output_prefix.with_name(f"{output_prefix.name}_llm_candidates").with_suffix(".jsonl")
-            for path in (resolved_xlsx, unresolved_xlsx, llm_candidates):
+        def fake_build_mail_thread_funnel_keep_workbook(
+            *,
+            db,
+            input_path,
+            output_prefix,
+            keyword,
+            sent_since,
+            include_from,
+            env_path,
+            base_url,
+            api_key,
+            model,
+            wire_api,
+        ):
+            review_xlsx = output_prefix.with_suffix(".xlsx")
+            keep_xlsx = output_prefix.with_name(f"{output_prefix.name}_keep").with_suffix(".xlsx")
+            manual_tail_xlsx = output_prefix.with_name(f"{output_prefix.name}_manual_tail").with_suffix(".xlsx")
+            for path in (review_xlsx, keep_xlsx, manual_tail_xlsx):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.touch()
+            self.assertEqual(str(sent_since), "2025-12-27")
             return {
-                "resolved_xlsx_path": str(resolved_xlsx),
-                "unresolved_xlsx_path": str(unresolved_xlsx),
-                "llm_candidates_jsonl_path": str(llm_candidates),
-                "resolved_group_count": 1,
-                "resolved_row_count": 1,
-                "unresolved_group_count": 1,
-                "unresolved_row_count": 2,
-                "llm_candidate_group_count": 1,
-            }
-
-        def fake_run_shared_email_final_review(*, input_prefix, env_path, auto_keep_paths, base_url, api_key, model, wire_api):
-            llm_review = input_prefix.with_name(f"{input_prefix.name}_llm_review").with_suffix(".jsonl")
-            llm_resolved = input_prefix.with_name(f"{input_prefix.name}_llm_resolved").with_suffix(".xlsx")
-            manual_tail = input_prefix.with_name(f"{input_prefix.name}_manual_tail").with_suffix(".xlsx")
-            final_keep = input_prefix.with_name(f"{input_prefix.name}_final_keep").with_suffix(".xlsx")
-            for path in (llm_review, llm_resolved, manual_tail, final_keep):
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.touch()
-            return {
-                "llm_review_jsonl_path": str(llm_review),
-                "llm_resolved_xlsx_path": str(llm_resolved),
-                "manual_tail_xlsx_path": str(manual_tail),
-                "final_keep_xlsx_path": str(final_keep),
-                "review_group_count": 1,
-                "llm_resolved_row_count": 1,
-                "manual_row_count": 1,
-                "final_keep_row_count": 6,
-                "retryable_failure_count": 1,
-                "selected_provider": "Secondary",
-                "selected_model": "qwen-max",
-                "selected_wire_api": "responses",
-                "provider_attempts": [
-                    {
-                        "candidate_stage": "primary",
-                        "provider": "Primary",
-                        "model": "gpt-5.4",
-                        "wire_api": "responses",
-                        "attempt_count": 1,
-                        "success_count": 0,
-                        "failure_count": 1,
-                        "retryable_failure_count": 1,
-                        "last_error": "SSLEOFError",
-                    },
-                    {
-                        "candidate_stage": "secondary",
-                        "provider": "Secondary",
-                        "model": "qwen-max",
-                        "wire_api": "responses",
-                        "attempt_count": 1,
-                        "success_count": 1,
-                        "failure_count": 0,
-                        "retryable_failure_count": 0,
-                        "last_error": "",
-                    },
-                ],
-                "absorbed_failures": [
-                    {
-                        "candidate_stage": "primary",
-                        "provider": "Primary",
-                        "model": "gpt-5.4",
-                        "wire_api": "responses",
-                        "error": "SSLEOFError",
-                        "retryable": True,
-                        "recovered_by_provider": "Secondary",
-                        "recovered_by_model": "qwen-max",
-                    }
-                ],
+                "message_hit_count": 20,
+                "external_message_count": 18,
+                "pass0_sending_list_email_count": 5,
+                "regex_pass1_count": 8,
+                "regex_pass2_count": 3,
+                "llm_high_count": 2,
+                "manual_row_count": 4,
+                "filtered_auto_reply_count": 1,
+                "no_match_count": 0,
+                "keep_row_count": 18,
+                "review_xlsx_path": str(review_xlsx),
+                "keep_xlsx_path": str(keep_xlsx),
+                "manual_tail_xlsx_path": str(manual_tail_xlsx),
             }
 
         def fail_legacy(*args, **kwargs):
@@ -1784,8 +1899,9 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
             "download_task_upload_screening_assets": fake_download_task_upload_screening_assets,
             "sync_task_upload_mailboxes": fake_sync_task_upload_mailboxes,
             "match_brand_keyword": fake_match_brand_keyword,
-            "resolve_shared_email_candidates": fake_resolve_shared_email_candidates,
-            "run_shared_email_final_review": fake_run_shared_email_final_review,
+            "resolve_shared_email_candidates": lambda **kwargs: (_ for _ in ()).throw(AssertionError("shared resolution should not run when mail funnel is wired")),
+            "run_shared_email_final_review": lambda **kwargs: (_ for _ in ()).throw(AssertionError("shared email final review should not run when mail funnel is wired")),
+            "build_mail_thread_funnel_keep_workbook": fake_build_mail_thread_funnel_keep_workbook,
             "enrich_creator_workbook": fail_legacy,
             "prepare_llm_review_candidates": fail_legacy,
             "run_and_apply_llm_review": fail_legacy,
@@ -1812,17 +1928,19 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
         self.assertEqual(summary["status"], "stopped_after_keep-list")
         self.assertEqual(summary["matching_strategy"], "brand-keyword-fast-path")
         self.assertEqual(summary["steps"]["brand_match"]["status"], "completed")
-        self.assertEqual(summary["steps"]["shared_resolution"]["status"], "completed")
-        self.assertEqual(summary["steps"]["final_review"]["status"], "completed")
-        self.assertEqual(summary["steps"]["final_review"]["selected_provider"], "Secondary")
-        self.assertEqual(summary["steps"]["final_review"]["selected_model"], "qwen-max")
-        self.assertEqual(summary["steps"]["final_review"]["stats"]["retryable_failure_count"], 1)
-        self.assertEqual(len(summary["steps"]["final_review"]["provider_attempts"]), 2)
-        self.assertEqual(len(summary["steps"]["final_review"]["absorbed_failures"]), 1)
+        self.assertEqual(summary["steps"]["mail_funnel"]["status"], "completed")
+        self.assertNotIn("shared_resolution", summary["steps"])
+        self.assertNotIn("final_review", summary["steps"])
         self.assertNotIn("enrichment", summary["steps"])
-        self.assertTrue(summary["artifacts"]["keep_workbook"].endswith("_final_keep.xlsx"))
+        self.assertTrue(summary["artifacts"]["keep_workbook"].endswith("_keep.xlsx"))
         self.assertTrue(summary["artifacts"]["manual_tail_xlsx"].endswith("_manual_tail.xlsx"))
-        self.assertEqual(summary["resume_points"]["brand_match"]["shared_email_workbook"], summary["artifacts"]["brand_match_shared_xlsx"])
+        self.assertEqual(summary["steps"]["mail_funnel"]["stats"]["pass0_sending_list_email_count"], 5)
+        self.assertEqual(summary["steps"]["mail_funnel"]["stats"]["regex_pass1_count"], 8)
+        self.assertEqual(summary["steps"]["mail_funnel"]["stats"]["llm_high_count"], 2)
+        self.assertEqual(
+            summary["steps"]["mail_funnel"]["artifacts"]["review_xlsx"],
+            summary["resume_points"]["keep_list"]["mail_funnel_review_xlsx"],
+        )
 
 
 if __name__ == "__main__":
