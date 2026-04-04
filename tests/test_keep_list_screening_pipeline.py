@@ -2606,6 +2606,98 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         self.assertEqual(summary["platforms"]["instagram"]["status"], "completed")
         self.assertEqual(export_calls, ["instagram"])
 
+    def test_runner_attaches_structured_failure_when_no_platform_succeeds(self) -> None:
+        preflight = {
+            "status": "configured",
+            "error_code": "",
+            "message": "视觉模型已就绪：openai",
+            "configured_provider_names": ["openai"],
+            "runnable_provider_names": ["openai"],
+            "preferred_provider": "openai",
+            "providers": [{"name": "openai", "runnable": True}],
+        }
+        backend_app = FakeBackendApp(
+            preflight,
+            metadata={
+                "tiktok": {"alpha": {"handle": "alpha"}},
+                "instagram": {"beta": {"handle": "beta"}},
+                "youtube": {"gamma": {"handle": "gamma"}},
+            },
+        )
+
+        def fake_prepare_screening_inputs(**kwargs):
+            return {
+                "prepared_at": "2026-03-28T01:02:03Z",
+                "upload": {"stats": {"TikTok": 1, "Instagram": 1, "YouTube": 1}},
+            }
+
+        def fake_build_all_platforms_final_review_artifacts(**kwargs):
+            payload_json_path = Path(kwargs["payload_json_path"])
+            payload_json_path.parent.mkdir(parents=True, exist_ok=True)
+            payload_json_path.write_text(json.dumps({"rows": []}, ensure_ascii=False), encoding="utf-8")
+            workbook_path = Path(kwargs["output_path"])
+            workbook_path.write_text("placeholder", encoding="utf-8")
+            return {
+                "all_platforms_final_review": str(workbook_path),
+                "all_platforms_upload_payload_json": str(payload_json_path),
+                "all_platforms_upload_local_archive_dir": "",
+                "all_platforms_upload_skipped_archive_json": "",
+                "all_platforms_upload_skipped_archive_xlsx": "",
+                "row_count": 0,
+                "source_row_count": 0,
+                "skipped_row_count": 0,
+            }
+
+        def fake_require_success(response, label):
+            if label.endswith("scrape start"):
+                raise RuntimeError(f"{label} timeout")
+            return response.get_json()
+
+        keep_list_runner._load_runtime_dependencies = lambda: {
+            "backend_app": backend_app,
+            "build_all_platforms_final_review_artifacts": fake_build_all_platforms_final_review_artifacts,
+            "collect_final_exports": lambda platforms: {},
+            "prepare_screening_inputs": fake_prepare_screening_inputs,
+            "count_passed_profiles": lambda scrape_job: 0,
+            "export_platform_artifacts": lambda client, platform, export_dir: {},
+            "poll_job": lambda client, job_id, label, interval: {},
+            "require_success": fake_require_success,
+            "reset_backend_runtime_state": lambda: None,
+            "upload_final_review_payload_to_bitable": lambda client, **kwargs: (_ for _ in ()).throw(
+                AssertionError("upload should not be called when no platform succeeds")
+            ),
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            keep_path = temp_root / "keep.xlsx"
+            template_path = temp_root / "template.xlsx"
+            keep_path.touch()
+            template_path.touch()
+            env_path = self._write_env_file(temp_root)
+            summary = keep_list_runner.run_keep_list_screening_pipeline(
+                keep_workbook=keep_path,
+                template_workbook=template_path,
+                env_file=env_path,
+                output_root=temp_root / "run",
+                platform_filters=["tiktok", "instagram", "youtube"],
+                skip_visual=True,
+                skip_positioning_card_analysis=True,
+            )
+
+        self.assertEqual(summary["status"], "failed")
+        self.assertEqual(summary["error_code"], "NO_SUCCESSFUL_PLATFORMS")
+        self.assertEqual(summary["verdict"]["outcome"], "failed")
+        self.assertEqual(summary["verdict"]["recommended_action"], "inspect_runtime")
+        self.assertEqual(summary["failure"]["stage"], "platform_runtime")
+        self.assertEqual(summary["failure_decision"]["category"], "runtime")
+        self.assertEqual(summary["artifacts"]["all_platforms_upload_source_row_count"], 0)
+        self.assertEqual(summary["artifacts"]["all_platforms_upload_row_count"], 0)
+        self.assertEqual(summary["artifacts"]["feishu_upload_result_json"], "")
+        self.assertEqual(summary["platforms"]["tiktok"]["status"], "failed")
+        self.assertEqual(summary["platforms"]["instagram"]["status"], "failed")
+        self.assertEqual(summary["platforms"]["youtube"]["status"], "failed")
+
 
 if __name__ == "__main__":
     unittest.main()
