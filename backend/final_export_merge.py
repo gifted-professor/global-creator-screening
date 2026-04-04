@@ -193,12 +193,13 @@ def _combine_reason_with_note(base_text: Any, note: str) -> str:
     return f"{cleaned_base}；{cleaned_note}"
 
 
-def _build_quote_text(keep_row: dict[str, Any]) -> str:
+def _build_quote_text(keep_row: dict[str, Any], *, mail_body_text: Any = "") -> str:
     latest_quote_text = _clean_text(keep_row.get("latest_quote_text"))
     for candidate in (
         latest_quote_text,
         _clean_text(keep_row.get("last_mail_snippet")),
         _clean_text(keep_row.get("brand_message_snippet")),
+        _clean_text(mail_body_text),
     ):
         if not candidate:
             continue
@@ -248,6 +249,17 @@ def _median(values: list[float]) -> float | None:
     if not normalized:
         return None
     return float(statistics.median(normalized))
+
+
+def _average_post_engagement_rate(post_pairs: list[tuple[float, float]]) -> float | None:
+    rates: list[float] = []
+    for likes, views in post_pairs:
+        if likes is None or views is None or views <= 0:
+            continue
+        rates.append(float(likes) / float(views))
+    if not rates:
+        return None
+    return sum(rates) / len(rates)
 
 
 def _resolve_metric_note(apify_row: dict[str, Any], avg_views: Any) -> str:
@@ -456,16 +468,20 @@ def _build_metrics_from_raw_platform_data(platform: str, data: Any) -> dict[str,
             if not handle:
                 continue
             posts = item.get("latestPosts") or []
-            view_values = [
-                _coerce_number(post.get("videoViewCount"))
-                for post in posts
-                if isinstance(post, dict) and _coerce_number(post.get("videoViewCount")) is not None
-            ]
-            like_values = [
-                _coerce_number(post.get("likesCount"))
-                for post in posts
-                if isinstance(post, dict) and _coerce_number(post.get("likesCount")) is not None
-            ]
+            view_values: list[float] = []
+            like_values: list[float] = []
+            engagement_pairs: list[tuple[float, float]] = []
+            for post in posts:
+                if not isinstance(post, dict):
+                    continue
+                views = _coerce_number(post.get("videoViewCount"))
+                likes = _coerce_number(post.get("likesCount"))
+                if views is not None:
+                    view_values.append(views)
+                if likes is not None:
+                    like_values.append(likes)
+                if likes is not None and views is not None and views > 0:
+                    engagement_pairs.append((likes, views))
             avg_views = _average([value for value in view_values if value is not None])
             median_views = _median([value for value in view_values if value is not None])
             avg_likes = _average([value for value in like_values if value is not None])
@@ -475,6 +491,7 @@ def _build_metrics_from_raw_platform_data(platform: str, data: Any) -> dict[str,
                 "avg_views": avg_views,
                 "median_views": median_views,
                 "avg_likes": avg_likes,
+                "engagement_rate": _average_post_engagement_rate(engagement_pairs),
             }
         return metrics
 
@@ -491,7 +508,7 @@ def _build_metrics_from_raw_platform_data(platform: str, data: Any) -> dict[str,
             )
             if not handle:
                 continue
-            bucket = grouped.setdefault(handle, {"followers": None, "following": None, "views": [], "likes": []})
+            bucket = grouped.setdefault(handle, {"followers": None, "following": None, "views": [], "likes": [], "engagement_pairs": []})
             followers = _coerce_number((author_meta or {}).get("fans"))
             if followers is not None:
                 bucket["followers"] = followers
@@ -509,6 +526,8 @@ def _build_metrics_from_raw_platform_data(platform: str, data: Any) -> dict[str,
                 bucket["views"].append(play_count)
             if digg_count is not None:
                 bucket["likes"].append(digg_count)
+            if digg_count is not None and play_count is not None and play_count > 0:
+                bucket["engagement_pairs"].append((digg_count, play_count))
         for handle, bucket in grouped.items():
             metrics[handle] = {
                 "followers": bucket.get("followers"),
@@ -516,6 +535,7 @@ def _build_metrics_from_raw_platform_data(platform: str, data: Any) -> dict[str,
                 "avg_views": _average(bucket.get("views") or []),
                 "median_views": _median(bucket.get("views") or []),
                 "avg_likes": _average(bucket.get("likes") or []),
+                "engagement_rate": _average_post_engagement_rate(bucket.get("engagement_pairs") or []),
             }
         return metrics
     return {}
@@ -817,10 +837,13 @@ def build_all_platforms_final_review_artifacts(
             )
             avg_likes = _first_non_blank(apify_row.get("avg_likes"), record.get("upload_avg_likes"))
             engagement_rate = ""
+            post_level_engagement_rate = _coerce_number(apify_row.get("engagement_rate"))
             median_views_num = _coerce_number(median_views)
             avg_likes_num = _coerce_number(avg_likes)
             metric_note = _resolve_metric_note(apify_row, median_views)
-            if median_views_num is not None and median_views_num > 0 and avg_likes_num is not None:
+            if post_level_engagement_rate is not None and post_level_engagement_rate >= 0:
+                engagement_rate = _format_percentage(post_level_engagement_rate)
+            elif median_views_num is not None and median_views_num > 0 and avg_likes_num is not None:
                 engagement_rate = _format_percentage(avg_likes_num / median_views_num)
             else:
                 engagement_rate = _compute_engagement_rate(record)
@@ -888,7 +911,7 @@ def build_all_platforms_final_review_artifacts(
                 "Following": _format_k_value(_first_non_blank(apify_row.get("following"), record.get("upload_following"), "")),
                 "Median Views (K)": _format_k_value(median_views),
                 "互动率": engagement_rate,
-                "当前网红报价": _build_quote_text(keep_row),
+                "当前网红报价": _build_quote_text(keep_row, mail_body_text=mail_body_text),
                 "达人最后一次回复邮件时间": _format_date(
                     _first_non_blank(
                         keep_row.get("last_mail_time"),
@@ -990,7 +1013,7 @@ def build_all_platforms_final_review_artifacts(
             "Following": "",
             "Median Views (K)": "",
             "互动率": "",
-            "当前网红报价": _build_quote_text(keep_row),
+            "当前网红报价": _build_quote_text(keep_row, mail_body_text=mail_body_text),
             "达人最后一次回复邮件时间": _format_date(
                 _first_non_blank(
                     keep_row.get("last_mail_time"),

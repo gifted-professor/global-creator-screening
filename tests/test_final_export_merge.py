@@ -17,6 +17,7 @@ class FinalExportMergeTests(unittest.TestCase):
             root = Path(tmpdir)
             exports_dir = root / "exports"
             instagram_export = exports_dir / "instagram" / "instagram_final_review.xlsx"
+            instagram_positioning = exports_dir / "instagram" / "instagram_positioning_card_review.xlsx"
             instagram_export.parent.mkdir(parents=True, exist_ok=True)
 
             pd.DataFrame(
@@ -31,6 +32,19 @@ class FinalExportMergeTests(unittest.TestCase):
                     }
                 ]
             ).to_excel(instagram_export, index=False)
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "alpha",
+                        "username": "alpha",
+                        "profile_url": "https://www.instagram.com/alpha",
+                        "upload_handle": "alpha",
+                        "positioning_stage_status": "Completed",
+                        "positioning_labels": "家庭用品和家电-家庭博主",
+                        "fit_summary": "内容契合",
+                    }
+                ]
+            ).to_excel(instagram_positioning, index=False)
 
             keep_workbook = root / "upstream" / "exports" / "keep.xlsx"
             keep_workbook.parent.mkdir(parents=True, exist_ok=True)
@@ -148,6 +162,82 @@ class FinalExportMergeTests(unittest.TestCase):
             self.assertEqual(payload["rows"][0]["__brand_message_raw_path"], str(raw_mail_path))
             self.assertEqual(payload["rows"][0]["__last_mail_raw_path"], str(raw_mail_path))
             self.assertEqual(payload["rows"][0]["__feishu_attachment_local_paths"], [str(raw_mail_path.resolve())])
+
+    def test_quote_text_falls_back_to_resolved_full_body_when_snippet_has_no_quote(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            exports_dir = root / "exports"
+            tiktok_export = exports_dir / "tiktok" / "tiktok_final_review.xlsx"
+            tiktok_positioning = exports_dir / "tiktok" / "tiktok_positioning_card_review.xlsx"
+            tiktok_export.parent.mkdir(parents=True, exist_ok=True)
+
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "alpha",
+                        "username": "alpha",
+                        "profile_url": "https://www.tiktok.com/@alpha",
+                        "upload_handle": "alpha",
+                        "final_status": "Pass",
+                        "final_reason": "内容契合",
+                    }
+                ]
+            ).to_excel(tiktok_export, index=False)
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "alpha",
+                        "username": "alpha",
+                        "profile_url": "https://www.tiktok.com/@alpha",
+                        "upload_handle": "alpha",
+                        "positioning_stage_status": "Completed",
+                        "positioning_labels": "家庭用品和家电-家庭博主",
+                        "fit_summary": "适合家庭类合作",
+                    }
+                ]
+            ).to_excel(tiktok_positioning, index=False)
+
+            keep_workbook = root / "upstream" / "exports" / "keep.xlsx"
+            keep_workbook.parent.mkdir(parents=True, exist_ok=True)
+            raw_dir = root / "upstream" / "raw"
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            raw_mail_path = raw_dir / "alpha-brand-message.eml"
+            raw_mail_path.write_text(
+                "Subject: alpha\n\nHi team,\n\nOur full package is $1,500 USD for one video.",
+                encoding="utf-8",
+            )
+            pd.DataFrame(
+                [
+                    {
+                        "Platform": "TikTok",
+                        "@username": "alpha",
+                        "URL": "https://www.tiktok.com/@alpha",
+                        "brand_message_sent_at": "2026-03-30T21:55:31+00:00",
+                        "brand_message_snippet": "Hi team, thanks for reaching out.",
+                        "brand_message_raw_path": str(raw_mail_path),
+                    }
+                ]
+            ).to_excel(keep_workbook, index=False)
+
+            output_path = exports_dir / "all_platforms_final_review.xlsx"
+            payload_path = exports_dir / "all_platforms_final_review_payload.json"
+            build_all_platforms_final_review_artifacts(
+                output_path=output_path,
+                payload_json_path=payload_path,
+                final_exports={
+                    "tiktok": {
+                        "final_review": str(tiktok_export),
+                        "positioning_card_review": str(tiktok_positioning),
+                    }
+                },
+                keep_workbook=keep_workbook,
+                task_owner={"responsible_name": "陈俊仁"},
+            )
+
+            workbook = pd.read_excel(output_path)
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+            self.assertEqual(workbook.loc[0, "当前网红报价"], "$1,500 USD for one video")
+            self.assertEqual(payload["rows"][0]["当前网红报价"], "$1,500 USD for one video")
 
     def test_payload_carries_row_mail_file_and_shared_workbook_attachment_candidates(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -567,6 +657,158 @@ class FinalExportMergeTests(unittest.TestCase):
             ),
             "10.0%",
         )
+
+    def test_instagram_engagement_rate_uses_average_of_per_post_rates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            exports_dir = root / "exports"
+            instagram_export = exports_dir / "instagram" / "instagram_final_review.xlsx"
+            instagram_positioning = exports_dir / "instagram" / "instagram_positioning_card_review.xlsx"
+            instagram_export.parent.mkdir(parents=True, exist_ok=True)
+
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "alpha",
+                        "username": "alpha",
+                        "profile_url": "https://www.instagram.com/alpha",
+                        "upload_handle": "alpha",
+                        "final_status": "Pass",
+                        "final_reason": "内容契合",
+                    }
+                ]
+            ).to_excel(instagram_export, index=False)
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "alpha",
+                        "username": "alpha",
+                        "profile_url": "https://www.instagram.com/alpha",
+                        "upload_handle": "alpha",
+                        "positioning_stage_status": "Completed",
+                        "positioning_labels": "家庭用品和家电-家庭博主",
+                        "fit_summary": "内容契合",
+                    }
+                ]
+            ).to_excel(instagram_positioning, index=False)
+
+            cached_rows = {
+                "alpha": [
+                    {
+                        "username": "alpha",
+                        "url": "https://www.instagram.com/alpha",
+                        "followersCount": 50000,
+                        "followsCount": 1000,
+                        "latestPosts": [
+                            {"videoViewCount": 100, "likesCount": 50},
+                            {"videoViewCount": 10000, "likesCount": 1000},
+                        ],
+                    }
+                ]
+            }
+
+            output_path = exports_dir / "all_platforms_final_review.xlsx"
+            payload_path = exports_dir / "all_platforms_final_review_payload.json"
+            with patch(
+                "backend.final_export_merge.creator_cache.load_scrape_cache_entries",
+                return_value=cached_rows,
+            ):
+                build_all_platforms_final_review_artifacts(
+                    output_path=output_path,
+                    payload_json_path=payload_path,
+                    final_exports={
+                        "instagram": {
+                            "final_review": str(instagram_export),
+                            "positioning_card_review": str(instagram_positioning),
+                        }
+                    },
+                    task_owner={"responsible_name": "陈俊仁"},
+                )
+
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+            row = payload["rows"][0]
+            self.assertEqual(row["互动率"], "30.0%")
+
+    def test_tiktok_engagement_rate_uses_average_of_per_post_rates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            exports_dir = root / "exports"
+            tiktok_export = exports_dir / "tiktok" / "tiktok_final_review.xlsx"
+            tiktok_positioning = exports_dir / "tiktok" / "tiktok_positioning_card_review.xlsx"
+            tiktok_export.parent.mkdir(parents=True, exist_ok=True)
+
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "alpha",
+                        "username": "alpha",
+                        "profile_url": "https://www.tiktok.com/@alpha",
+                        "upload_handle": "alpha",
+                        "final_status": "Pass",
+                        "final_reason": "内容契合",
+                    }
+                ]
+            ).to_excel(tiktok_export, index=False)
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "alpha",
+                        "username": "alpha",
+                        "profile_url": "https://www.tiktok.com/@alpha",
+                        "upload_handle": "alpha",
+                        "positioning_stage_status": "Completed",
+                        "positioning_labels": "家庭用品和家电-家庭博主",
+                        "fit_summary": "内容契合",
+                    }
+                ]
+            ).to_excel(tiktok_positioning, index=False)
+
+            cached_rows = {
+                "alpha": [
+                    {
+                        "authorMeta": {
+                            "name": "alpha",
+                            "profileUrl": "https://www.tiktok.com/@alpha",
+                            "fans": 80000,
+                            "following": 500,
+                        },
+                        "playCount": 100,
+                        "diggCount": 50,
+                    },
+                    {
+                        "authorMeta": {
+                            "name": "alpha",
+                            "profileUrl": "https://www.tiktok.com/@alpha",
+                            "fans": 80000,
+                            "following": 500,
+                        },
+                        "playCount": 10000,
+                        "diggCount": 1000,
+                    },
+                ]
+            }
+
+            output_path = exports_dir / "all_platforms_final_review.xlsx"
+            payload_path = exports_dir / "all_platforms_final_review_payload.json"
+            with patch(
+                "backend.final_export_merge.creator_cache.load_scrape_cache_entries",
+                return_value=cached_rows,
+            ):
+                build_all_platforms_final_review_artifacts(
+                    output_path=output_path,
+                    payload_json_path=payload_path,
+                    final_exports={
+                        "tiktok": {
+                            "final_review": str(tiktok_export),
+                            "positioning_card_review": str(tiktok_positioning),
+                        }
+                    },
+                    task_owner={"responsible_name": "陈俊仁"},
+                )
+
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+            row = payload["rows"][0]
+            self.assertEqual(row["互动率"], "30.0%")
 
     def test_processing_failures_and_positioning_errors_are_explicit_in_combined_sheet(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

@@ -347,6 +347,7 @@ VISION_PROVIDER_CONFIGS = (
         "base_url_fallbacks_env_key": "VISION_REELX_BASE_URL_FALLBACKS",
         "default_base_url_fallbacks": DEFAULT_REELX_BASE_URL_FALLBACKS,
         "env_key": "VISION_REELX_API_KEY",
+        "fallback_api_key_env_key": "VISION_REELX_FALLBACK_API_KEY",
         "api_style": VISION_API_STYLE_GENERATE_CONTENT,
         "model_env_key": "VISION_REELX_MODEL",
         "default_model": DEFAULT_QWEN_VISION_MODEL,
@@ -1979,8 +1980,31 @@ def build_env_resolution_details(env_key):
 
 
 def resolve_vision_provider_api_key(provider):
+    candidates = resolve_vision_provider_api_key_candidates(provider)
+    return candidates[0] if candidates else ""
+
+
+def resolve_vision_provider_api_key_candidates(provider):
+    candidates = []
+
+    def _append(value):
+        cleaned = str(value or "").strip()
+        if cleaned and cleaned not in candidates:
+            candidates.append(cleaned)
+
     env_key = str((provider or {}).get("env_key") or "").strip()
-    return str(os.getenv(env_key, "") or "").strip()
+    if env_key:
+        _append(os.getenv(env_key, ""))
+
+    fallback_env_key = str((provider or {}).get("fallback_api_key_env_key") or "").strip()
+    if fallback_env_key:
+        for token in split_apify_token_list(os.getenv(fallback_env_key, "")):
+            _append(token)
+
+    for candidate in (provider or {}).get("api_key_candidates") or []:
+        _append(candidate)
+
+    return candidates
 
 
 def resolve_vision_provider_base_url(provider):
@@ -2528,7 +2552,8 @@ def build_positioning_card_prompt(provider_name, platform, username, model_name=
 
 def build_vision_provider_snapshot(provider):
     normalized_name = normalize_vision_provider_name((provider or {}).get("name"))
-    api_key = resolve_vision_provider_api_key(provider)
+    api_key_candidates = resolve_vision_provider_api_key_candidates(provider)
+    api_key = api_key_candidates[0] if api_key_candidates else ""
     base_url = resolve_vision_provider_base_url(provider)
     base_url_candidates = resolve_vision_provider_base_urls(provider)
     api_style = str((provider or {}).get("api_style") or VISION_API_STYLE_RESPONSES).strip().lower()
@@ -2565,6 +2590,7 @@ def build_vision_provider_snapshot(provider):
         "env_key": str((provider or {}).get("env_key") or "").strip(),
         "api_key_present": bool(api_key),
         "api_key_masked": mask_apify_token(api_key),
+        "api_key_fallback_count": max(0, len(api_key_candidates) - 1),
         "api_key_source": resolve_env_source((provider or {}).get("env_key")),
         "api_key_resolution": build_env_resolution_details((provider or {}).get("env_key")),
         "base_url": base_url,
@@ -2666,6 +2692,7 @@ def get_available_vision_providers(provider_name=None):
             **provider,
             "name": normalized_name,
             "api_key": resolve_vision_provider_api_key(provider),
+            "api_key_candidates": resolve_vision_provider_api_key_candidates(provider),
             "base_url": snapshot.get("base_url") or resolve_vision_provider_base_url(provider),
             "base_url_candidates": snapshot.get("base_url_candidates") or resolve_vision_provider_base_urls(provider),
             "model": snapshot.get("model") or resolve_vision_provider_model(provider),
@@ -4719,7 +4746,12 @@ def call_vision_provider_with_json_contract(
         raise VisionProviderError(provider_name, "base_url 未配置")
     configured_model = str(resolve_vision_provider_model(provider)).strip()
 
-    headers = build_vision_provider_headers(provider)
+    api_key_candidates = dedupe_non_empty_strings(
+        (provider.get("api_key_candidates") or resolve_vision_provider_api_key_candidates(provider))
+        or [provider.get("api_key")]
+    )
+    if not api_key_candidates:
+        raise VisionProviderError(provider_name, "api_key 未配置")
     last_error = None
     request_timeout = resolve_vision_provider_request_timeout(provider)
     model_candidates = (
@@ -4728,128 +4760,134 @@ def call_vision_provider_with_json_contract(
         else [resolve_vision_provider_model(provider)]
     )
     for model_name in model_candidates:
-        for candidate_index, candidate_base_url in enumerate(base_urls):
-            request_cover_limit_override = None
-            force_data_url_override = False
-            input_payload = None
-            is_last_candidate = (
-                model_name == model_candidates[-1] and candidate_index == len(base_urls) - 1
-            )
-            while True:
-                try:
-                    input_payload = build_input_fn(
-                        provider_name,
-                        platform,
-                        username,
-                        cover_urls,
-                        model_name=model_name or configured_model,
-                        api_style=api_style,
-                        force_data_url_override=force_data_url_override,
-                        request_cover_limit_override=request_cover_limit_override,
-                    )
-                except requests.exceptions.RequestException as exc:
-                    raise VisionProviderError(
-                        provider_name,
-                        sanitize_vision_provider_exception_message(exc),
-                        retryable=True,
-                    ) from exc
-                if api_style == VISION_API_STYLE_CHAT_COMPLETIONS:
-                    url = f"{candidate_base_url}/chat/completions"
-                    body = build_vision_provider_chat_body(provider, input_payload["chat"], model_override=model_name)
-                elif api_style == VISION_API_STYLE_GENERATE_CONTENT:
-                    url = f"{candidate_base_url}/models/{quote(str(model_name or '').strip(), safe='')}:generateContent"
-                    body = input_payload["generate_content"]
-                else:
-                    url = f"{candidate_base_url}/responses"
-                    body = {
-                        "model": model_name,
-                        "input": input_payload["responses"],
-                    }
-
-                try:
-                    with acquire_vision_provider_request_slot(provider, candidate_base_url, request_timeout):
-                        response = requests.post(url, headers=headers, json=body, timeout=request_timeout)
-                except requests.exceptions.RequestException as exc:
-                    last_error = VisionProviderError(
-                        provider_name,
-                        sanitize_vision_provider_exception_message(exc),
-                        retryable=True,
-                    )
-                    if not is_last_candidate:
-                        break
-                    raise last_error from exc
-                if response.status_code >= 400:
-                    error_message = build_vision_provider_http_error_message(response)
-                    if should_retry_visual_provider_with_inline_images(api_style, error_message) and not force_data_url_override:
-                        force_data_url_override = True
-                        request_cover_limit_override = resolve_inline_visual_retry_cover_limit(
-                            input_payload.get("selected_cover_count")
+        for api_key_index, api_key in enumerate(api_key_candidates):
+            current_provider = {**provider, "api_key": api_key}
+            headers = build_vision_provider_headers(current_provider)
+            for candidate_index, candidate_base_url in enumerate(base_urls):
+                request_cover_limit_override = None
+                force_data_url_override = False
+                input_payload = None
+                is_last_candidate = (
+                    model_name == model_candidates[-1]
+                    and api_key_index == len(api_key_candidates) - 1
+                    and candidate_index == len(base_urls) - 1
+                )
+                while True:
+                    try:
+                        input_payload = build_input_fn(
+                            provider_name,
+                            platform,
+                            username,
+                            cover_urls,
+                            model_name=model_name or configured_model,
+                            api_style=api_style,
+                            force_data_url_override=force_data_url_override,
+                            request_cover_limit_override=request_cover_limit_override,
                         )
-                        continue
-                    if api_style == VISION_API_STYLE_GENERATE_CONTENT and response.status_code == 413:
-                        reduced_cover_limit = reduce_visual_review_cover_limit(input_payload.get("selected_cover_count"))
-                        if reduced_cover_limit and reduced_cover_limit != request_cover_limit_override:
-                            request_cover_limit_override = reduced_cover_limit
+                    except requests.exceptions.RequestException as exc:
+                        raise VisionProviderError(
+                            provider_name,
+                            sanitize_vision_provider_exception_message(exc),
+                            retryable=True,
+                        ) from exc
+                    if api_style == VISION_API_STYLE_CHAT_COMPLETIONS:
+                        url = f"{candidate_base_url}/chat/completions"
+                        body = build_vision_provider_chat_body(current_provider, input_payload["chat"], model_override=model_name)
+                    elif api_style == VISION_API_STYLE_GENERATE_CONTENT:
+                        url = f"{candidate_base_url}/models/{quote(str(model_name or '').strip(), safe='')}:generateContent"
+                        body = input_payload["generate_content"]
+                    else:
+                        url = f"{candidate_base_url}/responses"
+                        body = {
+                            "model": model_name,
+                            "input": input_payload["responses"],
+                        }
+
+                    try:
+                        with acquire_vision_provider_request_slot(current_provider, candidate_base_url, request_timeout):
+                            response = requests.post(url, headers=headers, json=body, timeout=request_timeout)
+                    except requests.exceptions.RequestException as exc:
+                        last_error = VisionProviderError(
+                            provider_name,
+                            sanitize_vision_provider_exception_message(exc),
+                            retryable=True,
+                        )
+                        if not is_last_candidate:
+                            break
+                        raise last_error from exc
+                    if response.status_code >= 400:
+                        error_message = build_vision_provider_http_error_message(response)
+                        if should_retry_visual_provider_with_inline_images(api_style, error_message) and not force_data_url_override:
+                            force_data_url_override = True
+                            request_cover_limit_override = resolve_inline_visual_retry_cover_limit(
+                                input_payload.get("selected_cover_count")
+                            )
                             continue
-                    last_error = VisionProviderError(
-                        provider_name,
-                        error_message,
-                        status_code=response.status_code,
-                        retryable=response.status_code in VISUAL_REVIEW_RETRYABLE_STATUS_CODES,
-                    )
-                    if not is_last_candidate:
-                        break
-                    raise last_error
-                payload = parse_vision_provider_response_payload(response)
-                if should_retry_vision_payload(provider_name, payload):
-                    last_error = VisionProviderError(
-                        provider_name,
-                        "模型输出被截断，未返回最终 JSON",
-                        retryable=True,
-                    )
-                    if not is_last_candidate:
-                        break
-                    raise last_error
-                raw_text = extract_vision_response_text(payload)
-                text_error = extract_vision_provider_text_error(raw_text)
-                if text_error:
-                    last_error = VisionProviderError(
-                        provider_name,
-                        text_error["message"],
-                        status_code=text_error.get("status_code"),
-                        retryable=text_error.get("retryable", False),
-                    )
-                    if not is_last_candidate:
-                        break
-                    raise last_error
-                _cleaned_contract_text, contract_payload = parse_json_contract_payload(raw_text)
-                if not validate_payload_fn(contract_payload):
-                    last_error = VisionProviderError(
-                        provider_name,
-                        f"模型未返回合法的{contract_label} JSON contract",
-                        retryable=True,
-                    )
-                    if not is_last_candidate:
-                        break
-                    raise last_error
-                response_model = extract_vision_response_model(payload)
-                effective_model = str(response_model or model_name or configured_model).strip()
-                parsed = parse_result_fn(raw_text)
-                parsed["provider"] = provider_name
-                parsed["model"] = effective_model
-                parsed["configured_model"] = configured_model
-                parsed["requested_model"] = str(model_name or "").strip()
-                parsed["response_model"] = response_model
-                parsed["effective_model"] = effective_model
-                parsed["raw_text"] = raw_text
-                parsed["usage"] = extract_vision_usage(payload)
-                parsed["cover_count"] = input_payload.get("selected_cover_count")
-                parsed["candidate_cover_count"] = input_payload.get("candidate_cover_count")
-                parsed["skipped_cover_count"] = input_payload.get("skipped_cover_count")
-                parsed["prompt_source"] = input_payload.get("prompt_source")
-                parsed["prompt_selection"] = dict(input_payload.get("prompt_selection") or {})
-                parsed["base_url"] = candidate_base_url
-                return parsed
+                        if api_style == VISION_API_STYLE_GENERATE_CONTENT and response.status_code == 413:
+                            reduced_cover_limit = reduce_visual_review_cover_limit(input_payload.get("selected_cover_count"))
+                            if reduced_cover_limit and reduced_cover_limit != request_cover_limit_override:
+                                request_cover_limit_override = reduced_cover_limit
+                                continue
+                        last_error = VisionProviderError(
+                            provider_name,
+                            error_message,
+                            status_code=response.status_code,
+                            retryable=response.status_code in VISUAL_REVIEW_RETRYABLE_STATUS_CODES,
+                        )
+                        if not is_last_candidate:
+                            break
+                        raise last_error
+                    payload = parse_vision_provider_response_payload(response)
+                    if should_retry_vision_payload(provider_name, payload):
+                        last_error = VisionProviderError(
+                            provider_name,
+                            "模型输出被截断，未返回最终 JSON",
+                            retryable=True,
+                        )
+                        if not is_last_candidate:
+                            break
+                        raise last_error
+                    raw_text = extract_vision_response_text(payload)
+                    text_error = extract_vision_provider_text_error(raw_text)
+                    if text_error:
+                        last_error = VisionProviderError(
+                            provider_name,
+                            text_error["message"],
+                            status_code=text_error.get("status_code"),
+                            retryable=text_error.get("retryable", False),
+                        )
+                        if not is_last_candidate:
+                            break
+                        raise last_error
+                    _cleaned_contract_text, contract_payload = parse_json_contract_payload(raw_text)
+                    if not validate_payload_fn(contract_payload):
+                        last_error = VisionProviderError(
+                            provider_name,
+                            f"模型未返回合法的{contract_label} JSON contract",
+                            retryable=True,
+                        )
+                        if not is_last_candidate:
+                            break
+                        raise last_error
+                    response_model = extract_vision_response_model(payload)
+                    effective_model = str(response_model or model_name or configured_model).strip()
+                    parsed = parse_result_fn(raw_text)
+                    parsed["provider"] = provider_name
+                    parsed["model"] = effective_model
+                    parsed["configured_model"] = configured_model
+                    parsed["requested_model"] = str(model_name or "").strip()
+                    parsed["response_model"] = response_model
+                    parsed["effective_model"] = effective_model
+                    parsed["raw_text"] = raw_text
+                    parsed["usage"] = extract_vision_usage(payload)
+                    parsed["cover_count"] = input_payload.get("selected_cover_count")
+                    parsed["candidate_cover_count"] = input_payload.get("candidate_cover_count")
+                    parsed["skipped_cover_count"] = input_payload.get("skipped_cover_count")
+                    parsed["prompt_source"] = input_payload.get("prompt_source")
+                    parsed["prompt_selection"] = dict(input_payload.get("prompt_selection") or {})
+                    parsed["base_url"] = candidate_base_url
+                    parsed["api_key_masked"] = mask_apify_token(api_key)
+                    return parsed
     if last_error is not None:
         raise last_error
     raise VisionProviderError(provider_name, "视觉模型调用失败")
@@ -4921,6 +4959,12 @@ def build_vision_provider_probe_request(provider):
 
 
 def probe_vision_provider(provider):
+    api_key_candidates = dedupe_non_empty_strings(
+        (provider.get("api_key_candidates") or resolve_vision_provider_api_key_candidates(provider))
+        or [provider.get("api_key")]
+    )
+    if not api_key_candidates:
+        raise VisionProviderError(str((provider or {}).get("name") or "").strip(), "api_key 未配置")
     base_urls = [
         str(item or "").strip().rstrip("/")
         for item in ((provider or {}).get("base_url_candidates") or resolve_vision_provider_base_urls(provider))
@@ -4931,58 +4975,65 @@ def probe_vision_provider(provider):
         if fallback_base_url:
             base_urls = [fallback_base_url]
     last_error = None
-    for candidate_index, candidate_base_url in enumerate(base_urls):
-        request_payload = build_vision_provider_probe_request({**provider, "base_url": candidate_base_url})
-        try:
-            probe_timeout = min(VISION_REQUEST_TIMEOUT, 20)
-            with acquire_vision_provider_request_slot(provider, candidate_base_url, probe_timeout):
-                response = requests.post(
-                    request_payload["url"],
-                    headers=request_payload["headers"],
-                    json=request_payload["body"],
-                    timeout=probe_timeout,
+    for api_key_index, api_key in enumerate(api_key_candidates):
+        current_provider = {**provider, "api_key": api_key}
+        for candidate_index, candidate_base_url in enumerate(base_urls):
+            request_payload = build_vision_provider_probe_request({**current_provider, "base_url": candidate_base_url})
+            is_last_candidate = (
+                api_key_index == len(api_key_candidates) - 1
+                and candidate_index == len(base_urls) - 1
+            )
+            try:
+                probe_timeout = min(VISION_REQUEST_TIMEOUT, 20)
+                with acquire_vision_provider_request_slot(current_provider, candidate_base_url, probe_timeout):
+                    response = requests.post(
+                        request_payload["url"],
+                        headers=request_payload["headers"],
+                        json=request_payload["body"],
+                        timeout=probe_timeout,
+                    )
+            except requests.exceptions.RequestException as exc:
+                last_error = VisionProviderError(
+                    request_payload["provider_name"],
+                    sanitize_vision_provider_exception_message(exc),
+                    retryable=True,
                 )
-        except requests.exceptions.RequestException as exc:
-            last_error = VisionProviderError(
-                request_payload["provider_name"],
-                sanitize_vision_provider_exception_message(exc),
-                retryable=True,
-            )
-            if candidate_index != len(base_urls) - 1:
-                continue
-            raise last_error from exc
-        if response.status_code >= 400:
-            last_error = VisionProviderError(
-                request_payload["provider_name"],
-                build_vision_provider_http_error_message(response),
-                status_code=response.status_code,
-                retryable=response.status_code in VISUAL_REVIEW_RETRYABLE_STATUS_CODES,
-            )
-            if candidate_index != len(base_urls) - 1:
-                continue
-            raise last_error
-        payload = parse_vision_provider_response_payload(response)
-        raw_text = extract_vision_response_text(payload) if isinstance(payload, dict) else ""
-        text_error = extract_vision_provider_text_error(raw_text)
-        if text_error:
-            last_error = VisionProviderError(
-                request_payload["provider_name"],
-                text_error["message"],
-                status_code=text_error.get("status_code"),
-                retryable=text_error.get("retryable", False),
-            )
-            if candidate_index != len(base_urls) - 1:
-                continue
-            raise last_error
-        return {
-            "success": True,
-            "provider": request_payload["provider_name"],
-            "api_style": request_payload["api_style"],
-            "base_url": candidate_base_url,
-            "model": str((provider or {}).get("model") or resolve_vision_provider_model(provider)),
-            "checked_at": iso_now(),
-            "response_excerpt": str(raw_text or "").strip()[:160],
-        }
+                if not is_last_candidate:
+                    continue
+                raise last_error from exc
+            if response.status_code >= 400:
+                last_error = VisionProviderError(
+                    request_payload["provider_name"],
+                    build_vision_provider_http_error_message(response),
+                    status_code=response.status_code,
+                    retryable=response.status_code in VISUAL_REVIEW_RETRYABLE_STATUS_CODES,
+                )
+                if not is_last_candidate:
+                    continue
+                raise last_error
+            payload = parse_vision_provider_response_payload(response)
+            raw_text = extract_vision_response_text(payload) if isinstance(payload, dict) else ""
+            text_error = extract_vision_provider_text_error(raw_text)
+            if text_error:
+                last_error = VisionProviderError(
+                    request_payload["provider_name"],
+                    text_error["message"],
+                    status_code=text_error.get("status_code"),
+                    retryable=text_error.get("retryable", False),
+                )
+                if not is_last_candidate:
+                    continue
+                raise last_error
+            return {
+                "success": True,
+                "provider": request_payload["provider_name"],
+                "api_style": request_payload["api_style"],
+                "base_url": candidate_base_url,
+                "model": str((provider or {}).get("model") or resolve_vision_provider_model(provider)),
+                "checked_at": iso_now(),
+                "response_excerpt": str(raw_text or "").strip()[:160],
+                "api_key_masked": mask_apify_token(api_key),
+            }
     if last_error is not None:
         raise last_error
     raise VisionProviderError(str((provider or {}).get("name") or "").strip(), "视觉模型探测失败")

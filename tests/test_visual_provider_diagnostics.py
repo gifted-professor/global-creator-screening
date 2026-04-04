@@ -40,6 +40,8 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
         "OPENAI_VISION_MODEL",
         "VISION_MODEL",
         "VISION_PROVIDER_PREFERENCE",
+        "VISION_REELX_API_KEY",
+        "VISION_REELX_FALLBACK_API_KEY",
         "VISION_VISUAL_REVIEW_PROBE_RANKED_RETRY_ATTEMPTS",
         "VISUAL_REVIEW_ITEM_TIMEOUT_SECONDS",
         "CREATOR_CACHE_DB_PATH",
@@ -1634,6 +1636,38 @@ class VisualProviderConfigDefaultsTests(unittest.TestCase):
             ],
         )
 
+    def test_resolve_reelx_api_key_candidates_includes_fallback_key(self) -> None:
+        provider = next(item for item in backend_app.VISION_PROVIDER_CONFIGS if item["name"] == "reelx")
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "VISION_REELX_API_KEY": "reelx-primary-key",
+                "VISION_REELX_FALLBACK_API_KEY": "reelx-fallback-key",
+            },
+            clear=False,
+        ):
+            candidates = backend_app.resolve_vision_provider_api_key_candidates(provider)
+
+        self.assertEqual(candidates, ["reelx-primary-key", "reelx-fallback-key"])
+
+    def test_reelx_snapshot_is_runnable_with_only_fallback_api_key(self) -> None:
+        provider = next(item for item in backend_app.VISION_PROVIDER_CONFIGS if item["name"] == "reelx")
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "VISION_REELX_API_KEY": "",
+                "VISION_REELX_FALLBACK_API_KEY": "reelx-fallback-key",
+            },
+            clear=False,
+        ):
+            snapshot = backend_app.build_vision_provider_snapshot(provider)
+
+        self.assertTrue(snapshot["runnable"])
+        self.assertTrue(snapshot["api_key_present"])
+        self.assertEqual(snapshot["api_key_fallback_count"], 0)
+
     def test_mimo_defaults_to_chat_completions_with_api_key_header(self) -> None:
         provider = next(item for item in backend_app.VISION_PROVIDER_CONFIGS if item["name"] == "mimo")
 
@@ -2223,6 +2257,61 @@ data: [DONE]
         self.assertEqual(mocked_post.call_args_list[0].args[0], "https://llmxapi.com/v1beta/models/qwen-vl-max:generateContent")
         self.assertEqual(mocked_post.call_args_list[1].args[0], "https://reelxai.com/v1beta/models/qwen-vl-max:generateContent")
 
+    def test_call_vision_provider_retries_reelx_with_fallback_api_key(self) -> None:
+        provider = {
+            "name": "reelx",
+            "base_url": "https://llmxapi.com/v1beta",
+            "api_key": "reelx-primary-key",
+            "api_key_candidates": ["reelx-primary-key", "reelx-fallback-key"],
+            "api_style": backend_app.VISION_API_STYLE_GENERATE_CONTENT,
+            "default_model": "qwen-vl-max",
+            "default_fallback_model": "gemini-3-flash-preview",
+        }
+        unauthorized = DummyProviderResponse(
+            {"error": {"message": "invalid api key"}},
+            status_code=401,
+        )
+        success = DummyProviderResponse(
+            {
+                "modelVersion": "qwen-vl-max",
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [
+                                {
+                                    "text": '{"decision":"Pass","reason":"画面正常","signals":["无高风险信号"]}'
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+            status_code=200,
+        )
+
+        with mock.patch.object(
+            backend_app.requests,
+            "post",
+            side_effect=[unauthorized, success],
+        ) as mocked_post:
+            parsed = backend_app.call_vision_provider(
+                provider,
+                "instagram",
+                "alpha",
+                ["data:image/jpeg;base64,ZmFrZQ=="],
+            )
+
+        self.assertEqual(parsed["decision"], "Pass")
+        self.assertEqual(parsed["api_key_masked"], backend_app.mask_apify_token("reelx-fallback-key"))
+        self.assertEqual(
+            mocked_post.call_args_list[0].kwargs["headers"]["Authorization"],
+            "Bearer reelx-primary-key",
+        )
+        self.assertEqual(
+            mocked_post.call_args_list[1].kwargs["headers"]["Authorization"],
+            "Bearer reelx-fallback-key",
+        )
+
     def test_call_vision_provider_rejects_non_json_visual_contract(self) -> None:
         provider = {
             "name": "reelx",
@@ -2294,6 +2383,51 @@ data: [DONE]
         self.assertEqual(result["base_url"], "https://hk.llmxapi.com/v1beta")
         self.assertEqual(mocked_post.call_args_list[0].args[0], "https://llmxapi.com/v1beta/models/qwen-vl-max:generateContent")
         self.assertEqual(mocked_post.call_args_list[1].args[0], "https://hk.llmxapi.com/v1beta/models/qwen-vl-max:generateContent")
+
+    def test_probe_vision_provider_retries_reelx_with_fallback_api_key(self) -> None:
+        provider = {
+            "name": "reelx",
+            "base_url": "https://llmxapi.com/v1beta",
+            "api_key": "reelx-primary-key",
+            "api_key_candidates": ["reelx-primary-key", "reelx-fallback-key"],
+            "api_style": backend_app.VISION_API_STYLE_GENERATE_CONTENT,
+            "model": "qwen-vl-max",
+            "default_model": "qwen-vl-max",
+        }
+        unauthorized = DummyProviderResponse(
+            {"error": {"message": "invalid api key"}},
+            status_code=401,
+        )
+        success = DummyProviderResponse(
+            {
+                "candidates": [
+                    {
+                        "content": {
+                            "parts": [{"text": "ok"}]
+                        }
+                    }
+                ]
+            },
+            status_code=200,
+        )
+
+        with mock.patch.object(
+            backend_app.requests,
+            "post",
+            side_effect=[unauthorized, success],
+        ) as mocked_post:
+            result = backend_app.probe_vision_provider(provider)
+
+        self.assertTrue(result["success"])
+        self.assertEqual(result["api_key_masked"], backend_app.mask_apify_token("reelx-fallback-key"))
+        self.assertEqual(
+            mocked_post.call_args_list[0].kwargs["headers"]["Authorization"],
+            "Bearer reelx-primary-key",
+        )
+        self.assertEqual(
+            mocked_post.call_args_list[1].kwargs["headers"]["Authorization"],
+            "Bearer reelx-fallback-key",
+        )
 
     def test_call_vision_provider_sanitizes_html_413_without_base_url_leak(self) -> None:
         provider = {
