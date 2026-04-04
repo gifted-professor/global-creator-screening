@@ -428,9 +428,24 @@ def _collect_upload_validation_errors(row: dict[str, Any]) -> list[str]:
     profile_url = _clean_text(row.get("主页链接"))
     if profile_url and "://" not in profile_url:
         errors.append("主页链接格式无效")
-    if _clean_text(row.get("ai是否通过")) == "是" and _is_blank(row.get("标签(ai)")):
-        errors.append("通过记录缺少标签(ai)")
     return errors
+
+
+def _apply_missing_ai_label_fallback(
+    ai_pass_value: str,
+    ai_label_value: str,
+    screening_reason: str,
+    screening_comment: str,
+) -> tuple[str, str, str, str]:
+    if _clean_text(ai_pass_value) != "是" or _clean_text(ai_label_value):
+        return ai_pass_value, ai_label_value, screening_reason, screening_comment
+    fallback_note = "缺少标签(ai)，已自动转人工"
+    return (
+        "转人工",
+        ai_label_value,
+        _combine_reason_with_note(screening_reason, fallback_note),
+        _combine_reason_with_note(screening_comment, fallback_note),
+    )
 
 
 def _resolve_run_root_from_export(final_review_path: Path) -> Path | None:
@@ -518,6 +533,56 @@ def _load_mail_full_body_from_raw_path(
     return full_body
 
 
+def _load_mail_snapshot_from_raw_path(
+    raw_path: Any,
+    *,
+    base_dirs: list[Path | None] | None = None,
+    cache: dict[str, dict[str, str]] | None = None,
+) -> dict[str, str]:
+    resolved_paths = _resolve_existing_local_paths(raw_path, base_dirs=base_dirs)
+    if not resolved_paths:
+        return {"full_body": "", "from_email": "", "sent_at": ""}
+    resolved = str(Path(resolved_paths[0]).expanduser().resolve())
+    if cache is not None and resolved in cache:
+        return dict(cache[resolved])
+
+    snapshot = {"full_body": "", "from_email": "", "sent_at": ""}
+    try:
+        raw_bytes = Path(resolved).read_bytes()
+        parsed = parse_email_message(
+            raw_bytes,
+            account_email="",
+            folder_name="",
+            uid=0,
+            uidvalidity=0,
+            flags=[],
+            internal_date_raw=None,
+            size_bytes=len(raw_bytes),
+        )
+        snapshot["full_body"] = _clean_text(parsed.body_text) or _clean_text(parsed.snippet)
+        if not snapshot["full_body"]:
+            snapshot["full_body"] = _extract_mail_body_from_raw_text(raw_bytes.decode("utf-8", errors="replace"))
+        for addresses in (parsed.from_addresses, parsed.sender_addresses, parsed.reply_to_addresses):
+            for item in addresses:
+                email = _clean_text((item or {}).get("address"))
+                if email:
+                    snapshot["from_email"] = email
+                    break
+            if snapshot["from_email"]:
+                break
+        snapshot["sent_at"] = _clean_text(parsed.sent_at) or _clean_text(parsed.sent_at_raw)
+    except Exception:
+        try:
+            raw_text = Path(resolved).read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            raw_text = ""
+        snapshot["full_body"] = _extract_mail_body_from_raw_text(raw_text)
+
+    if cache is not None:
+        cache[resolved] = dict(snapshot)
+    return snapshot
+
+
 def _resolve_mail_full_body(
     keep_row: dict[str, Any],
     *,
@@ -539,6 +604,72 @@ def _resolve_mail_full_body(
             keep_row.get("brand_message_snippet"),
         )
     )
+
+
+def _resolve_keep_row_mail_context(
+    keep_row: dict[str, Any],
+    *,
+    last_mail_raw_path: Any = "",
+    base_dirs: list[Path | None] | None = None,
+    snapshot_cache: dict[str, dict[str, str]] | None = None,
+) -> dict[str, str]:
+    snapshot = _load_mail_snapshot_from_raw_path(
+        last_mail_raw_path or keep_row.get("last_mail_raw_path") or keep_row.get("brand_message_raw_path"),
+        base_dirs=base_dirs,
+        cache=snapshot_cache,
+    )
+    full_body = _clean_text(
+        _first_non_blank(
+            keep_row.get("last_mail_full_body"),
+            keep_row.get("brand_message_full_body"),
+            keep_row.get("latest_external_full_body"),
+            snapshot.get("full_body"),
+            keep_row.get("last_mail_snippet"),
+            keep_row.get("brand_message_snippet"),
+        )
+    )
+    clean_body = _clean_text(
+        _first_non_blank(
+            keep_row.get("latest_external_clean_body"),
+            keep_row.get("brand_message_snippet"),
+            full_body[:1000] if full_body else "",
+        )
+    )
+    return {
+        "creator_emails": _clean_text(_first_non_blank(keep_row.get("creator_emails"), keep_row.get("Email"))),
+        "matched_contact_email": _clean_text(
+            _first_non_blank(
+                keep_row.get("matched_contact_email"),
+                keep_row.get("matched_email"),
+            )
+        ),
+        "matched_contact_name": _clean_text(keep_row.get("matched_contact_name")),
+        "latest_external_from": _clean_text(
+            _first_non_blank(
+                keep_row.get("latest_external_from"),
+                snapshot.get("from_email"),
+                keep_row.get("matched_contact_email"),
+                keep_row.get("matched_email"),
+            )
+        ),
+        "latest_external_sent_at": _clean_text(
+            _first_non_blank(
+                keep_row.get("latest_external_sent_at"),
+                keep_row.get("last_mail_time"),
+                keep_row.get("brand_message_sent_at"),
+                snapshot.get("sent_at"),
+            )
+        ),
+        "latest_external_clean_body": clean_body,
+        "latest_external_full_body": full_body,
+        "resolution_stage_final": _clean_text(
+            _first_non_blank(
+                keep_row.get("resolution_stage_final"),
+                keep_row.get("resolution_stage"),
+                keep_row.get("resolution_method"),
+            )
+        ),
+    }
 
 
 def _build_metrics_from_raw_platform_data(platform: str, data: Any) -> dict[str, dict[str, float | None]]:
@@ -846,6 +977,7 @@ def build_all_platforms_final_review_artifacts(
     skipped_payload_rows: list[dict[str, Any]] = []
     seen_creator_keys: set[tuple[str, str]] = set()
     mail_body_cache: dict[str, str] = {}
+    mail_snapshot_cache: dict[str, dict[str, str]] = {}
 
     for platform, export_map in final_exports.items():
         final_review_path = Path(_clean_text((export_map or {}).get("final_review"))).expanduser()
@@ -884,6 +1016,20 @@ def build_all_platforms_final_review_artifacts(
                     keep_row.get("brand_message_raw_path"),
                 )
             )
+            mail_context = _resolve_keep_row_mail_context(
+                keep_row,
+                last_mail_raw_path=last_mail_raw_path,
+                base_dirs=[
+                    Path.cwd(),
+                    keep_workbook_path.parent if keep_workbook_path else None,
+                    final_review_path.parent,
+                    run_root,
+                    run_root / "upstream" if run_root else None,
+                    run_root / "upstream" / "exports" if run_root else None,
+                    run_root / "upstream" / "mail_data" if run_root else None,
+                ],
+                snapshot_cache=mail_snapshot_cache,
+            )
             row_attachment_paths = _resolve_existing_local_paths(
                 last_mail_raw_path,
                 base_dirs=[
@@ -910,6 +1056,8 @@ def build_all_platforms_final_review_artifacts(
                 ],
                 cache=mail_body_cache,
             )
+            if not mail_body_text:
+                mail_body_text = mail_context["latest_external_full_body"]
             median_views = _first_non_blank(
                 apify_row.get("median_views"),
                 record.get("runtime_median_views"),
@@ -978,6 +1126,13 @@ def build_all_platforms_final_review_artifacts(
             )
             screening_comment = _combine_reason_with_note(base_comment, metric_note)
             screening_comment = _combine_reason_with_note(screening_comment, positioning_comment_note)
+            ai_label_value = _clean_text(positioning_row.get("positioning_labels")) or positioning_label_note
+            ai_pass_value, ai_label_value, screening_reason, screening_comment = _apply_missing_ai_label_fallback(
+                ai_pass_value,
+                ai_label_value,
+                screening_reason,
+                screening_comment,
+            )
 
             display_row = {
                 "达人ID": _clean_text(
@@ -997,6 +1152,7 @@ def build_all_platforms_final_review_artifacts(
                 "当前网红报价": _build_quote_text(keep_row, mail_body_text=mail_body_text),
                 "达人最后一次回复邮件时间": _format_date(
                     _first_non_blank(
+                        mail_context.get("latest_external_sent_at"),
                         keep_row.get("last_mail_time"),
                         keep_row.get("brand_message_sent_at"),
                     )
@@ -1007,7 +1163,7 @@ def build_all_platforms_final_review_artifacts(
                 or owner_display_name,
                 "ai是否通过": ai_pass_value,
                 "ai筛号反馈理由": screening_reason,
-                "标签(ai)": _clean_text(positioning_row.get("positioning_labels")) or positioning_label_note,
+                "标签(ai)": ai_label_value,
                 "ai评价": screening_comment,
             }
             rows.append(display_row)
@@ -1019,9 +1175,14 @@ def build_all_platforms_final_review_artifacts(
                 {
                     "linked_bitable_url": _clean_text(row_owner_context.get("linked_bitable_url")),
                     "任务名": _clean_text(row_owner_context.get("task_name")),
-                    "creator_emails": _clean_text(keep_row.get("creator_emails")),
-                    "matched_contact_email": _clean_text(keep_row.get("matched_contact_email")),
-                    "matched_contact_name": _clean_text(keep_row.get("matched_contact_name")),
+                    "creator_emails": mail_context["creator_emails"],
+                    "matched_contact_email": mail_context["matched_contact_email"],
+                    "matched_contact_name": mail_context["matched_contact_name"],
+                    "latest_external_from": mail_context["latest_external_from"],
+                    "latest_external_sent_at": mail_context["latest_external_sent_at"],
+                    "latest_external_clean_body": mail_context["latest_external_clean_body"],
+                    "latest_external_full_body": mail_context["latest_external_full_body"],
+                    "resolution_stage_final": mail_context["resolution_stage_final"],
                     _ROW_UPDATE_MODE_KEY: _UPDATE_MODE_CREATE_OR_MAIL_ONLY,
                     "达人回复的最后一封邮件内容": mail_body_text,
                     "__brand_message_raw_path": _clean_text(keep_row.get("brand_message_raw_path")),
@@ -1072,6 +1233,15 @@ def build_all_platforms_final_review_artifacts(
                 keep_row.get("brand_message_raw_path"),
             )
         )
+        mail_context = _resolve_keep_row_mail_context(
+            keep_row,
+            last_mail_raw_path=last_mail_raw_path,
+            base_dirs=[
+                Path.cwd(),
+                keep_workbook_path.parent if keep_workbook_path else None,
+            ],
+            snapshot_cache=mail_snapshot_cache,
+        )
         row_attachment_paths = _resolve_existing_local_paths(
             last_mail_raw_path,
             base_dirs=[
@@ -1088,6 +1258,8 @@ def build_all_platforms_final_review_artifacts(
             ],
             cache=mail_body_cache,
         )
+        if not mail_body_text:
+            mail_body_text = mail_context["latest_external_full_body"]
         display_row = {
             "达人ID": _clean_text(_first_non_blank(handle, keep_row.get("@username"))),
             "平台": platform,
@@ -1099,6 +1271,7 @@ def build_all_platforms_final_review_artifacts(
             "当前网红报价": _build_quote_text(keep_row, mail_body_text=mail_body_text),
             "达人最后一次回复邮件时间": _format_date(
                 _first_non_blank(
+                    mail_context.get("latest_external_sent_at"),
                     keep_row.get("last_mail_time"),
                     keep_row.get("brand_message_sent_at"),
                 )
@@ -1120,9 +1293,14 @@ def build_all_platforms_final_review_artifacts(
             {
                 "linked_bitable_url": _clean_text(row_owner_context.get("linked_bitable_url")),
                 "任务名": _clean_text(row_owner_context.get("task_name")),
-                "creator_emails": _clean_text(keep_row.get("creator_emails")),
-                "matched_contact_email": _clean_text(keep_row.get("matched_contact_email")),
-                "matched_contact_name": _clean_text(keep_row.get("matched_contact_name")),
+                "creator_emails": mail_context["creator_emails"],
+                "matched_contact_email": mail_context["matched_contact_email"],
+                "matched_contact_name": mail_context["matched_contact_name"],
+                "latest_external_from": mail_context["latest_external_from"],
+                "latest_external_sent_at": mail_context["latest_external_sent_at"],
+                "latest_external_clean_body": mail_context["latest_external_clean_body"],
+                "latest_external_full_body": mail_context["latest_external_full_body"],
+                "resolution_stage_final": mail_context["resolution_stage_final"],
                 _ROW_UPDATE_MODE_KEY: _UPDATE_MODE_CREATE_OR_MAIL_ONLY,
                 "达人回复的最后一封邮件内容": mail_body_text,
                 "__brand_message_raw_path": _clean_text(keep_row.get("brand_message_raw_path")),

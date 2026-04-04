@@ -244,6 +244,7 @@ class FinalExportMergeTests(unittest.TestCase):
             root = Path(tmpdir)
             exports_dir = root / "exports"
             instagram_export = exports_dir / "instagram" / "instagram_final_review.xlsx"
+            instagram_positioning = exports_dir / "instagram" / "instagram_positioning_card_review.xlsx"
             instagram_export.parent.mkdir(parents=True, exist_ok=True)
 
             pd.DataFrame(
@@ -258,6 +259,19 @@ class FinalExportMergeTests(unittest.TestCase):
                     }
                 ]
             ).to_excel(instagram_export, index=False)
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "alpha",
+                        "username": "alpha",
+                        "profile_url": "https://www.instagram.com/alpha",
+                        "upload_handle": "alpha",
+                        "positioning_stage_status": "Completed",
+                        "positioning_labels": "家庭用品和家电-家庭博主",
+                        "fit_summary": "内容契合",
+                    }
+                ]
+            ).to_excel(instagram_positioning, index=False)
 
             keep_workbook = root / "upstream" / "exports" / "keep.xlsx"
             keep_workbook.parent.mkdir(parents=True, exist_ok=True)
@@ -576,15 +590,19 @@ class FinalExportMergeTests(unittest.TestCase):
             )
 
             self.assertEqual(artifacts["source_row_count"], 2)
-            self.assertEqual(artifacts["row_count"], 1)
-            self.assertEqual(artifacts["skipped_row_count"], 1)
+            self.assertEqual(artifacts["row_count"], 2)
+            self.assertEqual(artifacts["skipped_row_count"], 0)
             rows = pd.read_excel(output_path).fillna("")
 
             instagram_row = rows.loc[rows["达人ID"] == "ejay.cruzz"].iloc[0].to_dict()
             self.assertEqual(instagram_row["# Followers(K)#"], 290.2)
             self.assertEqual(instagram_row["Median Views (K)"], "")
+            self.assertEqual(instagram_row["ai是否通过"], "转人工")
+            self.assertEqual(instagram_row["标签(ai)"], "")
             self.assertIn("无视频播放数据", instagram_row["ai筛号反馈理由"])
+            self.assertIn("缺少标签(ai)，已自动转人工", instagram_row["ai筛号反馈理由"])
             self.assertIn("无视频播放数据", instagram_row["ai评价"])
+            self.assertIn("缺少标签(ai)，已自动转人工", instagram_row["ai评价"])
 
             tiktok_row = rows.loc[rows["达人ID"] == "farrobear"].iloc[0].to_dict()
             self.assertEqual(tiktok_row["# Followers(K)#"], "")
@@ -891,6 +909,96 @@ class FinalExportMergeTests(unittest.TestCase):
             payload = json.loads(payload_path.read_text(encoding="utf-8"))
             row = payload["rows"][0]
             self.assertEqual(row["互动率"], "30.0%")
+
+    def test_instagram_metrics_prefer_reels_over_regular_video_posts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            exports_dir = root / "exports"
+            instagram_export = exports_dir / "instagram" / "instagram_final_review.xlsx"
+            instagram_positioning = exports_dir / "instagram" / "instagram_positioning_card_review.xlsx"
+            instagram_export.parent.mkdir(parents=True, exist_ok=True)
+
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "alpha",
+                        "username": "alpha",
+                        "profile_url": "https://www.instagram.com/alpha",
+                        "upload_handle": "alpha",
+                        "final_status": "Pass",
+                        "final_reason": "内容契合",
+                    }
+                ]
+            ).to_excel(instagram_export, index=False)
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "alpha",
+                        "username": "alpha",
+                        "profile_url": "https://www.instagram.com/alpha",
+                        "upload_handle": "alpha",
+                        "positioning_stage_status": "Completed",
+                        "positioning_labels": "家庭用品和家电-家庭博主",
+                        "fit_summary": "内容契合",
+                    }
+                ]
+            ).to_excel(instagram_positioning, index=False)
+
+            cached_rows = {
+                "alpha": [
+                    {
+                        "username": "alpha",
+                        "url": "https://www.instagram.com/alpha",
+                        "followersCount": 50000,
+                        "followsCount": 1000,
+                        "latestPosts": [
+                            {
+                                "url": "https://www.instagram.com/p/feed-video/",
+                                "type": "Video",
+                                "videoViewCount": 66000,
+                                "likesCount": 6000,
+                            },
+                            {
+                                "url": "https://www.instagram.com/reel/high-performing-reel/",
+                                "productType": "clips",
+                                "videoViewCount": 64000,
+                                "videoPlayCount": 2400000,
+                                "likesCount": 120000,
+                            },
+                            {
+                                "url": "https://www.instagram.com/reel/second-high-performing-reel/",
+                                "productType": "clips",
+                                "videoViewCount": 71000,
+                                "videoPlayCount": 2600000,
+                                "likesCount": 130000,
+                            },
+                        ],
+                    }
+                ]
+            }
+
+            output_path = exports_dir / "all_platforms_final_review.xlsx"
+            payload_path = exports_dir / "all_platforms_final_review_payload.json"
+            with patch(
+                "backend.final_export_merge.creator_cache.load_scrape_cache_entries",
+                return_value=cached_rows,
+            ):
+                build_all_platforms_final_review_artifacts(
+                    output_path=output_path,
+                    payload_json_path=payload_path,
+                    final_exports={
+                        "instagram": {
+                            "final_review": str(instagram_export),
+                            "positioning_card_review": str(instagram_positioning),
+                        }
+                    },
+                    task_owner={"responsible_name": "陈俊仁"},
+                )
+
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+            row = payload["rows"][0]
+            self.assertEqual(row["Median Views (K)"], 2500.0)
+            self.assertEqual(row["互动率"], "5.0%")
 
     def test_processing_failures_and_positioning_errors_are_explicit_in_combined_sheet(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
