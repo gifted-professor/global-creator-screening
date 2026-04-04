@@ -79,6 +79,25 @@ def _load_runtime_dependencies():
     }
 
 
+def _expand_platforms_for_fallback(requested_platforms: list[str]) -> list[str]:
+    normalized_requested = [str(item or "").strip().lower() for item in (requested_platforms or []) if str(item or "").strip()]
+    if not normalized_requested:
+        return []
+    expanded: list[str] = []
+    seen: set[str] = set()
+    for requested in normalized_requested:
+        try:
+            start_index = DEFAULT_PLATFORM_ORDER.index(requested)
+        except ValueError:
+            continue
+        for candidate in DEFAULT_PLATFORM_ORDER[start_index:]:
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            expanded.append(candidate)
+    return expanded
+
+
 def default_output_root() -> Path:
     return resolve_keep_list_downstream_paths(task_name="task").run_root
 
@@ -907,6 +926,7 @@ def run_keep_list_screening_pipeline(
     exports_dir = runner_paths.exports_dir
     downloads_dir = runner_paths.downloads_dir
     requested_platforms = normalize_platforms(platform_filters)
+    execution_platforms = _expand_platforms_for_fallback(requested_platforms)
     resolved_config_sources, resolved_config = _build_resolved_config_sources(
         env_file=env_file,
         keep_workbook=keep_workbook,
@@ -1001,6 +1021,7 @@ def run_keep_list_screening_pipeline(
         },
         "preflight": preflight,
         "requested_platforms": requested_platforms,
+        "execution_platforms": execution_platforms,
         "requested_vision_provider": str(vision_provider or "").strip().lower(),
         "max_identifiers_per_platform": int(max_identifiers_per_platform),
         "skip_scrape": bool(skip_scrape),
@@ -1268,7 +1289,7 @@ def run_keep_list_screening_pipeline(
                     and hasattr(backend_app, "run_probe_ranked_visual_provider_race")
                 ):
                     race_payload = backend_app.run_probe_ranked_visual_provider_race(
-                        platform=requested_platforms[0] if requested_platforms else "instagram"
+                        platform=execution_platforms[0] if execution_platforms else "instagram"
                     )
                     probe_payload = {
                         "success": bool(race_payload.get("success")),
@@ -1319,7 +1340,7 @@ def run_keep_list_screening_pipeline(
                 persist_summary(summary)
                 return summary
 
-            for platform in requested_platforms:
+            for platform in execution_platforms:
                 requested_identifiers = select_platform_identifiers(platform, max(0, int(max_identifiers_per_platform)))
                 platform_summary: dict[str, Any] = {
                     "staged_identifier_count": len(backend_app.load_upload_metadata(platform)),
@@ -1476,7 +1497,7 @@ def run_keep_list_screening_pipeline(
                 }
                 if missing_profiles:
                     current_lookup = dict(backend_app.load_upload_metadata(platform) or {})
-                    next_platform = _resolve_next_fallback_platform(platform, requested_platforms)
+                    next_platform = _resolve_next_fallback_platform(platform, execution_platforms)
                     current_has_fallback_contract = any(
                         (
                             str((current_lookup.get(str(item.get("identifier") or "").strip()) or {}).get("handle") or "").strip()
