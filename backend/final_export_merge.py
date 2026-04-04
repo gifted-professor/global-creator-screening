@@ -844,8 +844,6 @@ def _build_keep_lookup(
         return handle_lookup, url_lookup, handle_any_lookup, url_any_lookup
     for record in frame.to_dict(orient="records"):
         platform = _normalize_platform(record.get("Platform") or record.get("平台"))
-        if not platform:
-            continue
         for candidate in (
             record.get("@username"),
             record.get("达人ID"),
@@ -859,7 +857,8 @@ def _build_keep_lookup(
         ):
             handle = _extract_handle(candidate)
             if handle:
-                handle_lookup.setdefault((platform, handle), dict(record))
+                if platform:
+                    handle_lookup.setdefault((platform, handle), dict(record))
                 handle_any_lookup.setdefault(handle, dict(record))
         for candidate in (
             record.get("URL"),
@@ -869,7 +868,8 @@ def _build_keep_lookup(
             url = _normalize_url(candidate)
             if not url:
                 continue
-            url_lookup.setdefault((platform, url), dict(record))
+            if platform:
+                url_lookup.setdefault((platform, url), dict(record))
             url_any_lookup.setdefault(url, dict(record))
     return handle_lookup, url_lookup, handle_any_lookup, url_any_lookup
 

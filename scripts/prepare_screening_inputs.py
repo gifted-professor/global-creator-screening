@@ -67,6 +67,7 @@ MAIL_THREAD_CONFIDENCE_ALIASES = (
 )
 MAIL_THREAD_LLM_HANDLE_ALIASES = ("llm_handle",)
 MAIL_THREAD_EVIDENCE_ALIASES = ("llm_evidence", "latest_external_clean_body", "latest_external_body_preview")
+MAIL_THREAD_PLATFORM_ALIASES = ("Platform", "平台", "platform")
 MAIL_THREAD_AUTO_REPLY_PATTERNS = (
     re.compile(
         r"(out of office|automatic reply|auto.?reply|ooo\b|vacation|abwesenheitsnotiz|thank you for your email|derzeit keine erreichbarkeit)",
@@ -134,6 +135,22 @@ def _normalize_mail_thread_confidence(value: Any) -> str:
 
 def _normalize_mail_thread_sent_at(value: Any) -> str:
     return isoformat_shanghai_datetime(value) or _clean_mail_thread_value(value)
+
+
+def _normalize_mail_thread_platform(value: Any) -> str:
+    text = _clean_mail_thread_value(value).strip().lower()
+    if not text:
+        return ""
+    inferred = infer_platform_from_value(text)
+    if inferred:
+        return inferred
+    if "instagram" in text or text in {"ig", "ins"}:
+        return "instagram"
+    if "tiktok" in text or "douyin" in text or text == "tt":
+        return "tiktok"
+    if "youtube" in text or text == "yt":
+        return "youtube"
+    return ""
 
 
 def _normalize_brand_token(value: Any) -> str:
@@ -241,15 +258,24 @@ def build_canonical_upload_from_mail_thread_funnel(
                 continue
             if normalized_stage == "llm" and normalized_confidence == "high":
                 llm_high_accepted_count += 1
-            normalized_handle = backend_app.screening.extract_platform_identifier("tiktok", handle) or _clean_text(handle).lstrip("@")
+            row_platform = _normalize_mail_thread_platform(_select_mail_thread_value(row_dict, MAIL_THREAD_PLATFORM_ALIASES))
+            normalized_platform = row_platform or "tiktok"
+            normalized_handle = (
+                backend_app.screening.extract_platform_identifier(normalized_platform, handle)
+                or _clean_text(handle).lstrip("@")
+            )
             if not normalized_handle:
                 skipped_row_count += 1
                 continue
 
-            platform = "TikTok"
+            platform = backend_app.UPLOAD_PLATFORM_RESPONSE_LABELS.get(normalized_platform, normalized_platform)
             tiktok_url = backend_app.screening.build_canonical_profile_url("tiktok", normalized_handle)
             instagram_url = backend_app.screening.build_canonical_profile_url("instagram", normalized_handle)
             youtube_url = backend_app.screening.build_canonical_profile_url("youtube", normalized_handle)
+            canonical_url = backend_app.screening.build_canonical_profile_url(normalized_platform, normalized_handle)
+            attempt_order = ",".join(
+                [normalized_platform, *[item for item in ("tiktok", "instagram", "youtube") if item != normalized_platform]]
+            )
             resolution_stage = normalized_stage or _select_mail_thread_value(row_dict, MAIL_THREAD_STAGE_ALIASES)
             resolution_confidence = normalized_confidence or _select_mail_thread_value(row_dict, MAIL_THREAD_CONFIDENCE_ALIASES)
             mail_evidence = _select_mail_thread_value(row_dict, MAIL_THREAD_EVIDENCE_ALIASES)
@@ -259,7 +285,7 @@ def build_canonical_upload_from_mail_thread_funnel(
                     evidence_fallback_count += 1
             latest_external_sent_at = _normalize_mail_thread_sent_at(row_dict.get("latest_external_sent_at"))
             source_row_number = int(row_dict.get("__source_row_number") or 0)
-            record_key = ("tiktok", normalized_handle)
+            record_key = (normalized_platform, normalized_handle)
             sort_key = (latest_external_sent_at, source_row_number)
             if record_key in record_sort_key and record_sort_key[record_key] >= sort_key:
                 continue
@@ -267,14 +293,14 @@ def build_canonical_upload_from_mail_thread_funnel(
             records_by_key[record_key] = {
                 "Platform": platform,
                 "@username": normalized_handle,
-                "URL": tiktok_url,
+                "URL": canonical_url,
                 "nickname": normalized_handle,
                 "Region": "",
                 "email": _clean_mail_thread_value(row_dict.get("latest_external_from")),
                 "tiktok_url": tiktok_url,
                 "instagram_url": instagram_url,
                 "youtube_url": youtube_url,
-                "platform_attempt_order": "tiktok,instagram,youtube",
+                "platform_attempt_order": attempt_order,
                 "mail_thread_key": _clean_mail_thread_value(row_dict.get("thread_key")),
                 "mail_resolution_stage": resolution_stage,
                 "mail_resolution_confidence": resolution_confidence,

@@ -15,10 +15,12 @@ from .creator_enrichment import (
     _clean_text,
     _extract_emails,
     _extract_handles_from_text,
+    _infer_platform_from_value,
     _load_addresses,
     _normalize_email,
     _normalize_handle,
     _normalize_name,
+    _platform_label,
     _write_xlsx,
 )
 from .db import Database
@@ -37,6 +39,7 @@ FUNNEL_HEADERS = [
     "latest_external_sent_at",
     "latest_external_clean_body",
     "latest_external_full_body",
+    "Platform",
     "sending_list_match_status",
     "resolution_stage_final",
     "resolution_confidence_final",
@@ -81,9 +84,12 @@ _GREETING_PATTERN = re.compile(
     r"(?im)(?:^|[\n>])\s*(?:hi|hello|hallo)\s*@?\s*\*?([A-Za-z0-9._]{3,40})\*?",
 )
 _SOCIAL_LABEL_PATTERN = re.compile(
-    r"(?im)\b(?:tiktok|instagram|ig|ins|youtube)\s*[:：]\s*@?\s*([A-Za-z0-9._]{3,40})\b",
+    r"(?im)\b(tiktok|instagram|ig|ins|youtube)\s*[:：]\s*@?\s*([A-Za-z0-9._]{3,40})\b",
 )
 _GENERIC_AT_HANDLE_PATTERN = re.compile(r"(?<![A-Za-z0-9])@([A-Za-z0-9._]{3,40})\b")
+_TIKTOK_URL_PATTERN = re.compile(r"tiktok\.com/@([A-Za-z0-9._]{3,40})", re.I)
+_INSTAGRAM_URL_PATTERN = re.compile(r"instagram\.com/([A-Za-z0-9._]{3,40})", re.I)
+_YOUTUBE_URL_PATTERN = re.compile(r"youtube\.com/@([A-Za-z0-9._-]{3,80})", re.I)
 _AUTO_REPLY_PATTERNS = (
     re.compile(r"(out of office|automatic reply|auto.?reply|ooo\b|vacation|abwesenheitsnotiz)", re.I),
     re.compile(r"(thank you for your email|deine anfrage ist bei uns gelandet|ticket#|\[##gl-\d+##\])", re.I),
@@ -99,20 +105,45 @@ _QUOTE_SPLIT_PATTERNS = (
 )
 
 
-def _build_email_to_handle_map(candidate_rows: Sequence[dict[str, Any]]) -> tuple[dict[str, set[str]], set[str]]:
+def _normalize_platform(value: Any) -> str:
+    inferred = _infer_platform_from_value(value)
+    if inferred:
+        return inferred
+    text = _clean_text(value).lower()
+    if not text:
+        return ""
+    if "instagram" in text or text in {"ig", "ins"}:
+        return "instagram"
+    if "tiktok" in text or "douyin" in text or text == "tt":
+        return "tiktok"
+    if "youtube" in text or text == "yt":
+        return "youtube"
+    return ""
+
+
+def _build_candidate_identity_maps(
+    candidate_rows: Sequence[dict[str, Any]],
+) -> tuple[dict[str, set[str]], set[str], dict[str, set[str]], dict[str, set[tuple[str, str]]]]:
     email_to_handles: dict[str, set[str]] = {}
     known_handles: set[str] = set()
+    handle_to_platforms: dict[str, set[str]] = {}
+    email_to_profile_pairs: dict[str, set[tuple[str, str]]] = {}
     for row in candidate_rows:
         handle = _normalize_handle(row.get("@username")) or _normalize_handle(row.get("URL"))
+        platform = _normalize_platform(row.get("Platform")) or _normalize_platform(row.get("URL"))
         if not handle:
             continue
         known_handles.add(handle)
+        if platform:
+            handle_to_platforms.setdefault(handle, set()).add(platform)
         for email in _extract_emails(row.get("Email")):
             normalized_email = _normalize_email(email)
             if not normalized_email:
                 continue
             email_to_handles.setdefault(normalized_email, set()).add(handle)
-    return email_to_handles, known_handles
+            if platform:
+                email_to_profile_pairs.setdefault(normalized_email, set()).add((handle, platform))
+    return email_to_handles, known_handles, handle_to_platforms, email_to_profile_pairs
 
 
 def _first_sender_email(message_row: Any) -> str:
@@ -198,14 +229,60 @@ def _extract_explicit_candidates(full_body: str) -> list[str]:
             continue
         seen.add(normalized)
         result.append(normalized)
-    for pattern in (_SOCIAL_LABEL_PATTERN, _GENERIC_AT_HANDLE_PATTERN):
-        for match in pattern.finditer(full_body or ""):
-            normalized = _filter_handle(match.group(1))
-            if not normalized or normalized in seen:
-                continue
-            seen.add(normalized)
-            result.append(normalized)
+    for match in _SOCIAL_LABEL_PATTERN.finditer(full_body or ""):
+        normalized = _filter_handle(match.group(2))
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
+    for match in _GENERIC_AT_HANDLE_PATTERN.finditer(full_body or ""):
+        normalized = _filter_handle(match.group(1))
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        result.append(normalized)
     return result
+
+
+def _extract_platform_handle_pairs(full_body: str) -> dict[str, set[str]]:
+    result: dict[str, set[str]] = {}
+    for match in _SOCIAL_LABEL_PATTERN.finditer(full_body or ""):
+        platform = _normalize_platform(match.group(1))
+        handle = _filter_handle(match.group(2))
+        if platform and handle:
+            result.setdefault(handle, set()).add(platform)
+    for pattern, platform in (
+        (_TIKTOK_URL_PATTERN, "tiktok"),
+        (_INSTAGRAM_URL_PATTERN, "instagram"),
+        (_YOUTUBE_URL_PATTERN, "youtube"),
+    ):
+        for match in pattern.finditer(full_body or ""):
+            handle = _filter_handle(match.group(1))
+            if handle:
+                result.setdefault(handle, set()).add(platform)
+    return result
+
+
+def _resolve_platform_for_handle(
+    handle: str,
+    *,
+    body_pairs: dict[str, set[str]] | None = None,
+    handle_to_platforms: dict[str, set[str]] | None = None,
+    preferred_platforms: Iterable[str] | None = None,
+) -> str:
+    body_platforms = {item for item in (body_pairs or {}).get(handle, set()) if item}
+    if len(body_platforms) == 1:
+        return next(iter(body_platforms))
+    preferred = {item for item in (preferred_platforms or []) if item}
+    if len(preferred) == 1:
+        return next(iter(preferred))
+    known_platforms = {item for item in (handle_to_platforms or {}).get(handle, set()) if item}
+    if len(known_platforms) == 1:
+        return next(iter(known_platforms))
+    merged = body_platforms | preferred | known_platforms
+    if len(merged) == 1:
+        return next(iter(merged))
+    return ""
 
 
 def _matches_auto_reply(subject: str, body: str) -> bool:
@@ -220,6 +297,7 @@ def _build_row(
     confidence: str,
     final_id: str,
     sending_list_match_status: str,
+    platform: str = "",
     llm_handle: str = "",
     llm_evidence: str = "",
 ) -> dict[str, Any]:
@@ -231,6 +309,7 @@ def _build_row(
         "latest_external_sent_at": _clean_text(message_row["sent_at"]),
         "latest_external_clean_body": _build_clean_body(full_body),
         "latest_external_full_body": full_body,
+        "Platform": _platform_label(platform) if platform else "",
         "sending_list_match_status": sending_list_match_status,
         "resolution_stage_final": stage,
         "resolution_confidence_final": confidence,
@@ -446,7 +525,7 @@ def build_mail_thread_funnel_keep_workbook(
         sent_since=sent_since,
         limit=max(0, int(message_limit)),
     )
-    email_to_handles, known_handles = _build_email_to_handle_map(candidate_rows)
+    email_to_handles, known_handles, handle_to_platforms, email_to_profile_pairs = _build_candidate_identity_maps(candidate_rows)
     external_messages = [row for row in messages if _is_external_sender(row)]
 
     review_rows: list[dict[str, Any]] = []
@@ -462,6 +541,7 @@ def build_mail_thread_funnel_keep_workbook(
 
     for message_row in external_messages:
         full_body = _build_full_body(message_row)
+        body_pairs = _extract_platform_handle_pairs(full_body)
         subject = _clean_text(message_row["subject"])
         if _matches_auto_reply(subject, full_body):
             filtered_auto_reply_count += 1
@@ -478,10 +558,19 @@ def build_mail_thread_funnel_keep_workbook(
             continue
 
         sender_handles: set[str] = set()
+        sender_profile_pairs: set[tuple[str, str]] = set()
         for sender_email in _all_sender_emails(message_row):
             sender_handles.update(email_to_handles.get(sender_email, set()))
+            sender_profile_pairs.update(email_to_profile_pairs.get(sender_email, set()))
         if len(sender_handles) == 1:
             final_id = sorted(sender_handles)[0]
+            sender_platforms = {platform for handle, platform in sender_profile_pairs if handle == final_id}
+            platform = _resolve_platform_for_handle(
+                final_id,
+                body_pairs=body_pairs,
+                handle_to_platforms=handle_to_platforms,
+                preferred_platforms=sender_platforms,
+            )
             pass0_count += 1
             review_rows.append(
                 _build_row(
@@ -491,6 +580,7 @@ def build_mail_thread_funnel_keep_workbook(
                     confidence="high",
                     final_id=final_id,
                     sending_list_match_status="email_exact",
+                    platform=platform,
                 )
             )
             continue
@@ -498,6 +588,11 @@ def build_mail_thread_funnel_keep_workbook(
         greeting_candidates = _extract_greeting_candidates(full_body)
         if len(greeting_candidates) == 1:
             final_id = greeting_candidates[0]
+            platform = _resolve_platform_for_handle(
+                final_id,
+                body_pairs=body_pairs,
+                handle_to_platforms=handle_to_platforms,
+            )
             regex_pass1_count += 1
             review_rows.append(
                 _build_row(
@@ -507,6 +602,7 @@ def build_mail_thread_funnel_keep_workbook(
                     confidence="high",
                     final_id=final_id,
                     sending_list_match_status="in_sending_list" if final_id in known_handles else "out_of_sending_list",
+                    platform=platform,
                 )
             )
             continue
@@ -515,6 +611,11 @@ def build_mail_thread_funnel_keep_workbook(
         unique_explicit = [candidate for candidate in explicit_candidates if candidate not in set(greeting_candidates)]
         if len(unique_explicit) == 1:
             final_id = unique_explicit[0]
+            platform = _resolve_platform_for_handle(
+                final_id,
+                body_pairs=body_pairs,
+                handle_to_platforms=handle_to_platforms,
+            )
             regex_pass2_count += 1
             review_rows.append(
                 _build_row(
@@ -524,6 +625,7 @@ def build_mail_thread_funnel_keep_workbook(
                     confidence="high",
                     final_id=final_id,
                     sending_list_match_status="in_sending_list" if final_id in known_handles else "out_of_sending_list",
+                    platform=platform,
                 )
             )
             continue
@@ -565,11 +667,17 @@ def build_mail_thread_funnel_keep_workbook(
     for llm_row in reviewed_llm_rows:
         llm_handle = _filter_handle(llm_row.get("llm_handle"))
         confidence = _clean_text(llm_row.get("resolution_confidence_final")).lower()
+        platform = _resolve_platform_for_handle(
+            llm_handle,
+            body_pairs=_extract_platform_handle_pairs(_clean_text(llm_row.get("latest_external_full_body"))),
+            handle_to_platforms=handle_to_platforms,
+        )
         if llm_handle and confidence == "high":
             llm_high_count += 1
             review_rows.append(
                 {
                     **llm_row,
+                    "Platform": _platform_label(platform) if platform else _clean_text(llm_row.get("Platform")),
                     "final_id_final": llm_handle,
                     "resolution_stage_final": "llm",
                     "resolution_confidence_final": "high",
@@ -581,6 +689,7 @@ def build_mail_thread_funnel_keep_workbook(
             review_rows.append(
                 {
                     **llm_row,
+                    "Platform": _platform_label(platform) if platform else _clean_text(llm_row.get("Platform")),
                     "final_id_final": llm_handle,
                     "resolution_stage_final": "llm",
                     "resolution_confidence_final": confidence or "low",

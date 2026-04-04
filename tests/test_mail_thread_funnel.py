@@ -241,6 +241,7 @@ class MailThreadFunnelTests(unittest.TestCase):
         keep_headers = list(keep_rows[0])
         review_stage_index = review_headers.index("resolution_stage_final")
         review_id_index = review_headers.index("final_id_final")
+        keep_platform_index = keep_headers.index("Platform")
         keep_stage_index = keep_headers.index("resolution_stage_final")
         keep_id_index = keep_headers.index("final_id_final")
 
@@ -254,6 +255,8 @@ class MailThreadFunnelTests(unittest.TestCase):
         self.assertIn(("pass0_sending_list_email", "creatoralpha"), keep_pairs)
         self.assertIn(("regex_pass1", "downwithopc0"), keep_pairs)
         self.assertIn(("llm", "llmresolvedcreator"), keep_pairs)
+        keep_platform_by_id = {row[keep_id_index]: row[keep_platform_index] for row in keep_rows[1:]}
+        self.assertEqual(keep_platform_by_id["creatoralpha"], "TikTok")
 
 
 if __name__ == "__main__":

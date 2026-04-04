@@ -153,6 +153,7 @@ def build_mail_thread_funnel_workbook(path: Path) -> None:
     sheet = workbook.active
     sheet.title = "threads"
     sheet.append([
+        "Platform",
         "thread_key",
         "subject",
         "latest_external_from",
@@ -166,6 +167,7 @@ def build_mail_thread_funnel_workbook(path: Path) -> None:
         "raw_path",
     ])
     sheet.append([
+        "TikTok",
         "thread-1",
         "Re: Paid collaboration with SKG",
         "manager@example.com",
@@ -179,6 +181,7 @@ def build_mail_thread_funnel_workbook(path: Path) -> None:
         "raw/thread-1.eml",
     ])
     sheet.append([
+        "TikTok",
         "thread-2",
         "Automatic Reply: Paid collaboration with SKG",
         "auto.reply@example.com",
@@ -192,6 +195,7 @@ def build_mail_thread_funnel_workbook(path: Path) -> None:
         "raw/thread-2.eml",
     ])
     sheet.append([
+        "TikTok",
         "thread-3",
         "Re: Paid collaboration with SKG",
         "team@example.com",
@@ -205,6 +209,7 @@ def build_mail_thread_funnel_workbook(path: Path) -> None:
         "raw/thread-3.eml",
     ])
     sheet.append([
+        "TikTok",
         "thread-4",
         "Re: Paid collaboration with SKG",
         "agent@example.com",
@@ -218,6 +223,7 @@ def build_mail_thread_funnel_workbook(path: Path) -> None:
         "raw/thread-4.eml",
     ])
     sheet.append([
+        "TikTok",
         "thread-5",
         "Re: Paid collaboration with SKG",
         "agent2@example.com",
@@ -231,6 +237,7 @@ def build_mail_thread_funnel_workbook(path: Path) -> None:
         "raw/thread-5.eml",
     ])
     sheet.append([
+        "TikTok",
         "thread-6",
         "Re: Paid collaboration with SKG",
         "agent3@example.com",
@@ -244,6 +251,7 @@ def build_mail_thread_funnel_workbook(path: Path) -> None:
         "raw/thread-6.eml",
     ])
     sheet.append([
+        "TikTok",
         "thread-7",
         "Re: Paid collaboration with OTHERBRAND",
         "brand@example.com",
@@ -556,6 +564,61 @@ class PrepareScreeningInputsTests(unittest.TestCase):
             self.assertEqual(
                 tiktok_metadata["llm.upgraded.creator"]["mail_resolution_confidence"],
                 "high",
+            )
+
+    def test_prepare_screening_inputs_respects_platform_column_for_mail_thread_funnel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            creator_workbook = tmp_path / "mail_thread_funnel.xlsx"
+            screening_data_dir = tmp_path / "screening_data"
+            config_dir = tmp_path / "config"
+            temp_dir = tmp_path / "temp"
+            template_output_dir = tmp_path / "parsed_outputs"
+
+            build_mail_thread_funnel_workbook(creator_workbook)
+
+            from openpyxl import load_workbook
+
+            workbook = load_workbook(creator_workbook)
+            sheet = workbook.active
+            platform_col = 1
+            sheet.cell(2, platform_col).value = "Instagram"
+            sheet.cell(4, platform_col).value = "TikTok"
+            sheet.cell(5, platform_col).value = "YouTube"
+            sheet.cell(7, platform_col).value = "Instagram"
+            sheet.cell(8, platform_col).value = "TikTok"
+            workbook.save(creator_workbook)
+
+            summary = prepare_screening_inputs(
+                creator_workbook=creator_workbook,
+                template_workbook=FIXTURE_TEMPLATE,
+                template_output_dir=template_output_dir,
+                screening_data_dir=screening_data_dir,
+                config_dir=config_dir,
+                temp_dir=temp_dir,
+            )
+
+            self.assertEqual(summary["upload"]["parsed_source_kind"], "mail_thread_funnel", summary)
+            self.assertEqual(summary["upload"]["metadata_count_by_platform"]["instagram"], 2, summary)
+            self.assertEqual(summary["upload"]["metadata_count_by_platform"]["tiktok"], 2, summary)
+            self.assertEqual(summary["upload"]["metadata_count_by_platform"]["youtube"], 1, summary)
+
+            instagram_metadata = json.loads(Path(summary["upload"]["upload_metadata_paths"]["instagram"]).read_text(encoding="utf-8"))
+            tiktok_metadata = json.loads(Path(summary["upload"]["upload_metadata_paths"]["tiktok"]).read_text(encoding="utf-8"))
+            youtube_metadata = json.loads(Path(summary["upload"]["upload_metadata_paths"]["youtube"]).read_text(encoding="utf-8"))
+
+            self.assertIn("livio.official", instagram_metadata, instagram_metadata)
+            self.assertIn("llm.upgraded.creator", instagram_metadata, instagram_metadata)
+            self.assertIn("maggy_valentine", tiktok_metadata, tiktok_metadata)
+            self.assertIn("wrong.brand.creator", tiktok_metadata, tiktok_metadata)
+            self.assertIn("high.confidence.creator", youtube_metadata, youtube_metadata)
+            self.assertEqual(
+                instagram_metadata["livio.official"]["url"],
+                "https://www.instagram.com/livio.official/",
+            )
+            self.assertEqual(
+                youtube_metadata["high.confidence.creator"]["url"],
+                "https://www.youtube.com/@high.confidence.creator",
             )
 
     def test_prepare_screening_inputs_filters_brand_mismatch_for_mail_thread_funnel(self) -> None:
