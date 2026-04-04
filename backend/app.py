@@ -143,12 +143,21 @@ APIFY_TRANSPORT_RETRY_BACKOFF_SECONDS = max(
 APIFY_TOKEN_POOL_STATE_FILE = str(Path(DATA_DIR) / "apify_token_pool_state.json")
 APIFY_BALANCE_CACHE_FILE = str(Path(DATA_DIR) / "apify_balance_cache.json")
 APIFY_RUN_GUARDS_FILE = str(Path(DATA_DIR) / "apify_run_guards.json")
+SCRAPE_JOB_GUARDS_FILE = str(Path(DATA_DIR) / "scrape_job_guards.json")
 APIFY_BALANCE_REFRESH_INTERVAL_SECONDS = max(
     60,
     int(os.getenv("APIFY_BALANCE_REFRESH_INTERVAL_SECONDS", "300")),
 )
 APIFY_BALANCE_POLLER_ENABLED = parse_env_flag("APIFY_BALANCE_POLLER_ENABLED", default=True)
 APIFY_GUARD_TTL_SECONDS = max(60, int(os.getenv("APIFY_GUARD_TTL_SECONDS", "1800")))
+SCRAPE_JOB_RUNNING_GUARD_TTL_SECONDS = max(
+    60,
+    int(os.getenv("SCRAPE_JOB_RUNNING_GUARD_TTL_SECONDS", "3600")),
+)
+SCRAPE_JOB_COMPLETED_REUSE_TTL_SECONDS = max(
+    0,
+    int(os.getenv("SCRAPE_JOB_COMPLETED_REUSE_TTL_SECONDS", "900")),
+)
 APIFY_BUDGET_SAFETY_MULTIPLIER = max(
     1.0,
     float(os.getenv("APIFY_BUDGET_SAFETY_MULTIPLIER", "1.1")),
@@ -503,6 +512,7 @@ APIFY_BALANCE_CACHE_LOCK = threading.Lock()
 APIFY_BALANCE_REFRESH_LOCK = threading.Lock()
 APIFY_BALANCE_POLLER_LOCK = threading.Lock()
 APIFY_RUN_GUARDS_LOCK = threading.Lock()
+SCRAPE_JOB_GUARDS_LOCK = threading.Lock()
 APIFY_BALANCE_POLLER_THREAD = None
 APIFY_BALANCE_POLLER_STOP_EVENT = threading.Event()
 OPERATOR_RUNS_LOCK = threading.Lock()
@@ -1407,6 +1417,53 @@ def save_apify_run_guards(guards):
     with APIFY_RUN_GUARDS_LOCK:
         write_json_file(APIFY_RUN_GUARDS_FILE, guards or {})
     return guards or {}
+
+
+def load_scrape_job_guards():
+    return load_json_payload(SCRAPE_JOB_GUARDS_FILE, default={}) or {}
+
+
+def save_scrape_job_guards(guards):
+    with SCRAPE_JOB_GUARDS_LOCK:
+        write_json_file(SCRAPE_JOB_GUARDS_FILE, guards or {})
+    return guards or {}
+
+
+def purge_expired_scrape_job_guards(guards):
+    now_ts = time.time()
+    cleaned = {}
+    for key, record in (guards or {}).items():
+        try:
+            expires_at_ts = float((record or {}).get("expires_at_ts") or 0)
+        except Exception:
+            expires_at_ts = 0
+        if expires_at_ts and expires_at_ts <= now_ts:
+            continue
+        cleaned[key] = record
+    return cleaned
+
+
+def get_scrape_job_guard(guard_key):
+    with SCRAPE_JOB_GUARDS_LOCK:
+        guards = purge_expired_scrape_job_guards(load_scrape_job_guards())
+        write_json_file(SCRAPE_JOB_GUARDS_FILE, guards)
+    return guards.get(guard_key)
+
+
+def remember_scrape_job_guard(guard_key, record):
+    with SCRAPE_JOB_GUARDS_LOCK:
+        guards = purge_expired_scrape_job_guards(load_scrape_job_guards())
+        guards[guard_key] = record
+        write_json_file(SCRAPE_JOB_GUARDS_FILE, guards)
+    return record
+
+
+def clear_scrape_job_guard(guard_key):
+    with SCRAPE_JOB_GUARDS_LOCK:
+        guards = purge_expired_scrape_job_guards(load_scrape_job_guards())
+        if guard_key in guards:
+            guards.pop(guard_key, None)
+            write_json_file(SCRAPE_JOB_GUARDS_FILE, guards)
 
 
 def purge_expired_apify_run_guards(guards):
@@ -6296,6 +6353,114 @@ def build_requested_identifier_lookup(platform, identifiers):
     return lookup
 
 
+def build_scrape_request_guard_options(platform, payload):
+    normalized_platform = str(platform or "").strip().lower()
+    payload = payload or {}
+    if normalized_platform == "tiktok":
+        return {
+            "limit": int(payload.get("limit", 20)),
+            "exclude_pinned_posts": _resolve_boolean_payload_flag(
+                payload,
+                "excludePinnedPosts",
+                "exclude_pinned_posts",
+                default=True,
+            ),
+            "download_videos": bool(payload.get("downloadVideos", False)),
+            "download_covers": bool(payload.get("downloadCovers", True)),
+            "download_avatars": bool(payload.get("downloadAvatars", False)),
+            "download_slideshow": bool(payload.get("downloadSlideshow", False) or payload.get("downloadCovers", True)),
+            "missing_retry_attempts": resolve_scrape_missing_retry_attempts(payload),
+        }
+    if normalized_platform == "instagram":
+        return {
+            "include_about": bool(payload.get("includeAbout", True)),
+            "missing_retry_attempts": resolve_scrape_missing_retry_attempts(payload),
+        }
+    if normalized_platform == "youtube":
+        return {
+            "mode": str(payload.get("mode") or "channel").strip().lower(),
+            "limit": int(payload.get("limit", 10)),
+            "download_subtitles": bool(payload.get("downloadSubtitles", False)),
+            "has_cc": bool(payload.get("hasCC", False)),
+            "missing_retry_attempts": resolve_scrape_missing_retry_attempts(payload),
+        }
+    return {"missing_retry_attempts": resolve_scrape_missing_retry_attempts(payload)}
+
+
+def build_scrape_job_guard_key(platform, payload):
+    normalized_platform = str(platform or "").strip().lower()
+    identifiers = resolve_requested_identifiers(normalized_platform, payload)
+    normalized_identifiers = []
+    for item in identifiers or []:
+        resolved = screening.extract_platform_identifier(normalized_platform, item)
+        candidate = str(resolved or item or "").strip()
+        if candidate:
+            normalized_identifiers.append(candidate)
+    canonical_payload = json.dumps(
+        {
+            "platform": normalized_platform,
+            "identifiers": sorted(set(normalized_identifiers)),
+            "options": build_scrape_request_guard_options(normalized_platform, payload),
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(canonical_payload.encode("utf-8")).hexdigest()
+
+
+def build_scrape_job_guard_record(
+    guard_key,
+    platform,
+    payload,
+    job_id,
+    status,
+    *,
+    expires_in_seconds,
+):
+    identifiers = resolve_requested_identifiers(platform, payload)
+    normalized_identifiers = []
+    for item in identifiers or []:
+        resolved = screening.extract_platform_identifier(platform, item)
+        candidate = str(resolved or item or "").strip()
+        if candidate:
+            normalized_identifiers.append(candidate)
+    return {
+        "guard_key": str(guard_key or "").strip(),
+        "platform": str(platform or "").strip().lower(),
+        "job_id": str(job_id or "").strip(),
+        "status": str(status or "").strip().lower(),
+        "requested_identifier_count": len(list(identifiers or [])),
+        "identifier_preview": sorted(set(normalized_identifiers))[:10],
+        "options": build_scrape_request_guard_options(platform, payload),
+        "created_at": iso_now(),
+        "expires_at_ts": time.time() + max(0, int(expires_in_seconds or 0)),
+    }
+
+
+def resolve_reusable_scrape_job(platform, payload):
+    guard_key = build_scrape_job_guard_key(platform, payload)
+    record = get_scrape_job_guard(guard_key)
+    if not isinstance(record, dict):
+        return guard_key, None, ""
+
+    job = get_job(str(record.get("job_id") or "").strip())
+    if not isinstance(job, dict):
+        clear_scrape_job_guard(guard_key)
+        return guard_key, None, ""
+
+    job_status = str(job.get("status") or "").strip().lower()
+    if job_status in {"queued", "running"}:
+        return guard_key, job, "inflight"
+
+    force_refresh = creator_cache.creator_cache_force_refresh(payload)
+    if not force_refresh and job_status == "completed" and SCRAPE_JOB_COMPLETED_REUSE_TTL_SECONDS > 0:
+        return guard_key, job, "completed"
+
+    clear_scrape_job_guard(guard_key)
+    return guard_key, None, ""
+
+
 def extract_missing_profile_review_identifiers(platform, profile_reviews):
     identifiers = []
     for item in profile_reviews or []:
@@ -7800,8 +7965,68 @@ def start_scrape_job():
             "error": "缺少 Apify 配置：请设置 APIFY_TOKEN 或 APIFY_API_TOKEN。",
         }), 400
 
+    guard_key, reusable_job, reused_reason = resolve_reusable_scrape_job(platform, data)
+    if isinstance(reusable_job, dict):
+        response_job = dict(reusable_job)
+        response_job["reused_existing_job"] = True
+        response_job["reused_existing_job_reason"] = reused_reason
+        response_job["scrape_job_guard_key"] = guard_key
+        return jsonify({"success": True, "job": response_job})
+
     job = create_job("scrape", platform=platform, message="采集任务已创建")
-    start_background_job(job, lambda progress_callback, cancel_check: perform_scrape(platform, data, progress_callback, cancel_check))
+    remember_scrape_job_guard(
+        guard_key,
+        build_scrape_job_guard_record(
+            guard_key,
+            platform,
+            data,
+            job["id"],
+            "queued",
+            expires_in_seconds=SCRAPE_JOB_RUNNING_GUARD_TTL_SECONDS,
+        ),
+    )
+
+    def scrape_worker(progress_callback, cancel_check):
+        remember_scrape_job_guard(
+            guard_key,
+            build_scrape_job_guard_record(
+                guard_key,
+                platform,
+                data,
+                job["id"],
+                "running",
+                expires_in_seconds=SCRAPE_JOB_RUNNING_GUARD_TTL_SECONDS,
+            ),
+        )
+        try:
+            result = perform_scrape(platform, data, progress_callback, cancel_check)
+        except Exception:
+            clear_scrape_job_guard(guard_key)
+            raise
+        final_status = "failed"
+        expires_in_seconds = 0
+        if result and result.get("cancelled"):
+            final_status = "cancelled"
+        elif result and result.get("success"):
+            final_status = "completed"
+            expires_in_seconds = SCRAPE_JOB_COMPLETED_REUSE_TTL_SECONDS
+        if expires_in_seconds > 0:
+            remember_scrape_job_guard(
+                guard_key,
+                build_scrape_job_guard_record(
+                    guard_key,
+                    platform,
+                    data,
+                    job["id"],
+                    final_status,
+                    expires_in_seconds=expires_in_seconds,
+                ),
+            )
+        else:
+            clear_scrape_job_guard(guard_key)
+        return result
+
+    start_background_job(job, scrape_worker)
     return jsonify({"success": True, "job": get_job(job["id"])})
 
 

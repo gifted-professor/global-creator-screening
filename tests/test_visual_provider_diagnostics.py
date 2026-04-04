@@ -51,6 +51,9 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
         self.original_provider_configs = backend_app.VISION_PROVIDER_CONFIGS
         self.original_dotenv_values = dict(backend_app.DOTENV_LOCAL_VALUES)
         self.original_dotenv_loaded_keys = set(backend_app.DOTENV_LOCAL_LOADED_KEYS)
+        self.original_scrape_job_guards_file = backend_app.SCRAPE_JOB_GUARDS_FILE
+        self._tempdir = tempfile.TemporaryDirectory()
+        backend_app.SCRAPE_JOB_GUARDS_FILE = str(Path(self._tempdir.name) / "scrape_job_guards.json")
         self.original_env = {key: os.environ.get(key) for key in self.ENV_KEYS}
         for key in self.ENV_KEYS:
             os.environ.pop(key, None)
@@ -75,6 +78,8 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
         backend_app.VISION_PROVIDER_CONFIGS = self.original_provider_configs
         backend_app.DOTENV_LOCAL_VALUES = self.original_dotenv_values
         backend_app.DOTENV_LOCAL_LOADED_KEYS = self.original_dotenv_loaded_keys
+        backend_app.SCRAPE_JOB_GUARDS_FILE = self.original_scrape_job_guards_file
+        self._tempdir.cleanup()
         for key, value in self.original_env.items():
             if value is None:
                 os.environ.pop(key, None)
@@ -140,6 +145,88 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
         )
 
         self.assertTrue(payload["excludePinnedPosts"])
+
+    def test_start_scrape_job_reuses_existing_running_job_for_same_identifier_set(self) -> None:
+        with mock.patch.object(backend_app, "get_apify_token_pool", return_value=["apify_token"]), mock.patch.object(
+            backend_app,
+            "start_background_job",
+            side_effect=lambda job, worker: None,
+        ):
+            first = self.client.post(
+                "/api/jobs/scrape",
+                json={
+                    "platform": "tiktok",
+                    "payload": {
+                        "profiles": ["https://www.tiktok.com/@alpha", "https://www.tiktok.com/@beta"],
+                    },
+                },
+            )
+            second = self.client.post(
+                "/api/jobs/scrape",
+                json={
+                    "platform": "tiktok",
+                    "payload": {
+                        "profiles": ["beta", "alpha"],
+                    },
+                },
+            )
+
+        first_payload = first.get_json()
+        second_payload = second.get_json()
+        self.assertTrue(first_payload["success"])
+        self.assertTrue(second_payload["success"])
+        self.assertEqual(first_payload["job"]["id"], second_payload["job"]["id"])
+        self.assertTrue(second_payload["job"]["reused_existing_job"])
+        self.assertEqual(second_payload["job"]["reused_existing_job_reason"], "inflight")
+        with backend_app.JOBS_LOCK:
+            self.assertEqual(len(backend_app.JOBS), 1)
+
+    def test_start_scrape_job_reuses_recently_completed_job_without_force_refresh(self) -> None:
+        with mock.patch.object(backend_app, "get_apify_token_pool", return_value=["apify_token"]), mock.patch.object(
+            backend_app,
+            "start_background_job",
+            side_effect=lambda job, worker: None,
+        ):
+            first = self.client.post(
+                "/api/jobs/scrape",
+                json={
+                    "platform": "instagram",
+                    "payload": {
+                        "usernames": ["creator_a"],
+                    },
+                },
+            )
+
+        first_payload = first.get_json()
+        job_id = first_payload["job"]["id"]
+        backend_app.update_job(
+            job_id,
+            status="completed",
+            stage="completed",
+            message="任务完成",
+            result={"success": True, "message": "done"},
+        )
+
+        with mock.patch.object(backend_app, "get_apify_token_pool", return_value=["apify_token"]), mock.patch.object(
+            backend_app,
+            "start_background_job",
+            side_effect=lambda job, worker: None,
+        ):
+            second = self.client.post(
+                "/api/jobs/scrape",
+                json={
+                    "platform": "instagram",
+                    "payload": {
+                        "usernames": ["creator_a"],
+                    },
+                },
+            )
+
+        second_payload = second.get_json()
+        self.assertTrue(second_payload["success"])
+        self.assertEqual(job_id, second_payload["job"]["id"])
+        self.assertTrue(second_payload["job"]["reused_existing_job"])
+        self.assertEqual(second_payload["job"]["reused_existing_job_reason"], "completed")
 
         explicit_false_payload = backend_app.build_actor_input(
             "tiktok",
