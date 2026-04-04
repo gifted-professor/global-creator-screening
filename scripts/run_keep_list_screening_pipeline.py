@@ -111,6 +111,10 @@ def _write_summary(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def _emit_runtime_progress(scope: str, message: str) -> None:
+    print(f"[{iso_now()}] [{scope}] {message}", flush=True)
+
+
 def _path_summary(path: Path | None, *, source: str, kind: str) -> dict[str, Any]:
     if path is None:
         return {
@@ -1141,8 +1145,71 @@ def run_keep_list_screening_pipeline(
         task_owner_owner_name=normalized_task_owner_owner_name,
         linked_bitable_url=normalized_linked_bitable_url,
     )
+    progress_scope = f"keep-list:{normalized_task_name or runner_paths.run_id}"
+    progress_state: dict[str, Any] = {
+        "status": "",
+        "vision_probe_signature": "",
+        "platform_signatures": {},
+    }
 
     def persist_summary(payload: dict[str, Any]) -> None:
+        current_status = str(payload.get("status") or "").strip()
+        if current_status and current_status != progress_state["status"]:
+            progress_state["status"] = current_status
+            _emit_runtime_progress(progress_scope, f"run_status={current_status}")
+
+        vision_probe = payload.get("vision_probe")
+        if isinstance(vision_probe, dict):
+            probe_signature = "|".join(
+                [
+                    str(vision_probe.get("success")),
+                    str(vision_probe.get("provider") or ""),
+                    str(vision_probe.get("error_code") or ""),
+                ]
+            )
+            if probe_signature != progress_state["vision_probe_signature"]:
+                progress_state["vision_probe_signature"] = probe_signature
+                probe_status = "passed" if vision_probe.get("success") else "failed"
+                provider_name = str(vision_probe.get("provider") or "").strip()
+                detail = f"vision_probe={probe_status}"
+                if provider_name:
+                    detail += f" provider={provider_name}"
+                error_code = str(vision_probe.get("error_code") or "").strip()
+                if error_code:
+                    detail += f" error_code={error_code}"
+                _emit_runtime_progress(progress_scope, detail)
+
+        platform_signatures = progress_state["platform_signatures"]
+        for platform, platform_payload in (payload.get("platforms") or {}).items():
+            if not isinstance(platform_payload, dict):
+                continue
+            stage = str(platform_payload.get("current_stage") or "").strip()
+            status = str(platform_payload.get("status") or "").strip()
+            signature = (
+                stage,
+                status,
+                int(platform_payload.get("profile_review_count") or 0),
+                int(platform_payload.get("prescreen_pass_count") or 0),
+                int(platform_payload.get("missing_profile_count") or 0),
+            )
+            if platform_signatures.get(platform) == signature:
+                continue
+            platform_signatures[platform] = signature
+            detail_parts = []
+            if stage:
+                detail_parts.append(f"stage={stage}")
+            if status:
+                detail_parts.append(f"status={status}")
+            if int(platform_payload.get("requested_identifier_count") or 0) > 0:
+                detail_parts.append(f"requested={int(platform_payload.get('requested_identifier_count') or 0)}")
+            if int(platform_payload.get("profile_review_count") or 0) > 0:
+                detail_parts.append(f"reviewed={int(platform_payload.get('profile_review_count') or 0)}")
+            if int(platform_payload.get("prescreen_pass_count") or 0) > 0:
+                detail_parts.append(f"pass={int(platform_payload.get('prescreen_pass_count') or 0)}")
+            if int(platform_payload.get("missing_profile_count") or 0) > 0:
+                detail_parts.append(f"missing={int(platform_payload.get('missing_profile_count') or 0)}")
+            _emit_runtime_progress(progress_scope, f"{platform} " + " ".join(detail_parts or ["updated"]))
+
         _write_summary(run_summary_path, payload)
         write_workflow_handoff(
             runner_paths.workflow_handoff_json,
@@ -1171,6 +1238,11 @@ def run_keep_list_screening_pipeline(
             failure={**failure, "failure_layer": "preflight"},
             finished_at=iso_now(),
         )
+
+    _emit_runtime_progress(
+        progress_scope,
+        f"starting keep workbook={resolved_keep_workbook.resolve()} platforms={','.join(execution_platforms) or 'none'}",
+    )
 
     setup = materialize_setup(
         scope="keep-list-screening",
@@ -1290,6 +1362,7 @@ def run_keep_list_screening_pipeline(
 
     try:
         try:
+            _emit_runtime_progress(progress_scope, "staging_inputs=running")
             reset_backend_runtime_state()
             staging_summary = prepare_screening_inputs(
                 creator_workbook=resolved_keep_workbook.resolve(),
@@ -1319,6 +1392,7 @@ def run_keep_list_screening_pipeline(
 
         summary["started_at"] = backend_app.iso_now()
         summary["staging"] = staging_summary
+        _emit_runtime_progress(progress_scope, "staging_inputs=completed")
         summary["vision_providers"] = backend_app.get_available_vision_provider_names()
         summary["vision_preflight"] = backend_app.build_vision_preflight(vision_provider)
         if skip_scrape and not probe_vision_provider_only:
@@ -1337,6 +1411,7 @@ def run_keep_list_screening_pipeline(
             if callable(resolve_routing_strategy):
                 active_routing_strategy = str(resolve_routing_strategy({}) or "").strip().lower()
             if (not skip_scrape and not skip_visual) or probe_vision_provider_only:
+                _emit_runtime_progress(progress_scope, "vision_probe=running")
                 if (
                     not str(vision_provider or "").strip()
                     and active_routing_strategy == "probe_ranked"
