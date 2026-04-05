@@ -45,7 +45,10 @@ DEFAULT_PLATFORM_ORDER = ("tiktok", "instagram", "youtube")
 def _load_runtime_dependencies():
     import backend.app as backend_app
     from backend.final_export_merge import build_all_platforms_final_review_artifacts, collect_final_exports
-    from feishu_screening_bridge.bitable_upload import upload_final_review_payload_to_bitable
+    from feishu_screening_bridge.bitable_upload import (
+        fetch_existing_bitable_record_analysis,
+        upload_final_review_payload_to_bitable,
+    )
     from feishu_screening_bridge.feishu_api import DEFAULT_FEISHU_BASE_URL, FeishuOpenClient
     from feishu_screening_bridge.local_env import get_preferred_value, load_local_env
     from scripts.prepare_screening_inputs import (
@@ -74,6 +77,7 @@ def _load_runtime_dependencies():
         "snapshot_backend_runtime_state": snapshot_backend_runtime_state,
         "count_passed_profiles": count_passed_profiles,
         "export_platform_artifacts": export_platform_artifacts,
+        "fetch_existing_bitable_record_analysis": fetch_existing_bitable_record_analysis,
         "poll_job": poll_job,
         "require_success": require_success,
         "reset_backend_runtime_state": reset_backend_runtime_state,
@@ -203,6 +207,130 @@ def select_platform_identifiers(platform: str, max_identifiers_per_platform: int
     if max_identifiers_per_platform > 0:
         return identifiers[:max_identifiers_per_platform]
     return identifiers
+
+
+def _build_casefold_record_key(*parts: Any) -> str:
+    normalized_parts = [str(part or "").strip().casefold() for part in parts]
+    if any(not part for part in normalized_parts):
+        return ""
+    return "::".join(normalized_parts)
+
+
+def _resolve_staged_creator_id(backend_app, platform: str, metadata_key: str, metadata: dict[str, Any] | None) -> str:
+    screening_module = getattr(backend_app, "screening", None)
+    for candidate in (
+        (metadata or {}).get("creator_id"),
+        (metadata or {}).get("达人ID"),
+        (metadata or {}).get("handle"),
+        metadata_key,
+    ):
+        value = str(candidate or "").strip()
+        if not value:
+            continue
+        if "://" in value and hasattr(screening_module, "extract_platform_identifier"):
+            extracted = str(screening_module.extract_platform_identifier(platform, value) or "").strip()
+            if extracted:
+                return extracted
+        if value.startswith("@"):
+            value = value[1:]
+        return value.rstrip("/")
+    return ""
+
+
+def _build_platform_identifier_plan(
+    backend_app,
+    platform: str,
+    *,
+    max_identifiers_per_platform: int,
+    existing_bitable_analysis: Any | None = None,
+    task_owner_employee_id: str = "",
+) -> dict[str, Any]:
+    metadata_lookup = dict(backend_app.load_upload_metadata(platform) or {})
+    key_field_names = tuple(getattr(existing_bitable_analysis, "key_field_names", ()) or ())
+    owner_scope_field_name = str(getattr(existing_bitable_analysis, "owner_scope_field_name", "") or "").strip()
+    existing_record_index = dict(getattr(existing_bitable_analysis, "index", {}) or {})
+    duplicate_existing_group_count = len(list(getattr(existing_bitable_analysis, "duplicate_groups", []) or []))
+    owner_scope_value = str(task_owner_employee_id or "").strip()
+
+    planned_entries: list[dict[str, Any]] = []
+    for metadata_key, raw_metadata in metadata_lookup.items():
+        metadata = dict(raw_metadata or {})
+        creator_id = _resolve_staged_creator_id(backend_app, platform, str(metadata_key or "").strip(), metadata)
+        scrape_identifier = _build_platform_scrape_identifier(
+            backend_app,
+            platform,
+            str(metadata_key or "").strip(),
+            metadata,
+        )
+        planned_entries.append(
+            {
+                "creator_id": creator_id,
+                "scrape_identifier": scrape_identifier,
+                "profile_url": str(metadata.get("url") or metadata.get("profile_url") or "").strip(),
+            }
+        )
+
+    new_entries: list[dict[str, Any]] = []
+    existing_entries: list[dict[str, Any]] = []
+    if existing_record_index:
+        for entry in planned_entries:
+            key_parts: list[str] = []
+            for field_name in key_field_names or ("达人ID", "平台"):
+                if field_name == "达人对接人":
+                    key_parts.append(owner_scope_value)
+                elif field_name == "达人ID":
+                    key_parts.append(str(entry.get("creator_id") or "").strip())
+                elif field_name == "平台":
+                    key_parts.append(str(platform or "").strip())
+                else:
+                    key_parts.append("")
+            record_key = _build_casefold_record_key(*key_parts)
+            if record_key and record_key in existing_record_index:
+                existing_entries.append(
+                    {
+                        **entry,
+                        "record_key": record_key,
+                        "record_id": str((existing_record_index.get(record_key) or {}).get("record_id") or "").strip(),
+                    }
+                )
+                continue
+            new_entries.append({**entry, "record_key": record_key})
+    else:
+        new_entries = list(planned_entries)
+
+    requested_entries = list(new_entries)
+    if max_identifiers_per_platform > 0:
+        requested_entries = requested_entries[: int(max_identifiers_per_platform)]
+
+    incremental_prefilter = {
+        "enabled": bool(existing_record_index),
+        "status": "ready" if existing_record_index else "disabled",
+        "key_field_names": list(key_field_names),
+        "owner_scope_field_name": owner_scope_field_name,
+        "existing_bitable_match_count": len(existing_entries),
+        "existing_bitable_match_preview": [
+            str(item.get("creator_id") or "").strip()
+            for item in existing_entries[:10]
+            if str(item.get("creator_id") or "").strip()
+        ],
+        "incremental_candidate_count": len(new_entries),
+        "incremental_candidate_preview": [
+            str(item.get("creator_id") or "").strip()
+            for item in new_entries[:10]
+            if str(item.get("creator_id") or "").strip()
+        ],
+        "duplicate_existing_group_count": duplicate_existing_group_count,
+        "all_existing": bool(planned_entries) and not requested_entries and len(existing_entries) == len(planned_entries),
+    }
+    return {
+        "staged_identifier_count": len(planned_entries),
+        "requested_identifiers": [
+            str(item.get("scrape_identifier") or "").strip()
+            for item in requested_entries
+            if str(item.get("scrape_identifier") or "").strip()
+        ],
+        "incremental_prefilter": incremental_prefilter,
+    }
 
 
 def build_scrape_payload(
@@ -673,6 +801,69 @@ def _build_feishu_open_client(
         base_url=base_url,
         timeout_seconds=timeout_seconds,
     )
+
+
+def _prepare_existing_bitable_prefilter(
+    *,
+    runtime: dict[str, Any],
+    env_file: str | Path,
+    linked_bitable_url: str,
+    warnings_bucket: dict[str, Any],
+) -> tuple[dict[str, Any], Any | None]:
+    summary = {
+        "enabled": False,
+        "status": "disabled",
+        "linked_bitable_url": str(linked_bitable_url or "").strip(),
+        "target_url": "",
+        "target_table_id": "",
+        "target_table_name": "",
+        "key_field_names": [],
+        "owner_scope_field_name": "",
+        "duplicate_existing_group_count": 0,
+        "error": "",
+    }
+    normalized_linked_bitable_url = str(linked_bitable_url or "").strip()
+    if not normalized_linked_bitable_url:
+        summary["error"] = "linked_bitable_url is empty"
+        return summary, None
+
+    fetch_existing_bitable_record_analysis = runtime.get("fetch_existing_bitable_record_analysis")
+    if fetch_existing_bitable_record_analysis is None:
+        from feishu_screening_bridge.bitable_upload import fetch_existing_bitable_record_analysis
+
+    build_feishu_open_client = runtime.get("build_feishu_open_client")
+    try:
+        feishu_client = (
+            build_feishu_open_client(runtime=runtime, env_file=env_file)
+            if callable(build_feishu_open_client)
+            else _build_feishu_open_client(runtime=runtime, env_file=env_file)
+        )
+        resolved_view, analysis = fetch_existing_bitable_record_analysis(
+            feishu_client,
+            linked_bitable_url=normalized_linked_bitable_url,
+        )
+    except Exception as exc:  # noqa: BLE001
+        summary["status"] = "failed"
+        summary["error"] = str(exc) or exc.__class__.__name__
+        warnings_bucket["existing_bitable_prefilter_unavailable"] = {
+            "linked_bitable_url": normalized_linked_bitable_url,
+            "error": summary["error"],
+        }
+        return summary, None
+
+    summary.update(
+        {
+            "enabled": True,
+            "status": "ready",
+            "target_url": str(getattr(resolved_view, "source_url", "") or "").strip(),
+            "target_table_id": str(getattr(resolved_view, "table_id", "") or "").strip(),
+            "target_table_name": str(getattr(resolved_view, "table_name", "") or "").strip(),
+            "key_field_names": list(getattr(analysis, "key_field_names", ()) or ()),
+            "owner_scope_field_name": str(getattr(analysis, "owner_scope_field_name", "") or "").strip(),
+            "duplicate_existing_group_count": len(list(getattr(analysis, "duplicate_groups", []) or [])),
+        }
+    )
+    return summary, analysis
 
 
 def _build_platform_quality_report(platform: str, platform_summary: dict[str, Any]) -> dict[str, Any]:
@@ -1374,6 +1565,7 @@ def run_keep_list_screening_pipeline(
         "probe_vision_provider_only": bool(probe_vision_provider_only),
         "vision_providers": [],
         "vision_preflight": {},
+        "existing_bitable_prefilter": {},
         "staging": {},
         "platforms": {},
         "manual_review_rows": [],
@@ -1747,13 +1939,32 @@ def run_keep_list_screening_pipeline(
                 persist_summary(summary)
                 return summary
 
+            existing_bitable_prefilter, existing_bitable_analysis = _prepare_existing_bitable_prefilter(
+                runtime=runtime,
+                env_file=env_file,
+                linked_bitable_url=normalized_linked_bitable_url,
+                warnings_bucket=summary.setdefault("warnings", {}),
+            )
+            summary["existing_bitable_prefilter"] = existing_bitable_prefilter
+            persist_summary(summary)
+
             for platform in execution_platforms:
                 platform_summary: dict[str, Any] = {
-                    "staged_identifier_count": len(backend_app.load_upload_metadata(platform)),
+                    "staged_identifier_count": 0,
                     "requested_identifier_count": 0,
                     "requested_identifier_preview": [],
                     "requested_vision_provider": str(vision_provider or "").strip().lower(),
                     "vision_preflight": backend_app.build_vision_preflight(vision_provider),
+                    "incremental_prefilter": {
+                        "enabled": False,
+                        "status": "disabled",
+                        "existing_bitable_match_count": 0,
+                        "existing_bitable_match_preview": [],
+                        "incremental_candidate_count": 0,
+                        "incremental_candidate_preview": [],
+                        "duplicate_existing_group_count": 0,
+                        "all_existing": False,
+                    },
                     "status": "running",
                     "current_stage": "platform_preparing",
                 }
@@ -1766,7 +1977,16 @@ def run_keep_list_screening_pipeline(
                     summary_writer=persist_summary,
                 )
                 try:
-                    requested_identifiers = select_platform_identifiers(platform, max(0, int(max_identifiers_per_platform)))
+                    identifier_plan = _build_platform_identifier_plan(
+                        backend_app,
+                        platform,
+                        max_identifiers_per_platform=max(0, int(max_identifiers_per_platform)),
+                        existing_bitable_analysis=existing_bitable_analysis,
+                        task_owner_employee_id=normalized_task_owner_employee_id,
+                    )
+                    requested_identifiers = list(identifier_plan.get("requested_identifiers") or [])
+                    platform_summary["staged_identifier_count"] = int(identifier_plan.get("staged_identifier_count") or 0)
+                    platform_summary["incremental_prefilter"] = dict(identifier_plan.get("incremental_prefilter") or {})
                     platform_summary["requested_identifier_count"] = len(requested_identifiers)
                     platform_summary["requested_identifier_preview"] = requested_identifiers[:10]
                 except Exception as exc:  # noqa: BLE001
@@ -1778,6 +1998,34 @@ def run_keep_list_screening_pipeline(
                         platform_summary=platform_summary,
                         exc=exc,
                         current_stage="platform_preparing_failed",
+                        summary_writer=persist_summary,
+                    )
+                    continue
+
+                if bool((platform_summary.get("incremental_prefilter") or {}).get("all_existing")):
+                    platform_summary["status"] = "completed"
+                    platform_summary["reason"] = "all staged creators already exist in target bitable"
+                    platform_summary["scrape_job"] = {"status": "skipped", "reason": platform_summary["reason"]}
+                    platform_summary["visual_job"] = {"status": "skipped", "reason": platform_summary["reason"]}
+                    platform_summary["visual_gate"] = {
+                        "executed": False,
+                        "reason": platform_summary["reason"],
+                        "preflight_status": platform_summary["vision_preflight"]["status"],
+                        "runnable_provider_names": platform_summary["vision_preflight"]["runnable_provider_names"],
+                        "selected_provider": platform_summary["vision_preflight"].get("preferred_provider") or "",
+                    }
+                    platform_summary["positioning_card_analysis"] = _build_positioning_stage_payload(
+                        "skipped",
+                        "incremental filter found no new creators",
+                    )
+                    platform_summary["exports"] = {}
+                    _persist_platform_summary(
+                        summary=summary,
+                        run_summary_path=run_summary_path,
+                        backend_app=backend_app,
+                        platform=platform,
+                        platform_summary=platform_summary,
+                        current_stage="incremental_filter_completed",
                         summary_writer=persist_summary,
                     )
                     continue
@@ -1994,51 +2242,9 @@ def run_keep_list_screening_pipeline(
                         unresolved_missing = list(fallback_result.get("unresolved_missing") or [])
                     else:
                         if not current_has_fallback_contract:
-                            if not missing_profiles:
-                                unresolved_missing = []
-                            elif available_identifiers:
-                                unresolved_missing = list(fallback_profiles)
-                            else:
-                                platform_summary["visual_gate"]["blocked"] = True
-                                platform_summary["visual_gate"]["reason"] = "prescreen contains Missing targets"
-                                platform_summary["visual_job"] = {
-                                    "status": "skipped",
-                                    "reason": "名单账号未在本次抓取结果中返回，已阻断视觉复核和最终导出",
-                                }
-                                platform_summary["positioning_card_analysis"] = _build_positioning_stage_payload(
-                                    "skipped",
-                                    "missing profiles blocked downstream stages",
-                                )
-                                try:
-                                    platform_summary["artifact_status"] = require_success(
-                                        client.get(f"/api/artifacts/{platform}/status"),
-                                        f"{platform} artifact status",
-                                    )
-                                except Exception as exc:  # noqa: BLE001
-                                    _mark_platform_runtime_failure(
-                                        summary=summary,
-                                        run_summary_path=run_summary_path,
-                                        backend_app=backend_app,
-                                        platform=platform,
-                                        platform_summary=platform_summary,
-                                        exc=exc,
-                                        current_stage="artifact_status_failed",
-                                        summary_writer=persist_summary,
-                                    )
-                                    continue
-                                platform_summary["exports"] = {}
-                                platform_summary["status"] = "missing_profiles_blocked"
-                                _persist_platform_summary(
-                                    summary=summary,
-                                    run_summary_path=run_summary_path,
-                                    backend_app=backend_app,
-                                    platform=platform,
-                                    platform_summary=platform_summary,
-                                    current_stage="missing_profiles_blocked",
-                                    summary_writer=persist_summary,
-                                )
-                                continue
-                        unresolved_missing = list(fallback_profiles)
+                            unresolved_missing = [] if not missing_profiles else list(fallback_profiles)
+                        else:
+                            unresolved_missing = list(fallback_profiles)
                     if unresolved_missing:
                         manual_rows = []
                         for item in unresolved_missing:
@@ -2079,35 +2285,9 @@ def run_keep_list_screening_pipeline(
                             "skipped",
                             "no successful scrape rows remain after fallback staging",
                         )
-                        try:
-                            platform_summary["artifact_status"] = require_success(
-                                client.get(f"/api/artifacts/{platform}/status"),
-                                f"{platform} artifact status",
-                            )
-                        except Exception as exc:  # noqa: BLE001
-                            _mark_platform_runtime_failure(
-                                summary=summary,
-                                run_summary_path=run_summary_path,
-                                backend_app=backend_app,
-                                platform=platform,
-                                platform_summary=platform_summary,
-                                exc=exc,
-                                current_stage="artifact_status_failed",
-                                summary_writer=persist_summary,
-                            )
-                            continue
-                        platform_summary["exports"] = {}
-                        platform_summary["status"] = "fallback_staged"
-                        _persist_platform_summary(
-                            summary=summary,
-                            run_summary_path=run_summary_path,
-                            backend_app=backend_app,
-                            platform=platform,
-                            platform_summary=platform_summary,
-                            current_stage="fallback_staged",
-                            summary_writer=persist_summary,
+                        platform_summary["fallback_only"] = bool(
+                            int(((platform_summary.get("fallback") or {}).get("staged_count") or 0)) > 0
                         )
-                        continue
                 if skip_visual:
                     platform_summary["visual_job"] = {"status": "skipped", "reason": "skip_visual flag set"}
                 elif pass_count <= 0:
@@ -2305,8 +2485,7 @@ def run_keep_list_screening_pipeline(
                         f"{platform} artifact status",
                     )
                     fallback_stage_count = int(((platform_summary.get("fallback") or {}).get("staged_count") or 0))
-                    final_review_export_blocked = bool((platform_summary.get("artifact_status") or {}).get("final_review_export_blocked"))
-                    if final_review_export_blocked and fallback_stage_count > 0:
+                    if fallback_stage_count > 0:
                         platform_summary["exports"] = {}
                         platform_summary["final_review_export"] = {
                             "status": "deferred",
@@ -2315,7 +2494,10 @@ def run_keep_list_screening_pipeline(
                         }
                     else:
                         platform_summary["exports"] = export_platform_artifacts(client, platform, exports_dir / platform)
-                    platform_summary["status"] = "completed_with_partial_scrape" if scrape_was_salvaged else "completed"
+                    if bool(platform_summary.get("fallback_only")):
+                        platform_summary["status"] = "fallback_staged"
+                    else:
+                        platform_summary["status"] = "completed_with_partial_scrape" if scrape_was_salvaged else "completed"
                     _persist_platform_summary(
                         summary=summary,
                         run_summary_path=run_summary_path,

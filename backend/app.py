@@ -8170,7 +8170,7 @@ def artifact_status(platform):
     visual_results = load_visual_results(platform)
     positioning_card_results = load_positioning_card_results(platform)
     missing_profiles = list_missing_profile_reviews(platform, profile_reviews)
-    final_review_export_blocked = bool(missing_profiles)
+    final_review_export_blocked = False
     return jsonify({
         "platform": platform,
         "raw_data_path": get_raw_data_path(platform),
@@ -8184,7 +8184,7 @@ def artifact_status(platform):
         "missing_profile_count": len(missing_profiles),
         "missing_profiles_preview": missing_profiles[:20],
         "final_review_export_blocked": final_review_export_blocked,
-        "saved_final_review_artifacts_available": bool(profile_reviews and visual_results and not final_review_export_blocked),
+        "saved_final_review_artifacts_available": bool(profile_reviews),
         "saved_positioning_card_artifacts_available": bool(positioning_card_results),
     })
 
@@ -8316,9 +8316,6 @@ def download_final_review(platform):
         profile_reviews = load_profile_reviews(platform)
     if not isinstance(profile_reviews, list) or not profile_reviews:
         return jsonify({"error": "No profile review data available to export"}), 400
-    missing_profiles = list_missing_profile_reviews(platform, profile_reviews)
-    if missing_profiles:
-        return jsonify(build_final_review_missing_block_payload(platform, profile_reviews)), 409
     visual_results = merge_visual_results(platform, payload.get("visual_results") or {})
     rows = build_final_review_rows(platform, profile_reviews, visual_results)
     if not rows:

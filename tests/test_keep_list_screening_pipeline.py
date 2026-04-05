@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 from harness.contract import RUN_CONTRACT_VERSION
@@ -1954,6 +1955,178 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         self.assertEqual(summary["platforms"]["instagram"]["requested_identifier_preview"], ["alpha"])
         self.assertEqual(export_calls, ["instagram"])
 
+    def test_runner_filters_existing_bitable_creators_before_scrape(self) -> None:
+        preflight = {
+            "status": "configured",
+            "error_code": "",
+            "message": "视觉模型已就绪：openai",
+            "configured_provider_names": ["openai"],
+            "runnable_provider_names": ["openai"],
+            "preferred_provider": "openai",
+            "providers": [{"name": "openai", "runnable": True}],
+        }
+        backend_app = FakeBackendApp(
+            preflight,
+            metadata={
+                "instagram": {
+                    "alpha": {"handle": "alpha"},
+                    "beta": {"handle": "beta"},
+                    "gamma": {"handle": "gamma"},
+                }
+            },
+        )
+
+        def fake_prepare_screening_inputs(**kwargs):
+            return {"prepared_at": "2026-03-28T01:02:03Z", "upload": {"stats": {"Instagram": 3}}}
+
+        def fake_poll_job(client, job_id, label, interval):
+            if job_id == "scrape-job-1":
+                return {
+                    "id": job_id,
+                    "status": "completed",
+                    "result": {"profile_reviews": [{"status": "Pass", "username": "gamma"}]},
+                }
+            return {"id": job_id, "status": "completed", "result": {"success": True}}
+
+        keep_list_runner._load_runtime_dependencies = lambda: {
+            "backend_app": backend_app,
+            "build_feishu_open_client": lambda **kwargs: object(),
+            "fetch_existing_bitable_record_analysis": lambda client, *, linked_bitable_url: (
+                SimpleNamespace(source_url=linked_bitable_url, table_id="tbl", table_name="达人管理"),
+                SimpleNamespace(
+                    index={
+                        "alpha::instagram": {"record_id": "rec_alpha", "fields": {}},
+                        "beta::instagram": {"record_id": "rec_beta", "fields": {}},
+                    },
+                    duplicate_groups=[],
+                    key_field_names=("达人ID", "平台"),
+                    owner_scope_field_name="",
+                ),
+            ),
+            "prepare_screening_inputs": fake_prepare_screening_inputs,
+            "count_passed_profiles": lambda scrape_job: 1,
+            "export_platform_artifacts": lambda client, platform, export_dir: {},
+            "poll_job": fake_poll_job,
+            "require_success": lambda response, label: response.get_json(),
+            "reset_backend_runtime_state": lambda: None,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            keep_path = temp_root / "keep.xlsx"
+            template_path = temp_root / "template.xlsx"
+            keep_path.touch()
+            template_path.touch()
+            env_path = self._write_env_file(temp_root)
+
+            summary = keep_list_runner.run_keep_list_screening_pipeline(
+                keep_workbook=keep_path,
+                template_workbook=template_path,
+                env_file=env_path,
+                output_root=temp_root / "run",
+                platform_filters=["instagram"],
+                skip_visual=True,
+                skip_positioning_card_analysis=True,
+                linked_bitable_url="https://bitable.example.com/base/app?table=tbl&view=vew",
+            )
+
+        platform_summary = summary["platforms"]["instagram"]
+        self.assertEqual(summary["status"], "completed")
+        self.assertEqual(platform_summary["status"], "completed")
+        self.assertEqual(
+            backend_app.app.test_client().scrape_start_calls[0]["payload"]["usernames"],
+            ["gamma"],
+        )
+        self.assertTrue(summary["existing_bitable_prefilter"]["enabled"])
+        self.assertEqual(platform_summary["incremental_prefilter"]["existing_bitable_match_count"], 2)
+        self.assertEqual(platform_summary["incremental_prefilter"]["incremental_candidate_count"], 1)
+        self.assertEqual(platform_summary["requested_identifier_count"], 1)
+
+    def test_runner_treats_all_existing_bitable_matches_as_completed_without_scrape(self) -> None:
+        preflight = {
+            "status": "configured",
+            "error_code": "",
+            "message": "视觉模型已就绪：openai",
+            "configured_provider_names": ["openai"],
+            "runnable_provider_names": ["openai"],
+            "preferred_provider": "openai",
+            "providers": [{"name": "openai", "runnable": True}],
+        }
+        backend_app = FakeBackendApp(preflight, metadata={"instagram": {"alpha": {"handle": "alpha"}}})
+
+        def fake_prepare_screening_inputs(**kwargs):
+            return {"prepared_at": "2026-03-28T01:02:03Z", "upload": {"stats": {"Instagram": 1}}}
+
+        def fake_build_all_platforms_final_review_artifacts(**kwargs):
+            payload_json_path = Path(kwargs["payload_json_path"])
+            payload_json_path.parent.mkdir(parents=True, exist_ok=True)
+            payload_json_path.write_text(json.dumps({"rows": []}, ensure_ascii=False), encoding="utf-8")
+            workbook_path = Path(kwargs["output_path"])
+            workbook_path.write_text("placeholder", encoding="utf-8")
+            return {
+                "all_platforms_final_review": str(workbook_path),
+                "all_platforms_upload_payload_json": str(payload_json_path),
+                "all_platforms_upload_local_archive_dir": "",
+                "all_platforms_upload_skipped_archive_json": "",
+                "all_platforms_upload_skipped_archive_xlsx": "",
+                "row_count": 0,
+                "source_row_count": 0,
+                "skipped_row_count": 0,
+            }
+
+        keep_list_runner._load_runtime_dependencies = lambda: {
+            "backend_app": backend_app,
+            "build_all_platforms_final_review_artifacts": fake_build_all_platforms_final_review_artifacts,
+            "build_feishu_open_client": lambda **kwargs: object(),
+            "collect_final_exports": lambda platforms: {},
+            "fetch_existing_bitable_record_analysis": lambda client, *, linked_bitable_url: (
+                SimpleNamespace(source_url=linked_bitable_url, table_id="tbl", table_name="达人管理"),
+                SimpleNamespace(
+                    index={"alpha::instagram": {"record_id": "rec_alpha", "fields": {}}},
+                    duplicate_groups=[],
+                    key_field_names=("达人ID", "平台"),
+                    owner_scope_field_name="",
+                ),
+            ),
+            "prepare_screening_inputs": fake_prepare_screening_inputs,
+            "count_passed_profiles": lambda scrape_job: 0,
+            "export_platform_artifacts": lambda client, platform, export_dir: (_ for _ in ()).throw(
+                AssertionError("export should not run when everything is already in bitable")
+            ),
+            "poll_job": lambda client, job_id, label, interval: {},
+            "require_success": lambda response, label: response.get_json(),
+            "reset_backend_runtime_state": lambda: None,
+            "upload_final_review_payload_to_bitable": lambda client, **kwargs: (_ for _ in ()).throw(
+                AssertionError("upload should not run when everything is already in bitable")
+            ),
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            keep_path = temp_root / "keep.xlsx"
+            template_path = temp_root / "template.xlsx"
+            keep_path.touch()
+            template_path.touch()
+            env_path = self._write_env_file(temp_root)
+
+            summary = keep_list_runner.run_keep_list_screening_pipeline(
+                keep_workbook=keep_path,
+                template_workbook=template_path,
+                env_file=env_path,
+                output_root=temp_root / "run",
+                platform_filters=["instagram"],
+                linked_bitable_url="https://bitable.example.com/base/app?table=tbl&view=vew",
+            )
+
+        platform_summary = summary["platforms"]["instagram"]
+        self.assertEqual(summary["status"], "completed")
+        self.assertEqual(summary["verdict"]["outcome"], "completed")
+        self.assertEqual(platform_summary["status"], "completed")
+        self.assertEqual(platform_summary["current_stage"], "incremental_filter_completed")
+        self.assertEqual(backend_app.app.test_client().scrape_start_calls, [])
+        self.assertEqual(platform_summary["incremental_prefilter"]["existing_bitable_match_count"], 1)
+        self.assertTrue(platform_summary["incremental_prefilter"]["all_existing"])
+
     def test_runner_forwards_creator_cache_controls_to_scrape_and_visual_payloads(self) -> None:
         preflight = {
             "status": "configured",
@@ -2036,7 +2209,7 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             backend_app.app.test_client().visual_start_calls[0]["payload"]["force_refresh_creator_cache"]
         )
 
-    def test_runner_blocks_visual_and_export_when_scrape_contains_missing_profiles(self) -> None:
+    def test_runner_exports_missing_only_platform_non_blockingly(self) -> None:
         preflight = {
             "status": "configured",
             "error_code": "",
@@ -2070,8 +2243,27 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             export_calls.append(platform)
             return {}
 
+        def fake_build_all_platforms_final_review_artifacts(**kwargs):
+            payload_json_path = Path(kwargs["payload_json_path"])
+            payload_json_path.parent.mkdir(parents=True, exist_ok=True)
+            payload_json_path.write_text(json.dumps({"rows": []}, ensure_ascii=False), encoding="utf-8")
+            workbook_path = Path(kwargs["output_path"])
+            workbook_path.write_text("placeholder", encoding="utf-8")
+            return {
+                "all_platforms_final_review": str(workbook_path),
+                "all_platforms_upload_payload_json": str(payload_json_path),
+                "all_platforms_upload_local_archive_dir": "",
+                "all_platforms_upload_skipped_archive_json": "",
+                "all_platforms_upload_skipped_archive_xlsx": "",
+                "row_count": 0,
+                "source_row_count": 0,
+                "skipped_row_count": 0,
+            }
+
         keep_list_runner._load_runtime_dependencies = lambda: {
             "backend_app": backend_app,
+            "build_all_platforms_final_review_artifacts": fake_build_all_platforms_final_review_artifacts,
+            "collect_final_exports": lambda platforms: dict(platforms or {}),
             "prepare_screening_inputs": fake_prepare_screening_inputs,
             "count_passed_profiles": lambda scrape_job: 0,
             "export_platform_artifacts": fake_export_platform_artifacts,
@@ -2098,17 +2290,16 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             )
 
         platform_summary = summary["platforms"]["instagram"]
-        self.assertEqual(summary["status"], "missing_profiles_blocked")
-        self.assertEqual(summary["verdict"]["outcome"], "blocked")
-        self.assertEqual(summary["failure"]["error_code"], "MISSING_PROFILES_BLOCKED")
-        self.assertEqual(summary["failure_decision"]["category"], "input")
-        self.assertTrue(summary["failure_decision"]["requires_manual_intervention"])
-        self.assertEqual(platform_summary["status"], "missing_profiles_blocked")
+        self.assertEqual(summary["status"], "completed_with_quality_warnings")
+        self.assertEqual(summary["verdict"]["outcome"], "completed")
+        self.assertEqual(platform_summary["status"], "completed")
         self.assertEqual(platform_summary["missing_profile_count"], 1)
         self.assertEqual(platform_summary["missing_profiles"][0]["identifier"], "ghost")
         self.assertTrue(platform_summary["visual_gate"]["blocked"])
+        self.assertEqual(platform_summary["visual_job"]["status"], "skipped")
+        self.assertEqual(summary["manual_review_rows"][0]["identifier"], "ghost")
         self.assertEqual(backend_app.app.test_client().visual_start_calls, [])
-        self.assertEqual(export_calls, [])
+        self.assertEqual(export_calls, ["instagram"])
 
     def test_runner_keeps_successful_rows_when_missing_profiles_have_no_fallback_contract(self) -> None:
         preflight = {
@@ -2696,6 +2887,138 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         self.assertEqual(summary["quality_report"]["warnings"][0]["code"], "visual_coverage_gap")
         self.assertEqual(summary["quality_report"]["warnings"][0]["platform"], "instagram")
         self.assertEqual(summary["quality_report"]["warnings"][0]["count"], 1)
+
+    def test_runner_keeps_completed_status_when_upload_only_skips_existing_rows(self) -> None:
+        preflight = {
+            "status": "configured",
+            "error_code": "",
+            "message": "视觉模型已就绪：openai",
+            "configured_provider_names": ["openai"],
+            "runnable_provider_names": ["openai"],
+            "preferred_provider": "openai",
+            "providers": [{"name": "openai", "runnable": True}],
+        }
+        backend_app = FakeBackendApp(preflight, metadata={"instagram": {"alpha": {"handle": "alpha"}}})
+
+        def fake_prepare_screening_inputs(**kwargs):
+            return {"prepared_at": "2026-03-28T01:02:03Z", "upload": {"stats": {"Instagram": 1}}}
+
+        def fake_poll_job(client, job_id, label, interval):
+            if job_id == "scrape-job-1":
+                return {
+                    "id": job_id,
+                    "status": "completed",
+                    "result": {"profile_reviews": [{"status": "Pass", "username": "alpha"}]},
+                }
+            return {"id": job_id, "status": "completed", "result": {"success": True}}
+
+        def fake_build_all_platforms_final_review_artifacts(**kwargs):
+            output_path = Path(kwargs["output_path"])
+            payload_path = Path(kwargs["payload_json_path"])
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.touch()
+            payload_path.write_text(
+                json.dumps(
+                    {
+                        "source_row_count": 1,
+                        "row_count": 1,
+                        "rows": [{"达人ID": "alpha", "平台": "instagram", "主页链接": "https://instagram.com/alpha"}],
+                        "skipped_rows": [],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            skipped_json = output_path.with_name("skipped_from_feishu_upload.json")
+            skipped_xlsx = output_path.with_name("skipped_from_feishu_upload.xlsx")
+            skipped_json.write_text("[]", encoding="utf-8")
+            skipped_xlsx.touch()
+            return {
+                "all_platforms_final_review": str(output_path),
+                "all_platforms_upload_payload_json": str(payload_path),
+                "all_platforms_upload_local_archive_dir": str(output_path.parent / "archives"),
+                "all_platforms_upload_skipped_archive_json": str(skipped_json),
+                "all_platforms_upload_skipped_archive_xlsx": str(skipped_xlsx),
+                "row_count": 1,
+                "source_row_count": 1,
+                "skipped_row_count": 0,
+            }
+
+        keep_list_runner._load_runtime_dependencies = lambda: {
+            "backend_app": backend_app,
+            "build_all_platforms_final_review_artifacts": fake_build_all_platforms_final_review_artifacts,
+            "build_feishu_open_client": lambda **kwargs: object(),
+            "collect_final_exports": lambda platforms: dict(platforms or {}),
+            "DEFAULT_FEISHU_BASE_URL": "https://open.feishu.cn",
+            "FeishuOpenClient": lambda **kwargs: object(),
+            "get_preferred_value": lambda _fallback, env_values, key, default="": str(env_values.get(key) or default or ""),
+            "load_local_env": lambda env_file: {
+                "FEISHU_APP_ID": "cli_test_app_id",
+                "FEISHU_APP_SECRET": "cli_test_app_secret",
+            },
+            "prepare_screening_inputs": fake_prepare_screening_inputs,
+            "count_passed_profiles": lambda scrape_job: 1,
+            "export_platform_artifacts": lambda client, platform, export_dir: {
+                "final_review": str(export_dir / f"{platform}_final_review.xlsx")
+            },
+            "poll_job": fake_poll_job,
+            "require_success": lambda response, label: response.get_json(),
+            "reset_backend_runtime_state": lambda: None,
+            "upload_final_review_payload_to_bitable": lambda client, **kwargs: {
+                "ok": True,
+                "payload_json_path": str(kwargs["payload_json_path"]),
+                "result_json_path": str(Path(kwargs["payload_json_path"]).with_name("upload_result.json")),
+                "result_xlsx_path": str(Path(kwargs["payload_json_path"]).with_name("upload_result.xlsx")),
+                "target_url": "https://bitable.example.com/base/app?table=tbl&view=vew",
+                "target_table_id": "tbl",
+                "target_table_name": "达人管理",
+                "created_count": 0,
+                "updated_count": 0,
+                "failed_count": 0,
+                "skipped_existing_count": 1,
+                "created_rows": [],
+                "updated_rows": [],
+                "failed_rows": [],
+                "skipped_existing_rows": [
+                    {
+                        "reason": "record already exists",
+                        "row": {"达人ID": "alpha", "平台": "instagram"},
+                    }
+                ],
+                "report_write_warnings": [],
+                "upload_detail": {
+                    "created_keys": [],
+                    "updated_keys": [],
+                    "failed_detail": [],
+                    "deduplicated_detail": [],
+                    "duplicate_existing_groups": [],
+                },
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            keep_path = temp_root / "keep.xlsx"
+            template_path = temp_root / "template.xlsx"
+            keep_path.touch()
+            template_path.touch()
+            env_path = self._write_env_file(temp_root)
+
+            summary = keep_list_runner.run_keep_list_screening_pipeline(
+                keep_workbook=keep_path,
+                template_workbook=template_path,
+                env_file=env_path,
+                output_root=temp_root / "run",
+                platform_filters=["instagram"],
+                skip_visual=True,
+                skip_positioning_card_analysis=True,
+            )
+
+        self.assertEqual(summary["status"], "completed")
+        self.assertEqual(summary["verdict"]["outcome"], "completed")
+        self.assertEqual(summary["artifacts"]["feishu_upload_skipped_existing_count"], 1)
+        self.assertEqual(summary["artifacts"]["feishu_upload_failed_count"], 0)
+        self.assertEqual(summary["upload_summary"]["skipped_existing_count"], 1)
 
     def test_runner_does_not_emit_quality_warning_when_visual_is_explicitly_skipped(self) -> None:
         preflight = {

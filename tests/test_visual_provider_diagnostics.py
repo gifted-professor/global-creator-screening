@@ -346,7 +346,7 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
         self.assertNotIn("upload_metadata", payload)
         self.assertNotIn("raw_source_path", payload)
 
-    def test_artifact_status_reports_final_review_block_when_missing_profiles_exist(self) -> None:
+    def test_artifact_status_keeps_final_review_export_available_when_missing_profiles_exist(self) -> None:
         with mock.patch.object(
             backend_app,
             "load_profile_reviews",
@@ -369,10 +369,10 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
 
         payload = response.get_json()
         self.assertEqual(response.status_code, 200)
-        self.assertTrue(payload["final_review_export_blocked"])
+        self.assertFalse(payload["final_review_export_blocked"])
         self.assertEqual(payload["missing_profile_count"], 1)
         self.assertEqual(payload["missing_profiles_preview"][0]["identifier"], "ghost")
-        self.assertFalse(payload["saved_final_review_artifacts_available"])
+        self.assertTrue(payload["saved_final_review_artifacts_available"])
 
     def test_artifact_status_reports_positioning_card_paths_and_counts(self) -> None:
         with mock.patch.object(
@@ -405,7 +405,7 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
         self.assertEqual(payload["positioning_card_result_count"], 1)
         self.assertTrue(payload["saved_positioning_card_artifacts_available"])
 
-    def test_final_review_export_is_blocked_when_profile_reviews_contain_missing(self) -> None:
+    def test_final_review_export_allows_missing_profile_rows(self) -> None:
         with mock.patch.object(
             backend_app,
             "load_profile_reviews",
@@ -422,11 +422,11 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
         ):
             response = self.client.post("/api/download/instagram/final-review", json={})
 
-        payload = response.get_json()
-        self.assertEqual(response.status_code, 409)
-        self.assertEqual(payload["error_code"], "FINAL_REVIEW_BLOCKED_BY_MISSING_PROFILES")
-        self.assertEqual(payload["missing_profile_count"], 1)
-        self.assertEqual(payload["missing_profiles"][0]["identifier"], "ghost")
+        self.assertEqual(response.status_code, 200)
+        workbook = pd.read_excel(io.BytesIO(response.data))
+        self.assertEqual(len(workbook.index), 1)
+        self.assertEqual(workbook.loc[0, "identifier"], "ghost")
+        self.assertEqual(workbook.loc[0, "status"], "Missing")
 
     def test_perform_scrape_retries_missing_profiles_before_returning(self) -> None:
         batch_calls = []
