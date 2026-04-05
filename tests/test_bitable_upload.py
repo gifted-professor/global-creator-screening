@@ -717,7 +717,7 @@ class BitableUploadTests(unittest.TestCase):
         self.assertEqual(result["updated_count"], 0)
         self.assertEqual(result["skipped_existing_count"], 1)
 
-    def test_upload_payload_blocks_when_target_table_contains_duplicate_record_keys(self) -> None:
+    def test_upload_payload_updates_keep_record_when_target_table_contains_duplicate_record_keys(self) -> None:
         client = _FakeBitableUploadClient()
         client.search_items = [
             {
@@ -763,6 +763,7 @@ class BitableUploadTests(unittest.TestCase):
                                 "平台": "tiktok",
                                 "达人对接人": "陈俊仁",
                                 "ai是否通过": "是",
+                                "__feishu_update_mode": "create_or_update",
                             }
                         ],
                     },
@@ -781,13 +782,81 @@ class BitableUploadTests(unittest.TestCase):
                     linked_bitable_url="https://example.com/base/app?table=tbl&view=vew",
                 )
 
-        self.assertFalse(result["ok"])
-        self.assertTrue(result["guard_blocked"])
+        self.assertTrue(result["ok"])
         self.assertEqual(result["duplicate_existing_group_count"], 1)
         self.assertEqual(result["created_count"], 0)
-        self.assertEqual(result["updated_count"], 0)
+        self.assertEqual(result["updated_count"], 1)
         self.assertEqual(len(client.created_records), 0)
-        self.assertEqual(len(client.updated_records), 0)
+        self.assertEqual(len(client.updated_records), 1)
+        self.assertEqual(client.updated_records[0]["record_id"], "rec_dup_1")
+
+    def test_upload_payload_deduplicates_duplicate_rows_and_keeps_last_version(self) -> None:
+        client = _FakeBitableUploadClient()
+        client.search_items = []
+        resolved_view = ResolvedBitableView(
+            source_url="https://example.com/base/app?table=tbl&view=vew",
+            source_kind="base",
+            source_token="app_token",
+            app_token="app_token",
+            table_id="tbl",
+            view_id="vew",
+            table_name="达人管理",
+            view_name="总视图",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            payload_path = Path(tmpdir) / "payload.json"
+            payload_path.write_text(
+                json.dumps(
+                    {
+                        "rows": [
+                            {
+                                "达人ID": "alpha",
+                                "平台": "instagram",
+                                "主页链接": "https://www.instagram.com/alpha-old",
+                                "达人对接人": "陈俊仁",
+                                "ai是否通过": "否",
+                                "__feishu_update_mode": "create_or_update",
+                            },
+                            {
+                                "达人ID": "alpha",
+                                "平台": "instagram",
+                                "主页链接": "https://www.instagram.com/alpha-new",
+                                "达人对接人": "陈俊仁",
+                                "ai是否通过": "是",
+                                "__feishu_update_mode": "create_or_update",
+                            },
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            with patch(
+                "feishu_screening_bridge.bitable_upload.resolve_bitable_view_from_url",
+                return_value=resolved_view,
+            ):
+                result = upload_final_review_payload_to_bitable(
+                    client,
+                    payload_json_path=payload_path,
+                    linked_bitable_url="https://example.com/base/app?table=tbl&view=vew",
+                )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["created_count"], 1)
+        self.assertEqual(result["failed_count"], 0)
+        self.assertEqual(result["deduplicated_row_count"], 1)
+        self.assertEqual(len(result["deduplicated_rows"]), 1)
+        self.assertEqual(client.created_records[0]["fields"]["ai 是否通过"], "是")
+        self.assertEqual(
+            client.created_records[0]["fields"]["主页链接"],
+            {
+                "link": "https://www.instagram.com/alpha-new",
+                "text": "https://www.instagram.com/alpha-new",
+                "type": "url",
+            },
+        )
 
     def test_upload_prefers_task_upload_resolved_target_over_payload_link(self) -> None:
         client = _FakeBitableUploadClient()

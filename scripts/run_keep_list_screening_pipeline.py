@@ -7,6 +7,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+import pandas as pd
+
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -371,6 +373,169 @@ def _first_non_empty_text(*values: Any) -> str:
         if text:
             return text
     return ""
+
+
+def _apply_explicit_feishu_update_mode(payload_json_path: Path, *, update_mode: str) -> int:
+    try:
+        payload = json.loads(payload_json_path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return 0
+    rows = list(payload.get("rows") or [])
+    updated_count = 0
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("__feishu_update_mode") or "") != update_mode:
+            row["__feishu_update_mode"] = update_mode
+            updated_count += 1
+    if updated_count > 0:
+        payload["rows"] = rows
+        payload_json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return updated_count
+
+
+def _stringify_report_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        values = [_stringify_report_value(item) for item in value]
+        return "；".join(item for item in values if item)
+    if isinstance(value, dict):
+        for key in ("text", "name", "link", "value", "id"):
+            candidate = str(value.get(key) or "").strip()
+            if candidate:
+                return candidate
+        return ""
+    return str(value).strip()
+
+
+def _write_report_xlsx(output_path: Path, rows: list[dict[str, Any]], *, columns: tuple[str, ...]) -> str:
+    if not rows:
+        return ""
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    frame = pd.DataFrame(rows, columns=columns)
+    with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+        frame.to_excel(writer, index=False, sheet_name="report")
+    return str(output_path)
+
+
+def _collect_missing_profile_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for platform, platform_summary in (summary.get("platforms") or {}).items():
+        for item in list((platform_summary or {}).get("missing_profiles") or []):
+            if not isinstance(item, dict):
+                continue
+            rows.append(
+                {
+                    "platform": str(platform or "").strip(),
+                    "identifier": _stringify_report_value(item.get("identifier")),
+                    "profile_url": _stringify_report_value(item.get("profile_url")),
+                    "reason": _stringify_report_value(item.get("reason")),
+                }
+            )
+    return rows
+
+
+def _build_success_report_rows(upload_summary: dict[str, Any] | None) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    payload = dict(upload_summary or {})
+    for action, items in (
+        ("Created", list(payload.get("created_rows") or [])),
+        ("Updated", list(payload.get("updated_rows") or [])),
+    ):
+        for item in items:
+            row = dict((item or {}).get("row") or {})
+            rows.append(
+                {
+                    "达人ID": _stringify_report_value(row.get("达人ID")),
+                    "平台": _stringify_report_value(row.get("平台")),
+                    "主页链接": _stringify_report_value(row.get("主页链接")),
+                    "操作": action,
+                    "飞书记录ID": _stringify_report_value((item or {}).get("record_id")),
+                }
+            )
+    return rows
+
+
+def _build_error_report_rows(
+    summary: dict[str, Any],
+    upload_summary: dict[str, Any] | None,
+    *,
+    occurred_at: str,
+) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for item in _collect_missing_profile_rows(summary):
+        rows.append(
+            {
+                "严重级别": "warning",
+                "异常类别": "Missing",
+                "达人ID": item["identifier"],
+                "平台": item["platform"],
+                "原因详情": item["reason"] or item["profile_url"],
+                "飞书记录ID": "",
+                "时间": occurred_at,
+            }
+        )
+
+    for platform, platform_summary in (summary.get("platforms") or {}).items():
+        payload = dict(platform_summary or {})
+        if str(payload.get("status") or "").strip() not in {"scrape_failed", "failed"}:
+            continue
+        rows.append(
+            {
+                "严重级别": "error",
+                "异常类别": "Scrape Failed",
+                "达人ID": "",
+                "平台": str(platform or "").strip(),
+                "原因详情": _first_non_empty_text(payload.get("error"), payload.get("error_code")),
+                "飞书记录ID": "",
+                "时间": occurred_at,
+            }
+        )
+
+    normalized_upload = dict(upload_summary or {})
+    for item in list(normalized_upload.get("failed_rows") or []):
+        row = dict((item or {}).get("row") or {})
+        rows.append(
+            {
+                "严重级别": "error",
+                "异常类别": "Upload Failed",
+                "达人ID": _stringify_report_value(row.get("达人ID")),
+                "平台": _stringify_report_value(row.get("平台")),
+                "原因详情": _first_non_empty_text((item or {}).get("error"), (item or {}).get("reason")),
+                "飞书记录ID": _first_non_empty_text((item or {}).get("record_id"), (item or {}).get("existing_record_id")),
+                "时间": occurred_at,
+            }
+        )
+
+    for item in list(normalized_upload.get("deduplicated_rows") or []):
+        row = dict((item or {}).get("row") or {})
+        rows.append(
+            {
+                "严重级别": "warning",
+                "异常类别": "Payload Deduplicated",
+                "达人ID": _stringify_report_value(row.get("达人ID")),
+                "平台": _stringify_report_value(row.get("平台")),
+                "原因详情": _first_non_empty_text((item or {}).get("error"), (item or {}).get("reason")),
+                "飞书记录ID": "",
+                "时间": occurred_at,
+            }
+        )
+
+    for group in list(normalized_upload.get("duplicate_existing_groups") or []):
+        duplicate_count = len(list((group or {}).get("duplicate_records") or [])) + 1
+        rows.append(
+            {
+                "严重级别": "warning",
+                "异常类别": "Existing Duplicate Group",
+                "达人ID": _first_non_empty_text((group or {}).get("creator_id"), (group or {}).get("record_key")),
+                "平台": _stringify_report_value((group or {}).get("platform")),
+                "原因详情": f"目标飞书表存在 {duplicate_count} 条重复记录，本次仅更新 keep_record。",
+                "飞书记录ID": _stringify_report_value(((group or {}).get("keep_record") or {}).get("record_id")),
+                "时间": occurred_at,
+            }
+        )
+    return rows
 
 
 def _build_feishu_open_client(
@@ -1103,12 +1268,16 @@ def run_keep_list_screening_pipeline(
         "staging": {},
         "platforms": {},
         "manual_review_rows": [],
+        "warnings": {},
         "artifacts": {
             "keep_workbook": str(resolved_keep_workbook.resolve()),
             "template_workbook": str(resolved_template_workbook.resolve()) if resolved_template_workbook else "",
             "all_platforms_final_review": "",
             "all_platforms_upload_payload_json": "",
             "final_exports": {},
+            "missing_profiles_xlsx": "",
+            "success_report_xlsx": "",
+            "error_report_xlsx": "",
         },
         "setup": {
             "scope": "keep-list-screening",
@@ -2099,6 +2268,17 @@ def run_keep_list_screening_pipeline(
         summary["artifacts"]["all_platforms_upload_row_count"] = combined_artifacts["row_count"]
         summary["artifacts"]["all_platforms_upload_source_row_count"] = combined_artifacts["source_row_count"]
         summary["artifacts"]["all_platforms_upload_skipped_row_count"] = combined_artifacts["skipped_row_count"]
+        payload_json_path = Path(str(combined_artifacts["all_platforms_upload_payload_json"])).expanduser()
+        summary["artifacts"]["all_platforms_upload_explicit_update_mode_count"] = _apply_explicit_feishu_update_mode(
+            payload_json_path,
+            update_mode="create_or_update",
+        )
+        missing_profile_rows = _collect_missing_profile_rows(summary)
+        summary["artifacts"]["missing_profiles_xlsx"] = _write_report_xlsx(
+            exports_dir / "missing_profiles.xlsx",
+            missing_profile_rows,
+            columns=("platform", "identifier", "profile_url", "reason"),
+        )
         summary["artifacts"]["feishu_upload_result_json"] = ""
         summary["artifacts"]["feishu_upload_result_xlsx"] = ""
         summary["artifacts"]["feishu_upload_target_url"] = ""
@@ -2110,6 +2290,11 @@ def run_keep_list_screening_pipeline(
         summary["artifacts"]["feishu_upload_skipped_existing_count"] = 0
         if combined_artifacts["source_row_count"] > 0 and combined_artifacts["row_count"] <= 0:
             skip_archive = summary["artifacts"]["all_platforms_upload_skipped_archive_json"]
+            summary["artifacts"]["error_report_xlsx"] = _write_report_xlsx(
+                exports_dir / "error_report.xlsx",
+                _build_error_report_rows(summary, summary.get("upload_summary"), occurred_at=backend_app.iso_now()),
+                columns=("严重级别", "异常类别", "达人ID", "平台", "原因详情", "飞书记录ID", "时间"),
+            )
             failure = _build_failure_payload(
                 stage="feishu_upload",
                 error_code="FEISHU_UPLOAD_PAYLOAD_EMPTY",
@@ -2160,7 +2345,22 @@ def run_keep_list_screening_pipeline(
             summary["artifacts"]["feishu_upload_updated_count"] = int(upload_summary.get("updated_count") or 0)
             summary["artifacts"]["feishu_upload_failed_count"] = int(upload_summary.get("failed_count") or 0)
             summary["artifacts"]["feishu_upload_skipped_existing_count"] = int(upload_summary.get("skipped_existing_count") or 0)
-            if not bool(upload_summary.get("ok", True)) or int(upload_summary.get("failed_count") or 0) > 0:
+            summary["artifacts"]["success_report_xlsx"] = _write_report_xlsx(
+                exports_dir / "success_report.xlsx",
+                _build_success_report_rows(upload_summary),
+                columns=("达人ID", "平台", "主页链接", "操作", "飞书记录ID"),
+            )
+            summary["artifacts"]["error_report_xlsx"] = _write_report_xlsx(
+                exports_dir / "error_report.xlsx",
+                _build_error_report_rows(summary, upload_summary, occurred_at=backend_app.iso_now()),
+                columns=("严重级别", "异常类别", "达人ID", "平台", "原因详情", "飞书记录ID", "时间"),
+            )
+            created_count = int(upload_summary.get("created_count") or 0)
+            updated_count = int(upload_summary.get("updated_count") or 0)
+            failed_count = int(upload_summary.get("failed_count") or 0)
+            if created_count + updated_count == 0 and (
+                not bool(upload_summary.get("ok", True)) or failed_count > 0
+            ):
                 failure = _build_failure_payload(
                     stage="feishu_upload",
                     error_code="FEISHU_UPLOAD_FAILED",
@@ -2172,9 +2372,9 @@ def run_keep_list_screening_pipeline(
                     remediation="检查飞书返回的 failed_rows、目标表去重状态和负责人字段后重试。",
                     details={
                         "result_json_path": str(upload_summary.get("result_json_path") or "").strip(),
-                        "created_count": int(upload_summary.get("created_count") or 0),
-                        "updated_count": int(upload_summary.get("updated_count") or 0),
-                        "failed_count": int(upload_summary.get("failed_count") or 0),
+                        "created_count": created_count,
+                        "updated_count": updated_count,
+                        "failed_count": failed_count,
                         "skipped_existing_count": int(upload_summary.get("skipped_existing_count") or 0),
                     },
                 )
@@ -2182,6 +2382,17 @@ def run_keep_list_screening_pipeline(
                     failure=failure,
                     finished_at=backend_app.iso_now(),
                 )
+            if failed_count > 0:
+                summary.setdefault("warnings", {})["feishu_upload_partial_failure"] = {
+                    "failed_count": failed_count,
+                    "result_json_path": str(upload_summary.get("result_json_path") or "").strip(),
+                }
+        if not summary["artifacts"].get("error_report_xlsx"):
+            summary["artifacts"]["error_report_xlsx"] = _write_report_xlsx(
+                exports_dir / "error_report.xlsx",
+                _build_error_report_rows(summary, summary.get("upload_summary"), occurred_at=backend_app.iso_now()),
+                columns=("严重级别", "异常类别", "达人ID", "平台", "原因详情", "飞书记录ID", "时间"),
+            )
         summary["quality_report"] = build_quality_report(summary["platforms"])
         summary["status"] = summarize_platform_statuses(summary["platforms"])
         if summary["status"] == "completed" and str((summary.get("quality_report") or {}).get("status") or "") == "warning":

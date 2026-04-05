@@ -136,11 +136,14 @@ def upload_final_review_payload_to_bitable(
     rows = list(payload.get("rows") or [])
     if limit > 0:
         rows = rows[: int(limit)]
+    selected_row_count = len(rows)
 
     created_rows: list[dict[str, Any]] = []
     updated_rows: list[dict[str, Any]] = []
     skipped_existing_rows: list[dict[str, Any]] = []
     failed_rows: list[dict[str, Any]] = []
+    deduplicated_rows_log: list[dict[str, Any]] = []
+    duplicate_existing_warning_rows: list[dict[str, Any]] = []
     payload_duplicate_groups = _find_payload_duplicate_groups(rows, key_field_names=key_field_names)
     duplicate_existing_groups = list(existing_record_analysis.duplicate_groups)
     payload_owner_scopes = _extract_payload_owner_scopes(rows)
@@ -149,7 +152,7 @@ def upload_final_review_payload_to_bitable(
         existing_record_analysis.owner_scope_missing_record_count or 0
     ) > 0
 
-    if missing_owner_scope_field or has_unscoped_existing_records or duplicate_existing_groups or payload_duplicate_groups:
+    if missing_owner_scope_field or has_unscoped_existing_records:
         if missing_owner_scope_field:
             failed_rows.append(
                 {
@@ -172,50 +175,11 @@ def upload_final_review_payload_to_bitable(
                     "error": "目标飞书表已存在未填写 `达人对接人` 的历史记录，当前无法安全区分不同负责人下的达人，已阻止继续写入。",
                 }
             )
-        for group in duplicate_existing_groups:
-            keep_record = dict(group.get("keep_record") or {})
-            for duplicate_record in list(group.get("duplicate_records") or []):
-                failed_rows.append(
-                    {
-                        "status": "blocked_duplicate_existing",
-                        "record_key": group.get("record_key"),
-                        "record_id": duplicate_record.get("record_id") or "",
-                        "existing_record_id": keep_record.get("record_id") or "",
-                        "row": dict(duplicate_record.get("fields") or {}),
-                        "error": f"目标飞书表已存在重复的 {key_display_name} 记录，已阻止继续写入。",
-                    }
-                )
-        for group in payload_duplicate_groups:
-            first_row = dict(group.get("rows") or [{}])[0]
-            for duplicate_row in list(group.get("rows") or [])[1:]:
-                failed_rows.append(
-                    {
-                        "status": "blocked_duplicate_payload",
-                        "record_key": group.get("record_key"),
-                        "record_id": "",
-                        "existing_record_id": "",
-                        "row": dict(duplicate_row or {}),
-                        "error": f"当前上传 payload 内部存在重复的 {key_display_name} 记录，已阻止继续写入。",
-                    }
-                )
-            if not failed_rows and first_row:
-                failed_rows.append(
-                    {
-                        "status": "blocked_duplicate_payload",
-                        "record_key": group.get("record_key"),
-                        "record_id": "",
-                        "existing_record_id": "",
-                        "row": first_row,
-                        "error": f"当前上传 payload 内部存在重复的 {key_display_name} 记录，已阻止继续写入。",
-                    }
-                )
         error_messages: list[str] = []
         if missing_owner_scope_field:
             error_messages.append("目标飞书表缺少 `达人对接人` 字段")
         if has_unscoped_existing_records:
             error_messages.append("目标飞书表存在未填写 `达人对接人` 的历史记录")
-        if duplicate_existing_groups or payload_duplicate_groups:
-            error_messages.append(f"目标飞书表或当前 payload 存在重复的 {key_display_name} 记录")
         summary = {
             "ok": False,
             "dry_run": bool(dry_run),
@@ -230,7 +194,8 @@ def upload_final_review_payload_to_bitable(
             "target_view_id": resolved_view.view_id,
             "target_view_name": resolved_view.view_name,
             "source_row_count": int(payload.get("row_count") or len(payload.get("rows") or [])),
-            "selected_row_count": len(rows),
+            "selected_row_count": selected_row_count,
+            "processed_row_count": selected_row_count,
             "suppress_ai_labels": bool(suppress_ai_labels),
             "created_count": 0,
             "updated_count": 0,
@@ -246,6 +211,15 @@ def upload_final_review_payload_to_bitable(
             "duplicate_payload_group_count": len(payload_duplicate_groups),
             "duplicate_existing_groups": duplicate_existing_groups,
             "duplicate_payload_groups": payload_duplicate_groups,
+            "deduplicated_row_count": 0,
+            "deduplicated_rows": [],
+            "upload_detail": {
+                "created_keys": [],
+                "updated_keys": [],
+                "failed_detail": [{"key": item.get("record_key", ""), "error": item.get("error", "")} for item in failed_rows],
+                "deduplicated_detail": [],
+                "duplicate_existing_groups": duplicate_existing_groups,
+            },
             "created_rows": [],
             "updated_rows": [],
             "skipped_existing_rows": [],
@@ -255,6 +229,49 @@ def upload_final_review_payload_to_bitable(
         resolved_result_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         _write_upload_result_xlsx(resolved_result_xlsx, [], [], [], failed_rows)
         return summary
+
+    deduplicated_index: dict[str, int] = {}
+    deduplicated_rows: list[dict[str, Any]] = []
+    for raw_row in rows:
+        if not isinstance(raw_row, dict):
+            continue
+        row = dict(raw_row)
+        record_key = _build_payload_record_key(row, key_field_names=key_field_names)
+        if not record_key:
+            deduplicated_rows.append(row)
+            continue
+        if record_key in deduplicated_index:
+            previous_index = deduplicated_index[record_key]
+            previous_row = dict(deduplicated_rows[previous_index] or {})
+            deduplicated_rows_log.append(
+                {
+                    "status": "deduplicated_in_payload",
+                    "record_key": record_key,
+                    "record_id": "",
+                    "existing_record_id": "",
+                    "row": previous_row,
+                    "error": f"当前上传 payload 内部存在重复的 {key_display_name} 记录，已保留最后一条。",
+                }
+            )
+            deduplicated_rows[previous_index] = row
+            continue
+        deduplicated_index[record_key] = len(deduplicated_rows)
+        deduplicated_rows.append(row)
+    rows = deduplicated_rows
+
+    for group in duplicate_existing_groups:
+        keep_record = dict(group.get("keep_record") or {})
+        duplicate_count = len(list(group.get("duplicate_records") or [])) + 1
+        duplicate_existing_warning_rows.append(
+            {
+                "status": "warning_duplicate_existing_group",
+                "record_key": group.get("record_key"),
+                "record_id": keep_record.get("record_id") or "",
+                "existing_record_id": keep_record.get("record_id") or "",
+                "row": dict(keep_record.get("fields") or {}),
+                "error": f"目标飞书表已存在 {duplicate_count} 条重复的 {key_display_name} 记录，本次仅更新 keep_record。",
+            }
+        )
 
     for row in rows:
         if not isinstance(row, dict):
@@ -438,12 +455,29 @@ def upload_final_review_payload_to_bitable(
         "target_view_id": resolved_view.view_id,
         "target_view_name": resolved_view.view_name,
         "source_row_count": int(payload.get("row_count") or len(payload.get("rows") or [])),
-        "selected_row_count": len(rows),
+        "selected_row_count": selected_row_count,
+        "processed_row_count": len(rows),
         "suppress_ai_labels": bool(suppress_ai_labels),
         "created_count": len(created_rows),
         "updated_count": len(updated_rows),
         "skipped_existing_count": len(skipped_existing_rows),
         "failed_count": len(failed_rows),
+        "duplicate_existing_group_count": len(duplicate_existing_groups),
+        "duplicate_payload_group_count": len(payload_duplicate_groups),
+        "duplicate_existing_groups": duplicate_existing_groups,
+        "duplicate_payload_groups": payload_duplicate_groups,
+        "deduplicated_row_count": len(deduplicated_rows_log),
+        "deduplicated_rows": deduplicated_rows_log,
+        "upload_detail": {
+            "created_keys": [item.get("record_key", "") for item in created_rows],
+            "updated_keys": [item.get("record_key", "") for item in updated_rows],
+            "failed_detail": [{"key": item.get("record_key", ""), "error": item.get("error", "")} for item in failed_rows],
+            "deduplicated_detail": [
+                {"key": item.get("record_key", ""), "error": item.get("error", "")}
+                for item in deduplicated_rows_log
+            ],
+            "duplicate_existing_groups": duplicate_existing_groups,
+        },
         "created_rows": created_rows,
         "updated_rows": updated_rows,
         "skipped_existing_rows": skipped_existing_rows,
@@ -451,7 +485,14 @@ def upload_final_review_payload_to_bitable(
     }
     resolved_result_json.parent.mkdir(parents=True, exist_ok=True)
     resolved_result_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    _write_upload_result_xlsx(resolved_result_xlsx, created_rows, updated_rows, skipped_existing_rows, failed_rows)
+    _write_upload_result_xlsx(
+        resolved_result_xlsx,
+        created_rows,
+        updated_rows,
+        skipped_existing_rows,
+        failed_rows,
+        warning_rows=deduplicated_rows_log + duplicate_existing_warning_rows,
+    )
     return summary
 
 
@@ -1080,6 +1121,8 @@ def _write_upload_result_xlsx(
     updated_rows: list[dict[str, Any]],
     skipped_existing_rows: list[dict[str, Any]],
     failed_rows: list[dict[str, Any]],
+    *,
+    warning_rows: list[dict[str, Any]] | None = None,
 ) -> None:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     status_rows: list[dict[str, Any]] = []
@@ -1089,6 +1132,8 @@ def _write_upload_result_xlsx(
         status_rows.append(_flatten_status_row(item, default_reason=""))
     for item in skipped_existing_rows:
         status_rows.append(_flatten_status_row(item, default_reason=str(item.get("reason") or "")))
+    for item in list(warning_rows or []):
+        status_rows.append(_flatten_status_row(item, default_reason=str(item.get("error") or item.get("reason") or "")))
     for item in failed_rows:
         status_rows.append(_flatten_status_row(item, default_reason=str(item.get("error") or "")))
     columns = (

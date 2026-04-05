@@ -760,6 +760,172 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         self.assertEqual(summary["artifacts"]["feishu_upload_created_count"], 1)
         self.assertEqual(summary["artifacts"]["feishu_upload_failed_count"], 0)
 
+    def test_runner_keeps_completed_status_when_feishu_upload_has_partial_failures(self) -> None:
+        preflight = {
+            "status": "configured",
+            "error_code": "",
+            "message": "视觉模型已就绪：openai",
+            "configured_provider_names": ["openai"],
+            "runnable_provider_names": ["openai"],
+            "providers": [{"name": "openai", "runnable": True}],
+        }
+        backend_app = FakeBackendApp(preflight)
+        observed: dict[str, Any] = {}
+
+        def fake_prepare_screening_inputs(**kwargs):
+            return {
+                "prepared_at": "2026-03-28T01:02:03Z",
+                "upload": {"stats": {"Instagram": 1}},
+            }
+
+        def fake_poll_job(client, job_id, label, interval):
+            return {"status": "completed"}
+
+        def fake_export_platform_artifacts(client, platform, export_dir):
+            export_dir.mkdir(parents=True, exist_ok=True)
+            final_review_path = export_dir / f"{platform}_final_review.xlsx"
+            final_review_path.write_text("placeholder", encoding="utf-8")
+            return {"final_review": str(final_review_path)}
+
+        def fake_build_all_platforms_final_review_artifacts(**kwargs):
+            payload_json_path = Path(kwargs["payload_json_path"])
+            archive_dir = payload_json_path.parent / "feishu_upload_local_archive"
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            payload_json_path.write_text(
+                json.dumps(
+                    {
+                        "rows": [
+                            {
+                                "达人ID": "alpha",
+                                "平台": "instagram",
+                                "__feishu_update_mode": "create_or_mail_only_update",
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            skipped_json = archive_dir / "skipped_from_feishu_upload.json"
+            skipped_xlsx = archive_dir / "skipped_from_feishu_upload.xlsx"
+            skipped_json.write_text("{}", encoding="utf-8")
+            skipped_xlsx.write_text("placeholder", encoding="utf-8")
+            workbook_path = Path(kwargs["output_path"])
+            workbook_path.write_text("placeholder", encoding="utf-8")
+            return {
+                "all_platforms_final_review": str(workbook_path),
+                "all_platforms_upload_payload_json": str(payload_json_path),
+                "all_platforms_upload_local_archive_dir": str(archive_dir),
+                "all_platforms_upload_skipped_archive_json": str(skipped_json),
+                "all_platforms_upload_skipped_archive_xlsx": str(skipped_xlsx),
+                "row_count": 1,
+                "source_row_count": 1,
+                "skipped_row_count": 0,
+            }
+
+        def fake_upload_final_review_payload_to_bitable(client, **kwargs):
+            observed.update(kwargs)
+            observed["payload"] = json.loads(Path(kwargs["payload_json_path"]).read_text(encoding="utf-8"))
+            archive_dir = Path(kwargs["payload_json_path"]).parent / "feishu_upload_local_archive"
+            result_json = archive_dir / "feishu_bitable_upload_result.json"
+            result_xlsx = archive_dir / "feishu_bitable_upload_result.xlsx"
+            result_json.write_text(json.dumps({"ok": True}, ensure_ascii=False), encoding="utf-8")
+            result_xlsx.write_text("placeholder", encoding="utf-8")
+            return {
+                "ok": True,
+                "result_json_path": str(result_json),
+                "result_xlsx_path": str(result_xlsx),
+                "target_url": "https://example.com/base",
+                "target_table_id": "tbl123",
+                "target_table_name": "达人管理",
+                "created_count": 1,
+                "updated_count": 0,
+                "failed_count": 1,
+                "skipped_existing_count": 0,
+                "created_rows": [
+                    {
+                        "status": "created",
+                        "record_id": "rec_new",
+                        "row": {"达人ID": "alpha", "平台": "instagram", "主页链接": "https://instagram.com/alpha"},
+                    }
+                ],
+                "failed_rows": [
+                    {
+                        "status": "failed",
+                        "record_id": "",
+                        "row": {"达人ID": "beta", "平台": "instagram"},
+                        "error": "URLFieldConvFail",
+                    }
+                ],
+                "deduplicated_rows": [
+                    {
+                        "status": "deduplicated_in_payload",
+                        "row": {"达人ID": "dup", "平台": "instagram"},
+                        "record_key": "dup::instagram",
+                        "error": "Payload 内部重复，已保留最后一条。",
+                    }
+                ],
+                "duplicate_existing_groups": [
+                    {
+                        "record_key": "alpha::instagram",
+                        "creator_id": "alpha",
+                        "platform": "instagram",
+                        "keep_record": {"record_id": "rec_keep", "fields": {}},
+                        "duplicate_records": [{"record_id": "rec_dup", "fields": {}}],
+                    }
+                ],
+            }
+
+        keep_list_runner._load_runtime_dependencies = lambda: {
+            "backend_app": backend_app,
+            "DEFAULT_FEISHU_BASE_URL": "https://open.feishu.cn/open-apis",
+            "FeishuOpenClient": lambda **kwargs: object(),
+            "get_preferred_value": lambda cli_value, env_values, env_key, default="": str(env_values.get(env_key, default) or ""),
+            "load_local_env": lambda env_file: {
+                "FEISHU_APP_ID": "cli_app_id",
+                "FEISHU_APP_SECRET": "cli_app_secret",
+                "TIMEOUT_SECONDS": "30",
+            },
+            "build_all_platforms_final_review_artifacts": fake_build_all_platforms_final_review_artifacts,
+            "collect_final_exports": lambda platforms: {"instagram": {"final_review": "/tmp/instagram_final_review.xlsx"}},
+            "prepare_screening_inputs": fake_prepare_screening_inputs,
+            "count_passed_profiles": lambda scrape_job: 1,
+            "export_platform_artifacts": fake_export_platform_artifacts,
+            "poll_job": fake_poll_job,
+            "require_success": lambda response, label: response.get_json(),
+            "reset_backend_runtime_state": lambda: None,
+            "upload_final_review_payload_to_bitable": fake_upload_final_review_payload_to_bitable,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            env_path = self._write_env_file(temp_root)
+            keep_path = temp_root / "keep.xlsx"
+            template_path = temp_root / "template.xlsx"
+            keep_path.touch()
+            template_path.touch()
+            summary = keep_list_runner.run_keep_list_screening_pipeline(
+                keep_workbook=keep_path,
+                template_workbook=template_path,
+                env_file=env_path,
+                output_root=temp_root / "run",
+                platform_filters=["instagram"],
+                task_name="MINISO",
+                task_upload_url="https://example.com/task",
+                task_owner_name="陈俊仁",
+                task_owner_employee_id="ou_test",
+                linked_bitable_url="https://example.com/base",
+            )
+
+        self.assertEqual(summary["status"], "completed")
+        self.assertEqual(summary["verdict"]["outcome"], "completed")
+        self.assertEqual(summary["artifacts"]["feishu_upload_created_count"], 1)
+        self.assertEqual(summary["artifacts"]["feishu_upload_failed_count"], 1)
+        self.assertEqual(summary["warnings"]["feishu_upload_partial_failure"]["failed_count"], 1)
+        self.assertEqual(observed["payload"]["rows"][0]["__feishu_update_mode"], "create_or_update")
+        self.assertTrue(summary["artifacts"]["success_report_xlsx"].endswith("success_report.xlsx"))
+        self.assertTrue(summary["artifacts"]["error_report_xlsx"].endswith("error_report.xlsx"))
+
     def test_runner_fails_when_all_rows_are_locally_archived_before_upload(self) -> None:
         preflight = {
             "status": "configured",
