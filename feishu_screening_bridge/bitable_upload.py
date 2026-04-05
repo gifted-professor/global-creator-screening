@@ -224,10 +224,19 @@ def upload_final_review_payload_to_bitable(
             "updated_rows": [],
             "skipped_existing_rows": [],
             "failed_rows": failed_rows,
+            "result_json_written": False,
+            "result_xlsx_written": False,
+            "report_write_warnings": [],
         }
-        resolved_result_json.parent.mkdir(parents=True, exist_ok=True)
-        resolved_result_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        _write_upload_result_xlsx(resolved_result_xlsx, [], [], [], failed_rows)
+        _persist_upload_result_artifacts(
+            summary,
+            result_json_path=resolved_result_json,
+            result_xlsx_path=resolved_result_xlsx,
+            created_rows=[],
+            updated_rows=[],
+            skipped_existing_rows=[],
+            failed_rows=failed_rows,
+        )
         return summary
 
     deduplicated_index: dict[str, int] = {}
@@ -482,18 +491,72 @@ def upload_final_review_payload_to_bitable(
         "updated_rows": updated_rows,
         "skipped_existing_rows": skipped_existing_rows,
         "failed_rows": failed_rows,
+        "result_json_written": False,
+        "result_xlsx_written": False,
+        "report_write_warnings": [],
     }
-    resolved_result_json.parent.mkdir(parents=True, exist_ok=True)
-    resolved_result_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    _write_upload_result_xlsx(
-        resolved_result_xlsx,
-        created_rows,
-        updated_rows,
-        skipped_existing_rows,
-        failed_rows,
+    _persist_upload_result_artifacts(
+        summary,
+        result_json_path=resolved_result_json,
+        result_xlsx_path=resolved_result_xlsx,
+        created_rows=created_rows,
+        updated_rows=updated_rows,
+        skipped_existing_rows=skipped_existing_rows,
+        failed_rows=failed_rows,
         warning_rows=deduplicated_rows_log + duplicate_existing_warning_rows,
     )
     return summary
+
+
+def _persist_upload_result_artifacts(
+    summary: dict[str, Any],
+    *,
+    result_json_path: Path,
+    result_xlsx_path: Path,
+    created_rows: list[dict[str, Any]],
+    updated_rows: list[dict[str, Any]],
+    skipped_existing_rows: list[dict[str, Any]],
+    failed_rows: list[dict[str, Any]],
+    warning_rows: list[dict[str, Any]] | None = None,
+) -> None:
+    report_write_warnings: list[dict[str, str]] = list(summary.get("report_write_warnings") or [])
+
+    def append_warning(*, artifact: str, path: Path, exc: Exception) -> None:
+        report_write_warnings.append(
+            {
+                "artifact": artifact,
+                "path": str(path),
+                "error": str(exc) or exc.__class__.__name__,
+            }
+        )
+
+    def write_result_json_snapshot() -> None:
+        result_json_path.parent.mkdir(parents=True, exist_ok=True)
+        result_json_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    summary["report_write_warnings"] = report_write_warnings
+    try:
+        _write_upload_result_xlsx(
+            result_xlsx_path,
+            created_rows,
+            updated_rows,
+            skipped_existing_rows,
+            failed_rows,
+            warning_rows=warning_rows,
+        )
+        summary["result_xlsx_written"] = True
+    except Exception as exc:  # noqa: BLE001
+        summary["result_xlsx_written"] = False
+        append_warning(artifact="result_xlsx", path=result_xlsx_path, exc=exc)
+
+    summary["report_write_warnings"] = report_write_warnings
+    summary["result_json_written"] = True
+    try:
+        write_result_json_snapshot()
+    except Exception as exc:  # noqa: BLE001
+        summary["result_json_written"] = False
+        append_warning(artifact="result_json", path=result_json_path, exc=exc)
+        summary["report_write_warnings"] = report_write_warnings
 
 
 def _resolve_target_url(

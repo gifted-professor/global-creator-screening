@@ -858,6 +858,65 @@ class BitableUploadTests(unittest.TestCase):
             },
         )
 
+    def test_upload_payload_keeps_success_when_result_xlsx_write_fails(self) -> None:
+        client = _FakeBitableUploadClient()
+        client.search_items = []
+        resolved_view = ResolvedBitableView(
+            source_url="https://example.com/base/app?table=tbl&view=vew",
+            source_kind="base",
+            source_token="app_token",
+            app_token="app_token",
+            table_id="tbl",
+            view_id="vew",
+            table_name="达人管理",
+            view_name="总视图",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            payload_path = Path(tmpdir) / "payload.json"
+            payload_path.write_text(
+                json.dumps(
+                    {
+                        "rows": [
+                            {
+                                "达人ID": "alpha",
+                                "平台": "instagram",
+                                "主页链接": "https://www.instagram.com/alpha",
+                                "达人对接人": "陈俊仁",
+                                "ai是否通过": "是",
+                                "__feishu_update_mode": "create_or_update",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            with patch(
+                "feishu_screening_bridge.bitable_upload.resolve_bitable_view_from_url",
+                return_value=resolved_view,
+            ), patch(
+                "feishu_screening_bridge.bitable_upload._write_upload_result_xlsx",
+                side_effect=RuntimeError("xlsx write failed"),
+            ):
+                result = upload_final_review_payload_to_bitable(
+                    client,
+                    payload_json_path=payload_path,
+                    linked_bitable_url="https://example.com/base/app?table=tbl&view=vew",
+                )
+
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["created_count"], 1)
+            self.assertTrue(result["result_json_written"])
+            self.assertFalse(result["result_xlsx_written"])
+            self.assertEqual(len(result["report_write_warnings"]), 1)
+            self.assertEqual(result["report_write_warnings"][0]["artifact"], "result_xlsx")
+            self.assertTrue(Path(result["result_json_path"]).exists())
+            saved_result = json.loads(Path(result["result_json_path"]).read_text(encoding="utf-8"))
+            self.assertFalse(saved_result["result_xlsx_written"])
+            self.assertEqual(saved_result["report_write_warnings"][0]["artifact"], "result_xlsx")
+
     def test_upload_prefers_task_upload_resolved_target_over_payload_link(self) -> None:
         client = _FakeBitableUploadClient()
         resolved_view = ResolvedBitableView(

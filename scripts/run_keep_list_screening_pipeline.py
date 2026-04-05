@@ -419,6 +419,26 @@ def _write_report_xlsx(output_path: Path, rows: list[dict[str, Any]], *, columns
     return str(output_path)
 
 
+def _write_report_xlsx_best_effort(
+    output_path: Path,
+    rows: list[dict[str, Any]],
+    *,
+    columns: tuple[str, ...],
+    warnings_bucket: dict[str, Any],
+    warning_key: str,
+    artifact_label: str,
+) -> str:
+    try:
+        return _write_report_xlsx(output_path, rows, columns=columns)
+    except Exception as exc:  # noqa: BLE001
+        warnings_bucket[warning_key] = {
+            "artifact": artifact_label,
+            "path": str(output_path),
+            "error": str(exc) or exc.__class__.__name__,
+        }
+        return ""
+
+
 def _collect_missing_profile_rows(summary: dict[str, Any]) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     for platform, platform_summary in (summary.get("platforms") or {}).items():
@@ -536,6 +556,95 @@ def _build_error_report_rows(
             }
         )
     return rows
+
+
+def _compact_upload_summary(upload_summary: dict[str, Any] | None) -> dict[str, Any]:
+    payload = dict(upload_summary or {})
+    if not payload:
+        return {}
+    upload_detail = dict(payload.get("upload_detail") or {})
+    duplicate_existing_groups = list(upload_detail.get("duplicate_existing_groups") or [])
+    compact_upload_detail = {
+        "created_key_count": len(list(upload_detail.get("created_keys") or [])),
+        "created_key_preview": list(upload_detail.get("created_keys") or [])[:20],
+        "updated_key_count": len(list(upload_detail.get("updated_keys") or [])),
+        "updated_key_preview": list(upload_detail.get("updated_keys") or [])[:20],
+        "failed_detail": list(upload_detail.get("failed_detail") or [])[:20],
+        "deduplicated_detail": list(upload_detail.get("deduplicated_detail") or [])[:20],
+        "duplicate_existing_group_count": len(duplicate_existing_groups),
+        "duplicate_existing_group_preview": [
+            {
+                "record_key": str(group.get("record_key") or "").strip(),
+                "creator_id": str(group.get("creator_id") or "").strip(),
+                "platform": _stringify_report_value(group.get("platform")),
+                "keep_record_id": _stringify_report_value((group.get("keep_record") or {}).get("record_id")),
+                "duplicate_record_count": len(list(group.get("duplicate_records") or [])) + 1,
+            }
+            for group in duplicate_existing_groups[:20]
+            if isinstance(group, dict)
+        ],
+    }
+    return {
+        "ok": bool(payload.get("ok", True)),
+        "dry_run": bool(payload.get("dry_run")),
+        "payload_json_path": str(payload.get("payload_json_path") or "").strip(),
+        "result_json_path": str(payload.get("result_json_path") or "").strip(),
+        "result_xlsx_path": str(payload.get("result_xlsx_path") or "").strip(),
+        "result_json_written": bool(payload.get("result_json_written")),
+        "result_xlsx_written": bool(payload.get("result_xlsx_written")),
+        "target_url": str(payload.get("target_url") or "").strip(),
+        "target_table_id": str(payload.get("target_table_id") or "").strip(),
+        "target_table_name": str(payload.get("target_table_name") or "").strip(),
+        "created_count": int(payload.get("created_count") or 0),
+        "updated_count": int(payload.get("updated_count") or 0),
+        "failed_count": int(payload.get("failed_count") or 0),
+        "skipped_existing_count": int(payload.get("skipped_existing_count") or 0),
+        "duplicate_existing_group_count": int(payload.get("duplicate_existing_group_count") or 0),
+        "duplicate_payload_group_count": int(payload.get("duplicate_payload_group_count") or 0),
+        "deduplicated_row_count": int(payload.get("deduplicated_row_count") or 0),
+        "upload_detail": compact_upload_detail,
+        "report_write_warnings": list(payload.get("report_write_warnings") or []),
+    }
+
+
+def _build_cli_output_summary(summary: dict[str, Any]) -> dict[str, Any]:
+    artifacts = dict(summary.get("artifacts") or {})
+    platforms: dict[str, Any] = {}
+    for platform, payload in (summary.get("platforms") or {}).items():
+        if not isinstance(payload, dict):
+            continue
+        platforms[str(platform)] = {
+            "status": str(payload.get("status") or "").strip(),
+            "current_stage": str(payload.get("current_stage") or "").strip(),
+            "requested_identifier_count": int(payload.get("requested_identifier_count") or 0),
+            "profile_review_count": int(payload.get("profile_review_count") or 0),
+            "prescreen_pass_count": int(payload.get("prescreen_pass_count") or 0),
+            "missing_profile_count": int(payload.get("missing_profile_count") or 0),
+        }
+    return {
+        "status": str(summary.get("status") or "").strip(),
+        "verdict": dict(summary.get("verdict") or {}),
+        "run_root": str(summary.get("run_root") or "").strip(),
+        "summary_json": str(summary.get("summary_json") or "").strip(),
+        "warnings": dict(summary.get("warnings") or {}),
+        "quality_report": {
+            "status": str(((summary.get("quality_report") or {}).get("status")) or "").strip(),
+            "warning_count": int(((summary.get("quality_report") or {}).get("warning_count")) or 0),
+        },
+        "platforms": platforms,
+        "artifacts": {
+            "all_platforms_final_review": str(artifacts.get("all_platforms_final_review") or "").strip(),
+            "missing_profiles_xlsx": str(artifacts.get("missing_profiles_xlsx") or "").strip(),
+            "success_report_xlsx": str(artifacts.get("success_report_xlsx") or "").strip(),
+            "error_report_xlsx": str(artifacts.get("error_report_xlsx") or "").strip(),
+            "feishu_upload_result_json": str(artifacts.get("feishu_upload_result_json") or "").strip(),
+            "feishu_upload_result_xlsx": str(artifacts.get("feishu_upload_result_xlsx") or "").strip(),
+            "feishu_upload_created_count": int(artifacts.get("feishu_upload_created_count") or 0),
+            "feishu_upload_updated_count": int(artifacts.get("feishu_upload_updated_count") or 0),
+            "feishu_upload_failed_count": int(artifacts.get("feishu_upload_failed_count") or 0),
+        },
+        "upload_summary": dict(summary.get("upload_summary") or {}),
+    }
 
 
 def _build_feishu_open_client(
@@ -2274,10 +2383,13 @@ def run_keep_list_screening_pipeline(
             update_mode="create_or_update",
         )
         missing_profile_rows = _collect_missing_profile_rows(summary)
-        summary["artifacts"]["missing_profiles_xlsx"] = _write_report_xlsx(
+        summary["artifacts"]["missing_profiles_xlsx"] = _write_report_xlsx_best_effort(
             exports_dir / "missing_profiles.xlsx",
             missing_profile_rows,
             columns=("platform", "identifier", "profile_url", "reason"),
+            warnings_bucket=summary.setdefault("warnings", {}),
+            warning_key="missing_profiles_report_write_failed",
+            artifact_label="missing_profiles.xlsx",
         )
         summary["artifacts"]["feishu_upload_result_json"] = ""
         summary["artifacts"]["feishu_upload_result_xlsx"] = ""
@@ -2290,10 +2402,13 @@ def run_keep_list_screening_pipeline(
         summary["artifacts"]["feishu_upload_skipped_existing_count"] = 0
         if combined_artifacts["source_row_count"] > 0 and combined_artifacts["row_count"] <= 0:
             skip_archive = summary["artifacts"]["all_platforms_upload_skipped_archive_json"]
-            summary["artifacts"]["error_report_xlsx"] = _write_report_xlsx(
+            summary["artifacts"]["error_report_xlsx"] = _write_report_xlsx_best_effort(
                 exports_dir / "error_report.xlsx",
                 _build_error_report_rows(summary, summary.get("upload_summary"), occurred_at=backend_app.iso_now()),
                 columns=("严重级别", "异常类别", "达人ID", "平台", "原因详情", "飞书记录ID", "时间"),
+                warnings_bucket=summary.setdefault("warnings", {}),
+                warning_key="feishu_error_report_write_failed",
+                artifact_label="error_report.xlsx",
             )
             failure = _build_failure_payload(
                 stage="feishu_upload",
@@ -2335,7 +2450,7 @@ def run_keep_list_screening_pipeline(
                     failure=failure,
                     finished_at=backend_app.iso_now(),
                 )
-            summary["upload_summary"] = dict(upload_summary)
+            full_upload_summary = dict(upload_summary)
             summary["artifacts"]["feishu_upload_result_json"] = str(upload_summary.get("result_json_path") or "").strip()
             summary["artifacts"]["feishu_upload_result_xlsx"] = str(upload_summary.get("result_xlsx_path") or "").strip()
             summary["artifacts"]["feishu_upload_target_url"] = str(upload_summary.get("target_url") or "").strip()
@@ -2345,37 +2460,48 @@ def run_keep_list_screening_pipeline(
             summary["artifacts"]["feishu_upload_updated_count"] = int(upload_summary.get("updated_count") or 0)
             summary["artifacts"]["feishu_upload_failed_count"] = int(upload_summary.get("failed_count") or 0)
             summary["artifacts"]["feishu_upload_skipped_existing_count"] = int(upload_summary.get("skipped_existing_count") or 0)
-            summary["artifacts"]["success_report_xlsx"] = _write_report_xlsx(
+            summary["artifacts"]["success_report_xlsx"] = _write_report_xlsx_best_effort(
                 exports_dir / "success_report.xlsx",
-                _build_success_report_rows(upload_summary),
+                _build_success_report_rows(full_upload_summary),
                 columns=("达人ID", "平台", "主页链接", "操作", "飞书记录ID"),
+                warnings_bucket=summary.setdefault("warnings", {}),
+                warning_key="feishu_success_report_write_failed",
+                artifact_label="success_report.xlsx",
             )
-            summary["artifacts"]["error_report_xlsx"] = _write_report_xlsx(
+            summary["artifacts"]["error_report_xlsx"] = _write_report_xlsx_best_effort(
                 exports_dir / "error_report.xlsx",
-                _build_error_report_rows(summary, upload_summary, occurred_at=backend_app.iso_now()),
+                _build_error_report_rows(summary, full_upload_summary, occurred_at=backend_app.iso_now()),
                 columns=("严重级别", "异常类别", "达人ID", "平台", "原因详情", "飞书记录ID", "时间"),
+                warnings_bucket=summary.setdefault("warnings", {}),
+                warning_key="feishu_error_report_write_failed",
+                artifact_label="error_report.xlsx",
             )
-            created_count = int(upload_summary.get("created_count") or 0)
-            updated_count = int(upload_summary.get("updated_count") or 0)
-            failed_count = int(upload_summary.get("failed_count") or 0)
+            created_count = int(full_upload_summary.get("created_count") or 0)
+            updated_count = int(full_upload_summary.get("updated_count") or 0)
+            failed_count = int(full_upload_summary.get("failed_count") or 0)
+            if list(full_upload_summary.get("report_write_warnings") or []):
+                summary.setdefault("warnings", {})["feishu_upload_result_persistence"] = {
+                    "warning_count": len(list(full_upload_summary.get("report_write_warnings") or [])),
+                    "warnings": list(full_upload_summary.get("report_write_warnings") or []),
+                }
             if created_count + updated_count == 0 and (
-                not bool(upload_summary.get("ok", True)) or failed_count > 0
+                not bool(full_upload_summary.get("ok", True)) or failed_count > 0
             ):
                 failure = _build_failure_payload(
                     stage="feishu_upload",
                     error_code="FEISHU_UPLOAD_FAILED",
                     message=_first_non_empty_text(
-                        upload_summary.get("error"),
-                        upload_summary.get("message"),
+                        full_upload_summary.get("error"),
+                        full_upload_summary.get("message"),
                         "飞书上传未完整成功。",
                     ),
                     remediation="检查飞书返回的 failed_rows、目标表去重状态和负责人字段后重试。",
                     details={
-                        "result_json_path": str(upload_summary.get("result_json_path") or "").strip(),
+                        "result_json_path": str(full_upload_summary.get("result_json_path") or "").strip(),
                         "created_count": created_count,
                         "updated_count": updated_count,
                         "failed_count": failed_count,
-                        "skipped_existing_count": int(upload_summary.get("skipped_existing_count") or 0),
+                        "skipped_existing_count": int(full_upload_summary.get("skipped_existing_count") or 0),
                     },
                 )
                 return _finalize_failure(
@@ -2385,13 +2511,17 @@ def run_keep_list_screening_pipeline(
             if failed_count > 0:
                 summary.setdefault("warnings", {})["feishu_upload_partial_failure"] = {
                     "failed_count": failed_count,
-                    "result_json_path": str(upload_summary.get("result_json_path") or "").strip(),
+                    "result_json_path": str(full_upload_summary.get("result_json_path") or "").strip(),
                 }
+            summary["upload_summary"] = _compact_upload_summary(full_upload_summary)
         if not summary["artifacts"].get("error_report_xlsx"):
-            summary["artifacts"]["error_report_xlsx"] = _write_report_xlsx(
+            summary["artifacts"]["error_report_xlsx"] = _write_report_xlsx_best_effort(
                 exports_dir / "error_report.xlsx",
                 _build_error_report_rows(summary, summary.get("upload_summary"), occurred_at=backend_app.iso_now()),
                 columns=("严重级别", "异常类别", "达人ID", "平台", "原因详情", "飞书记录ID", "时间"),
+                warnings_bucket=summary.setdefault("warnings", {}),
+                warning_key="feishu_error_report_write_failed",
+                artifact_label="error_report.xlsx",
             )
         summary["quality_report"] = build_quality_report(summary["platforms"])
         summary["status"] = summarize_platform_statuses(summary["platforms"])
@@ -2695,7 +2825,7 @@ def main(argv: list[str] | None = None) -> int:
         task_owner_owner_name=args.task_owner_owner_name or "",
         linked_bitable_url=args.linked_bitable_url or "",
     )
-    print(json.dumps(summary, ensure_ascii=False, indent=2))
+    print(json.dumps(_build_cli_output_summary(summary), ensure_ascii=False, indent=2))
     return 0 if summary.get("status") != "failed" else 1
 
 

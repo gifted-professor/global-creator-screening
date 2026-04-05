@@ -874,6 +874,20 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
                         "duplicate_records": [{"record_id": "rec_dup", "fields": {}}],
                     }
                 ],
+                "report_write_warnings": [
+                    {
+                        "artifact": "result_xlsx",
+                        "path": str(result_xlsx),
+                        "error": "xlsx write failed",
+                    }
+                ],
+                "upload_detail": {
+                    "created_keys": ["alpha::instagram"],
+                    "updated_keys": [],
+                    "failed_detail": [{"key": "beta::instagram", "error": "URLFieldConvFail"}],
+                    "deduplicated_detail": [{"key": "dup::instagram", "error": "Payload 内部重复，已保留最后一条。"}],
+                    "duplicate_existing_groups": [],
+                },
             }
 
         keep_list_runner._load_runtime_dependencies = lambda: {
@@ -922,9 +936,14 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         self.assertEqual(summary["artifacts"]["feishu_upload_created_count"], 1)
         self.assertEqual(summary["artifacts"]["feishu_upload_failed_count"], 1)
         self.assertEqual(summary["warnings"]["feishu_upload_partial_failure"]["failed_count"], 1)
+        self.assertEqual(summary["warnings"]["feishu_upload_result_persistence"]["warning_count"], 1)
         self.assertEqual(observed["payload"]["rows"][0]["__feishu_update_mode"], "create_or_update")
         self.assertTrue(summary["artifacts"]["success_report_xlsx"].endswith("success_report.xlsx"))
         self.assertTrue(summary["artifacts"]["error_report_xlsx"].endswith("error_report.xlsx"))
+        self.assertEqual(summary["upload_summary"]["created_count"], 1)
+        self.assertNotIn("created_rows", summary["upload_summary"])
+        self.assertEqual(summary["upload_summary"]["upload_detail"]["created_key_count"], 1)
+        self.assertEqual(summary["upload_summary"]["upload_detail"]["created_key_preview"], ["alpha::instagram"])
 
     def test_runner_fails_when_all_rows_are_locally_archived_before_upload(self) -> None:
         preflight = {
