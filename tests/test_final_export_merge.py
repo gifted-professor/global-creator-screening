@@ -167,6 +167,76 @@ class FinalExportMergeTests(unittest.TestCase):
             self.assertEqual(payload["rows"][0]["__last_mail_raw_path"], str(raw_mail_path))
             self.assertEqual(payload["rows"][0]["__feishu_attachment_local_paths"], [str(raw_mail_path.resolve())])
 
+    def test_mail_context_uses_email_aliases_when_contact_fields_are_missing(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            exports_dir = root / "exports"
+            tiktok_export = exports_dir / "tiktok" / "tiktok_final_review.xlsx"
+            positioning_review = exports_dir / "tiktok" / "tiktok_positioning_card_review.xlsx"
+            tiktok_export.parent.mkdir(parents=True, exist_ok=True)
+
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "alpha",
+                        "username": "alpha",
+                        "profile_url": "https://www.tiktok.com/@alpha",
+                        "upload_handle": "alpha",
+                        "final_status": "Pass",
+                        "final_reason": "内容契合",
+                    }
+                ]
+            ).to_excel(tiktok_export, index=False)
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "alpha",
+                        "username": "alpha",
+                        "profile_url": "https://www.tiktok.com/@alpha",
+                        "upload_handle": "alpha",
+                        "positioning_stage_status": "Completed",
+                        "positioning_labels": "家庭用品和家电-家庭博主",
+                        "fit_summary": "适合家庭类合作",
+                    }
+                ]
+            ).to_excel(positioning_review, index=False)
+
+            keep_workbook = root / "upstream" / "exports" / "keep.xlsx"
+            keep_workbook.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(
+                [
+                    {
+                        "Platform": "TikTok",
+                        "@username": "alpha",
+                        "URL": "https://www.tiktok.com/@alpha",
+                        "email": "alpha@example.com",
+                        "latest_external_from": "alpha@example.com",
+                        "latest_external_sent_at": "2026-03-31T21:55:31+00:00",
+                        "latest_external_full_body": "Alpha says hello.",
+                    }
+                ]
+            ).to_excel(keep_workbook, index=False)
+
+            output_path = exports_dir / "all_platforms_final_review.xlsx"
+            payload_path = exports_dir / "all_platforms_final_review_payload.json"
+            build_all_platforms_final_review_artifacts(
+                output_path=output_path,
+                payload_json_path=payload_path,
+                final_exports={
+                    "tiktok": {
+                        "final_review": str(tiktok_export),
+                        "positioning_card_review": str(positioning_review),
+                    }
+                },
+                keep_workbook=keep_workbook,
+                task_owner={"responsible_name": "陈俊仁"},
+            )
+
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+            self.assertEqual(payload["rows"][0]["creator_emails"], "alpha@example.com")
+            self.assertEqual(payload["rows"][0]["matched_contact_email"], "alpha@example.com")
+            self.assertEqual(payload["rows"][0]["latest_external_from"], "alpha@example.com")
+
     def test_mail_context_can_match_keep_row_by_creator_id_when_username_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -724,6 +794,100 @@ class FinalExportMergeTests(unittest.TestCase):
             self.assertNotIn("达人对接人", payload["rows"][0])
             self.assertNotIn("达人对接人_employee_id", payload["rows"][0])
             self.assertEqual(payload["rows"][0]["linked_bitable_url"], "https://bitable.example/skg")
+
+    def test_owner_context_accepts_task_owner_and_responsible_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            exports_dir = root / "exports"
+            tiktok_export = exports_dir / "tiktok" / "tiktok_final_review.xlsx"
+            positioning_review = exports_dir / "tiktok" / "tiktok_positioning_card_review.xlsx"
+            tiktok_export.parent.mkdir(parents=True, exist_ok=True)
+
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "alpha",
+                        "username": "alpha",
+                        "profile_url": "https://www.tiktok.com/@alpha",
+                        "upload_handle": "alpha",
+                        "final_status": "Pass",
+                        "final_reason": "内容契合",
+                    },
+                    {
+                        "identifier": "beta",
+                        "username": "beta",
+                        "profile_url": "https://www.tiktok.com/@beta",
+                        "upload_handle": "beta",
+                        "final_status": "Pass",
+                        "final_reason": "内容契合",
+                    }
+                ]
+            ).to_excel(tiktok_export, index=False)
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "alpha",
+                        "username": "alpha",
+                        "profile_url": "https://www.tiktok.com/@alpha",
+                        "upload_handle": "alpha",
+                        "positioning_stage_status": "Completed",
+                        "positioning_labels": "家庭用品和家电-家庭博主",
+                        "fit_summary": "适合家庭类合作",
+                    },
+                    {
+                        "identifier": "beta",
+                        "username": "beta",
+                        "profile_url": "https://www.tiktok.com/@beta",
+                        "upload_handle": "beta",
+                        "positioning_stage_status": "Completed",
+                        "positioning_labels": "家庭用品和家电-家庭博主",
+                        "fit_summary": "适合家庭类合作",
+                    }
+                ]
+            ).to_excel(positioning_review, index=False)
+
+            keep_workbook = root / "upstream" / "exports" / "keep.xlsx"
+            keep_workbook.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(
+                [
+                    {
+                        "Platform": "TikTok",
+                        "达人ID": "alpha",
+                        "URL": "https://www.tiktok.com/@alpha",
+                        "负责人": "Eden",
+                    },
+                    {
+                        "Platform": "TikTok",
+                        "达人ID": "beta",
+                        "URL": "https://www.tiktok.com/@beta",
+                    }
+                ]
+            ).to_excel(keep_workbook, index=False)
+
+            output_path = exports_dir / "all_platforms_final_review.xlsx"
+            payload_path = exports_dir / "all_platforms_final_review_payload.json"
+            build_all_platforms_final_review_artifacts(
+                output_path=output_path,
+                payload_json_path=payload_path,
+                final_exports={
+                    "tiktok": {
+                        "final_review": str(tiktok_export),
+                        "positioning_card_review": str(positioning_review),
+                    }
+                },
+                keep_workbook=keep_workbook,
+                task_owner={
+                    "task_owner_name": "Fallback Owner",
+                    "task_owner_employee_id": "ou_fallback",
+                    "task_owner_employee_record_id": "rec_fallback",
+                    "task_owner_employee_email": "fallback@amagency.biz",
+                    "task_owner_owner_name": "fallback@amagency.biz",
+                },
+            )
+
+            workbook = pd.read_excel(output_path).fillna("")
+            self.assertEqual(workbook.loc[0, "达人对接人"], "Eden")
+            self.assertEqual(workbook.loc[1, "达人对接人"], "Fallback Owner")
 
     def test_extract_task_owner_context_uses_task_assets_linked_bitable_url_fallback(self) -> None:
         task_owner = extract_task_owner_context(

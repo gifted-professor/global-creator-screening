@@ -635,21 +635,33 @@ def _resolve_keep_row_mail_context(
             full_body[:1000] if full_body else "",
         )
     )
+    resolved_contact_email = _clean_text(
+        _first_non_blank(
+            keep_row.get("matched_contact_email"),
+            keep_row.get("matched_email"),
+            keep_row.get("latest_external_from"),
+            keep_row.get("email"),
+            keep_row.get("Email"),
+        )
+    )
     return {
-        "creator_emails": _clean_text(_first_non_blank(keep_row.get("creator_emails"), keep_row.get("Email"))),
-        "matched_contact_email": _clean_text(
+        "creator_emails": _clean_text(
             _first_non_blank(
-                keep_row.get("matched_contact_email"),
-                keep_row.get("matched_email"),
+                keep_row.get("creator_emails"),
+                keep_row.get("Email"),
+                keep_row.get("email"),
+                keep_row.get("latest_external_from"),
             )
         ),
+        "matched_contact_email": resolved_contact_email,
         "matched_contact_name": _clean_text(keep_row.get("matched_contact_name")),
         "latest_external_from": _clean_text(
             _first_non_blank(
                 keep_row.get("latest_external_from"),
                 snapshot.get("from_email"),
-                keep_row.get("matched_contact_email"),
-                keep_row.get("matched_email"),
+                resolved_contact_email,
+                keep_row.get("email"),
+                keep_row.get("Email"),
             )
         ),
         "latest_external_sent_at": _clean_text(
@@ -943,23 +955,78 @@ def extract_task_owner_context(upstream_summary: dict[str, Any] | None) -> dict[
 
 def _extract_row_owner_context(keep_row: dict[str, Any], task_owner: dict[str, Any] | None) -> dict[str, str]:
     owner_context = dict(task_owner or {})
-    display_name = _clean_text(keep_row.get("达人对接人"))
+    display_name = _clean_text(
+        _first_non_blank(
+            keep_row.get("达人对接人"),
+            keep_row.get("对接人"),
+            keep_row.get("负责人"),
+            keep_row.get("负责人姓名"),
+            keep_row.get("task_owner_name"),
+            keep_row.get("responsible_name"),
+            keep_row.get("employee_name"),
+        )
+    )
     return {
         "responsible_name": display_name
         or _clean_text(owner_context.get("responsible_name"))
+        or _clean_text(owner_context.get("task_owner_name"))
         or _clean_text(owner_context.get("employee_name"))
         or _clean_text(owner_context.get("owner_name")),
-        "employee_name": display_name or _clean_text(owner_context.get("employee_name")),
-        "employee_id": _normalize_employee_id(keep_row.get("达人对接人_employee_id") or owner_context.get("employee_id")),
-        "employee_record_id": _clean_text(keep_row.get("达人对接人_employee_record_id"))
-        or _clean_text(owner_context.get("employee_record_id")),
-        "employee_email": _clean_text(keep_row.get("达人对接人_employee_email"))
-        or _clean_text(owner_context.get("employee_email")),
-        "owner_name": _clean_text(keep_row.get("达人对接人_owner_name"))
-        or _clean_text(owner_context.get("owner_name")),
-        "linked_bitable_url": _clean_text(keep_row.get("linked_bitable_url"))
-        or _clean_text(owner_context.get("linked_bitable_url")),
-        "task_name": _clean_text(keep_row.get("任务名")) or _clean_text(owner_context.get("task_name")),
+        "employee_name": display_name
+        or _clean_text(owner_context.get("employee_name"))
+        or _clean_text(owner_context.get("task_owner_name"))
+        or _clean_text(owner_context.get("responsible_name")),
+        "employee_id": _normalize_employee_id(
+            _first_non_blank(
+                keep_row.get("达人对接人_employee_id"),
+                keep_row.get("employee_id"),
+                keep_row.get("task_owner_employee_id"),
+                owner_context.get("employee_id"),
+                owner_context.get("task_owner_employee_id"),
+            )
+        ),
+        "employee_record_id": _clean_text(
+            _first_non_blank(
+                keep_row.get("达人对接人_employee_record_id"),
+                keep_row.get("employee_record_id"),
+                keep_row.get("task_owner_employee_record_id"),
+                owner_context.get("employee_record_id"),
+                owner_context.get("task_owner_employee_record_id"),
+            )
+        ),
+        "employee_email": _clean_text(
+            _first_non_blank(
+                keep_row.get("达人对接人_employee_email"),
+                keep_row.get("employee_email"),
+                keep_row.get("task_owner_employee_email"),
+                owner_context.get("employee_email"),
+                owner_context.get("task_owner_employee_email"),
+            )
+        ),
+        "owner_name": _clean_text(
+            _first_non_blank(
+                keep_row.get("达人对接人_owner_name"),
+                keep_row.get("owner_name"),
+                keep_row.get("task_owner_owner_name"),
+                owner_context.get("owner_name"),
+                owner_context.get("task_owner_owner_name"),
+            )
+        ),
+        "linked_bitable_url": _clean_text(
+            _first_non_blank(
+                keep_row.get("linked_bitable_url"),
+                keep_row.get("linkedBitableUrl"),
+                owner_context.get("linked_bitable_url"),
+                owner_context.get("linkedBitableUrl"),
+            )
+        ),
+        "task_name": _clean_text(
+            _first_non_blank(
+                keep_row.get("任务名"),
+                keep_row.get("task_name"),
+                owner_context.get("task_name"),
+            )
+        ),
     }
 
 
