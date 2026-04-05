@@ -847,6 +847,9 @@ def _build_keep_lookup(
         for candidate in (
             record.get("@username"),
             record.get("达人ID"),
+            record.get("final_id_final"),
+            record.get("final_id"),
+            record.get("llm_handle"),
             record.get("identifier"),
             record.get("username"),
             record.get("upload_handle"),
