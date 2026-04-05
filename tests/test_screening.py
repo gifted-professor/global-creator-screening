@@ -6,6 +6,7 @@ import unittest
 from backend.screening import (
     check_instagram_profile,
     extract_platform_identifier,
+    extract_youtube_cover_urls,
     filter_scraped_items,
     has_instagram_allowed_region,
 )
@@ -140,3 +141,31 @@ class TikTokScrapeErrorHandlingTests(unittest.TestCase):
         review = result["profile_reviews"][0]
         self.assertEqual(review["status"], "Pass")
         self.assertIn("播放量达标", review["reason"])
+
+
+class YouTubeCoverExtractionTests(unittest.TestCase):
+    def test_extract_youtube_cover_urls_reads_nested_thumbnail_payloads(self) -> None:
+        covers = extract_youtube_cover_urls(
+            [
+                {
+                    "latestVideos": [
+                        {
+                            "title": "Video 1",
+                            "thumbnails": [
+                                {"url": "https://example.com/yt-1.jpg"},
+                                {"url": "https://example.com/yt-2.jpg"},
+                            ],
+                        }
+                    ]
+                }
+            ],
+            cover_limit=3,
+        )
+
+        self.assertEqual(
+            covers,
+            [
+                "https://example.com/yt-1.jpg",
+                "https://example.com/yt-2.jpg",
+            ],
+        )

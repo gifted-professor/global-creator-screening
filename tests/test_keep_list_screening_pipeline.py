@@ -1854,7 +1854,6 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
                 "status": "completed",
                 "result": {
                     "profile_reviews": [
-                        {"status": "Pass", "username": "alpha"},
                         {"status": "Missing", "username": "ghost", "reason": "名单账号未在本次抓取结果中返回"},
                     ],
                 },
@@ -1867,7 +1866,7 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         keep_list_runner._load_runtime_dependencies = lambda: {
             "backend_app": backend_app,
             "prepare_screening_inputs": fake_prepare_screening_inputs,
-            "count_passed_profiles": lambda scrape_job: 1,
+            "count_passed_profiles": lambda scrape_job: 0,
             "export_platform_artifacts": fake_export_platform_artifacts,
             "poll_job": fake_poll_job,
             "require_success": lambda response, label: response.get_json(),
@@ -1903,6 +1902,103 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         self.assertTrue(platform_summary["visual_gate"]["blocked"])
         self.assertEqual(backend_app.app.test_client().visual_start_calls, [])
         self.assertEqual(export_calls, [])
+
+    def test_runner_keeps_successful_rows_when_missing_profiles_have_no_fallback_contract(self) -> None:
+        preflight = {
+            "status": "configured",
+            "error_code": "",
+            "message": "视觉模型已就绪：openai",
+            "configured_provider_names": ["openai"],
+            "runnable_provider_names": ["openai"],
+            "preferred_provider": "openai",
+            "providers": [{"name": "openai", "runnable": True}],
+        }
+        backend_app = FakeBackendApp(preflight)
+        export_calls = []
+
+        def fake_prepare_screening_inputs(**kwargs):
+            return {
+                "prepared_at": "2026-03-28T01:02:03Z",
+                "upload": {"stats": {"Instagram": 2}},
+            }
+
+        def fake_poll_job(client, job_id, label, interval):
+            return {
+                "id": job_id,
+                "status": "completed",
+                "result": {
+                    "profile_reviews": [
+                        {"status": "Pass", "username": "alpha"},
+                        {"status": "Missing", "username": "ghost", "reason": "名单账号未在本次抓取结果中返回"},
+                    ],
+                },
+            }
+
+        def fake_export_platform_artifacts(client, platform, export_dir):
+            export_calls.append(platform)
+            return {"final_review": str(export_dir / f"{platform}_final_review.xlsx")}
+
+        def fake_build_all_platforms_final_review_artifacts(**kwargs):
+            output_path = Path(kwargs["output_path"])
+            payload_path = Path(kwargs["payload_json_path"])
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.touch()
+            payload_path.write_text(json.dumps({"rows": []}, ensure_ascii=False), encoding="utf-8")
+            skipped_json = output_path.with_name("skipped_from_feishu_upload.json")
+            skipped_xlsx = output_path.with_name("skipped_from_feishu_upload.xlsx")
+            skipped_json.write_text("[]", encoding="utf-8")
+            skipped_xlsx.touch()
+            return {
+                "all_platforms_final_review": str(output_path),
+                "all_platforms_upload_payload_json": str(payload_path),
+                "all_platforms_upload_local_archive_dir": str(output_path.parent / "archives"),
+                "all_platforms_upload_skipped_archive_json": str(skipped_json),
+                "all_platforms_upload_skipped_archive_xlsx": str(skipped_xlsx),
+                "row_count": 0,
+                "source_row_count": 0,
+                "skipped_row_count": 0,
+            }
+
+        keep_list_runner._load_runtime_dependencies = lambda: {
+            "backend_app": backend_app,
+            "prepare_screening_inputs": fake_prepare_screening_inputs,
+            "count_passed_profiles": lambda scrape_job: 1,
+            "export_platform_artifacts": fake_export_platform_artifacts,
+            "poll_job": fake_poll_job,
+            "require_success": lambda response, label: response.get_json(),
+            "reset_backend_runtime_state": lambda: None,
+            "collect_final_exports": lambda platforms: dict(platforms or {}),
+            "build_all_platforms_final_review_artifacts": fake_build_all_platforms_final_review_artifacts,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            keep_path = temp_root / "keep.xlsx"
+            template_path = temp_root / "template.xlsx"
+            keep_path.touch()
+            template_path.touch()
+            env_path = self._write_env_file(temp_root)
+
+            summary = keep_list_runner.run_keep_list_screening_pipeline(
+                keep_workbook=keep_path,
+                template_workbook=template_path,
+                env_file=env_path,
+                output_root=temp_root / "run",
+                platform_filters=["instagram"],
+                vision_provider="openai",
+                skip_visual=True,
+                skip_positioning_card_analysis=True,
+            )
+
+        platform_summary = summary["platforms"]["instagram"]
+        self.assertEqual(summary["status"], "completed_with_quality_warnings")
+        self.assertEqual(summary["verdict"]["outcome"], "completed")
+        self.assertEqual(platform_summary["status"], "completed")
+        self.assertEqual(platform_summary["missing_profile_count"], 1)
+        self.assertEqual(platform_summary["visual_job"]["status"], "skipped")
+        self.assertEqual(summary["manual_review_rows"][0]["identifier"], "ghost")
+        self.assertEqual(summary["manual_review_rows"][0]["platform"], "instagram")
+        self.assertEqual(export_calls, ["instagram"])
 
     def test_runner_persists_live_platform_stage_before_scrape_poll_returns(self) -> None:
         preflight = {

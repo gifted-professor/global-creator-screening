@@ -1718,6 +1718,8 @@ def run_keep_list_screening_pipeline(
                         if not current_has_fallback_contract:
                             if not missing_profiles:
                                 unresolved_missing = []
+                            elif available_identifiers:
+                                unresolved_missing = list(fallback_profiles)
                             else:
                                 platform_summary["visual_gate"]["blocked"] = True
                                 platform_summary["visual_gate"]["reason"] = "prescreen contains Missing targets"
