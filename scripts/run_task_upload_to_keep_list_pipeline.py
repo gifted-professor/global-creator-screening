@@ -1923,6 +1923,7 @@ def run_task_upload_to_keep_list_pipeline(
         )
         summary["resume_points"]["keep_list"] = keep_list_resume_point
         summary["canonical_artifacts"]["keep_list"] = _json_clone(summary["resume_points"]["keep_list"])
+        linked_bitable_url = str((summary.get("steps", {}).get("task_assets") or {}).get("linked_bitable_url") or "").strip()
         summary["downstream_handoff"] = {
             "boundary_step": "keep-list",
             "resume_point_key": "keep_list",
@@ -1930,6 +1931,12 @@ def run_task_upload_to_keep_list_pipeline(
             "runner_script": "scripts/run_keep_list_screening_pipeline.py",
             "keep_workbook": summary["artifacts"]["keep_workbook"],
             "template_workbook": summary["artifacts"]["template_workbook"],
+            "linked_bitable_url": linked_bitable_url,
+            "task_owner": {
+                "task_name": normalized_task_name,
+                "task_upload_url": resolved_task_upload_url,
+                "linked_bitable_url": linked_bitable_url,
+            },
             "recommended_command": (
                 'backend/.venv/bin/python scripts/run_keep_list_screening_pipeline.py '
                 f'--keep-workbook "{summary["artifacts"]["keep_workbook"]}" '

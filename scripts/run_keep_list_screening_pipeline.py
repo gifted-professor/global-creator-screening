@@ -2263,6 +2263,119 @@ def _load_json_if_exists(path: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _clean_text(value: Any) -> str:
+    return str(value or "").strip()
+
+
+def _first_non_empty(*values: Any) -> str:
+    for value in values:
+        normalized = _clean_text(value)
+        if normalized:
+            return normalized
+    return ""
+
+
+def _extract_task_owner_context_from_payload(
+    payload: dict[str, Any],
+    *,
+    candidate: Path,
+) -> dict[str, str]:
+    if not isinstance(payload, dict):
+        return {}
+
+    intent = payload.get("intent") if isinstance(payload.get("intent"), dict) else {}
+    task_owner = payload.get("task_owner") if isinstance(payload.get("task_owner"), dict) else {}
+    resolved_task_owner = (
+        payload.get("resolved_task_owner") if isinstance(payload.get("resolved_task_owner"), dict) else {}
+    )
+    downstream_handoff = payload.get("downstream_handoff") if isinstance(payload.get("downstream_handoff"), dict) else {}
+    handoff_owner = downstream_handoff.get("task_owner") if isinstance(downstream_handoff.get("task_owner"), dict) else {}
+    resolved_inputs = payload.get("resolved_inputs") if isinstance(payload.get("resolved_inputs"), dict) else {}
+    resolved_feishu = resolved_inputs.get("feishu") if isinstance(resolved_inputs.get("feishu"), dict) else {}
+    steps = payload.get("steps") if isinstance(payload.get("steps"), dict) else {}
+    task_assets_step = steps.get("task_assets") if isinstance(steps.get("task_assets"), dict) else {}
+    task_assets_raw = task_assets_step.get("raw") if isinstance(task_assets_step.get("raw"), dict) else {}
+
+    employee_id = _first_non_empty(
+        task_owner.get("task_owner_employee_id"),
+        task_owner.get("employee_id"),
+        resolved_task_owner.get("task_owner_employee_id"),
+        resolved_task_owner.get("employee_id"),
+        handoff_owner.get("task_owner_employee_id"),
+        handoff_owner.get("employee_id"),
+    )
+    linked_url = _first_non_empty(
+        task_owner.get("linked_bitable_url"),
+        resolved_task_owner.get("linked_bitable_url"),
+        handoff_owner.get("linked_bitable_url"),
+        downstream_handoff.get("linked_bitable_url"),
+        task_assets_step.get("linked_bitable_url"),
+        task_assets_step.get("linkedBitableUrl"),
+        task_assets_raw.get("linked_bitable_url"),
+        task_assets_raw.get("linkedBitableUrl"),
+    )
+    owner_name = _first_non_empty(
+        task_owner.get("task_owner_name"),
+        task_owner.get("responsible_name"),
+        resolved_task_owner.get("task_owner_name"),
+        resolved_task_owner.get("responsible_name"),
+        handoff_owner.get("task_owner_name"),
+        handoff_owner.get("responsible_name"),
+        handoff_owner.get("employee_name"),
+    )
+    record_id = _first_non_empty(
+        task_owner.get("task_owner_employee_record_id"),
+        task_owner.get("employee_record_id"),
+        resolved_task_owner.get("task_owner_employee_record_id"),
+        resolved_task_owner.get("employee_record_id"),
+        handoff_owner.get("task_owner_employee_record_id"),
+        handoff_owner.get("employee_record_id"),
+    )
+    employee_email = _first_non_empty(
+        task_owner.get("task_owner_employee_email"),
+        task_owner.get("employee_email"),
+        resolved_task_owner.get("task_owner_employee_email"),
+        resolved_task_owner.get("employee_email"),
+        handoff_owner.get("task_owner_employee_email"),
+        handoff_owner.get("employee_email"),
+    )
+    owner_login = _first_non_empty(
+        task_owner.get("task_owner_owner_name"),
+        task_owner.get("owner_name"),
+        resolved_task_owner.get("task_owner_owner_name"),
+        resolved_task_owner.get("owner_name"),
+        handoff_owner.get("task_owner_owner_name"),
+        handoff_owner.get("owner_name"),
+    )
+    task_name = _first_non_empty(
+        task_owner.get("task_name"),
+        resolved_task_owner.get("task_name"),
+        handoff_owner.get("task_name"),
+        intent.get("task_name"),
+    )
+    task_upload_url = _first_non_empty(
+        task_owner.get("task_upload_url"),
+        handoff_owner.get("task_upload_url"),
+        intent.get("task_upload_url"),
+        resolved_feishu.get("task_upload_url"),
+    )
+    if not any([employee_id, linked_url, owner_name, task_name, task_upload_url]):
+        return {}
+
+    source_path = str(candidate.resolve())
+    return {
+        "task_owner_name": owner_name,
+        "task_owner_employee_id": employee_id,
+        "task_owner_employee_record_id": record_id,
+        "task_owner_employee_email": employee_email,
+        "task_owner_owner_name": owner_login,
+        "linked_bitable_url": linked_url,
+        "task_name": task_name,
+        "task_upload_url": task_upload_url,
+        "task_spec_path": source_path,
+    }
+
+
 def _infer_task_owner_from_adjacent_task_spec(
     *,
     keep_workbook: Path,
@@ -2271,37 +2384,37 @@ def _infer_task_owner_from_adjacent_task_spec(
     for ancestor in [keep_workbook.parent, *keep_workbook.parents]:
         candidate_specs.append(ancestor / "downstream" / "task_spec.json")
         candidate_specs.append(ancestor / "task_spec.json")
+        candidate_specs.append(ancestor / "downstream" / "summary.json")
+        candidate_specs.append(ancestor / "summary.json")
 
     seen: set[Path] = set()
+    merged_context: dict[str, str] = {}
+    merged_fields = (
+        "task_owner_name",
+        "task_owner_employee_id",
+        "task_owner_employee_record_id",
+        "task_owner_employee_email",
+        "task_owner_owner_name",
+        "linked_bitable_url",
+        "task_name",
+        "task_upload_url",
+    )
     for candidate in candidate_specs:
         resolved_candidate = candidate.resolve(strict=False)
         if resolved_candidate in seen:
             continue
         seen.add(resolved_candidate)
         payload = _load_json_if_exists(candidate)
-        owner = payload.get("task_owner") if isinstance(payload, dict) else None
-        if not isinstance(owner, dict):
+        candidate_context = _extract_task_owner_context_from_payload(payload, candidate=candidate)
+        if not candidate_context:
             continue
-        employee_id = str(owner.get("task_owner_employee_id") or owner.get("employee_id") or "").strip()
-        linked_url = str(owner.get("linked_bitable_url") or "").strip()
-        owner_name = str(owner.get("task_owner_name") or owner.get("responsible_name") or "").strip()
-        if not any([employee_id, linked_url, owner_name]):
-            continue
-        return {
-            "task_owner_name": owner_name,
-            "task_owner_employee_id": employee_id,
-            "task_owner_employee_record_id": str(
-                owner.get("task_owner_employee_record_id") or owner.get("employee_record_id") or ""
-            ).strip(),
-            "task_owner_employee_email": str(
-                owner.get("task_owner_employee_email") or owner.get("employee_email") or ""
-            ).strip(),
-            "task_owner_owner_name": str(owner.get("task_owner_owner_name") or owner.get("owner_name") or "").strip(),
-            "linked_bitable_url": linked_url,
-            "task_name": str(owner.get("task_name") or payload.get("intent", {}).get("task_name") or "").strip(),
-            "task_upload_url": str(payload.get("intent", {}).get("task_upload_url") or "").strip(),
-            "task_spec_path": str(candidate.resolve()),
-        }
+        if not merged_context.get("task_spec_path"):
+            merged_context["task_spec_path"] = candidate_context["task_spec_path"]
+        for field in merged_fields:
+            if not merged_context.get(field) and candidate_context.get(field):
+                merged_context[field] = candidate_context[field]
+    if any(merged_context.get(field) for field in merged_fields):
+        return merged_context
     return {}
 
 

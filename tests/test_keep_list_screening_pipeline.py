@@ -846,7 +846,7 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         self.assertEqual(summary["error_code"], "FEISHU_UPLOAD_PAYLOAD_EMPTY")
         self.assertEqual(summary["failure"]["stage"], "feishu_upload")
 
-    def test_runner_infers_task_owner_from_adjacent_task_spec_when_rerunning_downstream(self) -> None:
+    def test_runner_merges_adjacent_task_spec_and_upstream_summary_context_when_rerunning_downstream(self) -> None:
         preflight = {
             "status": "configured",
             "error_code": "",
@@ -969,7 +969,29 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
                             "task_owner_employee_record_id": "rec_owner",
                             "task_owner_employee_email": "yvette@amagency.biz",
                             "task_owner_owner_name": "yvette@amagency.biz",
-                            "linked_bitable_url": "https://example.com/base",
+                            "linked_bitable_url": "",
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            upstream_summary = temp_root / "task" / "upstream" / "summary.json"
+            upstream_summary.parent.mkdir(parents=True, exist_ok=True)
+            upstream_summary.write_text(
+                json.dumps(
+                    {
+                        "steps": {
+                            "task_assets": {
+                                "linked_bitable_url": "https://example.com/base",
+                            }
+                        },
+                        "downstream_handoff": {
+                            "task_owner": {
+                                "task_name": "Duet1",
+                                "task_upload_url": "https://example.com/task-upload",
+                                "linked_bitable_url": "https://example.com/base",
+                            }
                         },
                     },
                     ensure_ascii=False,

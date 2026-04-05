@@ -450,6 +450,16 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
             summary["canonical_artifacts"]["keep_list"]["keep_workbook"],
             summary["artifacts"]["keep_workbook"],
         )
+        self.assertEqual(summary["downstream_handoff"]["linked_bitable_url"], "https://bitable.example/miniso")
+        self.assertEqual(
+            summary["downstream_handoff"]["task_owner"]["linked_bitable_url"],
+            "https://bitable.example/miniso",
+        )
+        self.assertEqual(summary["downstream_handoff"]["task_owner"]["task_name"], "MINISO")
+        self.assertEqual(
+            summary["downstream_handoff"]["task_owner"]["task_upload_url"],
+            "https://env.example/task",
+        )
         self.assertIn("--keep-workbook", summary["downstream_handoff"]["recommended_command"])
         self.assertEqual(
             persisted["resume_points"]["llm_candidates"]["llm_review_input_prefix"],
