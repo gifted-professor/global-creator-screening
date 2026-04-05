@@ -233,6 +233,105 @@ class FinalExportMergeTests(unittest.TestCase):
             self.assertEqual(workbook.loc[0, "full body"], "My rate is $500 per video.")
             self.assertEqual(payload["rows"][0]["达人回复的最后一封邮件内容"], "My rate is $500 per video.")
 
+    def test_mail_context_can_match_keep_row_by_final_id_and_llm_handle_aliases(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            exports_dir = root / "exports"
+            tiktok_export = exports_dir / "tiktok" / "tiktok_final_review.xlsx"
+            tiktok_positioning = exports_dir / "tiktok" / "tiktok_positioning_card_review.xlsx"
+            tiktok_export.parent.mkdir(parents=True, exist_ok=True)
+
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "alpha",
+                        "username": "",
+                        "profile_url": "https://www.tiktok.com/@alpha",
+                        "upload_handle": "",
+                        "final_status": "Pass",
+                        "final_reason": "内容契合",
+                    },
+                    {
+                        "identifier": "beta",
+                        "username": "",
+                        "profile_url": "https://www.tiktok.com/@beta",
+                        "upload_handle": "",
+                        "final_status": "Pass",
+                        "final_reason": "内容契合",
+                    },
+                ]
+            ).to_excel(tiktok_export, index=False)
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "alpha",
+                        "username": "",
+                        "profile_url": "https://www.tiktok.com/@alpha",
+                        "upload_handle": "",
+                        "positioning_stage_status": "Completed",
+                        "positioning_labels": "家庭用品和家电-家庭博主",
+                        "fit_summary": "适合家庭类合作",
+                    },
+                    {
+                        "identifier": "beta",
+                        "username": "",
+                        "profile_url": "https://www.tiktok.com/@beta",
+                        "upload_handle": "",
+                        "positioning_stage_status": "Completed",
+                        "positioning_labels": "家庭用品和家电-家庭博主",
+                        "fit_summary": "适合家庭类合作",
+                    },
+                ]
+            ).to_excel(tiktok_positioning, index=False)
+
+            keep_workbook = root / "upstream" / "exports" / "keep.xlsx"
+            keep_workbook.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(
+                [
+                    {
+                        "Platform": "TikTok",
+                        "final_id_final": "alpha",
+                        "creator_emails": "alpha@example.com",
+                        "matched_contact_email": "alpha@example.com",
+                        "latest_external_from": "alpha@example.com",
+                        "latest_external_sent_at": "2026-03-30T21:55:31+00:00",
+                        "latest_external_full_body": "Alpha says my rate is $500 per video.",
+                    },
+                    {
+                        "Platform": "TikTok",
+                        "llm_handle": "beta",
+                        "creator_emails": "beta@example.com",
+                        "matched_contact_email": "beta@example.com",
+                        "latest_external_from": "beta@example.com",
+                        "latest_external_sent_at": "2026-03-31T21:55:31+00:00",
+                        "latest_external_full_body": "Beta says my rate is $700 per video.",
+                    },
+                ]
+            ).to_excel(keep_workbook, index=False)
+
+            output_path = exports_dir / "all_platforms_final_review.xlsx"
+            payload_path = exports_dir / "all_platforms_final_review_payload.json"
+            build_all_platforms_final_review_artifacts(
+                output_path=output_path,
+                payload_json_path=payload_path,
+                final_exports={
+                    "tiktok": {
+                        "final_review": str(tiktok_export),
+                        "positioning_card_review": str(tiktok_positioning),
+                    }
+                },
+                keep_workbook=keep_workbook,
+                task_owner={"responsible_name": "陈俊仁"},
+            )
+
+            workbook = pd.read_excel(output_path).fillna("")
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+            self.assertEqual(workbook.loc[0, "full body"], "Alpha says my rate is $500 per video.")
+            self.assertEqual(workbook.loc[1, "full body"], "Beta says my rate is $700 per video.")
+            self.assertEqual(payload["rows"][0]["creator_emails"], "alpha@example.com")
+            self.assertEqual(payload["rows"][0]["latest_external_from"], "alpha@example.com")
+            self.assertEqual(payload["rows"][1]["creator_emails"], "beta@example.com")
+            self.assertEqual(payload["rows"][1]["latest_external_from"], "beta@example.com")
     def test_mail_context_can_fall_back_to_platformless_keep_row(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
