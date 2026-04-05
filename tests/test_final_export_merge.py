@@ -8,7 +8,11 @@ from unittest.mock import patch
 
 import pandas as pd
 
-from backend.final_export_merge import _compute_engagement_rate, build_all_platforms_final_review_artifacts
+from backend.final_export_merge import (
+    _compute_engagement_rate,
+    build_all_platforms_final_review_artifacts,
+    extract_task_owner_context,
+)
 
 
 class FinalExportMergeTests(unittest.TestCase):
@@ -440,6 +444,7 @@ class FinalExportMergeTests(unittest.TestCase):
             pd.DataFrame(
                 [
                     {
+                        "Platform": None,
                         "达人ID": "alpha",
                         "URL": "https://www.tiktok.com/@alpha",
                         "brand_message_sent_at": "2026-03-30T21:55:31+00:00",
@@ -719,6 +724,23 @@ class FinalExportMergeTests(unittest.TestCase):
             self.assertNotIn("达人对接人", payload["rows"][0])
             self.assertNotIn("达人对接人_employee_id", payload["rows"][0])
             self.assertEqual(payload["rows"][0]["linked_bitable_url"], "https://bitable.example/skg")
+
+    def test_extract_task_owner_context_uses_task_assets_linked_bitable_url_fallback(self) -> None:
+        task_owner = extract_task_owner_context(
+            {
+                "task_name": "SKG",
+                "steps": {
+                    "mail_sync": {"raw": {"items": []}},
+                    "task_assets": {
+                        "linked_bitable_url": "https://bitable.example/from-task-assets",
+                        "raw": {},
+                    },
+                },
+            }
+        )
+
+        self.assertEqual(task_owner["task_name"], "SKG")
+        self.assertEqual(task_owner["linked_bitable_url"], "https://bitable.example/from-task-assets")
 
     def test_payload_skips_processing_failures_and_preserves_uploadable_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

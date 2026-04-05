@@ -358,12 +358,73 @@ def extract_instagram_cover_urls(posts, cover_limit):
     ]
 
 
+def _append_unique_cover_url(candidate, covers, seen, cover_limit):
+    url = str(candidate or "").strip()
+    if not url or url in seen or len(covers) >= cover_limit:
+        return
+    seen.add(url)
+    covers.append(url)
+
+
+def _collect_youtube_thumbnail_urls(node, covers, seen, cover_limit, *, thumbnail_context=False):
+    if len(covers) >= cover_limit:
+        return
+    if isinstance(node, str):
+        if thumbnail_context:
+            _append_unique_cover_url(node, covers, seen, cover_limit)
+        return
+    if isinstance(node, list):
+        for item in node:
+            _collect_youtube_thumbnail_urls(
+                item,
+                covers,
+                seen,
+                cover_limit,
+                thumbnail_context=thumbnail_context,
+            )
+            if len(covers) >= cover_limit:
+                break
+        return
+    if not isinstance(node, dict):
+        return
+
+    thumbnail_url = node.get("thumbnailUrl")
+    if str(thumbnail_url or "").strip():
+        _append_unique_cover_url(thumbnail_url, covers, seen, cover_limit)
+
+    for key, value in node.items():
+        normalized_key = str(key or "").strip().lower()
+        if normalized_key == "thumbnailurl":
+            continue
+        child_thumbnail_context = (
+            thumbnail_context
+            or "thumb" in normalized_key
+            or normalized_key in {"image", "images", "preview", "previews", "default", "medium", "high", "standard", "maxres"}
+        )
+        if normalized_key in {"url", "src"}:
+            if child_thumbnail_context:
+                _append_unique_cover_url(value, covers, seen, cover_limit)
+            continue
+        _collect_youtube_thumbnail_urls(
+            value,
+            covers,
+            seen,
+            cover_limit,
+            thumbnail_context=child_thumbnail_context,
+        )
+        if len(covers) >= cover_limit:
+            break
+
+
 def extract_youtube_cover_urls(items, cover_limit):
-    return [
-        item.get("thumbnailUrl")
-        for item in list(items or [])[:max(1, int(cover_limit or 1))]
-        if str(item.get("thumbnailUrl") or "").strip()
-    ]
+    resolved_cover_limit = max(1, int(cover_limit or 1))
+    covers = []
+    seen = set()
+    for item in list(items or []):
+        _collect_youtube_thumbnail_urls(item, covers, seen, resolved_cover_limit)
+        if len(covers) >= resolved_cover_limit:
+            break
+    return covers
 
 
 def build_profile_review_record(

@@ -842,8 +842,9 @@ def _build_keep_lookup(
         frame = pd.read_excel(keep_path)
     except Exception:
         return handle_lookup, url_lookup, handle_any_lookup, url_any_lookup
-    for record in frame.to_dict(orient="records"):
-        platform = _normalize_platform(record.get("Platform") or record.get("平台"))
+    records = [dict(record) for record in frame.to_dict(orient="records")]
+
+    def _index_record(record: dict[str, Any], platform: str | None) -> None:
         for candidate in (
             record.get("@username"),
             record.get("达人ID"),
@@ -859,10 +860,11 @@ def _build_keep_lookup(
             record.get("profile_url"),
         ):
             handle = _extract_handle(candidate)
-            if handle:
-                if platform:
-                    handle_lookup.setdefault((platform, handle), dict(record))
-                handle_any_lookup.setdefault(handle, dict(record))
+            if not handle:
+                continue
+            if platform:
+                handle_lookup.setdefault((platform, handle), dict(record))
+            handle_any_lookup.setdefault(handle, dict(record))
         for candidate in (
             record.get("URL"),
             record.get("主页链接"),
@@ -874,6 +876,15 @@ def _build_keep_lookup(
             if platform:
                 url_lookup.setdefault((platform, url), dict(record))
             url_any_lookup.setdefault(url, dict(record))
+
+    for record in records:
+        platform = _normalize_platform(record.get("Platform") or record.get("平台"))
+        if platform:
+            _index_record(record, platform)
+    for record in records:
+        platform = _normalize_platform(record.get("Platform") or record.get("平台"))
+        if not platform:
+            _index_record(record, None)
     return handle_lookup, url_lookup, handle_any_lookup, url_any_lookup
 
 
@@ -908,7 +919,8 @@ def _build_positioning_lookup(positioning_review_path: str | Path | None) -> tup
 def extract_task_owner_context(upstream_summary: dict[str, Any] | None) -> dict[str, str]:
     payload = dict(upstream_summary or {})
     mail_sync_raw = (((payload.get("steps") or {}).get("mail_sync") or {}).get("raw") or {})
-    task_assets_raw = (((payload.get("steps") or {}).get("task_assets") or {}).get("raw") or {})
+    task_assets_step = ((payload.get("steps") or {}).get("task_assets") or {})
+    task_assets_raw = (task_assets_step.get("raw") or {})
     first_item = next(iter(mail_sync_raw.get("items") or []), {})
     if not isinstance(first_item, dict):
         first_item = {}
@@ -923,6 +935,8 @@ def extract_task_owner_context(upstream_summary: dict[str, Any] | None) -> dict[
         "task_record_id": _clean_text(first_item.get("recordId")),
         "task_name": _clean_text(first_item.get("taskName")) or _clean_text(payload.get("task_name")),
         "linked_bitable_url": _clean_text(first_item.get("linkedBitableUrl"))
+        or _clean_text(task_assets_step.get("linked_bitable_url"))
+        or _clean_text(task_assets_step.get("linkedBitableUrl"))
         or _clean_text(task_assets_raw.get("linkedBitableUrl")),
     }
 
