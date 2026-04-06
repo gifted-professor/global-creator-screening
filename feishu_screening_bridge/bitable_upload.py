@@ -980,13 +980,13 @@ def _select_attachment_field_schema(field_schemas: dict[str, FieldSchema]) -> Fi
 def _fetch_existing_records(client: FeishuOpenClient, resolved: ResolvedBitableView) -> list[tuple[str, dict[str, Any]]]:
     collected: list[tuple[str, dict[str, Any]]] = []
     page_token = ""
+    seen_page_tokens: set[str] = set()
     while True:
-        body: dict[str, Any] = {"view_id": resolved.view_id, "page_size": 500}
+        query: dict[str, Any] = {"view_id": resolved.view_id, "page_size": 500}
         if page_token:
-            body["page_token"] = page_token
-        payload = client.post_api_json(
-            f"/bitable/v1/apps/{resolved.app_token}/tables/{resolved.table_id}/records/search",
-            body=body,
+            query["page_token"] = page_token
+        payload = client.get_api_json(
+            f"/bitable/v1/apps/{resolved.app_token}/tables/{resolved.table_id}/records?{parse.urlencode(query)}",
         )
         data = payload.get("data") or {}
         for item in data.get("items") or []:
@@ -995,9 +995,13 @@ def _fetch_existing_records(client: FeishuOpenClient, resolved: ResolvedBitableV
             collected.append((str(item.get("record_id") or "").strip(), dict(item.get("fields") or {})))
         if not bool(data.get("has_more")):
             break
-        page_token = str(data.get("page_token") or "").strip()
-        if not page_token:
-            break
+        next_page_token = str(data.get("page_token") or "").strip()
+        if not next_page_token:
+            raise FeishuApiError("records 列表返回 has_more=true，但没有 page_token，无法继续分页。")
+        if next_page_token in seen_page_tokens:
+            raise FeishuApiError(f"records 列表分页返回重复 page_token={next_page_token}，已停止以避免死循环。")
+        seen_page_tokens.add(next_page_token)
+        page_token = next_page_token
     return collected
 
 

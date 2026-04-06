@@ -6,10 +6,11 @@ import unittest
 from datetime import datetime
 from pathlib import Path
 from unittest.mock import patch
+from urllib import parse
 from zoneinfo import ZoneInfo
 
 from feishu_screening_bridge.bitable_export import ResolvedBitableView
-from feishu_screening_bridge.bitable_upload import upload_final_review_payload_to_bitable
+from feishu_screening_bridge.bitable_upload import fetch_existing_bitable_record_analysis, upload_final_review_payload_to_bitable
 from feishu_screening_bridge.feishu_api import FeishuApiError
 from feishu_screening_bridge.task_upload_sync import TaskUploadEntry
 
@@ -28,6 +29,7 @@ class _FakeBitableUploadClient:
         self.search_side_effects: list[object] = []
         self.upload_side_effects: list[object] = []
         self.include_task_name_field = False
+        self.record_pages: list[dict[str, object]] | None = None
         self.search_items = [
             {
                 "record_id": "rec_existing",
@@ -64,6 +66,22 @@ class _FakeBitableUploadClient:
             return {"data": {"items": [{"view_id": "vew_ai", "view_name": "表格"}]}}
         if url_path == "/bitable/v1/apps/app_token/tables/tbl/views":
             return {"data": {"items": [{"view_id": "vew", "view_name": "总视图"}]}}
+        if "/records?" in url_path:
+            parsed = parse.urlparse(url_path)
+            query = parse.parse_qs(parsed.query)
+            page_token = str(query.get("page_token", [""])[0] or "")
+            if self.record_pages is not None:
+                if not page_token:
+                    page_index = 0
+                else:
+                    try:
+                        page_index = int(page_token.replace("page-", ""))
+                    except ValueError as exc:  # pragma: no cover - defensive only
+                        raise AssertionError(f"unexpected page token {page_token}") from exc
+                if page_index >= len(self.record_pages):
+                    raise AssertionError(f"unexpected page index {page_index}")
+                return {"data": dict(self.record_pages[page_index])}
+            return {"data": {"items": self.search_items, "has_more": False, "page_token": ""}}
         if url_path.endswith("/fields"):
             items = [
                 {"field_id": "fld1", "field_name": "达人ID", "type": 1, "property": None},
@@ -179,6 +197,62 @@ class _FakeBitableUploadClient:
 
 
 class BitableUploadTests(unittest.TestCase):
+    def test_fetch_existing_record_analysis_supports_multi_page_records_listing(self) -> None:
+        client = _FakeBitableUploadClient()
+        client.record_pages = [
+            {
+                "items": [
+                    {
+                        "record_id": "rec_page1",
+                        "fields": {
+                            "达人ID": "alpha",
+                            "平台": "instagram",
+                            "ai 是否通过": "是",
+                        },
+                    }
+                ],
+                "has_more": True,
+                "page_token": "page-1",
+            },
+            {
+                "items": [
+                    {
+                        "record_id": "rec_page2",
+                        "fields": {
+                            "达人ID": "beta",
+                            "平台": "tiktok",
+                            "ai 是否通过": "",
+                        },
+                    }
+                ],
+                "has_more": False,
+                "page_token": "",
+            },
+        ]
+        resolved_view = ResolvedBitableView(
+            source_url="https://example.com/base/app?table=tbl&view=vew",
+            source_kind="base",
+            source_token="app_token",
+            app_token="app_token",
+            table_id="tbl",
+            view_id="vew",
+            table_name="达人管理",
+            view_name="总视图",
+        )
+
+        with patch(
+            "feishu_screening_bridge.bitable_upload.resolve_bitable_view_from_url",
+            return_value=resolved_view,
+        ):
+            _resolved, analysis = fetch_existing_bitable_record_analysis(
+                client,
+                linked_bitable_url="https://example.com/base/app?table=tbl&view=vew",
+            )
+
+        self.assertEqual(len(analysis.index), 2)
+        self.assertEqual(analysis.index["alpha::instagram"]["record_id"], "rec_page1")
+        self.assertEqual(analysis.index["beta::tiktok"]["record_id"], "rec_page2")
+
     def test_upload_payload_maps_fields_and_skips_existing_rows(self) -> None:
         client = _FakeBitableUploadClient()
         resolved_view = ResolvedBitableView(
