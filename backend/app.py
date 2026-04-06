@@ -5732,6 +5732,89 @@ def build_visual_review_cache_prompt_descriptor(prompt_selection):
     }
 
 
+def build_positioning_card_cache_prompt_descriptor(prompt_selection):
+    if not isinstance(prompt_selection, dict):
+        return {}
+    prompt_text = str(prompt_selection.get("prompt") or "").strip()
+    return {
+        "platform": normalize_visual_prompt_lookup_key(prompt_selection.get("platform")),
+        "provider": normalize_vision_provider_name(prompt_selection.get("provider")),
+        "model": normalize_visual_prompt_lookup_key(prompt_selection.get("model")),
+        "source": str(prompt_selection.get("source") or "").strip(),
+        "visual_contract_source": str(prompt_selection.get("visual_contract_source") or "").strip(),
+        "resolved_cover_limit": screening.coerce_positive_int(prompt_selection.get("resolved_cover_limit")) or 0,
+        "prompt_key": creator_cache.stable_cache_key(prompt_text),
+        "visual_runtime_contract_key": creator_cache.stable_cache_key(
+            prompt_selection.get("visual_runtime_contract") or {}
+        ),
+    }
+
+
+def build_positioning_card_cache_context(
+    platform,
+    *,
+    requested_provider="",
+    providers=None,
+    active_rulespec=None,
+):
+    normalized_platform = str(platform or "").strip().lower()
+    normalized_requested_provider = normalize_vision_provider_name(requested_provider)
+    resolved_active_rulespec = load_active_rulespec() if active_rulespec is None else active_rulespec
+    resolved_providers = list(providers or get_available_vision_providers(normalized_requested_provider))
+
+    provider_descriptors = []
+    for provider in resolved_providers:
+        provider_name = normalize_vision_provider_name((provider or {}).get("name"))
+        configured_model = str(resolve_vision_provider_model(provider) or "").strip()
+        prompt_selection = resolve_positioning_card_prompt_selection(
+            provider_name,
+            normalized_platform,
+            model_name=configured_model,
+            active_rulespec=resolved_active_rulespec,
+        )
+        provider_descriptors.append(
+            {
+                "name": provider_name,
+                "api_style": str((provider or {}).get("api_style") or "").strip().lower(),
+                "model": configured_model,
+                "model_candidates": dedupe_non_empty_strings(resolve_vision_provider_model_candidates(provider)),
+                "base_urls": dedupe_non_empty_strings(
+                    (provider or {}).get("base_url_candidates") or resolve_vision_provider_base_urls(provider)
+                ),
+                "request_timeout_seconds": resolve_vision_provider_request_timeout(provider),
+                "prompt": build_positioning_card_cache_prompt_descriptor(prompt_selection),
+            }
+        )
+    provider_descriptors.sort(
+        key=lambda item: (
+            str(item.get("name") or ""),
+            str(item.get("model") or ""),
+            str(item.get("api_style") or ""),
+        )
+    )
+
+    selected_prompt = build_positioning_card_cache_prompt_descriptor(
+        resolve_positioning_card_prompt_selection(
+            normalized_requested_provider,
+            normalized_platform,
+            model_name="",
+            active_rulespec=resolved_active_rulespec,
+        )
+    )
+    context_payload = {
+        "version": "positioning_card_cache_v1",
+        "platform": normalized_platform,
+        "requested_provider": normalized_requested_provider,
+        "active_rulespec_key": creator_cache.stable_cache_key(resolved_active_rulespec or {}),
+        "prompt": selected_prompt,
+        "providers": provider_descriptors,
+    }
+    return {
+        "context_key": creator_cache.stable_cache_key(context_payload),
+        "context_payload": context_payload,
+    }
+
+
 def build_visual_review_cache_context(
     platform,
     *,
