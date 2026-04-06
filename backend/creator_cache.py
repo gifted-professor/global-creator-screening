@@ -16,6 +16,7 @@ DEFAULT_CREATOR_CACHE_DB_PATH = str(
     (BASE_DIR / "temp" / "creator_cache" / "creator_cache.db").resolve()
 )
 VISUAL_CACHE_TABLE_NAME = "creator_visual_cache_v2"
+POSITIONING_CACHE_TABLE_NAME = "creator_positioning_cache_v1"
 
 
 def _parse_boolish(value: Any, default: bool) -> bool:
@@ -97,6 +98,20 @@ def creator_cache_connection(db_path: str | Path) -> Iterator[sqlite3.Connection
 
             CREATE INDEX IF NOT EXISTS idx_creator_visual_cache_v2_lookup
             ON creator_visual_cache_v2(platform, context_key, identifier);
+
+            CREATE TABLE IF NOT EXISTS creator_positioning_cache_v1 (
+                platform TEXT NOT NULL,
+                identifier TEXT NOT NULL,
+                context_key TEXT NOT NULL,
+                context_json TEXT NOT NULL DEFAULT '{}',
+                positioning_result_json TEXT NOT NULL,
+                fit_recommendation TEXT NOT NULL DEFAULT '',
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (platform, identifier, context_key)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_creator_positioning_cache_v1_lookup
+            ON creator_positioning_cache_v1(platform, context_key, identifier);
             """
         )
         yield conn
@@ -232,6 +247,20 @@ def is_cacheable_visual_result(result: dict[str, Any] | None) -> bool:
     return bool(str(result.get("decision") or "").strip())
 
 
+def is_cacheable_positioning_result(result: dict[str, Any] | None) -> bool:
+    if not isinstance(result, dict):
+        return False
+    if result.get("success") is False:
+        return False
+    if str(result.get("fit_recommendation") or "").strip():
+        return True
+    return bool(
+        list(result.get("positioning_labels") or [])
+        or str(result.get("fit_summary") or "").strip()
+        or list(result.get("evidence_signals") or [])
+    )
+
+
 def load_visual_cache_entries(
     platform: str,
     identifiers: list[str],
@@ -292,6 +321,72 @@ def persist_visual_cache_entry(
                 json.dumps(context_payload or {}, ensure_ascii=False),
                 json.dumps(dict(visual_result or {}), ensure_ascii=False),
                 str((visual_result or {}).get("decision") or "").strip(),
+                str(updated_at or "").strip(),
+            ),
+        )
+    return True
+
+
+def load_positioning_cache_entries(
+    platform: str,
+    identifiers: list[str],
+    db_path: str | Path,
+    context_key: str,
+) -> dict[str, dict[str, Any]]:
+    normalized_identifiers = _normalize_requested_identifiers(platform, identifiers)
+    normalized_context_key = str(context_key or "").strip()
+    if not normalized_identifiers or not normalized_context_key:
+        return {}
+    placeholders = ",".join("?" for _ in normalized_identifiers)
+    query = (
+        f"SELECT identifier, positioning_result_json FROM {POSITIONING_CACHE_TABLE_NAME} "
+        f"WHERE platform = ? AND context_key = ? AND identifier IN ({placeholders})"
+    )
+    rows: dict[str, dict[str, Any]] = {}
+    with creator_cache_connection(db_path) as conn:
+        cursor = conn.execute(query, [str(platform or "").strip().lower(), normalized_context_key, *normalized_identifiers])
+        for identifier, positioning_result_json in cursor.fetchall():
+            try:
+                payload = json.loads(positioning_result_json or "{}")
+            except Exception:
+                continue
+            if is_cacheable_positioning_result(payload):
+                rows[str(identifier or "").strip().lower()] = dict(payload)
+    return rows
+
+
+def persist_positioning_cache_entry(
+    platform: str,
+    identifier: str,
+    positioning_result: dict[str, Any] | None,
+    db_path: str | Path,
+    *,
+    updated_at: str,
+    context_key: str,
+    context_payload: dict[str, Any] | None = None,
+) -> bool:
+    normalized_identifier = screening.normalize_identifier(identifier)
+    normalized_context_key = str(context_key or "").strip()
+    if not normalized_identifier or not normalized_context_key or not is_cacheable_positioning_result(positioning_result):
+        return False
+    with creator_cache_connection(db_path) as conn:
+        conn.execute(
+            f"""
+            INSERT INTO {POSITIONING_CACHE_TABLE_NAME}(platform, identifier, context_key, context_json, positioning_result_json, fit_recommendation, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(platform, identifier, context_key) DO UPDATE SET
+                context_json = excluded.context_json,
+                positioning_result_json = excluded.positioning_result_json,
+                fit_recommendation = excluded.fit_recommendation,
+                updated_at = excluded.updated_at
+            """,
+            (
+                str(platform or "").strip().lower(),
+                normalized_identifier,
+                normalized_context_key,
+                json.dumps(context_payload or {}, ensure_ascii=False),
+                json.dumps(dict(positioning_result or {}), ensure_ascii=False),
+                str((positioning_result or {}).get("fit_recommendation") or "").strip(),
                 str(updated_at or "").strip(),
             ),
         )
