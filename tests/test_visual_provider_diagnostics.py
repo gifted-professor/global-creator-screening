@@ -38,6 +38,12 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
         "OPENAI_API_KEY",
         "OPENAI_BASE_URL",
         "OPENAI_VISION_MODEL",
+        "VISION_998CODE_API_KEY",
+        "VISION_998CODE_BASE_URL",
+        "VISION_998CODE_MODEL",
+        "VISION_998CODE_MAX_INFLIGHT_REQUESTS",
+        "VISION_998CODE_DISABLE_RESPONSE_STORAGE",
+        "VISION_998CODE_REASONING_EFFORT",
         "VISION_MODEL",
         "VISION_PROVIDER_PREFERENCE",
         "VISION_REELX_API_KEY",
@@ -1514,8 +1520,35 @@ class VisualProviderDiagnosticsTests(unittest.TestCase):
 
 class VisualProviderConfigDefaultsTests(unittest.TestCase):
     def setUp(self) -> None:
-        os.environ.pop("VISION_PROVIDER_PREFERENCE", None)
+        self.env_keys = {
+            "VISION_PROVIDER_PREFERENCE",
+            "VISION_VISUAL_REVIEW_ROUTING_STRATEGY",
+            "VISION_VISUAL_REVIEW_PRIMARY_PROVIDER",
+            "VISION_VISUAL_REVIEW_PRIMARY_MODEL",
+            "VISION_VISUAL_REVIEW_BACKUP_PROVIDER",
+            "VISION_VISUAL_REVIEW_BACKUP_MODEL",
+            "VISION_VISUAL_REVIEW_JUDGE_PROVIDER",
+            "VISION_VISUAL_REVIEW_JUDGE_MODEL",
+            "VISION_VISUAL_REVIEW_PROBE_RANKED_PREFERRED_PROVIDER",
+            "VISION_VISUAL_REVIEW_PROBE_RANKED_PREFERRED_MODEL",
+            "VISION_VISUAL_REVIEW_PROBE_RANKED_PREFERRED_PARALLEL_PROVIDER",
+            "VISION_VISUAL_REVIEW_PROBE_RANKED_PREFERRED_PARALLEL_MODEL",
+            "VISION_VISUAL_REVIEW_PROBE_RANKED_SECONDARY_PROVIDER",
+            "VISION_VISUAL_REVIEW_PROBE_RANKED_SECONDARY_MODEL",
+            "VISION_VISUAL_REVIEW_PROBE_RANKED_TERTIARY_PROVIDER",
+            "VISION_VISUAL_REVIEW_PROBE_RANKED_TERTIARY_MODEL",
+        }
+        self.original_env = {key: os.environ.get(key) for key in self.env_keys}
+        for key in self.env_keys:
+            os.environ.pop(key, None)
         self.client = backend_app.app.test_client()
+
+    def tearDown(self) -> None:
+        for key, value in self.original_env.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
     def test_reelx_defaults_to_generate_content_with_qwen_model(self) -> None:
         provider = next(item for item in backend_app.VISION_PROVIDER_CONFIGS if item["name"] == "reelx")
@@ -1699,6 +1732,51 @@ class VisualProviderConfigDefaultsTests(unittest.TestCase):
             backend_app.DEFAULT_MIMO_MAX_COMPLETION_TOKENS,
         )
         self.assertEqual(request_payload["body"]["messages"][0]["content"][0]["type"], "text")
+
+    def test_998code_defaults_to_responses_with_medium_reasoning_and_storage_disabled(self) -> None:
+        provider = next(item for item in backend_app.VISION_PROVIDER_CONFIGS if item["name"] == "998code")
+
+        self.assertEqual(provider["api_style"], backend_app.VISION_API_STYLE_RESPONSES)
+        self.assertEqual(provider["default_base_url"], "https://9985678.xyz/v1")
+        self.assertEqual(provider["default_model"], "gpt-5.4")
+        self.assertTrue(provider["default_disable_response_storage"])
+        self.assertEqual(provider["default_reasoning_effort"], "medium")
+        self.assertEqual(provider["default_max_inflight_requests"], 2)
+
+    def test_998code_probe_request_includes_store_and_medium_reasoning(self) -> None:
+        provider_config = next(item for item in backend_app.VISION_PROVIDER_CONFIGS if item["name"] == "998code")
+        provider = {
+            **provider_config,
+            "api_key": "998code-test-key",
+            "base_url": "https://9985678.xyz/v1",
+            "model": backend_app.resolve_vision_provider_model(provider_config),
+        }
+
+        request_payload = backend_app.build_vision_provider_probe_request(provider)
+
+        self.assertEqual(request_payload["provider_name"], "998code")
+        self.assertEqual(request_payload["api_style"], backend_app.VISION_API_STYLE_RESPONSES)
+        self.assertEqual(request_payload["url"], "https://9985678.xyz/v1/responses")
+        self.assertEqual(request_payload["body"]["model"], "gpt-5.4")
+        self.assertFalse(request_payload["body"]["store"])
+        self.assertEqual(request_payload["body"]["reasoning"], {"effort": "medium"})
+
+    def test_998code_uses_conservative_default_request_gate(self) -> None:
+        provider = next(item for item in backend_app.VISION_PROVIDER_CONFIGS if item["name"] == "998code")
+
+        limit = backend_app.resolve_vision_provider_max_inflight_requests(provider, base_url="https://9985678.xyz/v1")
+
+        self.assertEqual(limit, 2)
+
+    def test_tiered_routing_defaults_to_998code_primary_with_openai_backup(self) -> None:
+        plan = backend_app.build_visual_review_routing_plan()
+
+        self.assertEqual(plan[0]["stage"], "primary")
+        self.assertEqual(plan[0]["provider"], "998code")
+        self.assertEqual(plan[0]["model"], "gpt-5.4")
+        self.assertEqual(plan[1]["stage"], "backup")
+        self.assertEqual(plan[1]["provider"], "openai")
+        self.assertEqual(plan[1]["model"], backend_app.DEFAULT_VISION_MODEL)
 
     def test_build_visual_review_prompt_prefers_active_bundle_platform_prompt(self) -> None:
         active_visual_prompts = {
@@ -2568,6 +2646,50 @@ data: [DONE]
         self.assertEqual(len([item for item in request_content if item["type"] == "input_image"]), 3)
         self.assertEqual(mocked_download.call_count, 3)
 
+    def test_call_vision_provider_applies_998code_store_and_reasoning_defaults(self) -> None:
+        provider = {
+            "name": "998code",
+            "base_url": "https://9985678.xyz/v1",
+            "api_key": "998code-test-key",
+            "api_style": backend_app.VISION_API_STYLE_RESPONSES,
+            "default_model": "gpt-5.4",
+            "default_disable_response_storage": True,
+            "default_reasoning_effort": "medium",
+        }
+        response = DummyProviderResponse(
+            {
+                "output": [
+                    {
+                        "content": [
+                            {
+                                "text": '{"decision":"Pass","reason":"画面正常","signals":["无高风险信号"]}'
+                            }
+                        ]
+                    }
+                ],
+                "model": "gpt-5.4",
+            },
+            status_code=200,
+        )
+
+        with mock.patch.object(
+            backend_app.requests,
+            "post",
+            return_value=response,
+        ) as mocked_post:
+            parsed = backend_app.call_vision_provider(
+                provider,
+                "instagram",
+                "alpha",
+                ["data:image/jpeg;base64,ZmFrZQ=="],
+            )
+
+        request_body = mocked_post.call_args.kwargs["json"]
+        self.assertEqual(parsed["decision"], "Pass")
+        self.assertEqual(request_body["model"], "gpt-5.4")
+        self.assertFalse(request_body["store"])
+        self.assertEqual(request_body["reasoning"], {"effort": "medium"})
+
     def test_call_vision_provider_falls_back_to_secondary_qiandao_model(self) -> None:
         provider = {
             "name": "qiandao",
@@ -2616,8 +2738,8 @@ data: [DONE]
     def test_tiered_routing_escalates_borderline_primary_to_backup(self) -> None:
         def fake_get_available(provider_name=None):
             provider_name = (provider_name or "").strip().lower()
-            if provider_name == "reelx":
-                return [{"name": "reelx", "base_url": "https://reelxai.com/v1beta", "api_key": "key", "api_style": backend_app.VISION_API_STYLE_GENERATE_CONTENT}]
+            if provider_name == "998code":
+                return [{"name": "998code", "base_url": "https://9985678.xyz/v1", "api_key": "key", "api_style": backend_app.VISION_API_STYLE_RESPONSES}]
             if provider_name == "openai":
                 return [{"name": "openai", "base_url": "https://example.com/v1", "api_key": "key", "api_style": backend_app.VISION_API_STYLE_RESPONSES}]
             return []
@@ -2638,15 +2760,15 @@ data: [DONE]
                     "decision": "Pass",
                     "reason": "可能存在边界情况",
                     "signals": ["可能擦边"],
-                    "model": "gemini-3-flash-preview-S",
-                    "provider": "reelx",
+                    "model": "gpt-5.4",
+                    "provider": "998code",
                 },
                 {
                     "decision": "Reject",
                     "reason": "存在明确高风险视觉信号",
                     "signals": ["明显暴露"],
-                    "model": "gemini-2.5-pro-preview-p",
-                    "provider": "reelx",
+                    "model": "gpt-5.4-mini",
+                    "provider": "openai",
                 },
             ],
         ):
@@ -2667,8 +2789,8 @@ data: [DONE]
     def test_tiered_routing_escalates_to_judge_after_primary_error_and_invalid_backup(self) -> None:
         def fake_get_available(provider_name=None):
             provider_name = (provider_name or "").strip().lower()
-            if provider_name == "reelx":
-                return [{"name": "reelx", "base_url": "https://reelxai.com/v1beta", "api_key": "key", "api_style": backend_app.VISION_API_STYLE_GENERATE_CONTENT}]
+            if provider_name == "998code":
+                return [{"name": "998code", "base_url": "https://9985678.xyz/v1", "api_key": "key", "api_style": backend_app.VISION_API_STYLE_RESPONSES}]
             if provider_name == "openai":
                 return [{"name": "openai", "base_url": "https://example.com/v1", "api_key": "key", "api_style": backend_app.VISION_API_STYLE_RESPONSES}]
             return []
@@ -2690,8 +2812,8 @@ data: [DONE]
                     "decision": "Pass",
                     "reason": "",
                     "signals": [],
-                    "model": "gemini-2.5-pro-preview-p",
-                    "provider": "reelx",
+                    "model": "gpt-5.4-mini",
+                    "provider": "openai",
                 },
                 {
                     "decision": "Reject",

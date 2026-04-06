@@ -341,6 +341,21 @@ VISION_PROVIDER_CONFIGS = (
         "max_inflight_env_key": "OPENAI_MAX_INFLIGHT_REQUESTS",
     },
     {
+        "name": "998code",
+        "base_url_env_key": "VISION_998CODE_BASE_URL",
+        "default_base_url": "https://9985678.xyz/v1",
+        "env_key": "VISION_998CODE_API_KEY",
+        "api_style": VISION_API_STYLE_RESPONSES,
+        "model_env_key": "VISION_998CODE_MODEL",
+        "default_model": "gpt-5.4",
+        "max_inflight_env_key": "VISION_998CODE_MAX_INFLIGHT_REQUESTS",
+        "default_max_inflight_requests": 2,
+        "disable_response_storage_env_key": "VISION_998CODE_DISABLE_RESPONSE_STORAGE",
+        "default_disable_response_storage": True,
+        "reasoning_effort_env_key": "VISION_998CODE_REASONING_EFFORT",
+        "default_reasoning_effort": "medium",
+    },
+    {
         "name": "reelx",
         "base_url_env_key": "VISION_REELX_BASE_URL",
         "default_base_url": DEFAULT_REELX_BASE_URL,
@@ -401,11 +416,11 @@ VISION_PROVIDER_CONFIGS = (
 )
 VISUAL_REVIEW_ROUTING_TIERED = "tiered"
 VISUAL_REVIEW_ROUTING_PROBE_RANKED = "probe_ranked"
-DEFAULT_VISUAL_REVIEW_ROUTING_PRIMARY_PROVIDER = "reelx"
-DEFAULT_VISUAL_REVIEW_ROUTING_PRIMARY_MODEL = "gemini-3-flash-preview"
+DEFAULT_VISUAL_REVIEW_ROUTING_PRIMARY_PROVIDER = "998code"
+DEFAULT_VISUAL_REVIEW_ROUTING_PRIMARY_MODEL = "gpt-5.4"
 DEFAULT_VISUAL_REVIEW_ROUTING_PRIMARY_TIMEOUT_SECONDS = 20
-DEFAULT_VISUAL_REVIEW_ROUTING_BACKUP_PROVIDER = "reelx"
-DEFAULT_VISUAL_REVIEW_ROUTING_BACKUP_MODEL = "gemini-3.1-pro-preview"
+DEFAULT_VISUAL_REVIEW_ROUTING_BACKUP_PROVIDER = "openai"
+DEFAULT_VISUAL_REVIEW_ROUTING_BACKUP_MODEL = DEFAULT_VISION_MODEL
 DEFAULT_VISUAL_REVIEW_ROUTING_BACKUP_TIMEOUT_SECONDS = 25
 DEFAULT_VISUAL_REVIEW_ROUTING_JUDGE_PROVIDER = "openai"
 DEFAULT_VISUAL_REVIEW_ROUTING_JUDGE_MODEL = "gpt-5.4-mini"
@@ -2144,6 +2159,38 @@ def resolve_vision_provider_request_timeout(provider):
     return VISION_REQUEST_TIMEOUT
 
 
+def resolve_vision_provider_disable_response_storage(provider):
+    default_value = bool((provider or {}).get("default_disable_response_storage"))
+    env_key = str((provider or {}).get("disable_response_storage_env_key") or "").strip()
+    if env_key and os.getenv(env_key) is not None:
+        return parse_env_flag(env_key, default=default_value)
+    return default_value
+
+
+def resolve_vision_provider_reasoning_effort(provider):
+    env_key = str((provider or {}).get("reasoning_effort_env_key") or "").strip()
+    raw_value = str(os.getenv(env_key, "") or "").strip() if env_key else ""
+    if not raw_value:
+        raw_value = str((provider or {}).get("default_reasoning_effort") or "").strip()
+    normalized = raw_value.lower()
+    if normalized in {"", "0", "false", "off", "none", "disable", "disabled"}:
+        return ""
+    return normalized
+
+
+def build_vision_provider_responses_body(provider, input_payload, model_override=""):
+    body = {
+        "model": str(model_override or resolve_vision_provider_model(provider)).strip(),
+        "input": input_payload,
+    }
+    if resolve_vision_provider_disable_response_storage(provider):
+        body["store"] = False
+    reasoning_effort = resolve_vision_provider_reasoning_effort(provider)
+    if reasoning_effort:
+        body["reasoning"] = {"effort": reasoning_effort}
+    return body
+
+
 def build_vision_provider_headers(provider):
     header_name = str((provider or {}).get("auth_header_name") or "Authorization").strip() or "Authorization"
     value_prefix = str((provider or {}).get("auth_header_value_prefix") or "").strip()
@@ -2644,7 +2691,7 @@ def build_vision_preflight(provider_name=None):
     else:
         status = "unconfigured"
         error_code = "MISSING_VISION_CONFIG"
-        message = "缺少视觉模型配置：请设置 OPENAI_API_KEY、VISION_REELX_API_KEY、VISION_MIMO_API_KEY、VISION_QIANDAO_API_KEY、VISION_QUAN2GO_API_KEY 或 VISION_LEMONAPI_API_KEY。"
+        message = "缺少视觉模型配置：请设置 OPENAI_API_KEY、VISION_998CODE_API_KEY、VISION_REELX_API_KEY、VISION_MIMO_API_KEY、VISION_QIANDAO_API_KEY、VISION_QUAN2GO_API_KEY 或 VISION_LEMONAPI_API_KEY。"
     return {
         "status": status,
         "error_code": error_code,
@@ -4601,6 +4648,12 @@ def resolve_vision_provider_max_inflight_requests(provider, base_url=""):
                 return max(0, int(raw_value))
             except (TypeError, ValueError):
                 return 0
+    default_limit = (provider or {}).get("default_max_inflight_requests")
+    if default_limit not in (None, ""):
+        try:
+            return max(0, int(default_limit))
+        except (TypeError, ValueError):
+            return 0
     if provider_name == "openai" and is_local_cliproxyapi_base_url(base_url or (provider or {}).get("base_url")):
         return DEFAULT_LOCAL_OPENAI_MAX_INFLIGHT_REQUESTS
     return 0
@@ -4798,10 +4851,11 @@ def call_vision_provider_with_json_contract(
                         body = input_payload["generate_content"]
                     else:
                         url = f"{candidate_base_url}/responses"
-                        body = {
-                            "model": model_name,
-                            "input": input_payload["responses"],
-                        }
+                        body = build_vision_provider_responses_body(
+                            current_provider,
+                            input_payload["responses"],
+                            model_override=model_name,
+                        )
 
                     try:
                         with acquire_vision_provider_request_slot(current_provider, candidate_base_url, request_timeout):
@@ -4951,10 +5005,11 @@ def build_vision_provider_probe_request(provider):
         "api_style": api_style,
         "url": f"{base_url}/responses",
         "headers": headers,
-        "body": {
-            "model": str((provider or {}).get("model") or resolve_vision_provider_model(provider)),
-            "input": [{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
-        },
+        "body": build_vision_provider_responses_body(
+            provider,
+            [{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
+            model_override=str((provider or {}).get("model") or resolve_vision_provider_model(provider)),
+        ),
     }
 
 
