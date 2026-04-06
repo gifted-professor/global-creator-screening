@@ -8,6 +8,7 @@ from pathlib import Path
 import sys
 from types import SimpleNamespace
 from typing import Any
+from urllib.parse import urlparse
 
 import pandas as pd
 
@@ -88,16 +89,22 @@ def _record_score(fields: dict[str, Any], record_id: str) -> tuple[Any, ...]:
 
 
 def _infer_platform_from_profile_url(value: Any) -> str:
-    url = _flatten_field_value(value).casefold()
-    if not url:
+    raw_url = _flatten_field_value(value)
+    if not raw_url:
         return ""
-    if "tiktok.com" in url:
+    parsed = urlparse(raw_url if "://" in raw_url else f"https://{raw_url.lstrip('/')}")
+    hostname = str(parsed.hostname or "").strip().casefold()
+    if not hostname and str(parsed.path or "").strip():
+        hostname = str(parsed.path).split("/", 1)[0].split(":", 1)[0].strip().casefold()
+    if not hostname:
+        return ""
+    if hostname == "tiktok.com" or hostname.endswith(".tiktok.com"):
         return "tiktok"
-    if "instagram.com" in url:
+    if hostname == "instagram.com" or hostname.endswith(".instagram.com"):
         return "instagram"
-    if "youtube.com" in url or "youtu.be" in url:
+    if hostname == "youtube.com" or hostname.endswith(".youtube.com") or hostname == "youtu.be" or hostname.endswith(".youtu.be"):
         return "youtube"
-    if "facebook.com" in url:
+    if hostname == "facebook.com" or hostname.endswith(".facebook.com"):
         return "facebook"
     return ""
 
@@ -124,6 +131,26 @@ def _partition_duplicate_groups(
         else:
             risky_groups.append(group)
     return safe_groups, risky_groups
+
+
+def _count_platform_pollution(groups: list[dict[str, Any]]) -> tuple[int, int]:
+    polluted_group_count = 0
+    polluted_row_count = 0
+    for group in groups:
+        group_polluted_rows = 0
+        records = [dict(group.get("keep_record") or {})] + [dict(item or {}) for item in list(group.get("duplicate_records") or [])]
+        for record in records:
+            fields = dict(record.get("fields") or {})
+            inferred_platform = _infer_platform_from_profile_url(fields.get("主页链接"))
+            if not inferred_platform:
+                continue
+            current_platform = _flatten_field_value(fields.get("平台"))
+            if current_platform.casefold() != inferred_platform.casefold():
+                group_polluted_rows += 1
+        if group_polluted_rows > 0:
+            polluted_group_count += 1
+            polluted_row_count += group_polluted_rows
+    return polluted_group_count, polluted_row_count
 
 
 def _build_report_rows(duplicate_groups: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], Counter]:
@@ -219,12 +246,18 @@ def _resolve_cleanup_record_analysis(
     existing_records = _fetch_existing_records(client, resolved_view)
     owner_scope_field_name = _resolve_owner_scope_field_name(field_schemas or {})
     owner_scope_missing_record_count = 0
+    missing_creator_id_record_count = 0
+    missing_profile_url_record_count = 0
     grouped: dict[str, list[dict[str, Any]]] = {}
 
     for record_id, fields in existing_records:
         creator_id = _flatten_field_value(fields.get("达人ID"))
         profile_url = _flatten_field_value(fields.get("主页链接"))
-        if not creator_id or not profile_url:
+        if not creator_id:
+            missing_creator_id_record_count += 1
+            continue
+        if not profile_url:
+            missing_profile_url_record_count += 1
             continue
         owner_scope_value = _extract_existing_owner_scope(fields, owner_scope_field_name)
         if owner_scope_field_name and not owner_scope_value:
@@ -288,6 +321,14 @@ def _resolve_cleanup_record_analysis(
         key_display_name=key_display_name,
         owner_scope_field_name=owner_scope_field_name,
         owner_scope_missing_record_count=owner_scope_missing_record_count,
+        skipped_owner_scope_record_count=owner_scope_missing_record_count,
+        skipped_missing_creator_id_record_count=missing_creator_id_record_count,
+        skipped_missing_profile_url_record_count=missing_profile_url_record_count,
+        skipped_record_count=(
+            owner_scope_missing_record_count
+            + missing_creator_id_record_count
+            + missing_profile_url_record_count
+        ),
     )
 
 
@@ -364,11 +405,26 @@ def cleanup_duplicate_records(
     safe_groups, risky_groups = _partition_duplicate_groups(list(analysis.duplicate_groups))
     safe_duplicate_row_count = sum(len(group.get("duplicate_records") or []) for group in safe_groups)
     risky_duplicate_row_count = sum(len(group.get("duplicate_records") or []) for group in risky_groups)
+    safe_platform_pollution_group_count, safe_platform_pollution_row_count = _count_platform_pollution(safe_groups)
+    risky_platform_pollution_group_count, risky_platform_pollution_row_count = _count_platform_pollution(risky_groups)
     executable_groups = safe_groups if safe_only else list(analysis.duplicate_groups)
     executable_duplicate_row_count = sum(len(group.get("duplicate_records") or []) for group in executable_groups)
     deleted_record_ids: list[str] = []
     blocked_reason = ""
     scope_mode = "owner_scoped" if _clean_text(analysis.owner_scope_field_name) else "global_creator_platform"
+    skipped_owner_scope_record_count = int(
+        getattr(analysis, "skipped_owner_scope_record_count", getattr(analysis, "owner_scope_missing_record_count", 0)) or 0
+    )
+    skipped_missing_creator_id_record_count = int(getattr(analysis, "skipped_missing_creator_id_record_count", 0) or 0)
+    skipped_missing_profile_url_record_count = int(getattr(analysis, "skipped_missing_profile_url_record_count", 0) or 0)
+    skipped_record_count = int(
+        getattr(
+            analysis,
+            "skipped_record_count",
+            skipped_owner_scope_record_count + skipped_missing_creator_id_record_count + skipped_missing_profile_url_record_count,
+        )
+        or 0
+    )
     if execute and _clean_text(analysis.owner_scope_field_name) and int(analysis.owner_scope_missing_record_count or 0) > 0:
         blocked_reason = "目标飞书表存在未填写 `达人对接人` 的历史记录，当前不允许执行重复清理，需先补齐负责人维度。"
     if execute:
@@ -391,12 +447,20 @@ def cleanup_duplicate_records(
                 "scope_mode": scope_mode,
                 "owner_scope_field_name": analysis.owner_scope_field_name,
                 "owner_scope_missing_record_count": analysis.owner_scope_missing_record_count,
+                "skipped_owner_scope_record_count": skipped_owner_scope_record_count,
+                "skipped_missing_creator_id_record_count": skipped_missing_creator_id_record_count,
+                "skipped_missing_profile_url_record_count": skipped_missing_profile_url_record_count,
+                "skipped_record_count": skipped_record_count,
                 "duplicate_group_count": len(analysis.duplicate_groups),
                 "duplicate_row_count": sum(len(group.get("duplicate_records") or []) for group in analysis.duplicate_groups),
                 "safe_group_count": len(safe_groups),
                 "safe_duplicate_row_count": safe_duplicate_row_count,
+                "safe_platform_pollution_group_count": safe_platform_pollution_group_count,
+                "safe_platform_pollution_row_count": safe_platform_pollution_row_count,
                 "risky_group_count": len(risky_groups),
                 "risky_duplicate_row_count": risky_duplicate_row_count,
+                "risky_platform_pollution_group_count": risky_platform_pollution_group_count,
+                "risky_platform_pollution_row_count": risky_platform_pollution_row_count,
                 "execute_mode": "safe_only" if safe_only else "all_duplicate_groups",
                 "planned_delete_group_count": len(executable_groups),
                 "planned_delete_row_count": executable_duplicate_row_count,
@@ -436,12 +500,20 @@ def cleanup_duplicate_records(
         "scope_mode": scope_mode,
         "owner_scope_field_name": analysis.owner_scope_field_name,
         "owner_scope_missing_record_count": analysis.owner_scope_missing_record_count,
+        "skipped_owner_scope_record_count": skipped_owner_scope_record_count,
+        "skipped_missing_creator_id_record_count": skipped_missing_creator_id_record_count,
+        "skipped_missing_profile_url_record_count": skipped_missing_profile_url_record_count,
+        "skipped_record_count": skipped_record_count,
         "duplicate_group_count": len(analysis.duplicate_groups),
         "duplicate_row_count": sum(len(group.get("duplicate_records") or []) for group in analysis.duplicate_groups),
         "safe_group_count": len(safe_groups),
         "safe_duplicate_row_count": safe_duplicate_row_count,
+        "safe_platform_pollution_group_count": safe_platform_pollution_group_count,
+        "safe_platform_pollution_row_count": safe_platform_pollution_row_count,
         "risky_group_count": len(risky_groups),
         "risky_duplicate_row_count": risky_duplicate_row_count,
+        "risky_platform_pollution_group_count": risky_platform_pollution_group_count,
+        "risky_platform_pollution_row_count": risky_platform_pollution_row_count,
         "execute_mode": "safe_only" if safe_only else "all_duplicate_groups",
         "planned_delete_group_count": len(executable_groups),
         "planned_delete_row_count": executable_duplicate_row_count,
@@ -466,6 +538,8 @@ def repair_platform_field_from_profile_url(
 ) -> dict[str, Any]:
     resolved_view, analysis = fetch_existing_bitable_record_analysis(client, linked_bitable_url=linked_bitable_url)
     safe_groups, risky_groups = _partition_duplicate_groups(list(analysis.duplicate_groups))
+    safe_platform_pollution_group_count, safe_platform_pollution_row_count = _count_platform_pollution(safe_groups)
+    risky_platform_pollution_group_count, risky_platform_pollution_row_count = _count_platform_pollution(risky_groups)
     report_rows, platform_histogram = _build_platform_repair_rows(risky_groups)
     planned_updates = [row for row in report_rows if str(row.get("action")) == "update"]
     updated_record_ids: list[str] = []
@@ -494,7 +568,12 @@ def repair_platform_field_from_profile_url(
         "target_view_name": resolved_view.view_name,
         "duplicate_group_count": len(analysis.duplicate_groups),
         "safe_group_count": len(safe_groups),
+        "skipped_safe_group_count": len(safe_groups),
+        "skipped_safe_platform_pollution_group_count": safe_platform_pollution_group_count,
+        "skipped_safe_platform_pollution_row_count": safe_platform_pollution_row_count,
         "risky_group_count": len(risky_groups),
+        "risky_platform_pollution_group_count": risky_platform_pollution_group_count,
+        "risky_platform_pollution_row_count": risky_platform_pollution_row_count,
         "repair_group_count": len({str(row.get('record_key')) for row in planned_updates}),
         "repair_row_count": len(planned_updates),
         "platform_histogram": platform_histogram,

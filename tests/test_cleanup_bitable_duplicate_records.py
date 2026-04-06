@@ -30,6 +30,16 @@ class _FakeCleanupClient:
 
 
 class CleanupBitableDuplicateRecordsTests(unittest.TestCase):
+    def test_infer_platform_from_profile_url_uses_hostname_instead_of_path_substring(self) -> None:
+        self.assertEqual(
+            cleanup_script._infer_platform_from_profile_url("https://www.instagram.com/username/tiktok.com"),
+            "instagram",
+        )
+        self.assertEqual(
+            cleanup_script._infer_platform_from_profile_url("www.tiktok.com/@alpha"),
+            "tiktok",
+        )
+
     def test_parser_accepts_linked_bitable_url_alias(self) -> None:
         parser = cleanup_script._build_parser()
         args = parser.parse_args(["--linked-bitable-url", "https://example.com/base/app?table=tbl&view=vew"])
@@ -127,6 +137,89 @@ class CleanupBitableDuplicateRecordsTests(unittest.TestCase):
         self.assertEqual(result["safe_group_count"], 2)
         self.assertEqual(result["risky_group_count"], 0)
         self.assertEqual(result["planned_delete_row_count"], 2)
+
+    def test_cleanup_profile_url_key_mode_surfaces_skipped_counts(self) -> None:
+        client = _FakeCleanupClient()
+        resolved_view = SimpleNamespace(
+            source_url="https://example.com/base/app?table=tbl&view=vew",
+            app_token="app_token",
+            table_id="tbl",
+            table_name="达人管理",
+            view_id="vew",
+            view_name="总视图",
+        )
+        field_schemas = {"达人对接人": object()}
+        existing_records = [
+            (
+                "rec_missing_owner",
+                {
+                    "达人ID": "alpha",
+                    "主页链接": "https://www.instagram.com/alpha",
+                },
+            ),
+            (
+                "rec_missing_profile",
+                {
+                    "达人ID": "beta",
+                    "达人对接人": "owner_1",
+                },
+            ),
+            (
+                "rec_missing_creator",
+                {
+                    "主页链接": "https://www.tiktok.com/@gamma",
+                    "达人对接人": "owner_1",
+                },
+            ),
+            (
+                "rec_valid_keep",
+                {
+                    "达人ID": "delta",
+                    "主页链接": "https://www.instagram.com/delta",
+                    "达人对接人": "owner_1",
+                    "ai 是否通过": "是",
+                },
+            ),
+            (
+                "rec_valid_dup",
+                {
+                    "达人ID": "delta",
+                    "主页链接": "https://www.instagram.com/delta",
+                    "达人对接人": "owner_1",
+                },
+            ),
+        ]
+
+        with tempfile.TemporaryDirectory() as tmpdir, patch(
+            "scripts.cleanup_bitable_duplicate_records.resolve_bitable_view_from_url",
+            return_value=resolved_view,
+        ), patch(
+            "scripts.cleanup_bitable_duplicate_records._canonicalize_target_url",
+            return_value=resolved_view.source_url,
+        ), patch(
+            "scripts.cleanup_bitable_duplicate_records._fetch_field_schemas",
+            return_value=field_schemas,
+        ), patch(
+            "scripts.cleanup_bitable_duplicate_records._fetch_existing_records",
+            return_value=existing_records,
+        ), patch(
+            "scripts.cleanup_bitable_duplicate_records._resolve_owner_scope_field_name",
+            return_value="达人对接人",
+        ):
+            result = cleanup_script.cleanup_duplicate_records(
+                client=client,
+                linked_bitable_url=resolved_view.source_url,
+                output_root=Path(tmpdir),
+                execute=False,
+                safe_only=True,
+                key_mode=cleanup_script.KEY_MODE_CREATOR_PROFILE_URL,
+            )
+
+        self.assertEqual(result["skipped_owner_scope_record_count"], 1)
+        self.assertEqual(result["skipped_missing_profile_url_record_count"], 1)
+        self.assertEqual(result["skipped_missing_creator_id_record_count"], 1)
+        self.assertEqual(result["skipped_record_count"], 3)
+        self.assertEqual(result["planned_delete_row_count"], 1)
 
     def test_cleanup_execute_safe_only_deletes_only_single_profile_url_groups(self) -> None:
         client = _FakeCleanupClient()
@@ -228,12 +321,12 @@ class CleanupBitableDuplicateRecordsTests(unittest.TestCase):
                     "platform": "instagram",
                     "keep_record": {
                         "record_id": "rec_keep_safe",
-                        "fields": {"平台": "instagram", "主页链接": "https://www.instagram.com/safe"},
+                        "fields": {"平台": "🚫重复", "主页链接": "https://www.instagram.com/safe"},
                     },
                     "duplicate_records": [
                         {
                             "record_id": "rec_dup_safe",
-                            "fields": {"平台": "instagram", "主页链接": "https://www.instagram.com/safe"},
+                            "fields": {"平台": "🚫重复", "主页链接": "https://www.instagram.com/safe"},
                         }
                     ],
                 },
@@ -280,7 +373,12 @@ class CleanupBitableDuplicateRecordsTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["repair_strategy"], cleanup_script.PLATFORM_REPAIR_STRATEGY_NAME)
         self.assertEqual(result["safe_group_count"], 1)
+        self.assertEqual(result["skipped_safe_group_count"], 1)
+        self.assertEqual(result["skipped_safe_platform_pollution_group_count"], 1)
+        self.assertEqual(result["skipped_safe_platform_pollution_row_count"], 2)
         self.assertEqual(result["risky_group_count"], 1)
+        self.assertEqual(result["risky_platform_pollution_group_count"], 1)
+        self.assertEqual(result["risky_platform_pollution_row_count"], 3)
         self.assertEqual(result["repair_group_count"], 1)
         self.assertEqual(result["repair_row_count"], 3)
         self.assertEqual(result["updated_record_count"], 3)
