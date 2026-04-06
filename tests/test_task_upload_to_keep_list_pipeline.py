@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+
+from openpyxl import Workbook
 
 from harness.contract import RUN_CONTRACT_VERSION
 import scripts.run_task_upload_to_keep_list_pipeline as task_runner
@@ -2119,6 +2122,206 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
             summary["steps"]["mail_funnel"]["artifacts"]["review_xlsx"],
             summary["resume_points"]["keep_list"]["mail_funnel_review_xlsx"],
         )
+
+    def test_runner_persists_thread_assignment_cache_from_fast_path_keep_workbook(self) -> None:
+        class FakeClient:
+            pass
+
+        class FakeDb:
+            def __init__(self, db_path):
+                self.db_path = Path(db_path)
+
+            def close(self):
+                return None
+
+        def fake_download_task_upload_screening_assets(**kwargs):
+            download_dir = Path(kwargs["download_dir"])
+            template_path = download_dir / "miniso_template.xlsx"
+            sending_list_path = download_dir / "miniso_sending_list.xlsx"
+            template_path.parent.mkdir(parents=True, exist_ok=True)
+            template_path.touch()
+            sending_list_path.touch()
+            return {
+                "recordId": "rec123",
+                "taskName": "MINISO",
+                "linkedBitableUrl": "https://bitable.example/miniso",
+                "templateDownloadedPath": str(template_path),
+                "sendingListDownloadedPath": str(sending_list_path),
+            }
+
+        def fake_sync_task_upload_mailboxes(**kwargs):
+            mail_root = Path(kwargs["mail_data_dir"])
+            db_path = mail_root / "MINISO" / "email_sync.db"
+            raw_dir = mail_root / "MINISO" / "raw"
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+            db_path.touch()
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            return {
+                "selectedCount": 1,
+                "syncedCount": 1,
+                "failedCount": 0,
+                "items": [
+                    {
+                        "taskName": "MINISO",
+                        "employeeName": "Alice",
+                        "employeeId": "ou_miniso",
+                        "employeeRecordId": "rec_emp",
+                        "employeeEmail": "alice@amagency.biz",
+                        "responsibleName": "Alice",
+                        "ownerName": "Alice",
+                        "resolvedFolder": "其他文件夹/MINISO",
+                        "mailFetchedCount": 3,
+                        "mailSyncOk": True,
+                        "mailSyncError": "",
+                        "mailDbPath": str(db_path),
+                        "mailRawDir": str(raw_dir),
+                        "mailDataDir": str(db_path.parent),
+                    }
+                ],
+            }
+
+        def fake_match_brand_keyword(*, db, input_path, output_prefix, keyword, sent_since, include_from):
+            all_xlsx = output_prefix.with_suffix(".xlsx")
+            deduped_xlsx = output_prefix.with_name(f"{output_prefix.name}_deduped").with_suffix(".xlsx")
+            unique_xlsx = output_prefix.with_name(f"{output_prefix.name}_unique_email").with_suffix(".xlsx")
+            shared_xlsx = output_prefix.with_name(f"{output_prefix.name}_shared_email").with_suffix(".xlsx")
+            for path in (all_xlsx, deduped_xlsx, unique_xlsx, shared_xlsx):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+            return {
+                "source_kind": "sending_list",
+                "message_hit_count": 3,
+                "matched_email_count": 1,
+                "email_direct_match_row_count": 1,
+                "profile_deduped_row_count": 1,
+                "unique_email_row_count": 1,
+                "shared_email_row_count": 0,
+                "shared_email_group_count": 0,
+                "xlsx_path": str(all_xlsx),
+                "deduped_xlsx_path": str(deduped_xlsx),
+                "unique_xlsx_path": str(unique_xlsx),
+                "shared_xlsx_path": str(shared_xlsx),
+            }
+
+        def fake_build_mail_thread_funnel_keep_workbook(
+            *,
+            db,
+            input_path,
+            output_prefix,
+            keyword,
+            sent_since,
+            include_from,
+            env_path,
+            base_url,
+            api_key,
+            model,
+            wire_api,
+        ):
+            review_xlsx = output_prefix.with_suffix(".xlsx")
+            keep_xlsx = output_prefix.with_name(f"{output_prefix.name}_keep").with_suffix(".xlsx")
+            manual_tail_xlsx = output_prefix.with_name(f"{output_prefix.name}_manual_tail").with_suffix(".xlsx")
+            for path in (review_xlsx, manual_tail_xlsx):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.touch()
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(
+                [
+                    "thread_key",
+                    "subject",
+                    "Platform",
+                    "resolution_confidence_final",
+                    "final_id_final",
+                    "matched_contact_email",
+                    "last_mail_message_id",
+                    "last_mail_time",
+                ]
+            )
+            sheet.append(
+                [
+                    "mid:<alpha-root>",
+                    "Re: Alpha outreach",
+                    "Instagram",
+                    "high",
+                    "alpha",
+                    "alpha@example.com",
+                    "101",
+                    "2026-04-05T10:00:00+08:00",
+                ]
+            )
+            keep_xlsx.parent.mkdir(parents=True, exist_ok=True)
+            workbook.save(keep_xlsx)
+            return {
+                "message_hit_count": 3,
+                "external_message_count": 2,
+                "pass0_sending_list_email_count": 1,
+                "regex_pass1_count": 1,
+                "regex_pass2_count": 0,
+                "llm_high_count": 0,
+                "manual_row_count": 0,
+                "filtered_auto_reply_count": 0,
+                "no_match_count": 0,
+                "keep_row_count": 1,
+                "review_xlsx_path": str(review_xlsx),
+                "keep_xlsx_path": str(keep_xlsx),
+                "manual_tail_xlsx_path": str(manual_tail_xlsx),
+            }
+
+        task_runner._load_runtime_dependencies = lambda: {
+            "Settings": object,
+            "Database": FakeDb,
+            "FeishuOpenClient": lambda **kwargs: FakeClient(),
+            "DEFAULT_FEISHU_BASE_URL": "https://open.feishu.cn",
+            "download_task_upload_screening_assets": fake_download_task_upload_screening_assets,
+            "sync_task_upload_mailboxes": fake_sync_task_upload_mailboxes,
+            "match_brand_keyword": fake_match_brand_keyword,
+            "build_mail_thread_funnel_keep_workbook": fake_build_mail_thread_funnel_keep_workbook,
+            "resolve_shared_email_candidates": lambda **kwargs: (_ for _ in ()).throw(AssertionError("shared resolution should not run")),
+            "run_shared_email_final_review": lambda **kwargs: (_ for _ in ()).throw(AssertionError("final review should not run")),
+            "enrich_creator_workbook": lambda **kwargs: (_ for _ in ()).throw(AssertionError("legacy enrichment should not run")),
+            "prepare_llm_review_candidates": lambda **kwargs: (_ for _ in ()).throw(AssertionError("legacy llm candidates should not run")),
+            "run_and_apply_llm_review": lambda **kwargs: (_ for _ in ()).throw(AssertionError("legacy llm review should not run")),
+            "resolve_sync_sent_since": lambda value: __import__("datetime").date(2025, 12, 27),
+            "load_local_env": lambda env_file: {},
+            "get_preferred_value": lambda cli_value, env_values, env_key, default="": str(cli_value or "").strip() or str(env_values.get(env_key, default) or "").strip(),
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            env_path = self._write_env_file(temp_root)
+            summary = task_runner.run_task_upload_to_keep_list_pipeline(
+                task_name="MINISO",
+                env_file=env_path,
+                output_root=temp_root / "run",
+                summary_json=temp_root / "run" / "summary.json",
+                stop_after="keep-list",
+                matching_strategy="brand-keyword-fast-path",
+                task_upload_url="https://example.com/task",
+                employee_info_url="https://example.com/employee",
+                feishu_app_id="app-id",
+                feishu_app_secret="app-secret",
+            )
+            cache_summary = summary["artifacts"]["thread_assignment_cache"]
+            db_path = Path(summary["artifacts"]["mail_db_path"])
+            conn = sqlite3.connect(str(db_path))
+            row = conn.execute(
+                """
+                SELECT thread_key, owner_scope, creator_id, platform, matched_contact_email, last_mail_message_id
+                FROM thread_assignments
+                """
+            ).fetchone()
+            conn.close()
+
+        self.assertEqual(summary["status"], "stopped_after_keep-list")
+        self.assertEqual(cache_summary["status"], "completed")
+        self.assertEqual(cache_summary["upserted_count"], 1)
+        self.assertIsNotNone(row)
+        self.assertEqual(row[0], "mid:<alpha-root>")
+        self.assertEqual(row[1], "ou_miniso")
+        self.assertEqual(row[2], "alpha")
+        self.assertEqual(row[3], "instagram")
+        self.assertEqual(row[4], "alpha@example.com")
+        self.assertEqual(row[5], "101")
 
 
 if __name__ == "__main__":
