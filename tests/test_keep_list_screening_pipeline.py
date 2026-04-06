@@ -2153,14 +2153,43 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
                 }
             return {"id": job_id, "status": "completed", "result": {"success": True}}
 
+        def fake_build_all_platforms_final_review_artifacts(**kwargs):
+            payload_json_path = Path(kwargs["payload_json_path"])
+            payload_json_path.parent.mkdir(parents=True, exist_ok=True)
+            payload_json_path.write_text(
+                json.dumps(
+                    {
+                        "rows": [],
+                        "row_count": 0,
+                        "source_row_count": 0,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            workbook_path = Path(kwargs["output_path"])
+            workbook_path.write_text("placeholder", encoding="utf-8")
+            return {
+                "all_platforms_final_review": str(workbook_path),
+                "all_platforms_upload_payload_json": str(payload_json_path),
+                "all_platforms_upload_local_archive_dir": "",
+                "all_platforms_upload_skipped_archive_json": "",
+                "all_platforms_upload_skipped_archive_xlsx": "",
+                "row_count": 0,
+                "source_row_count": 0,
+                "skipped_row_count": 0,
+            }
+
         keep_list_runner._load_runtime_dependencies = lambda: {
             "backend_app": backend_app,
+            "build_all_platforms_final_review_artifacts": fake_build_all_platforms_final_review_artifacts,
             "build_feishu_open_client": lambda **kwargs: object(),
+            "collect_final_exports": lambda platforms: {},
             "fetch_existing_bitable_record_analysis": lambda client, *, linked_bitable_url: (
                 SimpleNamespace(source_url=linked_bitable_url, table_id="tbl", table_name="达人管理"),
                 SimpleNamespace(
                     index={
-                        "alpha::instagram": {"record_id": "rec_alpha", "fields": {}},
+                        "alpha::instagram": {"record_id": "rec_alpha", "fields": {"ai 是否通过": "是"}},
                         "beta::instagram": {"record_id": "rec_beta", "fields": {}},
                     },
                     duplicate_groups=[],
@@ -2200,17 +2229,27 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         self.assertEqual(platform_summary["status"], "completed")
         self.assertEqual(
             backend_app.app.test_client().scrape_start_calls[0]["payload"]["usernames"],
-            ["gamma"],
+            ["beta", "gamma"],
         )
         self.assertTrue(summary["existing_bitable_prefilter"]["enabled"])
         self.assertEqual(platform_summary["incremental_prefilter"]["existing_bitable_match_count"], 2)
         self.assertEqual(platform_summary["incremental_prefilter"]["incremental_candidate_count"], 1)
-        self.assertEqual(platform_summary["requested_identifier_count"], 1)
+        self.assertEqual(platform_summary["incremental_prefilter"]["existing_screened_count"], 1)
+        self.assertEqual(platform_summary["incremental_prefilter"]["existing_unscreened_count"], 1)
+        self.assertEqual(platform_summary["incremental_prefilter"]["full_screening_candidate_count"], 2)
+        self.assertEqual(platform_summary["incremental_prefilter"]["mail_only_update_count"], 1)
+        self.assertEqual(platform_summary["mail_only_update_count"], 1)
+        self.assertEqual(platform_summary["requested_identifier_count"], 2)
         self.assertTrue(summary["observability"]["layers"]["incremental_creator"]["enabled"])
         self.assertEqual(summary["observability"]["layers"]["incremental_creator"]["existing_bitable_match_count"], 2)
         self.assertEqual(summary["observability"]["layers"]["incremental_creator"]["incremental_candidate_count"], 1)
-        self.assertEqual(summary["observability"]["layers"]["screening_execution"]["platforms"]["instagram"]["requested_identifier_count"], 1)
+        self.assertEqual(summary["observability"]["layers"]["incremental_creator"]["existing_screened_count"], 1)
+        self.assertEqual(summary["observability"]["layers"]["incremental_creator"]["existing_unscreened_count"], 1)
+        self.assertEqual(summary["observability"]["layers"]["incremental_creator"]["mail_only_update_count"], 1)
+        self.assertEqual(summary["observability"]["layers"]["screening_execution"]["platforms"]["instagram"]["requested_identifier_count"], 2)
+        self.assertEqual(summary["observability"]["layers"]["screening_execution"]["platforms"]["instagram"]["mail_only_update_count"], 1)
         self.assertIn("新增 1 个", json.dumps(summary["diagnostics"], ensure_ascii=False))
+        self.assertIn("邮件直更 1 个", json.dumps(summary["diagnostics"], ensure_ascii=False))
 
     def test_runner_supports_dry_run_incremental_plan_without_launching_jobs(self) -> None:
         preflight = {
@@ -2243,7 +2282,7 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
                 SimpleNamespace(source_url=linked_bitable_url, table_id="tbl", table_name="达人管理"),
                 SimpleNamespace(
                     index={
-                        "alpha::instagram": {"record_id": "rec_alpha", "fields": {}},
+                        "alpha::instagram": {"record_id": "rec_alpha", "fields": {"ai 是否通过": "是"}},
                         "beta::instagram": {"record_id": "rec_beta", "fields": {}},
                     },
                     duplicate_groups=[],
@@ -2283,16 +2322,20 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         self.assertEqual(backend_app.app.test_client().visual_start_calls, [])
         self.assertEqual(backend_app.app.test_client().positioning_start_calls, [])
         self.assertEqual(summary["platforms"]["instagram"]["status"], "dry_run_only")
-        self.assertEqual(summary["platforms"]["instagram"]["requested_identifier_count"], 1)
+        self.assertEqual(summary["platforms"]["instagram"]["requested_identifier_count"], 2)
+        self.assertEqual(summary["platforms"]["instagram"]["mail_only_update_count"], 1)
         self.assertEqual(summary["dry_run_report"]["total_keep_row_count"], 3)
         self.assertEqual(summary["dry_run_report"]["existing_bitable_match_count"], 2)
         self.assertEqual(summary["dry_run_report"]["incremental_candidate_count"], 1)
+        self.assertEqual(summary["dry_run_report"]["full_screening_candidate_count"], 2)
+        self.assertEqual(summary["dry_run_report"]["mail_only_update_count"], 1)
         self.assertEqual(summary["dry_run_report"]["estimated_execution_platforms"], ["instagram"])
         self.assertTrue(summary["observability"]["fallback_flags"]["dry_run"])
         self.assertEqual(summary["observability"]["layers"]["upload"]["status"], "skipped")
         self.assertIn("本次为 dry-run", json.dumps(summary["diagnostics"], ensure_ascii=False))
+        self.assertIn("邮件直更 1 个", json.dumps(summary["diagnostics"], ensure_ascii=False))
 
-    def test_runner_treats_all_existing_bitable_matches_as_completed_without_scrape(self) -> None:
+    def test_runner_routes_existing_screened_creators_to_mail_only_update_without_scrape(self) -> None:
         preflight = {
             "status": "configured",
             "error_code": "",
@@ -2303,14 +2346,32 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             "providers": [{"name": "openai", "runnable": True}],
         }
         backend_app = FakeBackendApp(preflight, metadata={"instagram": {"alpha": {"handle": "alpha"}}})
+        observed: dict[str, Any] = {}
 
         def fake_prepare_screening_inputs(**kwargs):
             return {"prepared_at": "2026-03-28T01:02:03Z", "upload": {"stats": {"Instagram": 1}}}
 
         def fake_build_all_platforms_final_review_artifacts(**kwargs):
+            observed["mail_only_updates"] = kwargs.get("mail_only_updates")
             payload_json_path = Path(kwargs["payload_json_path"])
             payload_json_path.parent.mkdir(parents=True, exist_ok=True)
-            payload_json_path.write_text(json.dumps({"rows": []}, ensure_ascii=False), encoding="utf-8")
+            payload_json_path.write_text(
+                json.dumps(
+                    {
+                        "rows": [
+                            {
+                                "达人ID": "alpha",
+                                "平台": "instagram",
+                                "__feishu_update_mode": "mail_only_update",
+                            }
+                        ],
+                        "row_count": 1,
+                        "source_row_count": 1,
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
             workbook_path = Path(kwargs["output_path"])
             workbook_path.write_text("placeholder", encoding="utf-8")
             return {
@@ -2319,8 +2380,8 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
                 "all_platforms_upload_local_archive_dir": "",
                 "all_platforms_upload_skipped_archive_json": "",
                 "all_platforms_upload_skipped_archive_xlsx": "",
-                "row_count": 0,
-                "source_row_count": 0,
+                "row_count": 1,
+                "source_row_count": 1,
                 "skipped_row_count": 0,
             }
 
@@ -2329,10 +2390,12 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             "build_all_platforms_final_review_artifacts": fake_build_all_platforms_final_review_artifacts,
             "build_feishu_open_client": lambda **kwargs: object(),
             "collect_final_exports": lambda platforms: {},
+            "DEFAULT_FEISHU_BASE_URL": "https://open.feishu.cn/open-apis",
+            "FeishuOpenClient": lambda **kwargs: object(),
             "fetch_existing_bitable_record_analysis": lambda client, *, linked_bitable_url: (
                 SimpleNamespace(source_url=linked_bitable_url, table_id="tbl", table_name="达人管理"),
                 SimpleNamespace(
-                    index={"alpha::instagram": {"record_id": "rec_alpha", "fields": {}}},
+                    index={"alpha::instagram": {"record_id": "rec_alpha", "fields": {"ai 是否通过": "是"}}},
                     duplicate_groups=[],
                     key_field_names=("达人ID", "平台"),
                     owner_scope_field_name="",
@@ -2343,12 +2406,26 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             "export_platform_artifacts": lambda client, platform, export_dir: (_ for _ in ()).throw(
                 AssertionError("export should not run when everything is already in bitable")
             ),
+            "get_preferred_value": lambda cli_value, env_values, env_key, default="": str(env_values.get(env_key, default) or ""),
+            "load_local_env": lambda env_file: {
+                "FEISHU_APP_ID": "app_id",
+                "FEISHU_APP_SECRET": "app_secret",
+                "FEISHU_OPEN_BASE_URL": "https://open.feishu.cn/open-apis",
+            },
             "poll_job": lambda client, job_id, label, interval: {},
             "require_success": lambda response, label: response.get_json(),
             "reset_backend_runtime_state": lambda: None,
-            "upload_final_review_payload_to_bitable": lambda client, **kwargs: (_ for _ in ()).throw(
-                AssertionError("upload should not run when everything is already in bitable")
-            ),
+            "upload_final_review_payload_to_bitable": lambda client, **kwargs: {
+                "ok": True,
+                "result_json_path": str(Path(kwargs["payload_json_path"]).parent / "feishu_upload_local_archive" / "feishu_bitable_upload_result.json"),
+                "result_xlsx_path": str(Path(kwargs["payload_json_path"]).parent / "feishu_upload_local_archive" / "feishu_bitable_upload_result.xlsx"),
+                "created_count": 0,
+                "updated_count": 1,
+                "failed_count": 0,
+                "skipped_existing_count": 0,
+                "result_json_written": True,
+                "result_xlsx_written": True,
+            },
         }
 
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -2374,8 +2451,13 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         self.assertEqual(platform_summary["status"], "completed")
         self.assertEqual(platform_summary["current_stage"], "incremental_filter_completed")
         self.assertEqual(backend_app.app.test_client().scrape_start_calls, [])
+        self.assertEqual(platform_summary["mail_only_update_count"], 1)
         self.assertEqual(platform_summary["incremental_prefilter"]["existing_bitable_match_count"], 1)
         self.assertTrue(platform_summary["incremental_prefilter"]["all_existing"])
+        self.assertEqual(platform_summary["incremental_prefilter"]["mail_only_update_count"], 1)
+        self.assertEqual(summary["artifacts"]["feishu_upload_updated_count"], 1)
+        self.assertEqual(observed["mail_only_updates"]["instagram"][0]["creator_id"], "alpha")
+        self.assertIn("邮件直更 1 个", json.dumps(summary["diagnostics"], ensure_ascii=False))
 
     def test_runner_forwards_creator_cache_controls_to_scrape_and_visual_payloads(self) -> None:
         preflight = {

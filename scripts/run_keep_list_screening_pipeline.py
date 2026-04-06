@@ -264,6 +264,30 @@ def _resolve_staged_creator_id(backend_app, platform: str, metadata_key: str, me
     return ""
 
 
+def _flatten_existing_field_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        parts = [_flatten_existing_field_value(item) for item in value]
+        return "；".join(part for part in parts if part)
+    if isinstance(value, dict):
+        for key in ("name", "text", "link", "value", "id"):
+            candidate = str(value.get(key) or "").strip()
+            if candidate:
+                return candidate
+        return ""
+    return str(value).strip()
+
+
+def _extract_existing_ai_status(fields: dict[str, Any]) -> str:
+    normalized_candidates = {"ai是否通过", "ai 是否通过"}
+    for key, value in (fields or {}).items():
+        normalized_key = str(key or "").strip().casefold()
+        if normalized_key in normalized_candidates or normalized_key.replace(" ", "") in {"ai是否通过"}:
+            return _flatten_existing_field_value(value)
+    return ""
+
+
 def _build_platform_identifier_plan(
     backend_app,
     platform: str,
@@ -299,6 +323,9 @@ def _build_platform_identifier_plan(
 
     new_entries: list[dict[str, Any]] = []
     existing_entries: list[dict[str, Any]] = []
+    existing_screened_entries: list[dict[str, Any]] = []
+    existing_unscreened_entries: list[dict[str, Any]] = []
+    full_screening_entries: list[dict[str, Any]] = []
     if existing_record_index:
         for entry in planned_entries:
             key_parts: list[str] = []
@@ -313,19 +340,30 @@ def _build_platform_identifier_plan(
                     key_parts.append("")
             record_key = _build_casefold_record_key(*key_parts)
             if record_key and record_key in existing_record_index:
-                existing_entries.append(
-                    {
-                        **entry,
-                        "record_key": record_key,
-                        "record_id": str((existing_record_index.get(record_key) or {}).get("record_id") or "").strip(),
-                    }
-                )
+                existing_record = dict(existing_record_index.get(record_key) or {})
+                classified_entry = {
+                    **entry,
+                    "record_key": record_key,
+                    "record_id": str(existing_record.get("record_id") or "").strip(),
+                    "existing_fields": dict(existing_record.get("fields") or {}),
+                }
+                existing_entries.append(classified_entry)
+                if _extract_existing_ai_status(classified_entry.get("existing_fields") or {}):
+                    classified_entry["execution_mode"] = "mail_only_update"
+                    existing_screened_entries.append(classified_entry)
+                else:
+                    classified_entry["execution_mode"] = "full_screening_existing"
+                    existing_unscreened_entries.append(classified_entry)
+                    full_screening_entries.append(classified_entry)
                 continue
-            new_entries.append({**entry, "record_key": record_key})
+            classified_entry = {**entry, "record_key": record_key, "execution_mode": "full_screening_new"}
+            new_entries.append(classified_entry)
+            full_screening_entries.append(classified_entry)
     else:
-        new_entries = list(planned_entries)
+        new_entries = [{**entry, "execution_mode": "full_screening_new"} for entry in planned_entries]
+        full_screening_entries = list(new_entries)
 
-    requested_entries = list(new_entries)
+    requested_entries = list(full_screening_entries)
     if max_identifiers_per_platform > 0:
         requested_entries = requested_entries[: int(max_identifiers_per_platform)]
 
@@ -340,14 +378,39 @@ def _build_platform_identifier_plan(
             for item in existing_entries[:10]
             if str(item.get("creator_id") or "").strip()
         ],
+        "existing_screened_count": len(existing_screened_entries),
+        "existing_screened_preview": [
+            str(item.get("creator_id") or "").strip()
+            for item in existing_screened_entries[:10]
+            if str(item.get("creator_id") or "").strip()
+        ],
+        "existing_unscreened_count": len(existing_unscreened_entries),
+        "existing_unscreened_preview": [
+            str(item.get("creator_id") or "").strip()
+            for item in existing_unscreened_entries[:10]
+            if str(item.get("creator_id") or "").strip()
+        ],
         "incremental_candidate_count": len(new_entries),
         "incremental_candidate_preview": [
             str(item.get("creator_id") or "").strip()
             for item in new_entries[:10]
             if str(item.get("creator_id") or "").strip()
         ],
+        "full_screening_candidate_count": len(full_screening_entries),
+        "full_screening_candidate_preview": [
+            str(item.get("creator_id") or "").strip()
+            for item in full_screening_entries[:10]
+            if str(item.get("creator_id") or "").strip()
+        ],
+        "mail_only_update_count": len(existing_screened_entries),
+        "mail_only_update_preview": [
+            str(item.get("creator_id") or "").strip()
+            for item in existing_screened_entries[:10]
+            if str(item.get("creator_id") or "").strip()
+        ],
         "duplicate_existing_group_count": duplicate_existing_group_count,
-        "all_existing": bool(planned_entries) and not requested_entries and len(existing_entries) == len(planned_entries),
+        "all_existing": bool(planned_entries) and len(existing_entries) == len(planned_entries),
+        "mail_only_update_only": bool(planned_entries) and len(existing_entries) == len(planned_entries) and bool(existing_screened_entries) and not requested_entries,
     }
     return {
         "staged_identifier_count": len(planned_entries),
@@ -356,6 +419,7 @@ def _build_platform_identifier_plan(
             for item in requested_entries
             if str(item.get("scrape_identifier") or "").strip()
         ],
+        "mail_only_update_entries": [dict(item) for item in existing_screened_entries],
         "incremental_prefilter": incremental_prefilter,
     }
 
@@ -802,6 +866,7 @@ def _build_cli_output_summary(summary: dict[str, Any]) -> dict[str, Any]:
             "status": str(payload.get("status") or "").strip(),
             "current_stage": str(payload.get("current_stage") or "").strip(),
             "requested_identifier_count": int(payload.get("requested_identifier_count") or 0),
+            "mail_only_update_count": int(payload.get("mail_only_update_count") or 0),
             "profile_review_count": int(payload.get("profile_review_count") or 0),
             "prescreen_pass_count": int(payload.get("prescreen_pass_count") or 0),
             "missing_profile_count": int(payload.get("missing_profile_count") or 0),
@@ -968,8 +1033,13 @@ def _build_incremental_observability_layer(summary: dict[str, Any]) -> dict[str,
     staged_identifier_count = 0
     existing_bitable_match_count = 0
     incremental_candidate_count = 0
+    full_screening_candidate_count = 0
+    existing_screened_count = 0
+    existing_unscreened_count = 0
+    mail_only_update_count = 0
     all_existing = True
     incremental_candidate_preview: list[str] = []
+    mail_only_update_preview: list[str] = []
     duplicate_existing_group_count = int(existing_bitable_prefilter.get("duplicate_existing_group_count") or 0)
     for platform_summary in platforms.values():
         if not isinstance(platform_summary, dict):
@@ -978,6 +1048,10 @@ def _build_incremental_observability_layer(summary: dict[str, Any]) -> dict[str,
         platform_prefilter = dict(platform_summary.get("incremental_prefilter") or {})
         existing_bitable_match_count += int(platform_prefilter.get("existing_bitable_match_count") or 0)
         incremental_candidate_count += int(platform_prefilter.get("incremental_candidate_count") or 0)
+        full_screening_candidate_count += int(platform_prefilter.get("full_screening_candidate_count") or 0)
+        existing_screened_count += int(platform_prefilter.get("existing_screened_count") or 0)
+        existing_unscreened_count += int(platform_prefilter.get("existing_unscreened_count") or 0)
+        mail_only_update_count += int(platform_prefilter.get("mail_only_update_count") or 0)
         duplicate_existing_group_count = max(
             duplicate_existing_group_count,
             int(platform_prefilter.get("duplicate_existing_group_count") or 0),
@@ -985,6 +1059,9 @@ def _build_incremental_observability_layer(summary: dict[str, Any]) -> dict[str,
         all_existing = all_existing and bool(platform_prefilter.get("all_existing"))
         incremental_candidate_preview.extend(
             [str(item) for item in list(platform_prefilter.get("incremental_candidate_preview") or []) if str(item).strip()]
+        )
+        mail_only_update_preview.extend(
+            [str(item) for item in list(platform_prefilter.get("mail_only_update_preview") or []) if str(item).strip()]
         )
     status = "ready" if existing_bitable_prefilter.get("enabled") else str(existing_bitable_prefilter.get("status") or "disabled")
     return {
@@ -994,9 +1071,14 @@ def _build_incremental_observability_layer(summary: dict[str, Any]) -> dict[str,
         "staged_identifier_count": staged_identifier_count,
         "existing_bitable_match_count": existing_bitable_match_count,
         "incremental_candidate_count": incremental_candidate_count,
+        "full_screening_candidate_count": full_screening_candidate_count,
+        "existing_screened_count": existing_screened_count,
+        "existing_unscreened_count": existing_unscreened_count,
+        "mail_only_update_count": mail_only_update_count,
         "all_existing": bool(staged_identifier_count > 0 and all_existing),
         "duplicate_existing_group_count": duplicate_existing_group_count,
         "incremental_candidate_preview": incremental_candidate_preview[:10],
+        "mail_only_update_preview": mail_only_update_preview[:10],
         "blocking_reason": str(existing_bitable_prefilter.get("error") or "").strip(),
     }
 
@@ -1015,6 +1097,7 @@ def _build_execution_observability_layer(summary: dict[str, Any]) -> dict[str, A
             "status": str(payload.get("status") or "").strip(),
             "current_stage": str(payload.get("current_stage") or "").strip(),
             "requested_identifier_count": int(payload.get("requested_identifier_count") or 0),
+            "mail_only_update_count": int(payload.get("mail_only_update_count") or 0),
             "profile_review_count": int(payload.get("profile_review_count") or 0),
             "prescreen_pass_count": int(payload.get("prescreen_pass_count") or 0),
             "missing_profile_count": int(payload.get("missing_profile_count") or 0),
@@ -1066,6 +1149,8 @@ def _build_dry_run_report(summary: dict[str, Any]) -> dict[str, Any]:
     staged_identifier_count = 0
     existing_bitable_match_count = 0
     incremental_candidate_count = 0
+    full_screening_candidate_count = 0
+    mail_only_update_count = 0
 
     for platform, payload in platforms.items():
         if not isinstance(payload, dict):
@@ -1077,11 +1162,15 @@ def _build_dry_run_report(summary: dict[str, Any]) -> dict[str, Any]:
         platform_staged = int(payload.get("staged_identifier_count") or 0)
         platform_existing = int(platform_prefilter.get("existing_bitable_match_count") or 0)
         platform_incremental = int(platform_prefilter.get("incremental_candidate_count") or 0)
+        platform_full_screening = int(platform_prefilter.get("full_screening_candidate_count") or 0)
+        platform_mail_only_update = int(platform_prefilter.get("mail_only_update_count") or 0)
         platform_requested = int(payload.get("requested_identifier_count") or 0)
         staged_identifier_count += platform_staged
         existing_bitable_match_count += platform_existing
         incremental_candidate_count += platform_incremental
-        if platform_requested > 0:
+        full_screening_candidate_count += platform_full_screening
+        mail_only_update_count += platform_mail_only_update
+        if platform_requested > 0 or platform_mail_only_update > 0:
             estimated_execution_platforms.append(platform_name)
         if bool(platform_prefilter.get("all_existing")):
             all_existing_platforms.append(platform_name)
@@ -1092,11 +1181,14 @@ def _build_dry_run_report(summary: dict[str, Any]) -> dict[str, Any]:
             "staged_identifier_count": platform_staged,
             "existing_bitable_match_count": platform_existing,
             "incremental_candidate_count": platform_incremental,
+            "full_screening_candidate_count": platform_full_screening,
+            "mail_only_update_count": platform_mail_only_update,
             "requested_identifier_count": platform_requested,
             "requested_identifier_preview": list(payload.get("requested_identifier_preview") or [])[:10],
             "incremental_candidate_preview": list(platform_prefilter.get("incremental_candidate_preview") or [])[:10],
+            "mail_only_update_preview": list(platform_prefilter.get("mail_only_update_preview") or [])[:10],
             "all_existing": bool(platform_prefilter.get("all_existing")),
-            "would_execute": bool(platform_requested > 0),
+            "would_execute": bool(platform_requested > 0 or platform_mail_only_update > 0),
         }
 
     return {
@@ -1104,6 +1196,8 @@ def _build_dry_run_report(summary: dict[str, Any]) -> dict[str, Any]:
         "staged_identifier_count": staged_identifier_count,
         "existing_bitable_match_count": existing_bitable_match_count,
         "incremental_candidate_count": incremental_candidate_count,
+        "full_screening_candidate_count": full_screening_candidate_count,
+        "mail_only_update_count": mail_only_update_count,
         "estimated_execution_platform_count": len(estimated_execution_platforms),
         "estimated_execution_platforms": estimated_execution_platforms,
         "all_existing_platforms": all_existing_platforms,
@@ -1220,6 +1314,8 @@ def _build_downstream_observability(summary: dict[str, Any]) -> dict[str, Any]:
                 for payload in platforms.values()
                 if isinstance(payload, dict)
             ),
+            "mail_only_update_count": int(incremental_layer.get("mail_only_update_count") or 0),
+            "full_screening_candidate_count": int(incremental_layer.get("full_screening_candidate_count") or 0),
         },
         "output_counts": {
             "profile_review_count": sum(
@@ -1232,6 +1328,7 @@ def _build_downstream_observability(summary: dict[str, Any]) -> dict[str, Any]:
                 for payload in platforms.values()
                 if isinstance(payload, dict)
             ),
+            "mail_only_update_count": int(incremental_layer.get("mail_only_update_count") or 0),
             "upload_created_count": int(upload_layer.get("created_count") or 0),
             "upload_failed_count": int(upload_layer.get("failed_count") or 0),
         },
@@ -1280,6 +1377,7 @@ def _build_downstream_diagnostics(summary: dict[str, Any]) -> dict[str, Any]:
                     f"staged {int(dry_run_report.get('staged_identifier_count') or 0)} 个达人，"
                     f"已存在 {int(dry_run_report.get('existing_bitable_match_count') or 0)} 个，"
                     f"新增 {int(dry_run_report.get('incremental_candidate_count') or 0)} 个，"
+                    f"邮件直更 {int(dry_run_report.get('mail_only_update_count') or 0)} 个，"
                     f"预计执行平台 {int(dry_run_report.get('estimated_execution_platform_count') or 0)} 个。"
                 ),
             }
@@ -1297,13 +1395,17 @@ def _build_downstream_diagnostics(summary: dict[str, Any]) -> dict[str, Any]:
         staged_count = int(incremental_layer.get("staged_identifier_count") or 0)
         existing_count = int(incremental_layer.get("existing_bitable_match_count") or 0)
         incremental_count = int(incremental_layer.get("incremental_candidate_count") or 0)
+        mail_only_update_count = int(incremental_layer.get("mail_only_update_count") or 0)
         if bool(incremental_layer.get("all_existing")):
             conclusions.append(
                 {
                     "layer": "incremental_creator",
                     "code": "all_existing_creators",
                     "severity": "info",
-                    "message": f"本次 staged {staged_count} 个达人均已存在于目标飞书表，本轮无需重跑 scrape / visual。",
+                    "message": (
+                        f"本次 staged {staged_count} 个达人均已存在于目标飞书表，"
+                        f"其中 {mail_only_update_count} 个会直接走邮件字段更新，无需重跑 scrape / visual。"
+                    ),
                 }
             )
         else:
@@ -1312,7 +1414,20 @@ def _build_downstream_diagnostics(summary: dict[str, Any]) -> dict[str, Any]:
                     "layer": "incremental_creator",
                     "code": "incremental_scope_resolved",
                     "severity": "info",
-                    "message": f"本次 staged {staged_count} 个达人，已存在 {existing_count} 个，新增 {incremental_count} 个，只对新增达人继续执行下游筛号。",
+                    "message": (
+                        f"本次 staged {staged_count} 个达人，已存在 {existing_count} 个，"
+                        f"新增 {incremental_count} 个，邮件直更 {mail_only_update_count} 个，"
+                        "只对需要完整筛号的达人继续执行下游 scrape / visual。"
+                    ),
+                }
+            )
+        if mail_only_update_count > 0:
+            conclusions.append(
+                {
+                    "layer": "incremental_creator",
+                    "code": "mail_only_updates_enabled",
+                    "severity": "info",
+                    "message": f"已有 {mail_only_update_count} 个已筛达人命中新邮件，本轮会复用飞书已有筛号结果，仅更新邮件字段。",
                 }
             )
     elif str(incremental_layer.get("linked_bitable_url") or "").strip():
@@ -2750,11 +2865,14 @@ def run_keep_list_screening_pipeline(
             persist_summary(summary)
 
             summary["current_stage"] = "screening_execution"
+            mail_only_updates_by_platform: dict[str, list[dict[str, Any]]] = {}
             for platform in execution_platforms:
                 platform_summary: dict[str, Any] = {
                     "staged_identifier_count": 0,
                     "requested_identifier_count": 0,
                     "requested_identifier_preview": [],
+                    "mail_only_update_count": 0,
+                    "mail_only_update_preview": [],
                     "requested_vision_provider": str(vision_provider or "").strip().lower(),
                     "vision_preflight": backend_app.build_vision_preflight(vision_provider),
                     "incremental_prefilter": {
@@ -2762,10 +2880,19 @@ def run_keep_list_screening_pipeline(
                         "status": "disabled",
                         "existing_bitable_match_count": 0,
                         "existing_bitable_match_preview": [],
+                        "existing_screened_count": 0,
+                        "existing_screened_preview": [],
+                        "existing_unscreened_count": 0,
+                        "existing_unscreened_preview": [],
                         "incremental_candidate_count": 0,
                         "incremental_candidate_preview": [],
+                        "full_screening_candidate_count": 0,
+                        "full_screening_candidate_preview": [],
+                        "mail_only_update_count": 0,
+                        "mail_only_update_preview": [],
                         "duplicate_existing_group_count": 0,
                         "all_existing": False,
+                        "mail_only_update_only": False,
                     },
                     "status": "running",
                     "current_stage": "platform_preparing",
@@ -2787,10 +2914,19 @@ def run_keep_list_screening_pipeline(
                         task_owner_employee_id=normalized_task_owner_employee_id,
                     )
                     requested_identifiers = list(identifier_plan.get("requested_identifiers") or [])
+                    mail_only_update_entries = [dict(item) for item in list(identifier_plan.get("mail_only_update_entries") or []) if isinstance(item, dict)]
                     platform_summary["staged_identifier_count"] = int(identifier_plan.get("staged_identifier_count") or 0)
                     platform_summary["incremental_prefilter"] = dict(identifier_plan.get("incremental_prefilter") or {})
                     platform_summary["requested_identifier_count"] = len(requested_identifiers)
                     platform_summary["requested_identifier_preview"] = requested_identifiers[:10]
+                    platform_summary["mail_only_update_count"] = len(mail_only_update_entries)
+                    platform_summary["mail_only_update_preview"] = [
+                        str(item.get("creator_id") or "").strip()
+                        for item in mail_only_update_entries[:10]
+                        if str(item.get("creator_id") or "").strip()
+                    ]
+                    if mail_only_update_entries:
+                        mail_only_updates_by_platform[str(platform)] = mail_only_update_entries
                 except Exception as exc:  # noqa: BLE001
                     _mark_platform_runtime_failure(
                         summary=summary,
@@ -2805,7 +2941,9 @@ def run_keep_list_screening_pipeline(
                     continue
 
                 if dry_run:
-                    if bool((platform_summary.get("incremental_prefilter") or {}).get("all_existing")):
+                    if int(platform_summary.get("mail_only_update_count") or 0) > 0 and not requested_identifiers:
+                        platform_summary["reason"] = "dry_run planned mail-only updates for already-screened creators"
+                    elif bool((platform_summary.get("incremental_prefilter") or {}).get("all_existing")):
                         platform_summary["reason"] = "all staged creators already exist in target bitable"
                     elif not requested_identifiers:
                         platform_summary["reason"] = "no staged identifiers for platform"
@@ -2830,6 +2968,34 @@ def run_keep_list_screening_pipeline(
                         "would_execute": bool(requested_identifiers),
                         "reason": str(platform_summary.get("reason") or "").strip(),
                     }
+                    _persist_platform_summary(
+                        summary=summary,
+                        run_summary_path=run_summary_path,
+                        backend_app=backend_app,
+                        platform=platform,
+                        platform_summary=platform_summary,
+                        current_stage="incremental_filter_completed",
+                        summary_writer=persist_summary,
+                    )
+                    continue
+
+                if int(platform_summary.get("mail_only_update_count") or 0) > 0 and not requested_identifiers:
+                    platform_summary["status"] = "completed"
+                    platform_summary["reason"] = "screened creators will be updated via mail-only export merge"
+                    platform_summary["scrape_job"] = {"status": "skipped", "reason": platform_summary["reason"]}
+                    platform_summary["visual_job"] = {"status": "skipped", "reason": platform_summary["reason"]}
+                    platform_summary["visual_gate"] = {
+                        "executed": False,
+                        "reason": platform_summary["reason"],
+                        "preflight_status": platform_summary["vision_preflight"]["status"],
+                        "runnable_provider_names": platform_summary["vision_preflight"]["runnable_provider_names"],
+                        "selected_provider": platform_summary["vision_preflight"].get("preferred_provider") or "",
+                    }
+                    platform_summary["positioning_card_analysis"] = _build_positioning_stage_payload(
+                        "skipped",
+                        "mail-only updates reuse existing screening result",
+                    )
+                    platform_summary["exports"] = {}
                     _persist_platform_summary(
                         summary=summary,
                         run_summary_path=run_summary_path,
@@ -3394,6 +3560,7 @@ def run_keep_list_screening_pipeline(
             final_exports=combined_exports,
             keep_workbook=resolved_keep_workbook,
             manual_review_rows=summary.get("manual_review_rows") or [],
+            mail_only_updates=mail_only_updates_by_platform,
             task_owner={
                 "responsible_name": normalized_task_owner_name,
                 "employee_name": normalized_task_owner_name,

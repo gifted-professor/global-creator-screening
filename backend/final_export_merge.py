@@ -36,6 +36,7 @@ _ROW_ATTACHMENT_PATHS_KEY = "__feishu_attachment_local_paths"
 _SHARED_ATTACHMENT_PATHS_KEY = "__feishu_shared_attachment_local_paths"
 _LAST_MAIL_RAW_PATH_KEY = "__last_mail_raw_path"
 _ROW_UPDATE_MODE_KEY = "__feishu_update_mode"
+_UPDATE_MODE_MAIL_ONLY = "mail_only_update"
 _UPDATE_MODE_CREATE_OR_MAIL_ONLY = "create_or_mail_only_update"
 _PLATFORM_ALIASES = {
     "tiktok": "tiktok",
@@ -102,6 +103,40 @@ def _clean_text(value: Any) -> str:
     if _is_blank(value):
         return ""
     return str(value).strip()
+
+
+def _flatten_field_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        parts = [_flatten_field_value(item) for item in value]
+        return "；".join(part for part in parts if part)
+    if isinstance(value, dict):
+        for key in ("name", "text", "link", "value", "id"):
+            candidate = _clean_text(value.get(key))
+            if candidate:
+                return candidate
+        return ""
+    return _clean_text(value)
+
+
+def _normalize_existing_field_name(value: str) -> str:
+    return (
+        str(value or "")
+        .strip()
+        .replace("（", "(")
+        .replace("）", ")")
+        .replace(" ", "")
+        .casefold()
+    )
+
+
+def _get_existing_field_value(fields: dict[str, Any], *candidates: str) -> Any:
+    normalized_candidates = {_normalize_existing_field_name(name) for name in candidates if _clean_text(name)}
+    for key, value in (fields or {}).items():
+        if _normalize_existing_field_name(str(key or "")) in normalized_candidates:
+            return value
+    return ""
 
 
 def _dedupe_preserve_order(values: list[str]) -> list[str]:
@@ -420,13 +455,15 @@ def _resolve_positioning_stage_note(positioning_row: dict[str, Any]) -> tuple[st
 
 def _collect_upload_validation_errors(row: dict[str, Any]) -> list[str]:
     errors: list[str] = []
-    missing_fields = [field for field in _REQUIRED_UPLOAD_FIELDS if _is_blank(row.get(field))]
+    update_mode = _clean_text(row.get(_ROW_UPDATE_MODE_KEY)).casefold()
+    required_fields = ("达人ID", "平台") if update_mode == _UPDATE_MODE_MAIL_ONLY else _REQUIRED_UPLOAD_FIELDS
+    missing_fields = [field for field in required_fields if _is_blank(row.get(field))]
     if missing_fields:
         errors.append(f"缺少关键字段: {', '.join(missing_fields)}")
-    if _clean_text(row.get("ai是否通过")) == "处理失败":
+    if update_mode != _UPDATE_MODE_MAIL_ONLY and _clean_text(row.get("ai是否通过")) == "处理失败":
         errors.append("系统处理失败")
     profile_url = _clean_text(row.get("主页链接"))
-    if profile_url and "://" not in profile_url:
+    if update_mode != _UPDATE_MODE_MAIL_ONLY and profile_url and "://" not in profile_url:
         errors.append("主页链接格式无效")
     return errors
 
@@ -681,6 +718,20 @@ def _resolve_keep_row_mail_context(
                 keep_row.get("resolution_method"),
             )
         ),
+    }
+
+
+def _build_mail_idempotency_fields(keep_row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "last_mail_message_id": _clean_text(keep_row.get("last_mail_message_id")),
+        "last_mail_sent_at": _clean_text(
+            _first_non_blank(
+                keep_row.get("latest_external_sent_at"),
+                keep_row.get("last_mail_time"),
+                keep_row.get("brand_message_sent_at"),
+            )
+        ),
+        "mail_update_revision": max(0, int(_coerce_number(keep_row.get("mail_update_revision")) or 0)),
     }
 
 
@@ -1030,6 +1081,92 @@ def _extract_row_owner_context(keep_row: dict[str, Any], task_owner: dict[str, A
     }
 
 
+def _build_mail_only_update_rows(
+    *,
+    platform: str,
+    creator_id: str,
+    profile_url: str,
+    keep_row: dict[str, Any],
+    existing_fields: dict[str, Any],
+    owner_context: dict[str, Any] | None,
+    owner_display_name: str,
+    last_mail_raw_path: str,
+    base_dirs: list[Path | None],
+    keep_workbook_path: Path | None,
+    mail_snapshot_cache: dict[str, dict[str, str]],
+    mail_body_cache: dict[str, str],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    row_owner_context = _extract_row_owner_context(keep_row, owner_context)
+    mail_context = _resolve_keep_row_mail_context(
+        keep_row,
+        last_mail_raw_path=last_mail_raw_path,
+        base_dirs=base_dirs,
+        snapshot_cache=mail_snapshot_cache,
+    )
+    row_attachment_paths = _resolve_existing_local_paths(last_mail_raw_path, base_dirs=base_dirs)
+    mail_body_text = _resolve_mail_full_body(
+        keep_row,
+        last_mail_raw_path=last_mail_raw_path,
+        base_dirs=base_dirs,
+        cache=mail_body_cache,
+    )
+    if not mail_body_text:
+        mail_body_text = mail_context["latest_external_full_body"]
+
+    existing_profile_url = _clean_text(_get_existing_field_value(existing_fields, "主页链接"))
+    display_row = {
+        "达人ID": _clean_text(_first_non_blank(creator_id, keep_row.get("@username"), _get_existing_field_value(existing_fields, "达人ID"))),
+        "平台": _normalize_platform(platform),
+        "主页链接": _clean_text(_first_non_blank(profile_url, keep_row.get("URL"), existing_profile_url)),
+        "# Followers(K)#": _flatten_field_value(_get_existing_field_value(existing_fields, "# Followers(K)#", "Followers(K)")),
+        "Following": _flatten_field_value(_get_existing_field_value(existing_fields, "Following")),
+        "Median Views (K)": _flatten_field_value(_get_existing_field_value(existing_fields, "Median Views (K)", "Average Views (K)")),
+        "互动率": _flatten_field_value(_get_existing_field_value(existing_fields, "互动率")),
+        "当前网红报价": _build_quote_text(keep_row, mail_body_text=mail_body_text),
+        "达人最后一次回复邮件时间": _format_date(
+            _first_non_blank(
+                mail_context.get("latest_external_sent_at"),
+                keep_row.get("last_mail_time"),
+                keep_row.get("brand_message_sent_at"),
+                _get_existing_field_value(existing_fields, "达人最后一次回复邮件时间"),
+            )
+        ),
+        _FULL_BODY_FIELD_NAME: mail_body_text,
+        "达人对接人": _clean_text(row_owner_context.get("responsible_name"))
+        or _clean_text(row_owner_context.get("employee_name"))
+        or owner_display_name
+        or _flatten_field_value(_get_existing_field_value(existing_fields, "达人对接人")),
+        "ai是否通过": _flatten_field_value(_get_existing_field_value(existing_fields, "ai是否通过", "ai 是否通过")),
+        "ai筛号反馈理由": _flatten_field_value(_get_existing_field_value(existing_fields, "ai筛号反馈理由")),
+        "标签(ai)": _flatten_field_value(_get_existing_field_value(existing_fields, "标签(ai)", "标签（ai）")),
+        "ai评价": _flatten_field_value(_get_existing_field_value(existing_fields, "ai评价", "ai 评价")),
+    }
+
+    payload_row = dict(display_row)
+    payload_row.pop("达人对接人", None)
+    payload_row.update(
+        {
+            "linked_bitable_url": _clean_text(row_owner_context.get("linked_bitable_url")),
+            "任务名": _clean_text(row_owner_context.get("task_name")),
+            "creator_emails": mail_context["creator_emails"],
+            "matched_contact_email": mail_context["matched_contact_email"],
+            "matched_contact_name": mail_context["matched_contact_name"],
+            "latest_external_from": mail_context["latest_external_from"],
+            "latest_external_sent_at": mail_context["latest_external_sent_at"],
+            "latest_external_clean_body": mail_context["latest_external_clean_body"],
+            "latest_external_full_body": mail_context["latest_external_full_body"],
+            "resolution_stage_final": mail_context["resolution_stage_final"],
+            _ROW_UPDATE_MODE_KEY: _UPDATE_MODE_MAIL_ONLY,
+            "达人回复的最后一封邮件内容": mail_body_text,
+            "__brand_message_raw_path": _clean_text(keep_row.get("brand_message_raw_path")),
+            _LAST_MAIL_RAW_PATH_KEY: last_mail_raw_path,
+            _ROW_ATTACHMENT_PATHS_KEY: row_attachment_paths,
+            **_build_mail_idempotency_fields(keep_row),
+        }
+    )
+    return display_row, payload_row
+
+
 def collect_final_exports(platforms: dict[str, Any] | None) -> dict[str, dict[str, str]]:
     final_exports: dict[str, dict[str, str]] = {}
     for platform, platform_summary in (platforms or {}).items():
@@ -1054,6 +1191,7 @@ def build_all_platforms_final_review_artifacts(
     task_owner: dict[str, Any] | None = None,
     payload_json_path: str | Path | None = None,
     manual_review_rows: Sequence[dict[str, Any]] | None = None,
+    mail_only_updates: dict[str, list[dict[str, Any]]] | None = None,
 ) -> dict[str, Any]:
     workbook_path = Path(str(output_path)).expanduser().resolve()
     workbook_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1074,6 +1212,7 @@ def build_all_platforms_final_review_artifacts(
     seen_creator_keys: set[tuple[str, str]] = set()
     mail_body_cache: dict[str, str] = {}
     mail_snapshot_cache: dict[str, dict[str, str]] = {}
+    mail_only_update_count = 0
 
     for platform, export_map in final_exports.items():
         final_review_path = Path(_clean_text((export_map or {}).get("final_review"))).expanduser()
@@ -1284,9 +1423,86 @@ def build_all_platforms_final_review_artifacts(
                     "__brand_message_raw_path": _clean_text(keep_row.get("brand_message_raw_path")),
                     _LAST_MAIL_RAW_PATH_KEY: last_mail_raw_path,
                     _ROW_ATTACHMENT_PATHS_KEY: row_attachment_paths,
+                    **_build_mail_idempotency_fields(keep_row),
                 }
             )
             validation_errors = _collect_upload_validation_errors(payload_row)
+            if validation_errors:
+                skipped_payload_rows.append(
+                    {
+                        "skip_reasons": validation_errors,
+                        "row": payload_row,
+                    }
+                )
+            else:
+                payload_rows.append(payload_row)
+
+    for platform, update_entries in (mail_only_updates or {}).items():
+        normalized_platform = _normalize_platform(platform)
+        if not normalized_platform:
+            continue
+        for entry in list(update_entries or []):
+            if not isinstance(entry, dict):
+                continue
+            creator_id = _extract_handle(
+                _first_non_blank(
+                    entry.get("creator_id"),
+                    entry.get("scrape_identifier"),
+                    entry.get("profile_url"),
+                )
+            )
+            existing_fields = dict(entry.get("existing_fields") or {})
+            profile_url = _clean_text(
+                _first_non_blank(
+                    entry.get("profile_url"),
+                    keep_url_lookup.get((normalized_platform, _normalize_url(entry.get("profile_url"))), {}).get("URL")
+                    if _clean_text(entry.get("profile_url"))
+                    else "",
+                    _get_existing_field_value(existing_fields, "主页链接"),
+                )
+            )
+            if not creator_id and not profile_url:
+                continue
+            seen_key = (normalized_platform, creator_id or _extract_handle(profile_url))
+            if seen_key[1] and seen_key in seen_creator_keys:
+                continue
+            normalized_url = _normalize_url(profile_url)
+            keep_row = (
+                keep_handle_lookup.get((normalized_platform, creator_id))
+                or keep_url_lookup.get((normalized_platform, normalized_url))
+                or keep_handle_any_lookup.get(creator_id)
+                or keep_url_any_lookup.get(normalized_url)
+                or {}
+            )
+            last_mail_raw_path = _clean_text(
+                _first_non_blank(
+                    keep_row.get("last_mail_raw_path"),
+                    keep_row.get("brand_message_raw_path"),
+                )
+            )
+            base_dirs = [
+                Path.cwd(),
+                keep_workbook_path.parent if keep_workbook_path else None,
+            ]
+            display_row, payload_row = _build_mail_only_update_rows(
+                platform=normalized_platform,
+                creator_id=creator_id,
+                profile_url=profile_url,
+                keep_row=keep_row,
+                existing_fields=existing_fields,
+                owner_context=owner_context,
+                owner_display_name=owner_display_name,
+                last_mail_raw_path=last_mail_raw_path,
+                base_dirs=base_dirs,
+                keep_workbook_path=keep_workbook_path,
+                mail_snapshot_cache=mail_snapshot_cache,
+                mail_body_cache=mail_body_cache,
+            )
+            validation_errors = _collect_upload_validation_errors(payload_row)
+            rows.append(display_row)
+            if display_row["达人ID"]:
+                seen_creator_keys.add((normalized_platform, _extract_handle(display_row["达人ID"])))
+            mail_only_update_count += 1
             if validation_errors:
                 skipped_payload_rows.append(
                     {
@@ -1402,6 +1618,7 @@ def build_all_platforms_final_review_artifacts(
                 "__brand_message_raw_path": _clean_text(keep_row.get("brand_message_raw_path")),
                 _LAST_MAIL_RAW_PATH_KEY: last_mail_raw_path,
                 _ROW_ATTACHMENT_PATHS_KEY: row_attachment_paths,
+                **_build_mail_idempotency_fields(keep_row),
             }
         )
         validation_errors = _collect_upload_validation_errors(payload_row)
@@ -1432,6 +1649,7 @@ def build_all_platforms_final_review_artifacts(
         "source_row_count": len(rows),
         "row_count": len(payload_rows),
         "skipped_row_count": len(skipped_payload_rows),
+        "mail_only_update_count": mail_only_update_count,
         _SHARED_ATTACHMENT_PATHS_KEY: shared_attachment_paths,
         "rows": payload_rows,
         "skipped_rows": skipped_payload_rows,
@@ -1472,4 +1690,5 @@ def build_all_platforms_final_review_artifacts(
         "source_row_count": len(rows),
         "skipped_row_count": len(skipped_payload_rows),
         "columns": list(FINAL_UPLOAD_COLUMNS),
+        "mail_only_update_count": mail_only_update_count,
     }

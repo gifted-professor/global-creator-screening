@@ -16,6 +16,81 @@ from backend.final_export_merge import (
 
 
 class FinalExportMergeTests(unittest.TestCase):
+    def test_build_artifacts_appends_mail_only_updates_for_existing_screened_creators(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            exports_dir = root / "exports"
+            keep_workbook = root / "upstream" / "exports" / "keep.xlsx"
+            keep_workbook.parent.mkdir(parents=True, exist_ok=True)
+            raw_dir = root / "upstream" / "raw"
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            raw_mail_path = raw_dir / "alpha-last.eml"
+            raw_mail_path.write_text("Subject: alpha\n\nLatest alpha reply body with $500 offer.", encoding="utf-8")
+            pd.DataFrame(
+                [
+                    {
+                        "Platform": "Instagram",
+                        "@username": "alpha",
+                        "URL": "https://www.instagram.com/alpha",
+                        "brand_message_sent_at": "2026-04-05T10:00:00+08:00",
+                        "brand_message_snippet": "Latest alpha reply body with $500 offer.",
+                        "brand_message_raw_path": str(raw_mail_path),
+                        "creator_emails": "alpha@example.com",
+                        "matched_contact_email": "alpha@example.com",
+                        "last_mail_message_id": "msg-101",
+                        "last_mail_time": "2026-04-05T10:00:00+08:00",
+                        "mail_update_revision": 4,
+                    }
+                ]
+            ).to_excel(keep_workbook, index=False)
+
+            output_path = exports_dir / "all_platforms_final_review.xlsx"
+            payload_path = exports_dir / "all_platforms_final_review_payload.json"
+            artifacts = build_all_platforms_final_review_artifacts(
+                output_path=output_path,
+                payload_json_path=payload_path,
+                final_exports={},
+                keep_workbook=keep_workbook,
+                task_owner={"responsible_name": "陈俊仁"},
+                mail_only_updates={
+                    "instagram": [
+                        {
+                            "creator_id": "alpha",
+                            "profile_url": "https://www.instagram.com/alpha",
+                            "record_id": "rec_alpha",
+                            "existing_fields": {
+                                "达人ID": "alpha",
+                                "平台": "instagram",
+                                "主页链接": "https://www.instagram.com/alpha",
+                                "Followers(K)": 120,
+                                "Following": 30,
+                                "Median Views (K)": 12,
+                                "互动率": "8.1%",
+                                "ai 是否通过": "是",
+                                "ai筛号反馈理由": "历史已筛通过",
+                                "标签（ai）": ["家庭用品和家电-家庭博主"],
+                                "ai 评价": "历史画像可复用",
+                            },
+                        }
+                    ]
+                },
+            )
+
+            workbook = pd.read_excel(output_path).fillna("")
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(artifacts["row_count"], 1)
+        self.assertEqual(workbook.loc[0, "达人ID"], "alpha")
+        self.assertEqual(workbook.loc[0, "ai是否通过"], "是")
+        self.assertEqual(workbook.loc[0, "当前网红报价"], "$500")
+        self.assertEqual(payload["rows"][0]["__feishu_update_mode"], "mail_only_update")
+        self.assertEqual(payload["rows"][0]["达人回复的最后一封邮件内容"], "Latest alpha reply body with $500 offer.")
+        self.assertEqual(payload["rows"][0]["matched_contact_email"], "alpha@example.com")
+        self.assertEqual(payload["rows"][0]["last_mail_message_id"], "msg-101")
+        self.assertEqual(payload["rows"][0]["last_mail_sent_at"], "2026-04-05T10:00:00+08:00")
+        self.assertEqual(payload["rows"][0]["mail_update_revision"], 4)
+        self.assertEqual(payload["mail_only_update_count"], 1)
+
     def test_keep_lookup_falls_back_across_platforms_for_mail_context(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
