@@ -182,6 +182,33 @@ def save_binary_response(response, output_path: Path) -> None:
     output_path.write_bytes(response.data)
 
 
+def _build_local_final_review_workbook(platform: str) -> bytes:
+    profile_reviews = backend_app.load_profile_reviews(platform)
+    if not profile_reviews:
+        raise RuntimeError(f"{platform} final review fallback failed: no profile review data available")
+    visual_results = backend_app.load_visual_results(platform)
+    rows = backend_app.build_final_review_rows(platform, profile_reviews, visual_results)
+    if not rows:
+        raise RuntimeError(f"{platform} final review fallback failed: no final review rows available")
+    workbook = backend_app.workbook_bytes_from_sheets([("Final Review", rows)])
+    if hasattr(workbook, "getvalue"):
+        return workbook.getvalue()
+    return bytes(workbook)
+
+
+def _save_final_review_with_missing_profile_fallback(client, platform: str, output_path: Path) -> str:
+    response = client.post(f"/api/download/{platform}/final-review", json={})
+    if response.status_code < 400:
+        save_binary_response(response, output_path)
+        return "api"
+    payload = response.get_json(silent=True) or {}
+    if str(payload.get("error_code") or "").strip() != "FINAL_REVIEW_BLOCKED_BY_MISSING_PROFILES":
+        raise RuntimeError(f"download failed for {output_path.name}: HTTP {response.status_code} {payload}")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_bytes(_build_local_final_review_workbook(platform))
+    return "local_missing_profile_fallback"
+
+
 def export_platform_artifacts(client, platform: str, export_dir: Path) -> dict[str, str]:
     outputs = {}
     prescreen_path = export_dir / f"{platform}_prescreen_review.xlsx"
@@ -205,7 +232,11 @@ def export_platform_artifacts(client, platform: str, export_dir: Path) -> dict[s
     outputs["test_info_json"] = str(test_info_json_path)
 
     final_review_path = export_dir / f"{platform}_final_review.xlsx"
-    save_binary_response(client.post(f"/api/download/{platform}/final-review", json={}), final_review_path)
+    outputs["final_review_export_mode"] = _save_final_review_with_missing_profile_fallback(
+        client,
+        platform,
+        final_review_path,
+    )
     outputs["final_review"] = str(final_review_path)
 
     artifact_status = require_success(client.get(f"/api/artifacts/{platform}/status"), f"{platform} artifact status")
