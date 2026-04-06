@@ -23,7 +23,7 @@ from email_sync.date_windows import resolve_sync_sent_since
 from email_sync.imap_sync import sync_mailboxes
 
 
-DEFAULT_FOLDER = "其他文件夹/邮件备份"
+DEFAULT_FOLDER = "其他文件夹/达人回信"
 DEFAULT_DATA_DIR = REPO_ROOT / "data" / "shared_mailbox"
 DEFAULT_LOCK_NAME = ".sync.lock"
 
