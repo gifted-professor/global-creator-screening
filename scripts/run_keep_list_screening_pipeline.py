@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import sys
 from datetime import datetime
@@ -360,6 +361,75 @@ def _merge_breakdown_counts(target: dict[str, int], source: dict[str, Any] | Non
         target[normalized_key] = int(target.get(normalized_key) or 0) + delta
 
 
+def _filter_profile_reviews_for_final_export(
+    backend_app,
+    platform: str,
+    profile_reviews: list[dict[str, Any]] | None,
+    excluded_identifiers: list[str] | None,
+) -> list[dict[str, Any]]:
+    excluded = {
+        _normalize_cache_identifier(backend_app, platform, value)
+        for value in (excluded_identifiers or [])
+        if _normalize_cache_identifier(backend_app, platform, value)
+    }
+    if not excluded:
+        return [dict(item) for item in list(profile_reviews or []) if isinstance(item, dict)]
+
+    screening_module = getattr(backend_app, "screening", None)
+    filtered: list[dict[str, Any]] = []
+    for item in list(profile_reviews or []):
+        if not isinstance(item, dict):
+            continue
+        identifier = ""
+        if screening_module is not None and hasattr(screening_module, "resolve_profile_review_identifier"):
+            try:
+                identifier = str(screening_module.resolve_profile_review_identifier(platform, item) or "").strip()
+            except Exception:
+                identifier = ""
+        normalized_identifier = _normalize_cache_identifier(
+            backend_app,
+            platform,
+            identifier
+            or item.get("profile_url")
+            or item.get("username")
+            or (item.get("upload_metadata") or {}).get("url")
+            or (item.get("upload_metadata") or {}).get("handle"),
+        )
+        if normalized_identifier and normalized_identifier in excluded:
+            continue
+        filtered.append(dict(item))
+    return filtered
+
+
+def _export_platform_artifacts_with_optional_final_review_subset(
+    export_platform_artifacts: Callable[..., dict[str, str]],
+    client,
+    platform: str,
+    export_dir: Path,
+    *,
+    final_review_profile_reviews: list[dict[str, Any]] | None = None,
+) -> dict[str, str]:
+    if final_review_profile_reviews is None:
+        return export_platform_artifacts(client, platform, export_dir)
+    try:
+        signature = inspect.signature(export_platform_artifacts)
+    except (TypeError, ValueError):
+        signature = None
+    if signature is not None:
+        parameters = signature.parameters.values()
+        if (
+            "final_review_profile_reviews" in signature.parameters
+            or any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters)
+        ):
+            return export_platform_artifacts(
+                client,
+                platform,
+                export_dir,
+                final_review_profile_reviews=final_review_profile_reviews,
+            )
+    return export_platform_artifacts(client, platform, export_dir)
+
+
 def _build_platform_identifier_plan(
     backend_app,
     platform: str,
@@ -491,18 +561,13 @@ def _build_platform_identifier_plan(
                         classified_entry["skip_reason"] = "no_local_cache"
                         skippable_entries.append(classified_entry)
                     elif partial_reasons:
-                        classified_entry["execution_mode"] = "partial_refresh"
+                        # 老达人已有本地缓存（scrape 或 visual 至少一个有），只做邮件更新，不再补抓/补做视觉
+                        classified_entry["execution_mode"] = "mail_only_update"
                         classified_entry["partial_refresh_reasons"] = list(partial_reasons)
-                        classified_entry["needs_scrape"] = not scrape_cache_hit
-                        classified_entry["needs_visual"] = bool(
-                            not skip_visual and creator_cache_enabled and visual_cache_context_key and not visual_cache_hit
-                        )
-                        classified_entry["needs_positioning"] = bool(
-                            not skip_positioning_card_analysis and not positioning_ready
-                        )
-                        partial_refresh_entries.append(classified_entry)
-                        for reason in partial_reasons:
-                            partial_refresh_breakdown[reason] = int(partial_refresh_breakdown.get(reason) or 0) + 1
+                        classified_entry["needs_scrape"] = False
+                        classified_entry["needs_visual"] = False
+                        classified_entry["needs_positioning"] = False
+                        mail_only_update_entries.append(classified_entry)
                     else:
                         classified_entry["execution_mode"] = "mail_only_update"
                         mail_only_update_entries.append(classified_entry)
@@ -732,6 +797,7 @@ def _stage_missing_profiles_for_fallback(
     current_lookup = dict(backend_app.load_upload_metadata(current_platform) or {})
     staged_payload: dict[str, Any] = {}
     staged_identifiers: list[str] = []
+    staged_source_identifiers: list[str] = []
     unresolved_missing: list[dict[str, Any]] = []
     for item in missing_profiles:
         identifier = str(item.get("identifier") or "").strip()
@@ -751,12 +817,15 @@ def _stage_missing_profiles_for_fallback(
         next_record["fallback_reason"] = str(item.get("reason") or "").strip()
         staged_payload[handle] = next_record
         staged_identifiers.append(handle)
+        staged_source_identifiers.append(identifier)
     if staged_payload:
         backend_app.save_upload_metadata(next_platform, staged_payload, replace=False)
     return {
         "next_platform": str(next_platform or "").strip().lower(),
         "staged_count": len(staged_identifiers),
         "staged_identifier_preview": staged_identifiers[:10],
+        "staged_source_identifiers": staged_source_identifiers,
+        "staged_source_identifier_preview": staged_source_identifiers[:10],
         "unresolved_missing": unresolved_missing,
     }
 
@@ -3532,6 +3601,7 @@ def run_keep_list_screening_pipeline(
                     "configured_provider_names": platform_summary["vision_preflight"]["configured_provider_names"],
                     "selected_provider": platform_summary["vision_preflight"].get("preferred_provider") or "",
                 }
+                staged_fallback_source_identifiers: list[str] = []
                 if fallback_profiles:
                     current_lookup = dict(backend_app.load_upload_metadata(platform) or {})
                     next_platform = _resolve_next_fallback_platform(platform, execution_platforms)
@@ -3581,8 +3651,16 @@ def run_keep_list_screening_pipeline(
                             "next_platform": next_platform,
                             "staged_count": int(fallback_result.get("staged_count") or 0),
                             "staged_identifier_preview": list(fallback_result.get("staged_identifier_preview") or []),
+                            "staged_source_identifier_preview": list(
+                                fallback_result.get("staged_source_identifier_preview") or []
+                            ),
                             "unresolved_missing_count": len(fallback_result.get("unresolved_missing") or []),
                         }
+                        staged_fallback_source_identifiers = [
+                            str(item or "").strip()
+                            for item in list(fallback_result.get("staged_source_identifiers") or [])
+                            if str(item or "").strip()
+                        ]
                         unresolved_missing = list(fallback_result.get("unresolved_missing") or [])
                     else:
                         if not current_has_fallback_contract:
@@ -3829,7 +3907,7 @@ def run_keep_list_screening_pipeline(
                         f"{platform} artifact status",
                     )
                     fallback_stage_count = int(((platform_summary.get("fallback") or {}).get("staged_count") or 0))
-                    if fallback_stage_count > 0:
+                    if fallback_stage_count > 0 and bool(platform_summary.get("fallback_only")):
                         platform_summary["exports"] = {}
                         platform_summary["final_review_export"] = {
                             "status": "deferred",
@@ -3837,7 +3915,53 @@ def run_keep_list_screening_pipeline(
                             "fallback_staged_count": fallback_stage_count,
                         }
                     else:
-                        platform_summary["exports"] = export_platform_artifacts(client, platform, exports_dir / platform)
+                        final_review_profile_reviews = None
+                        if staged_fallback_source_identifiers:
+                            final_review_profile_reviews = _filter_profile_reviews_for_final_export(
+                                backend_app,
+                                platform,
+                                scrape_profile_reviews,
+                                staged_fallback_source_identifiers,
+                            )
+                            if final_review_profile_reviews and len(final_review_profile_reviews) < len(scrape_profile_reviews):
+                                platform_summary["final_review_export"] = {
+                                    "status": "partial_with_fallback_staged",
+                                    "reason": "fallback-staged missing profiles were excluded from the current platform final review export",
+                                    "fallback_staged_count": fallback_stage_count,
+                                    "export_profile_review_count": len(final_review_profile_reviews),
+                                    "source_profile_review_count": len(scrape_profile_reviews),
+                                    "excluded_identifier_preview": list(staged_fallback_source_identifiers[:10]),
+                                }
+                            elif not final_review_profile_reviews and fallback_stage_count > 0:
+                                platform_summary["exports"] = {}
+                                platform_summary["final_review_export"] = {
+                                    "status": "deferred",
+                                    "reason": "all current-platform rows were staged to fallback platforms; defer final review export until fallback platforms finish",
+                                    "fallback_staged_count": fallback_stage_count,
+                                }
+                                if bool(platform_summary.get("fallback_only")):
+                                    platform_summary["status"] = "fallback_staged"
+                                else:
+                                    platform_summary["status"] = (
+                                        "completed_with_partial_scrape" if scrape_was_salvaged else "completed"
+                                    )
+                                _persist_platform_summary(
+                                    summary=summary,
+                                    run_summary_path=run_summary_path,
+                                    backend_app=backend_app,
+                                    platform=platform,
+                                    platform_summary=platform_summary,
+                                    current_stage="completed",
+                                    summary_writer=persist_summary,
+                                )
+                                continue
+                        platform_summary["exports"] = _export_platform_artifacts_with_optional_final_review_subset(
+                            export_platform_artifacts,
+                            client,
+                            platform,
+                            exports_dir / platform,
+                            final_review_profile_reviews=final_review_profile_reviews,
+                        )
                     if bool(platform_summary.get("fallback_only")):
                         platform_summary["status"] = "fallback_staged"
                     else:

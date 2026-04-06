@@ -2018,7 +2018,7 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             "instagram",
         )
 
-    def test_runner_defers_blocked_tiktok_final_export_until_instagram_fallback_finishes(self) -> None:
+    def test_runner_exports_partial_tiktok_final_review_while_staging_missing_rows_to_instagram(self) -> None:
         backend_app = FakeBackendApp(
             {"status": "configured", "runnable_provider_names": [], "configured_provider_names": []},
             metadata={
@@ -2084,13 +2084,16 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
                 }
             return {"id": job_id, "status": "completed", "result": {}}
 
-        export_calls: list[str] = []
+        export_calls: list[dict[str, Any]] = []
 
-        def fake_export_platform_artifacts(client, platform, export_dir):
-            export_calls.append(str(platform))
-            if str(platform) == "tiktok":
-                raise AssertionError("tiktok final export should be deferred when fallback staging succeeded")
-            return {}
+        def fake_export_platform_artifacts(client, platform, export_dir, final_review_profile_reviews=None):
+            export_calls.append(
+                {
+                    "platform": str(platform),
+                    "final_review_profile_reviews": list(final_review_profile_reviews or []),
+                }
+            )
+            return {"final_review": str(Path(export_dir) / f"{platform}_final_review.xlsx")}
 
         keep_list_runner._load_runtime_dependencies = lambda: {
             "backend_app": backend_app,
@@ -2121,10 +2124,15 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             )
 
         self.assertEqual(summary["platforms"]["tiktok"]["fallback"]["staged_count"], 1)
-        self.assertEqual(summary["platforms"]["tiktok"]["final_review_export"]["status"], "deferred")
+        self.assertEqual(summary["platforms"]["tiktok"]["final_review_export"]["status"], "partial_with_fallback_staged")
         self.assertIn("instagram", summary["platforms"])
         self.assertEqual(summary["platforms"]["instagram"]["requested_identifier_preview"], ["alpha"])
-        self.assertEqual(export_calls, ["instagram"])
+        self.assertEqual([item["platform"] for item in export_calls], ["tiktok", "instagram"])
+        self.assertEqual(
+            [item.get("username") for item in export_calls[0]["final_review_profile_reviews"]],
+            ["beta"],
+        )
+        self.assertEqual(export_calls[1]["final_review_profile_reviews"], [])
 
     def test_runner_filters_existing_bitable_creators_before_scrape(self) -> None:
         preflight = {
@@ -2357,7 +2365,7 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         self.assertIn("本次为 dry-run", json.dumps(summary["diagnostics"], ensure_ascii=False))
         self.assertIn("静默跳过 1 个", json.dumps(summary["diagnostics"], ensure_ascii=False))
 
-    def test_runner_classifies_existing_screened_creator_as_partial_refresh_when_visual_cache_is_missing(self) -> None:
+    def test_runner_routes_existing_screened_creator_to_mail_only_when_visual_cache_is_missing(self) -> None:
         preflight = {
             "status": "configured",
             "error_code": "",
@@ -2432,18 +2440,16 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
 
         platform_summary = summary["platforms"]["instagram"]
         self.assertEqual(summary["status"], "dry_run_only")
-        self.assertEqual(platform_summary["partial_refresh_count"], 1)
-        self.assertEqual(platform_summary["mail_only_update_count"], 0)
-        self.assertEqual(platform_summary["requested_identifier_count"], 1)
-        self.assertEqual(platform_summary["incremental_prefilter"]["partial_refresh_count"], 1)
-        self.assertEqual(platform_summary["incremental_prefilter"]["partial_refresh_preview"], ["alpha"])
-        self.assertEqual(
-            platform_summary["incremental_prefilter"]["partial_refresh_breakdown"],
-            {"visual_missing_instagram": 1},
-        )
-        self.assertEqual(summary["partial_refresh_count"], 1)
-        self.assertEqual(summary["partial_refresh_preview"], ["alpha"])
-        self.assertEqual(summary["partial_refresh_breakdown"], {"visual_missing_instagram": 1})
+        self.assertEqual(platform_summary["partial_refresh_count"], 0)
+        self.assertEqual(platform_summary["mail_only_update_count"], 1)
+        self.assertEqual(platform_summary["requested_identifier_count"], 0)
+        self.assertEqual(platform_summary["incremental_prefilter"]["partial_refresh_count"], 0)
+        self.assertEqual(platform_summary["incremental_prefilter"]["partial_refresh_preview"], [])
+        self.assertEqual(platform_summary["incremental_prefilter"]["partial_refresh_breakdown"], {})
+        self.assertEqual(platform_summary["incremental_prefilter"]["mail_only_update_count"], 1)
+        self.assertEqual(summary["partial_refresh_count"], 0)
+        self.assertEqual(summary["partial_refresh_preview"], [])
+        self.assertEqual(summary["partial_refresh_breakdown"], {})
 
     def test_runner_skips_existing_screened_creator_when_no_local_cache_exists(self) -> None:
         preflight = {
@@ -2524,7 +2530,7 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         self.assertEqual(summary["dry_run_report"]["estimated_execution_platforms"], [])
         self.assertIn("静默跳过 1 个", json.dumps(summary["diagnostics"], ensure_ascii=False))
 
-    def test_runner_partial_refresh_only_schedules_missing_stages(self) -> None:
+    def test_runner_mail_only_short_circuits_existing_screened_creator_without_blocking_new_creator_execution(self) -> None:
         preflight = {
             "status": "configured",
             "error_code": "",
@@ -2665,15 +2671,13 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         platform_summary = summary["platforms"]["instagram"]
         client = backend_app.app.test_client()
         self.assertEqual(summary["status"], "completed")
-        self.assertEqual(platform_summary["partial_refresh_count"], 1)
-        self.assertEqual(platform_summary["mail_only_update_count"], 0)
-        self.assertCountEqual(client.scrape_start_calls[0]["payload"]["usernames"], ["alpha", "beta"])
+        self.assertEqual(platform_summary["partial_refresh_count"], 0)
+        self.assertEqual(platform_summary["mail_only_update_count"], 1)
+        self.assertCountEqual(client.scrape_start_calls[0]["payload"]["usernames"], ["beta"])
         self.assertEqual(client.visual_start_calls[0]["payload"]["identifiers"], ["beta"])
         self.assertEqual(client.positioning_start_calls[0]["payload"]["identifiers"], ["beta"])
-        self.assertEqual(
-            platform_summary["incremental_prefilter"]["partial_refresh_breakdown"],
-            {"scrape_missing_instagram": 1},
-        )
+        self.assertEqual(platform_summary["incremental_prefilter"]["partial_refresh_breakdown"], {})
+        self.assertEqual(platform_summary["incremental_prefilter"]["mail_only_update_count"], 1)
 
     def test_runner_routes_existing_screened_creators_to_mail_only_update_without_scrape(self) -> None:
         preflight = {
