@@ -403,6 +403,7 @@ def _build_platform_identifier_plan(
     existing_screened_entries: list[dict[str, Any]] = []
     existing_unscreened_entries: list[dict[str, Any]] = []
     mail_only_update_entries: list[dict[str, Any]] = []
+    skippable_entries: list[dict[str, Any]] = []
     partial_refresh_entries: list[dict[str, Any]] = []
     full_screening_entries: list[dict[str, Any]] = []
     partial_refresh_breakdown: dict[str, int] = {}
@@ -477,6 +478,7 @@ def _build_platform_identifier_plan(
                     positioning_ready = _existing_record_has_positioning_payload(
                         classified_entry.get("existing_fields") or {}
                     )
+                    has_any_local_cache = bool(scrape_cache_hit or visual_cache_hit)
                     partial_reasons: list[str] = []
                     if creator_cache_enabled and not scrape_cache_hit:
                         partial_reasons.append(f"scrape_missing_{platform}")
@@ -484,7 +486,11 @@ def _build_platform_identifier_plan(
                         partial_reasons.append(f"visual_missing_{platform}")
                     if not skip_positioning_card_analysis and not positioning_ready:
                         partial_reasons.append(f"positioning_missing_{platform}")
-                    if partial_reasons:
+                    if not has_any_local_cache:
+                        classified_entry["execution_mode"] = "skippable"
+                        classified_entry["skip_reason"] = "no_local_cache"
+                        skippable_entries.append(classified_entry)
+                    elif partial_reasons:
                         classified_entry["execution_mode"] = "partial_refresh"
                         classified_entry["partial_refresh_reasons"] = list(partial_reasons)
                         classified_entry["needs_scrape"] = not scrape_cache_hit
@@ -581,6 +587,12 @@ def _build_platform_identifier_plan(
             for item in mail_only_update_entries[:10]
             if str(item.get("creator_id") or "").strip()
         ],
+        "skippable_count": len(skippable_entries),
+        "skippable_preview": [
+            str(item.get("creator_id") or "").strip()
+            for item in skippable_entries[:10]
+            if str(item.get("creator_id") or "").strip()
+        ],
         "partial_refresh_count": len(partial_refresh_entries),
         "partial_refresh_preview": [
             str(item.get("creator_id") or "").strip()
@@ -608,6 +620,7 @@ def _build_platform_identifier_plan(
         "visual_requested_identifiers": list(visual_requested_identifiers),
         "positioning_requested_identifiers": list(positioning_requested_identifiers),
         "mail_only_update_entries": [dict(item) for item in mail_only_update_entries],
+        "skippable_entries": [dict(item) for item in skippable_entries],
         "partial_refresh_entries": [dict(item) for item in partial_refresh_entries],
         "incremental_prefilter": incremental_prefilter,
     }
@@ -1056,6 +1069,7 @@ def _build_cli_output_summary(summary: dict[str, Any]) -> dict[str, Any]:
             "current_stage": str(payload.get("current_stage") or "").strip(),
             "requested_identifier_count": int(payload.get("requested_identifier_count") or 0),
             "mail_only_update_count": int(payload.get("mail_only_update_count") or 0),
+            "skippable_count": int(payload.get("skippable_count") or 0),
             "partial_refresh_count": int(payload.get("partial_refresh_count") or 0),
             "profile_review_count": int(payload.get("profile_review_count") or 0),
             "prescreen_pass_count": int(payload.get("prescreen_pass_count") or 0),
@@ -1227,10 +1241,12 @@ def _build_incremental_observability_layer(summary: dict[str, Any]) -> dict[str,
     existing_screened_count = 0
     existing_unscreened_count = 0
     mail_only_update_count = 0
+    skippable_count = 0
     partial_refresh_count = 0
     all_existing = True
     incremental_candidate_preview: list[str] = []
     mail_only_update_preview: list[str] = []
+    skippable_preview: list[str] = []
     partial_refresh_preview: list[str] = []
     partial_refresh_breakdown: dict[str, int] = {}
     duplicate_existing_group_count = int(existing_bitable_prefilter.get("duplicate_existing_group_count") or 0)
@@ -1245,6 +1261,7 @@ def _build_incremental_observability_layer(summary: dict[str, Any]) -> dict[str,
         existing_screened_count += int(platform_prefilter.get("existing_screened_count") or 0)
         existing_unscreened_count += int(platform_prefilter.get("existing_unscreened_count") or 0)
         mail_only_update_count += int(platform_prefilter.get("mail_only_update_count") or 0)
+        skippable_count += int(platform_prefilter.get("skippable_count") or 0)
         partial_refresh_count += int(platform_prefilter.get("partial_refresh_count") or 0)
         duplicate_existing_group_count = max(
             duplicate_existing_group_count,
@@ -1256,6 +1273,9 @@ def _build_incremental_observability_layer(summary: dict[str, Any]) -> dict[str,
         )
         mail_only_update_preview.extend(
             [str(item) for item in list(platform_prefilter.get("mail_only_update_preview") or []) if str(item).strip()]
+        )
+        skippable_preview.extend(
+            [str(item) for item in list(platform_prefilter.get("skippable_preview") or []) if str(item).strip()]
         )
         partial_refresh_preview.extend(
             [str(item) for item in list(platform_prefilter.get("partial_refresh_preview") or []) if str(item).strip()]
@@ -1277,11 +1297,13 @@ def _build_incremental_observability_layer(summary: dict[str, Any]) -> dict[str,
         "existing_screened_count": existing_screened_count,
         "existing_unscreened_count": existing_unscreened_count,
         "mail_only_update_count": mail_only_update_count,
+        "skippable_count": skippable_count,
         "partial_refresh_count": partial_refresh_count,
         "all_existing": bool(staged_identifier_count > 0 and all_existing),
         "duplicate_existing_group_count": duplicate_existing_group_count,
         "incremental_candidate_preview": incremental_candidate_preview[:10],
         "mail_only_update_preview": mail_only_update_preview[:10],
+        "skippable_preview": skippable_preview[:10],
         "partial_refresh_preview": partial_refresh_preview[:10],
         "partial_refresh_breakdown": dict(sorted(partial_refresh_breakdown.items())),
         "blocking_reason": str(existing_bitable_prefilter.get("error") or "").strip(),
@@ -1303,6 +1325,7 @@ def _build_execution_observability_layer(summary: dict[str, Any]) -> dict[str, A
             "current_stage": str(payload.get("current_stage") or "").strip(),
             "requested_identifier_count": int(payload.get("requested_identifier_count") or 0),
             "mail_only_update_count": int(payload.get("mail_only_update_count") or 0),
+            "skippable_count": int(payload.get("skippable_count") or 0),
             "partial_refresh_count": int(payload.get("partial_refresh_count") or 0),
             "profile_review_count": int(payload.get("profile_review_count") or 0),
             "prescreen_pass_count": int(payload.get("prescreen_pass_count") or 0),
@@ -1357,7 +1380,9 @@ def _build_dry_run_report(summary: dict[str, Any]) -> dict[str, Any]:
     incremental_candidate_count = 0
     full_screening_candidate_count = 0
     mail_only_update_count = 0
+    skippable_count = 0
     partial_refresh_count = 0
+    skippable_preview: list[str] = []
     partial_refresh_preview: list[str] = []
     partial_refresh_breakdown: dict[str, int] = {}
 
@@ -1373,6 +1398,7 @@ def _build_dry_run_report(summary: dict[str, Any]) -> dict[str, Any]:
         platform_incremental = int(platform_prefilter.get("incremental_candidate_count") or 0)
         platform_full_screening = int(platform_prefilter.get("full_screening_candidate_count") or 0)
         platform_mail_only_update = int(platform_prefilter.get("mail_only_update_count") or 0)
+        platform_skippable = int(platform_prefilter.get("skippable_count") or 0)
         platform_partial_refresh = int(platform_prefilter.get("partial_refresh_count") or 0)
         platform_requested = int(payload.get("requested_identifier_count") or 0)
         staged_identifier_count += platform_staged
@@ -1380,6 +1406,7 @@ def _build_dry_run_report(summary: dict[str, Any]) -> dict[str, Any]:
         incremental_candidate_count += platform_incremental
         full_screening_candidate_count += platform_full_screening
         mail_only_update_count += platform_mail_only_update
+        skippable_count += platform_skippable
         partial_refresh_count += platform_partial_refresh
         if platform_requested > 0 or platform_mail_only_update > 0 or platform_partial_refresh > 0:
             estimated_execution_platforms.append(platform_name)
@@ -1387,6 +1414,9 @@ def _build_dry_run_report(summary: dict[str, Any]) -> dict[str, Any]:
             all_existing_platforms.append(platform_name)
         elif platform_staged <= 0:
             no_candidate_platforms.append(platform_name)
+        skippable_preview.extend(
+            [str(item) for item in list(platform_prefilter.get("skippable_preview") or []) if str(item).strip()]
+        )
         partial_refresh_preview.extend(
             [str(item) for item in list(platform_prefilter.get("partial_refresh_preview") or []) if str(item).strip()]
         )
@@ -1404,11 +1434,13 @@ def _build_dry_run_report(summary: dict[str, Any]) -> dict[str, Any]:
             "incremental_candidate_count": platform_incremental,
             "full_screening_candidate_count": platform_full_screening,
             "mail_only_update_count": platform_mail_only_update,
+            "skippable_count": platform_skippable,
             "partial_refresh_count": platform_partial_refresh,
             "requested_identifier_count": platform_requested,
             "requested_identifier_preview": list(payload.get("requested_identifier_preview") or [])[:10],
             "incremental_candidate_preview": list(platform_prefilter.get("incremental_candidate_preview") or [])[:10],
             "mail_only_update_preview": list(platform_prefilter.get("mail_only_update_preview") or [])[:10],
+            "skippable_preview": list(platform_prefilter.get("skippable_preview") or [])[:10],
             "partial_refresh_preview": list(platform_prefilter.get("partial_refresh_preview") or [])[:10],
             "partial_refresh_breakdown": dict(platform_prefilter.get("partial_refresh_breakdown") or {}),
             "all_existing": bool(platform_prefilter.get("all_existing")),
@@ -1422,6 +1454,8 @@ def _build_dry_run_report(summary: dict[str, Any]) -> dict[str, Any]:
         "incremental_candidate_count": incremental_candidate_count,
         "full_screening_candidate_count": full_screening_candidate_count,
         "mail_only_update_count": mail_only_update_count,
+        "skippable_count": skippable_count,
+        "skippable_preview": skippable_preview[:10],
         "partial_refresh_count": partial_refresh_count,
         "partial_refresh_preview": partial_refresh_preview[:10],
         "partial_refresh_breakdown": dict(sorted(partial_refresh_breakdown.items())),
@@ -1542,6 +1576,7 @@ def _build_downstream_observability(summary: dict[str, Any]) -> dict[str, Any]:
                 if isinstance(payload, dict)
             ),
             "mail_only_update_count": int(incremental_layer.get("mail_only_update_count") or 0),
+            "skippable_count": int(incremental_layer.get("skippable_count") or 0),
             "partial_refresh_count": int(incremental_layer.get("partial_refresh_count") or 0),
             "full_screening_candidate_count": int(incremental_layer.get("full_screening_candidate_count") or 0),
         },
@@ -1557,6 +1592,7 @@ def _build_downstream_observability(summary: dict[str, Any]) -> dict[str, Any]:
                 if isinstance(payload, dict)
             ),
             "mail_only_update_count": int(incremental_layer.get("mail_only_update_count") or 0),
+            "skippable_count": int(incremental_layer.get("skippable_count") or 0),
             "partial_refresh_count": int(incremental_layer.get("partial_refresh_count") or 0),
             "upload_created_count": int(upload_layer.get("created_count") or 0),
             "upload_failed_count": int(upload_layer.get("failed_count") or 0),
@@ -1608,6 +1644,7 @@ def _build_downstream_diagnostics(summary: dict[str, Any]) -> dict[str, Any]:
                     f"新增 {int(dry_run_report.get('incremental_candidate_count') or 0)} 个，"
                     f"局部补齐 {int(dry_run_report.get('partial_refresh_count') or 0)} 个，"
                     f"邮件直更 {int(dry_run_report.get('mail_only_update_count') or 0)} 个，"
+                    f"静默跳过 {int(dry_run_report.get('skippable_count') or 0)} 个，"
                     f"预计执行平台 {int(dry_run_report.get('estimated_execution_platform_count') or 0)} 个。"
                 ),
             }
@@ -1626,6 +1663,7 @@ def _build_downstream_diagnostics(summary: dict[str, Any]) -> dict[str, Any]:
         existing_count = int(incremental_layer.get("existing_bitable_match_count") or 0)
         incremental_count = int(incremental_layer.get("incremental_candidate_count") or 0)
         mail_only_update_count = int(incremental_layer.get("mail_only_update_count") or 0)
+        skippable_count = int(incremental_layer.get("skippable_count") or 0)
         partial_refresh_count = int(incremental_layer.get("partial_refresh_count") or 0)
         if bool(incremental_layer.get("all_existing")):
             conclusions.append(
@@ -1636,7 +1674,8 @@ def _build_downstream_diagnostics(summary: dict[str, Any]) -> dict[str, Any]:
                     "message": (
                         f"本次 staged {staged_count} 个达人均已存在于目标飞书表，"
                         f"其中 {mail_only_update_count} 个会直接走邮件字段更新，"
-                        f"{partial_refresh_count} 个只会补抓缺失环节，无需完整重跑。"
+                        f"{partial_refresh_count} 个只会补抓缺失环节，"
+                        f"{skippable_count} 个因本地无缓存被直接跳过，无需完整重跑。"
                     ),
                 }
             )
@@ -1649,7 +1688,7 @@ def _build_downstream_diagnostics(summary: dict[str, Any]) -> dict[str, Any]:
                     "message": (
                         f"本次 staged {staged_count} 个达人，已存在 {existing_count} 个，"
                         f"新增 {incremental_count} 个，局部补齐 {partial_refresh_count} 个，"
-                        f"邮件直更 {mail_only_update_count} 个，"
+                        f"邮件直更 {mail_only_update_count} 个，静默跳过 {skippable_count} 个，"
                         "只对需要的达人继续执行补抓或完整筛号。"
                     ),
                 }
@@ -1670,6 +1709,15 @@ def _build_downstream_diagnostics(summary: dict[str, Any]) -> dict[str, Any]:
                     "code": "partial_refresh_enabled",
                     "severity": "info",
                     "message": f"已有 {partial_refresh_count} 个老达人命中本地缓存缺口，本轮只补抓缺失的 scrape / visual / positioning 环节。",
+                }
+            )
+        if skippable_count > 0:
+            conclusions.append(
+                {
+                    "layer": "incremental_creator",
+                    "code": "existing_screened_skipped_without_local_cache",
+                    "severity": "info",
+                    "message": f"已有 {skippable_count} 个已筛老达人在飞书存在但本地无可复用缓存，本轮会静默跳过，不再重复发起 scrape / visual 请求。",
                 }
             )
     elif str(incremental_layer.get("linked_bitable_url") or "").strip():
@@ -1788,6 +1836,8 @@ def _build_downstream_diagnostics(summary: dict[str, Any]) -> dict[str, Any]:
 def _refresh_downstream_observability(summary: dict[str, Any]) -> None:
     summary["observability"] = _build_downstream_observability(summary)
     incremental_layer = dict(((summary.get("observability") or {}).get("layers") or {}).get("incremental_creator") or {})
+    summary["skippable_count"] = int(incremental_layer.get("skippable_count") or 0)
+    summary["skippable_preview"] = list(incremental_layer.get("skippable_preview") or [])[:10]
     summary["partial_refresh_count"] = int(incremental_layer.get("partial_refresh_count") or 0)
     summary["partial_refresh_preview"] = list(incremental_layer.get("partial_refresh_preview") or [])[:10]
     summary["partial_refresh_breakdown"] = dict(incremental_layer.get("partial_refresh_breakdown") or {})
@@ -3119,6 +3169,8 @@ def run_keep_list_screening_pipeline(
                     "requested_identifier_preview": [],
                     "mail_only_update_count": 0,
                     "mail_only_update_preview": [],
+                    "skippable_count": 0,
+                    "skippable_preview": [],
                     "partial_refresh_count": 0,
                     "partial_refresh_preview": [],
                     "partial_refresh_breakdown": {},
@@ -3139,6 +3191,8 @@ def run_keep_list_screening_pipeline(
                         "full_screening_candidate_preview": [],
                         "mail_only_update_count": 0,
                         "mail_only_update_preview": [],
+                        "skippable_count": 0,
+                        "skippable_preview": [],
                         "partial_refresh_count": 0,
                         "partial_refresh_preview": [],
                         "partial_refresh_breakdown": {},
@@ -3174,6 +3228,7 @@ def run_keep_list_screening_pipeline(
                     visual_requested_identifiers = list(identifier_plan.get("visual_requested_identifiers") or [])
                     positioning_requested_identifiers = list(identifier_plan.get("positioning_requested_identifiers") or [])
                     mail_only_update_entries = [dict(item) for item in list(identifier_plan.get("mail_only_update_entries") or []) if isinstance(item, dict)]
+                    skippable_entries = [dict(item) for item in list(identifier_plan.get("skippable_entries") or []) if isinstance(item, dict)]
                     partial_refresh_entries = [dict(item) for item in list(identifier_plan.get("partial_refresh_entries") or []) if isinstance(item, dict)]
                     has_stage_work = bool(
                         requested_identifiers
@@ -3188,6 +3243,12 @@ def run_keep_list_screening_pipeline(
                     platform_summary["mail_only_update_preview"] = [
                         str(item.get("creator_id") or "").strip()
                         for item in mail_only_update_entries[:10]
+                        if str(item.get("creator_id") or "").strip()
+                    ]
+                    platform_summary["skippable_count"] = len(skippable_entries)
+                    platform_summary["skippable_preview"] = [
+                        str(item.get("creator_id") or "").strip()
+                        for item in skippable_entries[:10]
                         if str(item.get("creator_id") or "").strip()
                     ]
                     platform_summary["partial_refresh_count"] = len(partial_refresh_entries)

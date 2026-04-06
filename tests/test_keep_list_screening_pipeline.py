@@ -2235,7 +2235,7 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         self.assertEqual(platform_summary["status"], "completed")
         self.assertCountEqual(
             backend_app.app.test_client().scrape_start_calls[0]["payload"]["usernames"],
-            ["alpha", "beta", "gamma"],
+            ["beta", "gamma"],
         )
         self.assertTrue(summary["existing_bitable_prefilter"]["enabled"])
         self.assertEqual(platform_summary["incremental_prefilter"]["existing_bitable_match_count"], 2)
@@ -2244,26 +2244,27 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         self.assertEqual(platform_summary["incremental_prefilter"]["existing_unscreened_count"], 1)
         self.assertEqual(platform_summary["incremental_prefilter"]["full_screening_candidate_count"], 2)
         self.assertEqual(platform_summary["incremental_prefilter"]["mail_only_update_count"], 0)
-        self.assertEqual(platform_summary["incremental_prefilter"]["partial_refresh_count"], 1)
-        self.assertEqual(
-            platform_summary["incremental_prefilter"]["partial_refresh_breakdown"],
-            {"scrape_missing_instagram": 1},
-        )
+        self.assertEqual(platform_summary["incremental_prefilter"]["skippable_count"], 1)
+        self.assertEqual(platform_summary["incremental_prefilter"]["skippable_preview"], ["alpha"])
+        self.assertEqual(platform_summary["incremental_prefilter"]["partial_refresh_count"], 0)
         self.assertEqual(platform_summary["mail_only_update_count"], 0)
-        self.assertEqual(platform_summary["partial_refresh_count"], 1)
-        self.assertEqual(platform_summary["requested_identifier_count"], 3)
+        self.assertEqual(platform_summary["skippable_count"], 1)
+        self.assertEqual(platform_summary["partial_refresh_count"], 0)
+        self.assertEqual(platform_summary["requested_identifier_count"], 2)
         self.assertTrue(summary["observability"]["layers"]["incremental_creator"]["enabled"])
         self.assertEqual(summary["observability"]["layers"]["incremental_creator"]["existing_bitable_match_count"], 2)
         self.assertEqual(summary["observability"]["layers"]["incremental_creator"]["incremental_candidate_count"], 1)
         self.assertEqual(summary["observability"]["layers"]["incremental_creator"]["existing_screened_count"], 1)
         self.assertEqual(summary["observability"]["layers"]["incremental_creator"]["existing_unscreened_count"], 1)
         self.assertEqual(summary["observability"]["layers"]["incremental_creator"]["mail_only_update_count"], 0)
-        self.assertEqual(summary["observability"]["layers"]["incremental_creator"]["partial_refresh_count"], 1)
-        self.assertEqual(summary["observability"]["layers"]["screening_execution"]["platforms"]["instagram"]["requested_identifier_count"], 3)
+        self.assertEqual(summary["observability"]["layers"]["incremental_creator"]["skippable_count"], 1)
+        self.assertEqual(summary["observability"]["layers"]["incremental_creator"]["partial_refresh_count"], 0)
+        self.assertEqual(summary["observability"]["layers"]["screening_execution"]["platforms"]["instagram"]["requested_identifier_count"], 2)
         self.assertEqual(summary["observability"]["layers"]["screening_execution"]["platforms"]["instagram"]["mail_only_update_count"], 0)
-        self.assertEqual(summary["observability"]["layers"]["screening_execution"]["platforms"]["instagram"]["partial_refresh_count"], 1)
+        self.assertEqual(summary["observability"]["layers"]["screening_execution"]["platforms"]["instagram"]["skippable_count"], 1)
+        self.assertEqual(summary["observability"]["layers"]["screening_execution"]["platforms"]["instagram"]["partial_refresh_count"], 0)
         self.assertIn("新增 1 个", json.dumps(summary["diagnostics"], ensure_ascii=False))
-        self.assertIn("局部补齐 1 个", json.dumps(summary["diagnostics"], ensure_ascii=False))
+        self.assertIn("静默跳过 1 个", json.dumps(summary["diagnostics"], ensure_ascii=False))
 
     def test_runner_supports_dry_run_incremental_plan_without_launching_jobs(self) -> None:
         preflight = {
@@ -2336,24 +2337,25 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         self.assertEqual(backend_app.app.test_client().visual_start_calls, [])
         self.assertEqual(backend_app.app.test_client().positioning_start_calls, [])
         self.assertEqual(summary["platforms"]["instagram"]["status"], "dry_run_only")
-        self.assertEqual(summary["platforms"]["instagram"]["requested_identifier_count"], 3)
+        self.assertEqual(summary["platforms"]["instagram"]["requested_identifier_count"], 2)
         self.assertEqual(summary["platforms"]["instagram"]["mail_only_update_count"], 0)
-        self.assertEqual(summary["platforms"]["instagram"]["partial_refresh_count"], 1)
+        self.assertEqual(summary["platforms"]["instagram"]["skippable_count"], 1)
+        self.assertEqual(summary["platforms"]["instagram"]["partial_refresh_count"], 0)
         self.assertEqual(summary["dry_run_report"]["total_keep_row_count"], 3)
         self.assertEqual(summary["dry_run_report"]["existing_bitable_match_count"], 2)
         self.assertEqual(summary["dry_run_report"]["incremental_candidate_count"], 1)
         self.assertEqual(summary["dry_run_report"]["full_screening_candidate_count"], 2)
         self.assertEqual(summary["dry_run_report"]["mail_only_update_count"], 0)
-        self.assertEqual(summary["dry_run_report"]["partial_refresh_count"], 1)
-        self.assertEqual(summary["partial_refresh_count"], 1)
-        self.assertEqual(summary["partial_refresh_breakdown"]["scrape_missing_instagram"], 1)
-        self.assertEqual(summary["partial_refresh_breakdown"]["visual_missing_instagram"], 1)
-        self.assertEqual(summary["partial_refresh_breakdown"]["positioning_missing_instagram"], 1)
+        self.assertEqual(summary["dry_run_report"]["skippable_count"], 1)
+        self.assertEqual(summary["dry_run_report"]["partial_refresh_count"], 0)
+        self.assertEqual(summary["skippable_count"], 1)
+        self.assertEqual(summary["partial_refresh_count"], 0)
+        self.assertEqual(summary["partial_refresh_breakdown"], {})
         self.assertEqual(summary["dry_run_report"]["estimated_execution_platforms"], ["instagram"])
         self.assertTrue(summary["observability"]["fallback_flags"]["dry_run"])
         self.assertEqual(summary["observability"]["layers"]["upload"]["status"], "skipped")
         self.assertIn("本次为 dry-run", json.dumps(summary["diagnostics"], ensure_ascii=False))
-        self.assertIn("局部补齐 1 个", json.dumps(summary["diagnostics"], ensure_ascii=False))
+        self.assertIn("静默跳过 1 个", json.dumps(summary["diagnostics"], ensure_ascii=False))
 
     def test_runner_classifies_existing_screened_creator_as_partial_refresh_when_visual_cache_is_missing(self) -> None:
         preflight = {
@@ -2442,6 +2444,85 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         self.assertEqual(summary["partial_refresh_count"], 1)
         self.assertEqual(summary["partial_refresh_preview"], ["alpha"])
         self.assertEqual(summary["partial_refresh_breakdown"], {"visual_missing_instagram": 1})
+
+    def test_runner_skips_existing_screened_creator_when_no_local_cache_exists(self) -> None:
+        preflight = {
+            "status": "configured",
+            "error_code": "",
+            "message": "视觉模型已就绪：openai",
+            "configured_provider_names": ["openai"],
+            "runnable_provider_names": ["openai"],
+            "preferred_provider": "openai",
+            "providers": [{"name": "openai", "runnable": True}],
+        }
+        backend_app = FakeBackendApp(
+            preflight,
+            metadata={"instagram": {"alpha": {"handle": "alpha"}}},
+        )
+
+        def fake_prepare_screening_inputs(**kwargs):
+            return {"prepared_at": "2026-03-28T01:02:03Z", "upload": {"stats": {"Instagram": 1}}}
+
+        keep_list_runner._load_runtime_dependencies = lambda: {
+            "backend_app": backend_app,
+            "build_feishu_open_client": lambda **kwargs: object(),
+            "fetch_existing_bitable_record_analysis": lambda client, *, linked_bitable_url: (
+                SimpleNamespace(source_url=linked_bitable_url, table_id="tbl", table_name="达人管理"),
+                SimpleNamespace(
+                    index={
+                        "alpha::instagram": {
+                            "record_id": "rec_alpha",
+                            "fields": {
+                                "ai 是否通过": "是",
+                                "标签(ai)": "家庭用品",
+                                "ai评价": "existing good fit",
+                            },
+                        }
+                    },
+                    duplicate_groups=[],
+                    key_field_names=("达人ID", "平台"),
+                    owner_scope_field_name="",
+                ),
+            ),
+            "prepare_screening_inputs": fake_prepare_screening_inputs,
+            "count_passed_profiles": lambda scrape_job: (_ for _ in ()).throw(AssertionError("dry-run should not count scrape results")),
+            "export_platform_artifacts": lambda client, platform, export_dir: (_ for _ in ()).throw(AssertionError("dry-run should not export artifacts")),
+            "poll_job": lambda client, job_id, label, interval: (_ for _ in ()).throw(AssertionError("dry-run should not poll jobs")),
+            "require_success": lambda response, label: response.get_json(),
+            "reset_backend_runtime_state": lambda: None,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            keep_path = temp_root / "keep.xlsx"
+            template_path = temp_root / "template.xlsx"
+            keep_path.touch()
+            template_path.touch()
+            env_path = self._write_env_file(temp_root)
+
+            summary = keep_list_runner.run_keep_list_screening_pipeline(
+                keep_workbook=keep_path,
+                template_workbook=template_path,
+                env_file=env_path,
+                output_root=temp_root / "run",
+                platform_filters=["instagram"],
+                dry_run=True,
+                linked_bitable_url="https://bitable.example.com/base/app?table=tbl&view=vew",
+            )
+
+        platform_summary = summary["platforms"]["instagram"]
+        self.assertEqual(summary["status"], "dry_run_only")
+        self.assertEqual(platform_summary["requested_identifier_count"], 0)
+        self.assertEqual(platform_summary["mail_only_update_count"], 0)
+        self.assertEqual(platform_summary["partial_refresh_count"], 0)
+        self.assertEqual(platform_summary["skippable_count"], 1)
+        self.assertEqual(platform_summary["skippable_preview"], ["alpha"])
+        self.assertEqual(platform_summary["incremental_prefilter"]["skippable_count"], 1)
+        self.assertEqual(platform_summary["incremental_prefilter"]["skippable_preview"], ["alpha"])
+        self.assertEqual(summary["skippable_count"], 1)
+        self.assertEqual(summary["skippable_preview"], ["alpha"])
+        self.assertEqual(summary["dry_run_report"]["estimated_execution_platforms"], [])
+        self.assertIn("静默跳过 1 个", json.dumps(summary["diagnostics"], ensure_ascii=False))
 
     def test_runner_partial_refresh_only_schedules_missing_stages(self) -> None:
         preflight = {
