@@ -4080,6 +4080,7 @@ def run_keep_list_screening_pipeline(
             payload_json_path=exports_dir / "all_platforms_final_review_payload.json",
             final_exports=combined_exports,
             keep_workbook=resolved_keep_workbook,
+            pre_keep_mail_only_workbook=str(summary["artifacts"].get("pre_keep_mail_only_workbook") or "").strip(),
             manual_review_rows=summary.get("manual_review_rows") or [],
             mail_only_updates=mail_only_updates_by_platform,
             task_owner={
@@ -4361,6 +4362,15 @@ def _extract_task_owner_context_from_payload(
     resolved_inputs = payload.get("resolved_inputs") if isinstance(payload.get("resolved_inputs"), dict) else {}
     resolved_feishu = resolved_inputs.get("feishu") if isinstance(resolved_inputs.get("feishu"), dict) else {}
     steps = payload.get("steps") if isinstance(payload.get("steps"), dict) else {}
+    upstream_step = steps.get("upstream") if isinstance(steps.get("upstream"), dict) else {}
+    upstream_downstream_handoff = (
+        upstream_step.get("downstream_handoff") if isinstance(upstream_step.get("downstream_handoff"), dict) else {}
+    )
+    upstream_handoff_owner = (
+        upstream_downstream_handoff.get("task_owner")
+        if isinstance(upstream_downstream_handoff.get("task_owner"), dict)
+        else {}
+    )
     task_assets_step = steps.get("task_assets") if isinstance(steps.get("task_assets"), dict) else {}
     task_assets_raw = task_assets_step.get("raw") if isinstance(task_assets_step.get("raw"), dict) else {}
 
@@ -4371,12 +4381,16 @@ def _extract_task_owner_context_from_payload(
         resolved_task_owner.get("employee_id"),
         handoff_owner.get("task_owner_employee_id"),
         handoff_owner.get("employee_id"),
+        upstream_handoff_owner.get("task_owner_employee_id"),
+        upstream_handoff_owner.get("employee_id"),
     )
     linked_url = _first_non_empty(
         task_owner.get("linked_bitable_url"),
         resolved_task_owner.get("linked_bitable_url"),
         handoff_owner.get("linked_bitable_url"),
         downstream_handoff.get("linked_bitable_url"),
+        upstream_handoff_owner.get("linked_bitable_url"),
+        upstream_downstream_handoff.get("linked_bitable_url"),
         task_assets_step.get("linked_bitable_url"),
         task_assets_step.get("linkedBitableUrl"),
         task_assets_raw.get("linked_bitable_url"),
@@ -4390,6 +4404,9 @@ def _extract_task_owner_context_from_payload(
         handoff_owner.get("task_owner_name"),
         handoff_owner.get("responsible_name"),
         handoff_owner.get("employee_name"),
+        upstream_handoff_owner.get("task_owner_name"),
+        upstream_handoff_owner.get("responsible_name"),
+        upstream_handoff_owner.get("employee_name"),
     )
     record_id = _first_non_empty(
         task_owner.get("task_owner_employee_record_id"),
@@ -4398,6 +4415,8 @@ def _extract_task_owner_context_from_payload(
         resolved_task_owner.get("employee_record_id"),
         handoff_owner.get("task_owner_employee_record_id"),
         handoff_owner.get("employee_record_id"),
+        upstream_handoff_owner.get("task_owner_employee_record_id"),
+        upstream_handoff_owner.get("employee_record_id"),
     )
     employee_email = _first_non_empty(
         task_owner.get("task_owner_employee_email"),
@@ -4406,6 +4425,8 @@ def _extract_task_owner_context_from_payload(
         resolved_task_owner.get("employee_email"),
         handoff_owner.get("task_owner_employee_email"),
         handoff_owner.get("employee_email"),
+        upstream_handoff_owner.get("task_owner_employee_email"),
+        upstream_handoff_owner.get("employee_email"),
     )
     owner_login = _first_non_empty(
         task_owner.get("task_owner_owner_name"),
@@ -4414,16 +4435,20 @@ def _extract_task_owner_context_from_payload(
         resolved_task_owner.get("owner_name"),
         handoff_owner.get("task_owner_owner_name"),
         handoff_owner.get("owner_name"),
+        upstream_handoff_owner.get("task_owner_owner_name"),
+        upstream_handoff_owner.get("owner_name"),
     )
     task_name = _first_non_empty(
         task_owner.get("task_name"),
         resolved_task_owner.get("task_name"),
         handoff_owner.get("task_name"),
+        upstream_handoff_owner.get("task_name"),
         intent.get("task_name"),
     )
     task_upload_url = _first_non_empty(
         task_owner.get("task_upload_url"),
         handoff_owner.get("task_upload_url"),
+        upstream_handoff_owner.get("task_upload_url"),
         intent.get("task_upload_url"),
         resolved_feishu.get("task_upload_url"),
     )

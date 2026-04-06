@@ -169,6 +169,41 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         env_path.write_text("TEST_ONLY=1\n", encoding="utf-8")
         return env_path
 
+    def test_infer_task_owner_from_adjacent_final_runner_summary_uses_nested_upstream_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            keep_workbook = root / "downstream" / "exports" / "MINISO_final_keep.xlsx"
+            keep_workbook.parent.mkdir(parents=True, exist_ok=True)
+            keep_workbook.touch()
+            summary_path = root / "summary.json"
+            summary_path.write_text(
+                json.dumps(
+                    {
+                        "steps": {
+                            "upstream": {
+                                "downstream_handoff": {
+                                    "linked_bitable_url": "https://bitable.example/miniso",
+                                    "task_owner": {
+                                        "task_name": "MINISO",
+                                        "task_upload_url": "https://task.example/miniso",
+                                    },
+                                }
+                            }
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            inferred = keep_list_runner._infer_task_owner_from_adjacent_task_spec(
+                keep_workbook=keep_workbook,
+            )
+
+        self.assertEqual(inferred["linked_bitable_url"], "https://bitable.example/miniso")
+        self.assertEqual(inferred["task_name"], "MINISO")
+        self.assertEqual(inferred["task_upload_url"], "https://task.example/miniso")
+
     def test_runner_fails_early_when_keep_workbook_is_missing(self) -> None:
         keep_list_runner._load_runtime_dependencies = lambda: (_ for _ in ()).throw(AssertionError("runtime should not load"))
 
