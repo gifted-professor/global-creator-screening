@@ -6301,25 +6301,88 @@ def perform_positioning_card_analysis(platform, payload, progress_callback=None,
 
     results = load_positioning_card_results(platform)
     target_identifiers = [screening.resolve_profile_review_identifier(platform, item) for item in targets]
-    max_workers = resolve_visual_review_max_workers(payload, len(targets), requested_provider=requested_provider)
+    creator_cache_enabled = creator_cache.creator_cache_enabled(payload)
+    force_refresh_creator_cache = creator_cache.creator_cache_force_refresh(payload)
+    creator_cache_db_path = creator_cache.resolve_creator_cache_db_path(payload)
+    positioning_cache_context = build_positioning_card_cache_context(
+        platform,
+        requested_provider=requested_provider,
+        providers=providers,
+        active_rulespec=load_active_rulespec(),
+    )
+    creator_cache_hit_identifiers: list[str] = []
+    if creator_cache_enabled and not force_refresh_creator_cache:
+        cached_positioning_results = creator_cache.load_positioning_cache_entries(
+            platform,
+            target_identifiers,
+            creator_cache_db_path,
+            str(positioning_cache_context.get("context_key") or ""),
+        )
+        for identifier, cached_positioning_result in cached_positioning_results.items():
+            if creator_cache.is_cacheable_positioning_result(cached_positioning_result):
+                results[identifier] = dict(cached_positioning_result)
+                creator_cache_hit_identifiers.append(identifier)
+        if cached_positioning_results:
+            save_positioning_card_results(platform, results)
+
+    pending_targets = []
+    completed_identifier_set = {identifier for identifier in creator_cache_hit_identifiers if identifier}
+    seen_pending_identifiers = set()
+    for item in targets:
+        identifier = screening.resolve_profile_review_identifier(platform, item)
+        if identifier in completed_identifier_set:
+            continue
+        if identifier and identifier in seen_pending_identifiers:
+            continue
+        if identifier:
+            seen_pending_identifiers.add(identifier)
+        pending_targets.append(item)
+
+    max_workers = resolve_visual_review_max_workers(payload, len(pending_targets) or len(targets), requested_provider=requested_provider)
     item_timeout_seconds = resolve_visual_review_item_timeout_seconds(payload)
     started_at = time.monotonic()
     future_poll_timeout_seconds = min(0.5, max(0.05, item_timeout_seconds / 4.0))
+    creator_cache_summary = {
+        "enabled": bool(creator_cache_enabled),
+        "db_path": str(creator_cache_db_path),
+        "force_refresh": bool(force_refresh_creator_cache),
+        "positioning_hit_count": len(creator_cache_hit_identifiers),
+        "positioning_hit_preview": creator_cache_hit_identifiers[:10],
+        "positioning_miss_count": len(pending_targets),
+        "positioning_context_key": str(positioning_cache_context.get("context_key") or ""),
+    }
+    if not pending_targets:
+        final_result = build_positioning_card_partial_result(platform, results, targets)
+        final_result.update({
+            "success": True,
+            "message": (
+                f"{UPLOAD_PLATFORM_RESPONSE_LABELS.get(platform, platform)} 定位卡分析完成，"
+                f"共处理 {len(targets)} 个账号。"
+            ),
+            "positioning_card_results": results,
+            "max_workers": 0,
+            "selected_provider": preflight.get("preferred_provider") or requested_provider,
+            "elapsed_seconds": round(time.monotonic() - started_at, 3),
+            "creator_cache": creator_cache_summary,
+        })
+        return final_result
+
     if progress_callback:
         progress_callback(
             "preparing",
             "正在准备定位卡分析任务",
-            done=0,
+            done=len(creator_cache_hit_identifiers),
             total=len(targets),
             providers=[item["name"] for item in providers],
             selected_provider=preflight.get("preferred_provider") or requested_provider,
             max_workers=max_workers,
             item_timeout_seconds=item_timeout_seconds,
+            creator_cache=creator_cache_summary,
             **build_target_preview(target_identifiers),
         )
 
-    completed = 0
-    target_iter = iter(targets)
+    completed = len(creator_cache_hit_identifiers)
+    target_iter = iter(pending_targets)
     future_map = {}
 
     def finalize_analysis(identifier, review_item, result=None, error_text=None):
@@ -6371,6 +6434,16 @@ def perform_positioning_card_analysis(platform, payload, progress_callback=None,
                 "base_url": result.get("base_url"),
                 "raw_text": result.get("raw_text"),
             }
+            if creator_cache_enabled:
+                creator_cache.persist_positioning_cache_entry(
+                    platform,
+                    identifier,
+                    results[identifier],
+                    creator_cache_db_path,
+                    updated_at=str(results[identifier].get("reviewed_at") or iso_now()),
+                    context_key=str(positioning_cache_context.get("context_key") or ""),
+                    context_payload=positioning_cache_context.get("context_payload") or {},
+                )
 
         completed += 1
         save_positioning_card_results(platform, results)
@@ -6481,6 +6554,7 @@ def perform_positioning_card_analysis(platform, payload, progress_callback=None,
         "max_workers": max_workers,
         "selected_provider": preflight.get("preferred_provider") or requested_provider,
         "elapsed_seconds": round(time.monotonic() - started_at, 3),
+        "creator_cache": creator_cache_summary,
     })
     return final_result
 
