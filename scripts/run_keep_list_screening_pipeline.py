@@ -1090,6 +1090,7 @@ def _compact_upload_summary(upload_summary: dict[str, Any] | None) -> dict[str, 
     if not payload:
         return {}
     upload_detail = dict(payload.get("upload_detail") or {})
+    preflight = dict(payload.get("preflight") or {})
     duplicate_existing_groups = list(upload_detail.get("duplicate_existing_groups") or [])
     compact_upload_detail = {
         "created_key_count": len(list(upload_detail.get("created_keys") or [])),
@@ -1131,6 +1132,16 @@ def _compact_upload_summary(upload_summary: dict[str, Any] | None) -> dict[str, 
         "duplicate_existing_group_count": int(payload.get("duplicate_existing_group_count") or 0),
         "duplicate_payload_group_count": int(payload.get("duplicate_payload_group_count") or 0),
         "deduplicated_row_count": int(payload.get("deduplicated_row_count") or 0),
+        "preflight": {
+            "ready": bool(preflight.get("ready", True)),
+            "blocker_count": int(preflight.get("blocker_count") or 0),
+            "message": str(preflight.get("message") or "").strip(),
+            "missing_required_field_names": list(preflight.get("missing_required_field_names") or []),
+            "invalid_platform_record_count": int(preflight.get("invalid_platform_record_count") or 0),
+            "owner_scope_missing_record_count": int(preflight.get("owner_scope_missing_record_count") or 0),
+            "duplicate_existing_group_count": int(preflight.get("duplicate_existing_group_count") or 0),
+            "blockers": list(preflight.get("blockers") or [])[:10],
+        },
         "request_control": dict(payload.get("request_control") or {}),
         "retry_summary": {
             "enabled": bool(retry_summary.get("enabled")),

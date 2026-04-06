@@ -63,6 +63,9 @@ _MAIL_IDEMPOTENCY_FIELD_NAMES = (
     "last_mail_sent_at",
     "mail_update_revision",
 )
+_REQUIRED_TARGET_FIELD_NAMES = ("达人ID", "平台", "主页链接")
+_VALID_PLATFORM_VALUES = ("tiktok", "instagram", "youtube")
+_PREFLIGHT_DETAIL_PREVIEW_LIMIT = 100
 
 _UPLOAD_BASE_KEY_FIELDS = ("达人ID", "平台")
 _OWNER_SCOPE_FIELD_CANDIDATES: tuple[str, ...] = ()
@@ -112,6 +115,19 @@ class ExistingRecordAnalysis:
     key_display_name: str
     owner_scope_field_name: str
     owner_scope_missing_record_count: int
+
+
+@dataclass(frozen=True)
+class UploadPreflightResult:
+    ready: bool
+    blockers: list[dict[str, Any]]
+    missing_required_field_names: list[str]
+    owner_scope_field_name: str
+    invalid_platform_records: list[dict[str, Any]]
+    owner_scope_missing_records: list[dict[str, Any]]
+    duplicate_existing_groups: list[dict[str, Any]]
+    duplicate_payload_groups: list[dict[str, Any]]
+    message: str
 
 
 class _UploadRequestController:
@@ -371,8 +387,9 @@ def upload_final_review_payload_to_bitable(
     resolved_view = resolve_bitable_view_from_url(retrying_client, target_url)
     field_schemas = _fetch_field_schemas(retrying_client, resolved_view)
     attachment_schema = _select_attachment_field_schema(field_schemas)
+    existing_record_rows = _fetch_existing_records(retrying_client, resolved_view)
     existing_record_analysis = _build_existing_record_analysis(
-        _fetch_existing_records(retrying_client, resolved_view),
+        existing_record_rows,
         field_schemas=field_schemas,
     )
     existing_records = existing_record_analysis.index
@@ -384,6 +401,17 @@ def upload_final_review_payload_to_bitable(
         rows = rows[: int(limit)]
     selected_row_count = len(rows)
     mail_idempotency_field_names = _resolve_mail_idempotency_field_names(field_schemas)
+    payload_duplicate_groups = _find_payload_duplicate_groups(rows, key_field_names=key_field_names)
+    duplicate_existing_groups = list(existing_record_analysis.duplicate_groups)
+
+    preflight = _run_upload_preflight_checks(
+        field_schemas=field_schemas,
+        existing_records=existing_record_rows,
+        existing_record_analysis=existing_record_analysis,
+        duplicate_existing_groups=duplicate_existing_groups,
+        duplicate_payload_groups=payload_duplicate_groups,
+        key_display_name=key_display_name,
+    )
 
     created_rows: list[dict[str, Any]] = []
     updated_rows: list[dict[str, Any]] = []
@@ -392,42 +420,8 @@ def upload_final_review_payload_to_bitable(
     failed_rows: list[dict[str, Any]] = []
     deduplicated_rows_log: list[dict[str, Any]] = []
     duplicate_existing_warning_rows: list[dict[str, Any]] = []
-    payload_duplicate_groups = _find_payload_duplicate_groups(rows, key_field_names=key_field_names)
-    duplicate_existing_groups = list(existing_record_analysis.duplicate_groups)
-    payload_owner_scopes = _extract_payload_owner_scopes(rows)
-    missing_owner_scope_field = bool(payload_owner_scopes) and not existing_record_analysis.owner_scope_field_name
-    has_unscoped_existing_records = bool(payload_owner_scopes) and int(
-        existing_record_analysis.owner_scope_missing_record_count or 0
-    ) > 0
-
-    if missing_owner_scope_field or has_unscoped_existing_records:
-        if missing_owner_scope_field:
-            failed_rows.append(
-                {
-                    "status": "blocked_missing_owner_scope_field",
-                    "record_key": "",
-                    "record_id": "",
-                    "existing_record_id": "",
-                    "row": {},
-                    "error": "目标飞书表缺少 `达人对接人` 字段，无法区分不同负责人下重复的达人记录，已阻止继续写入。",
-                }
-            )
-        if has_unscoped_existing_records:
-            failed_rows.append(
-                {
-                    "status": "blocked_missing_owner_scope_existing_records",
-                    "record_key": "",
-                    "record_id": "",
-                    "existing_record_id": "",
-                    "row": {},
-                    "error": "目标飞书表已存在未填写 `达人对接人` 的历史记录，当前无法安全区分不同负责人下的达人，已阻止继续写入。",
-                }
-            )
-        error_messages: list[str] = []
-        if missing_owner_scope_field:
-            error_messages.append("目标飞书表缺少 `达人对接人` 字段")
-        if has_unscoped_existing_records:
-            error_messages.append("目标飞书表存在未填写 `达人对接人` 的历史记录")
+    if not preflight.ready:
+        failed_rows.extend(_build_preflight_failed_rows(preflight))
         summary = {
             "ok": False,
             "dry_run": bool(dry_run),
@@ -450,11 +444,12 @@ def upload_final_review_payload_to_bitable(
             "skipped_existing_count": 0,
             "failed_count": len(failed_rows),
             "guard_blocked": True,
-            "error": "；".join(error_messages) + "，已阻止继续写入。",
+            "error": preflight.message,
+            "preflight": _serialize_upload_preflight(preflight),
             "key_field_names": list(key_field_names),
             "key_display_name": key_display_name,
-            "owner_scope_field_name": existing_record_analysis.owner_scope_field_name,
-            "owner_scope_missing_record_count": existing_record_analysis.owner_scope_missing_record_count,
+            "owner_scope_field_name": preflight.owner_scope_field_name,
+            "owner_scope_missing_record_count": len(preflight.owner_scope_missing_records),
             "mail_idempotency_supported_field_names": dict(mail_idempotency_field_names),
             "mail_idempotency_skip_count": 0,
             "mail_idempotency_skipped_rows": [],
@@ -759,6 +754,7 @@ def upload_final_review_payload_to_bitable(
         "updated_count": len(updated_rows),
         "skipped_existing_count": len(skipped_existing_rows),
         "failed_count": len(failed_rows),
+        "preflight": _serialize_upload_preflight(preflight),
         "mail_idempotency_supported_field_names": dict(mail_idempotency_field_names),
         "mail_idempotency_skip_count": len(mail_idempotency_skipped_rows),
         "mail_idempotency_skipped_rows": mail_idempotency_skipped_rows,
@@ -808,6 +804,269 @@ def upload_final_review_payload_to_bitable(
         warning_rows=deduplicated_rows_log + duplicate_existing_warning_rows,
     )
     return summary
+
+
+def _run_upload_preflight_checks(
+    *,
+    field_schemas: dict[str, FieldSchema],
+    existing_records: list[tuple[str, dict[str, Any]]],
+    existing_record_analysis: ExistingRecordAnalysis,
+    duplicate_existing_groups: list[dict[str, Any]],
+    duplicate_payload_groups: list[dict[str, Any]],
+    key_display_name: str,
+) -> UploadPreflightResult:
+    missing_required_field_names = [
+        field_name
+        for field_name in _REQUIRED_TARGET_FIELD_NAMES
+        if _lookup_field_schema(field_schemas, field_name) is None
+    ]
+    owner_scope_field_name = ""
+
+    invalid_platform_records: list[dict[str, Any]] = []
+    owner_scope_missing_records: list[dict[str, Any]] = []
+    for record_id, fields in existing_records:
+        creator_id = _flatten_field_value(_get_field_value_by_candidates(fields, "达人ID"))
+        platform_value = _flatten_field_value(_get_field_value_by_candidates(fields, "平台"))
+        profile_url = _flatten_field_value(_get_field_value_by_candidates(fields, "主页链接"))
+        owner_scope_value = ""
+        normalized_platform = platform_value.casefold()
+        if normalized_platform not in _VALID_PLATFORM_VALUES:
+            invalid_platform_records.append(
+                {
+                    "record_id": _clean_text(record_id),
+                    "creator_id": creator_id,
+                    "platform": platform_value,
+                    "profile_url": profile_url,
+                    "owner_scope_value": owner_scope_value,
+                }
+            )
+
+    blockers: list[dict[str, Any]] = []
+    if missing_required_field_names:
+        blockers.append(
+            {
+                "category": "表结构检查",
+                "error_code": "MISSING_REQUIRED_FIELDS",
+                "status": "blocked_missing_required_fields",
+                "message": "目标表缺少必要字段：" + "、".join(f"「{name}」" for name in missing_required_field_names),
+                "details": [],
+            }
+        )
+    if invalid_platform_records:
+        blockers.append(
+            {
+                "category": "脏数据门禁",
+                "error_code": "INVALID_PLATFORM_VALUES",
+                "status": "blocked_invalid_platform_values",
+                "message": (
+                    f"发现 {len(invalid_platform_records)} 条「平台」列非标准值，"
+                    "仅允许 tiktok / instagram / youtube。"
+                ),
+                "details": invalid_platform_records[:_PREFLIGHT_DETAIL_PREVIEW_LIMIT],
+            }
+        )
+    if duplicate_existing_groups:
+        blockers.append(
+            {
+                "category": "重复组检查",
+                "error_code": "EXISTING_DUPLICATE_GROUPS_FOUND",
+                "status": "blocked_duplicate_existing_groups",
+                "message": (
+                    f"目标飞书表存在 {len(duplicate_existing_groups)} 组重复的 {key_display_name} 记录，"
+                    "请先清理后再上传。"
+                ),
+                "details": [
+                    {
+                        "record_key": _clean_text(group.get("record_key")),
+                        "creator_id": _clean_text(group.get("creator_id")),
+                        "platform": _clean_text(group.get("platform")),
+                        "keep_record_id": _clean_text(((group.get("keep_record") or {}).get("record_id"))),
+                        "duplicate_record_ids": [
+                            _clean_text(item.get("record_id"))
+                            for item in list(group.get("duplicate_records") or [])
+                            if _clean_text(item.get("record_id"))
+                        ],
+                    }
+                    for group in duplicate_existing_groups[:_PREFLIGHT_DETAIL_PREVIEW_LIMIT]
+                    if isinstance(group, dict)
+                ],
+            }
+        )
+
+    message = _compose_upload_preflight_block_message(blockers)
+    return UploadPreflightResult(
+        ready=not blockers,
+        blockers=blockers,
+        missing_required_field_names=missing_required_field_names,
+        owner_scope_field_name=owner_scope_field_name,
+        invalid_platform_records=invalid_platform_records,
+        owner_scope_missing_records=owner_scope_missing_records,
+        duplicate_existing_groups=duplicate_existing_groups,
+        duplicate_payload_groups=duplicate_payload_groups,
+        message=message,
+    )
+
+
+def _compose_upload_preflight_block_message(blockers: list[dict[str, Any]]) -> str:
+    if not blockers:
+        return ""
+    lines = [f"上传被阻断（{len(blockers)} 个检查未通过）"]
+    for index, blocker in enumerate(blockers, start=1):
+        category = _clean_text(blocker.get("category")) or "预检"
+        message = _clean_text(blocker.get("message"))
+        lines.append(f"{index}. {category}")
+        if message:
+            lines.append(f"   -> {message}")
+        details = list(blocker.get("details") or [])
+        if not details:
+            continue
+        if _clean_text(blocker.get("error_code")) == "INVALID_PLATFORM_VALUES":
+            preview = [
+                f"{_clean_text(item.get('record_id')) or '-'}={_clean_text(item.get('platform')) or '<空>'}"
+                for item in details[:10]
+            ]
+            if preview:
+                lines.append(f"   -> record_ids: {', '.join(preview)}")
+        elif _clean_text(blocker.get("error_code")) == "EXISTING_OWNER_SCOPE_MISSING":
+            preview = [
+                _clean_text(item.get("record_id"))
+                for item in details[:10]
+                if _clean_text(item.get("record_id"))
+            ]
+            if preview:
+                lines.append(f"   -> record_ids: {', '.join(preview)}")
+        elif _clean_text(blocker.get("error_code")) == "EXISTING_DUPLICATE_GROUPS_FOUND":
+            preview = [
+                _clean_text(item.get("keep_record_id"))
+                for item in details[:10]
+                if _clean_text(item.get("keep_record_id"))
+            ]
+            if preview:
+                lines.append(f"   -> keep_record_ids: {', '.join(preview)}")
+    lines.append("请先修复以上问题，再重新运行上传。")
+    return "\n".join(lines)
+
+
+def _serialize_upload_preflight(preflight: UploadPreflightResult) -> dict[str, Any]:
+    return {
+        "ready": bool(preflight.ready),
+        "blocker_count": len(preflight.blockers),
+        "message": str(preflight.message or "").strip(),
+        "missing_required_field_names": list(preflight.missing_required_field_names),
+        "owner_scope_field_name": str(preflight.owner_scope_field_name or "").strip(),
+        "invalid_platform_record_count": len(preflight.invalid_platform_records),
+        "invalid_platform_records": list(preflight.invalid_platform_records[:20]),
+        "owner_scope_missing_record_count": len(preflight.owner_scope_missing_records),
+        "owner_scope_missing_records": list(preflight.owner_scope_missing_records[:20]),
+        "duplicate_existing_group_count": len(preflight.duplicate_existing_groups),
+        "duplicate_existing_groups": list(preflight.duplicate_existing_groups[:20]),
+        "duplicate_payload_group_count": len(preflight.duplicate_payload_groups),
+        "blockers": [
+            {
+                "category": _clean_text(item.get("category")),
+                "error_code": _clean_text(item.get("error_code")),
+                "status": _clean_text(item.get("status")),
+                "message": _clean_text(item.get("message")),
+                "detail_count": len(list(item.get("details") or [])),
+                "details_preview": list(item.get("details") or [])[:20],
+            }
+            for item in preflight.blockers
+        ],
+    }
+
+
+def _build_preflight_failed_rows(preflight: UploadPreflightResult) -> list[dict[str, Any]]:
+    failed_rows: list[dict[str, Any]] = []
+    for blocker in preflight.blockers:
+        status = _clean_text(blocker.get("status")) or "blocked_preflight"
+        message = _clean_text(blocker.get("message")) or "上传前检查未通过。"
+        error_code = _clean_text(blocker.get("error_code"))
+        details = list(blocker.get("details") or [])
+        if not details:
+            failed_rows.append(
+                {
+                    "status": status,
+                    "record_key": "",
+                    "record_id": "",
+                    "existing_record_id": "",
+                    "row": {},
+                    "error": message,
+                    "error_code": error_code,
+                }
+            )
+            continue
+        if error_code == "INVALID_PLATFORM_VALUES":
+            for detail in details:
+                failed_rows.append(
+                    {
+                        "status": status,
+                        "record_key": "",
+                        "record_id": _clean_text(detail.get("record_id")),
+                        "existing_record_id": _clean_text(detail.get("record_id")),
+                        "row": {
+                            "达人ID": _clean_text(detail.get("creator_id")),
+                            "平台": _clean_text(detail.get("platform")),
+                            "主页链接": _clean_text(detail.get("profile_url")),
+                            "达人对接人": _clean_text(detail.get("owner_scope_value")),
+                        },
+                        "error": (
+                            f"「平台」列值非法：{_clean_text(detail.get('platform')) or '<空>'}；"
+                            "仅允许 tiktok / instagram / youtube。"
+                        ),
+                        "error_code": error_code,
+                    }
+                )
+            continue
+        if error_code == "EXISTING_OWNER_SCOPE_MISSING":
+            for detail in details:
+                failed_rows.append(
+                    {
+                        "status": status,
+                        "record_key": "",
+                        "record_id": _clean_text(detail.get("record_id")),
+                        "existing_record_id": _clean_text(detail.get("record_id")),
+                        "row": {
+                            "达人ID": _clean_text(detail.get("creator_id")),
+                            "平台": _clean_text(detail.get("platform")),
+                            "主页链接": _clean_text(detail.get("profile_url")),
+                            "达人对接人": "",
+                        },
+                        "error": "历史记录缺少「达人对接人」，当前无法安全区分不同负责人下的达人。",
+                        "error_code": error_code,
+                    }
+                )
+            continue
+        if error_code == "EXISTING_DUPLICATE_GROUPS_FOUND":
+            for group in list(preflight.duplicate_existing_groups[:_PREFLIGHT_DETAIL_PREVIEW_LIMIT]):
+                keep_record = dict(group.get("keep_record") or {})
+                duplicate_count = len(list(group.get("duplicate_records") or [])) + 1
+                failed_rows.append(
+                    {
+                        "status": status,
+                        "record_key": _clean_text(group.get("record_key")),
+                        "record_id": _clean_text(keep_record.get("record_id")),
+                        "existing_record_id": _clean_text(keep_record.get("record_id")),
+                        "row": dict(keep_record.get("fields") or {}),
+                        "error": (
+                            f"目标飞书表存在 {duplicate_count} 条重复记录，"
+                            "请先清理后再上传。"
+                        ),
+                        "error_code": error_code,
+                    }
+                )
+            continue
+        failed_rows.append(
+            {
+                "status": status,
+                "record_key": "",
+                "record_id": "",
+                "existing_record_id": "",
+                "row": {},
+                "error": message,
+                "error_code": error_code,
+            }
+        )
+    return failed_rows
 
 
 def _persist_upload_result_artifacts(
