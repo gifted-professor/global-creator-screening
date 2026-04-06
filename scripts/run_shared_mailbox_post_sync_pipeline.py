@@ -194,6 +194,13 @@ def _path_summary(path: Path | None, *, source: str, kind: str) -> dict[str, Any
     }
 
 
+def _resolve_optional_path(raw_value: Any) -> Path | None:
+    text = _clean_text(raw_value)
+    if not text:
+        return None
+    return Path(text).expanduser()
+
+
 def _build_failure_payload(
     *,
     stage: str,
@@ -1841,6 +1848,8 @@ def run_shared_mailbox_post_sync_pipeline(
         "new_creator_count": 0,
         "existing_screened_count": 0,
         "existing_unscreened_count": 0,
+        "pre_keep_mail_only_count": 0,
+        "partial_refresh_count": 0,
         "known_thread_hit_count": 0,
         "thread_assignment_cache_hit_count": 0,
         "full_screening_count": 0,
@@ -1927,6 +1936,8 @@ def run_shared_mailbox_post_sync_pipeline(
             "representative_task_name": _clean_text(item.get("representativeTaskName")) or task_name,
             "linked_bitable_url": _clean_text(item.get("linkedBitableUrl")),
             "matched_mail_count": 0,
+            "pre_keep_mail_only_count": 0,
+            "partial_refresh_count": 0,
             "known_thread_hit_count": 0,
             "thread_assignment_cache_hit_count": 0,
             "full_screening_count": 0,
@@ -2016,19 +2027,20 @@ def run_shared_mailbox_post_sync_pipeline(
                 task_scope,
                 f"upstream=completed status={str(upstream_summary.get('status') or '').strip() or 'unknown'}",
             )
-            keep_workbook = Path(
-                str(
-                    ((upstream_summary.get("resume_points") or {}).get("keep_list") or {}).get("keep_workbook")
-                    or (upstream_summary.get("artifacts") or {}).get("keep_workbook")
-                    or ""
-                )
-            ).expanduser()
+            keep_workbook = _resolve_optional_path(
+                ((upstream_summary.get("resume_points") or {}).get("keep_list") or {}).get("keep_workbook")
+                or (upstream_summary.get("artifacts") or {}).get("keep_workbook")
+            )
+            pre_keep_mail_only_workbook = _resolve_optional_path(
+                ((upstream_summary.get("resume_points") or {}).get("keep_list") or {}).get("pre_keep_mail_only_workbook")
+                or (upstream_summary.get("artifacts") or {}).get("pre_keep_mail_only_workbook")
+            )
             template_workbook_value = str(
                 ((upstream_summary.get("resume_points") or {}).get("keep_list") or {}).get("template_workbook")
                 or (upstream_summary.get("artifacts") or {}).get("template_workbook")
                 or ""
             ).strip()
-            if str(upstream_summary.get("status") or "") == "failed" or not keep_workbook.exists():
+            if str(upstream_summary.get("status") or "") == "failed" or keep_workbook is None or not keep_workbook.is_file():
                 failure = _build_failure_payload(
                     stage="upstream",
                     error_code=str(upstream_summary.get("error_code") or "UPSTREAM_KEEP_LIST_FAILED"),
@@ -2074,6 +2086,18 @@ def run_shared_mailbox_post_sync_pipeline(
                 shared_mail_data_dir=resolved_mail_data_dir,
                 keep_workbook=keep_workbook,
             )
+            pre_keep_mail_only_frame = pd.DataFrame(columns=list(keep_frame.columns))
+            if pre_keep_mail_only_workbook is not None and pre_keep_mail_only_workbook.is_file():
+                pre_keep_mail_only_frame = _annotate_keep_frame_owner_context(
+                    pd.read_excel(pre_keep_mail_only_workbook),
+                    task_owner_context=owner_context,
+                    enable_row_level_owner_routing=bool(item.get("rowLevelOwnerRouting")),
+                    owner_candidates=owner_candidates,
+                    shared_mail_db_path=resolved_mail_db_path,
+                    shared_mail_raw_dir=resolved_mail_raw_dir,
+                    shared_mail_data_dir=resolved_mail_data_dir,
+                    keep_workbook=pre_keep_mail_only_workbook,
+                )
             _, existing_analysis = fetch_existing_bitable_record_analysis(
                 client,
                 linked_bitable_url=linked_bitable_url,
@@ -2117,8 +2141,13 @@ def run_shared_mailbox_post_sync_pipeline(
             mail_only_payload_rows: list[dict[str, Any]] = []
             combined_skipped_rows: list[dict[str, Any]] = []
             prepared_candidates: list[dict[str, Any]] = []
+            pre_keep_mail_only_count = int(len(pre_keep_mail_only_frame.index))
+            combined_prepared_rows = [
+                *pre_keep_mail_only_frame.to_dict(orient="records"),
+                *keep_frame.to_dict(orient="records"),
+            ]
 
-            for keep_row in keep_frame.to_dict(orient="records"):
+            for keep_row in combined_prepared_rows:
                 row_owner_context = _build_owner_context_from_keep_row(keep_row, owner_context)
                 row_owner_scope_value = _clean_text(row_owner_context.get("employee_id")) or _clean_text(
                     row_owner_context.get("responsible_name")
@@ -2344,6 +2373,8 @@ def run_shared_mailbox_post_sync_pipeline(
             task_result.update(
                 {
                     "matched_mail_count": matched_mail_count,
+                    "pre_keep_mail_only_count": pre_keep_mail_only_count,
+                    "partial_refresh_count": 0,
                     "full_screening_count": len(full_screening_frame.index),
                     "mail_only_update_count": len(mail_only_payload_rows),
                     "skipped_existing_count": skipped_existing_count,
@@ -2402,6 +2433,8 @@ def run_shared_mailbox_post_sync_pipeline(
             )
 
             summary["matched_mail_count"] += int(matched_mail_count)
+            summary["pre_keep_mail_only_count"] += int(pre_keep_mail_only_count)
+            summary["partial_refresh_count"] += 0
             summary["new_creator_count"] += int(new_creator_count)
             summary["existing_screened_count"] += int(existing_screened_count)
             summary["existing_unscreened_count"] += int(existing_unscreened_count)

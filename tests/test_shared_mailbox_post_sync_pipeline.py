@@ -7,6 +7,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pandas as pd
 
@@ -2853,6 +2854,234 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
         self.assertEqual(miniso_result["updated_count"], 2)
         self.assertTrue(miniso_workbook_exists)
         self.assertTrue(miniso_payload_exists)
+
+    def test_pipeline_consumes_pre_keep_mail_only_workbook_before_full_screening(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            shared_root = root / "shared_mailbox"
+            shared_db_path = shared_root / "email_sync.db"
+            shared_raw_dir = shared_root / "raw"
+            shared_db_path.parent.mkdir(parents=True, exist_ok=True)
+            shared_db_path.touch()
+            shared_raw_dir.mkdir(parents=True, exist_ok=True)
+            for name in ("alpha.eml", "beta.eml"):
+                (shared_raw_dir / name).write_text(f"Subject: {name}\n\nbody", encoding="utf-8")
+
+            uploaded_payloads: list[dict[str, Any]] = []
+
+            class FakeClient:
+                pass
+
+            def fake_run_task_upload_to_keep_list_pipeline(**kwargs):
+                output_root = Path(kwargs["output_root"])
+                output_root.mkdir(parents=True, exist_ok=True)
+                keep_workbook = output_root / "MINISO_keep.xlsx"
+                pre_keep_workbook = output_root / "MINISO_pre_keep_mail_only.xlsx"
+                template_workbook = output_root / "MINISO_template.xlsx"
+                template_workbook.touch()
+                pd.DataFrame(
+                    [
+                        {
+                            "Platform": "TikTok",
+                            "@username": "beta",
+                            "URL": "https://www.tiktok.com/@beta",
+                            "brand_message_sent_at": "2026-03-31T11:00:00+08:00",
+                            "brand_message_snippet": "Latest beta reply $200",
+                            "brand_message_raw_path": "raw/beta.eml",
+                        }
+                    ]
+                ).to_excel(keep_workbook, index=False)
+                pd.DataFrame(
+                    [
+                        {
+                            "Platform": "Instagram",
+                            "@username": "alpha",
+                            "URL": "https://www.instagram.com/alpha",
+                            "brand_message_sent_at": "2026-03-31T10:00:00+08:00",
+                            "brand_message_snippet": "Latest alpha reply $100",
+                            "brand_message_raw_path": "raw/alpha.eml",
+                        }
+                    ]
+                ).to_excel(pre_keep_workbook, index=False)
+                summary = {
+                    "status": "stopped_after_keep-list",
+                    "resume_points": {
+                        "keep_list": {
+                            "keep_workbook": str(keep_workbook),
+                            "template_workbook": str(template_workbook),
+                            "pre_keep_mail_only_workbook": str(pre_keep_workbook),
+                        }
+                    },
+                    "artifacts": {
+                        "keep_workbook": str(keep_workbook),
+                        "template_workbook": str(template_workbook),
+                        "pre_keep_mail_only_workbook": str(pre_keep_workbook),
+                    },
+                    "steps": {
+                        "brand_match": {"stats": {"message_hit_count": 2}},
+                        "pre_keep_short_circuit": {"status": "completed", "mail_only_count": 1, "full_screening_count": 1},
+                    },
+                    "downstream_handoff": {
+                        "task_owner": {
+                            "task_name": "MINISO",
+                            "linked_bitable_url": "https://bitable.example/miniso",
+                            "responsible_name": "陈俊仁",
+                            "employee_name": "陈俊仁",
+                            "employee_id": "ou_miniso",
+                            "employee_record_id": "rec_miniso",
+                            "employee_email": "miniso@amagency.biz",
+                            "owner_name": "陈俊仁",
+                        }
+                    },
+                }
+                Path(kwargs["summary_json"]).write_text(json.dumps(summary, ensure_ascii=False), encoding="utf-8")
+                return summary
+
+            def fake_run_keep_list_screening_pipeline(**kwargs):
+                keep_rows = pd.read_excel(Path(kwargs["keep_workbook"])).to_dict(orient="records")
+                self.assertEqual(len(keep_rows), 1)
+                self.assertEqual(keep_rows[0]["@username"], "beta")
+                output_root = Path(kwargs["output_root"])
+                output_root.mkdir(parents=True, exist_ok=True)
+                exports_dir = output_root / "exports"
+                exports_dir.mkdir(parents=True, exist_ok=True)
+                final_review_path = exports_dir / "all_platforms_final_review.xlsx"
+                payload_path = exports_dir / "all_platforms_upload_payload.json"
+                pd.DataFrame(
+                    [
+                        {
+                            "达人ID": "beta",
+                            "平台": "tiktok",
+                            "主页链接": "https://www.tiktok.com/@beta",
+                            "达人对接人": kwargs["task_owner_name"],
+                            "ai是否通过": "是",
+                            "ai筛号反馈理由": "screened",
+                            "标签(ai)": "母婴用品-家庭/宝妈",
+                            "ai评价": "good fit",
+                        }
+                    ]
+                ).to_excel(final_review_path, index=False)
+                payload = {
+                    "task_owner": {"task_name": kwargs["task_name"]},
+                    "columns": [],
+                    "source_row_count": 1,
+                    "row_count": 1,
+                    "skipped_row_count": 0,
+                    "rows": [{"达人ID": "beta", "平台": "tiktok", "ai是否通过": "是"}],
+                    "skipped_rows": [],
+                }
+                payload_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+                summary = {
+                    "status": "completed",
+                    "artifacts": {
+                        "all_platforms_final_review": str(final_review_path),
+                        "all_platforms_upload_payload_json": str(payload_path),
+                    },
+                }
+                Path(kwargs["summary_json"]).write_text(json.dumps(summary, ensure_ascii=False), encoding="utf-8")
+                return summary
+
+            def fake_upload_final_review_payload_to_bitable(client, *, payload_json_path, linked_bitable_url="", **kwargs):
+                payload = json.loads(Path(payload_json_path).read_text(encoding="utf-8"))
+                uploaded_payloads.append(payload)
+                archive_dir = Path(payload_json_path).parent / "feishu_upload_local_archive"
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                result_json = archive_dir / "feishu_bitable_upload_result.json"
+                result_xlsx = archive_dir / "feishu_bitable_upload_result.xlsx"
+                result_json.write_text(json.dumps({"ok": True}, ensure_ascii=False), encoding="utf-8")
+                pd.DataFrame([{"status": "ok"}]).to_excel(result_xlsx, index=False)
+                return {
+                    "ok": True,
+                    "payload_json_path": str(payload_json_path),
+                    "result_json_path": str(result_json),
+                    "result_xlsx_path": str(result_xlsx),
+                    "created_count": 0,
+                    "updated_count": 2,
+                    "failed_count": 0,
+                    "skipped_existing_count": 0,
+                    "failed_rows": [],
+                    "skipped_existing_rows": [],
+                }
+
+            pipeline._build_feishu_client = lambda **kwargs: (
+                FakeClient(),
+                {
+                    "TASK_UPLOAD_URL": "https://task-upload.example.com",
+                    "EMPLOYEE_INFO_URL": "https://employee.example.com",
+                },
+                {"feishu_base_url": "https://open.feishu.cn", "timeout_seconds": 30.0},
+            )
+            pipeline._load_runtime_dependencies = lambda: {
+                "DEFAULT_FEISHU_BASE_URL": "https://open.feishu.cn",
+                "FeishuOpenClient": FakeClient,
+                "fetch_existing_bitable_record_analysis": lambda client, *, linked_bitable_url: (
+                    object(),
+                    SimpleNamespace(
+                        index={
+                            "ou_miniso::alpha::instagram": {
+                                "record_id": "rec_alpha",
+                                "fields": {
+                                    "达人ID": "alpha",
+                                    "平台": "instagram",
+                                    "主页链接": "https://www.instagram.com/alpha",
+                                    "ai 是否通过": "是",
+                                    "ai筛号反馈理由": "existing ok",
+                                    "标签（ai）": ["家庭用品和家电-家庭博主"],
+                                    "ai 评价": "already screened",
+                                },
+                            },
+                            "ou_miniso::beta::tiktok": {
+                                "record_id": "rec_beta",
+                                "fields": {
+                                    "达人ID": "beta",
+                                    "平台": "tiktok",
+                                    "主页链接": "https://www.tiktok.com/@beta",
+                                    "ai 是否通过": "",
+                                },
+                            },
+                        },
+                        owner_scope_field_name="达人对接人",
+                        duplicate_groups=[],
+                    ),
+                ),
+                "fetch_existing_bitable_record_index": lambda client, *, linked_bitable_url: (object(), {}),
+                "inspect_task_upload_assignments": lambda **kwargs: {
+                    "items": [
+                        {
+                            "recordId": "rec_miniso",
+                            "taskName": "MINISO",
+                            "linkedBitableUrl": "https://bitable.example/miniso",
+                            "employeeId": "ou_miniso",
+                            "employeeRecordId": "rec_miniso_emp",
+                            "employeeName": "陈俊仁",
+                            "employeeEmail": "chenjunren@amagency.biz",
+                            "responsibleName": "陈俊仁",
+                            "ownerName": "陈俊仁",
+                        }
+                    ]
+                },
+                "load_local_env": lambda env_file: {},
+                "run_keep_list_screening_pipeline": fake_run_keep_list_screening_pipeline,
+                "run_task_upload_to_keep_list_pipeline": fake_run_task_upload_to_keep_list_pipeline,
+                "upload_final_review_payload_to_bitable": fake_upload_final_review_payload_to_bitable,
+            }
+
+            summary = pipeline.run_shared_mailbox_post_sync_pipeline(
+                shared_mail_db_path=shared_db_path,
+                shared_mail_raw_dir=shared_raw_dir,
+                shared_mail_data_dir=shared_root,
+                env_file=".env",
+                output_root=root / "run",
+            )
+
+        self.assertEqual(summary["status"], "completed")
+        self.assertEqual(summary["pre_keep_mail_only_count"], 1)
+        self.assertEqual(summary["mail_only_update_count"], 1)
+        self.assertEqual(summary["full_screening_count"], 1)
+        payload_rows = uploaded_payloads[0]["rows"]
+        self.assertEqual({row["达人ID"] for row in payload_rows}, {"alpha", "beta"})
+        mode_by_creator = {row["达人ID"]: row["__feishu_update_mode"] for row in payload_rows}
+        self.assertEqual(mode_by_creator["alpha"], "mail_only_update")
 
     def test_project_name_filter_expands_numbered_tasks_without_hardcoded_alias(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
