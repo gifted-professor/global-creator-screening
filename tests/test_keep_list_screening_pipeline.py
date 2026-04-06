@@ -3440,7 +3440,17 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             if job_id == "visual-job-1":
                 return {"id": job_id, "status": "completed", "result": {"success": True}}
             if job_id == "positioning-job-1":
-                return {"id": job_id, "status": "completed", "result": {"success": True}}
+                return {
+                    "id": job_id,
+                    "status": "completed",
+                    "result": {
+                        "success": True,
+                        "creator_cache": {
+                            "positioning_hit_count": 1,
+                            "positioning_miss_count": 0,
+                        },
+                    },
+                }
             raise AssertionError(f"unexpected job id: {job_id}")
 
         keep_list_runner._load_runtime_dependencies = lambda: {
@@ -3472,6 +3482,12 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
 
         platform_summary = summary["platforms"]["instagram"]
         self.assertEqual(platform_summary["positioning_card_analysis"]["status"], "completed")
+        self.assertEqual(summary["positioning_analysis_cache_hit_count"], 1)
+        self.assertEqual(summary["positioning_analysis_cache_miss_count"], 0)
+        self.assertEqual(
+            summary["observability"]["layers"]["screening_execution"]["platforms"]["instagram"]["positioning"]["creator_cache_hit_count"],
+            1,
+        )
         self.assertEqual(
             backend_app.app.test_client().positioning_start_calls[0]["payload"]["provider"],
             "openai",

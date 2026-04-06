@@ -1424,12 +1424,20 @@ def _build_execution_observability_layer(summary: dict[str, Any]) -> dict[str, A
     platforms = dict(summary.get("platforms") or {})
     platform_payloads: dict[str, Any] = {}
     status = "ready"
+    positioning_analysis_cache_hit_count = 0
+    positioning_analysis_cache_miss_count = 0
     for platform, payload in platforms.items():
         if not isinstance(payload, dict):
             continue
         visual_gate = dict(payload.get("visual_gate") or {})
         visual_retry = dict(payload.get("visual_retry") or {})
         positioning = dict(payload.get("positioning_card_analysis") or {})
+        positioning_result = dict(positioning.get("result") or {})
+        positioning_creator_cache = dict(positioning_result.get("creator_cache") or positioning.get("creator_cache") or {})
+        positioning_hit_count = int(positioning_creator_cache.get("positioning_hit_count") or 0)
+        positioning_miss_count = int(positioning_creator_cache.get("positioning_miss_count") or 0)
+        positioning_analysis_cache_hit_count += positioning_hit_count
+        positioning_analysis_cache_miss_count += positioning_miss_count
         platform_payloads[str(platform)] = {
             "status": str(payload.get("status") or "").strip(),
             "current_stage": str(payload.get("current_stage") or "").strip(),
@@ -1457,6 +1465,8 @@ def _build_execution_observability_layer(summary: dict[str, Any]) -> dict[str, A
                 "started_at": str(((payload.get("stage_metrics") or {}).get("positioning") or {}).get("started_at") or "").strip(),
                 "finished_at": str(((payload.get("stage_metrics") or {}).get("positioning") or {}).get("finished_at") or "").strip(),
                 "duration_seconds": float((((payload.get("stage_metrics") or {}).get("positioning") or {}).get("duration_seconds") or 0.0)),
+                "creator_cache_hit_count": positioning_hit_count,
+                "creator_cache_miss_count": positioning_miss_count,
             },
             "stage_metrics": dict(payload.get("stage_metrics") or {}),
         }
@@ -1466,6 +1476,8 @@ def _build_execution_observability_layer(summary: dict[str, Any]) -> dict[str, A
             status = "warning"
     return {
         "status": status,
+        "positioning_analysis_cache_hit_count": positioning_analysis_cache_hit_count,
+        "positioning_analysis_cache_miss_count": positioning_analysis_cache_miss_count,
         "platforms": platform_payloads,
         "blocking_reason": "",
     }
@@ -1953,6 +1965,9 @@ def _refresh_downstream_observability(summary: dict[str, Any]) -> None:
     summary["partial_refresh_breakdown"] = dict(incremental_layer.get("partial_refresh_breakdown") or {})
     summary["positioning_cache_hit_count"] = int(incremental_layer.get("positioning_cache_hit_count") or 0)
     summary["positioning_cache_miss_count"] = int(incremental_layer.get("positioning_cache_miss_count") or 0)
+    execution_layer = dict(((summary.get("observability") or {}).get("layers") or {}).get("screening_execution") or {})
+    summary["positioning_analysis_cache_hit_count"] = int(execution_layer.get("positioning_analysis_cache_hit_count") or 0)
+    summary["positioning_analysis_cache_miss_count"] = int(execution_layer.get("positioning_analysis_cache_miss_count") or 0)
     summary["diagnostics"] = _build_downstream_diagnostics(summary)
 
 
