@@ -9,11 +9,11 @@ from typing import Any, Callable
 
 import pandas as pd
 
-
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from backend import creator_cache
 from harness.contract import attach_run_contract
 from harness.config import resolve_keep_list_downstream_config
 from harness.failures import attach_failure_to_summary, build_failure_payload as build_harness_failure_payload
@@ -288,6 +288,78 @@ def _extract_existing_ai_status(fields: dict[str, Any]) -> str:
     return ""
 
 
+def _extract_existing_field_text(fields: dict[str, Any], *field_names: str) -> str:
+    normalized_candidates = {
+        str(field_name or "").strip().casefold().replace(" ", "")
+        for field_name in field_names
+        if str(field_name or "").strip()
+    }
+    for key, value in (fields or {}).items():
+        normalized_key = str(key or "").strip().casefold().replace(" ", "")
+        if normalized_key in normalized_candidates:
+            return _flatten_existing_field_value(value)
+    return ""
+
+
+def _existing_record_has_positioning_payload(fields: dict[str, Any]) -> bool:
+    return bool(
+        _extract_existing_field_text(fields, "标签(ai)", "标签（ai）", "ai评价", "ai 评价", "ai筛号反馈理由")
+    )
+
+
+def _normalize_cache_identifier(backend_app, platform: str, raw_value: Any) -> str:
+    value = str(raw_value or "").strip()
+    if not value:
+        return ""
+    screening_module = getattr(backend_app, "screening", None)
+    if screening_module is not None and hasattr(screening_module, "extract_platform_identifier"):
+        normalized = str(screening_module.extract_platform_identifier(platform, value) or "").strip()
+        if normalized:
+            return normalized
+    return value.lstrip("@").rstrip("/").casefold()
+
+
+def _resolve_visual_cache_context_key(backend_app, platform: str, *, vision_provider: str) -> str:
+    context_builder = getattr(backend_app, "build_visual_review_cache_context", None)
+    if not callable(context_builder):
+        return ""
+    routing_strategy = ""
+    routing_resolver = getattr(backend_app, "resolve_visual_review_routing_strategy", None)
+    if callable(routing_resolver):
+        routing_strategy = str(routing_resolver({}) or "").strip()
+    try:
+        context = context_builder(
+            platform,
+            requested_provider=str(vision_provider or "").strip().lower(),
+            routing_strategy=routing_strategy,
+        )
+    except Exception:
+        return ""
+    return str((context or {}).get("context_key") or "").strip()
+
+
+def _append_unique_identifier(bucket: list[str], seen: set[str], raw_value: Any) -> None:
+    value = str(raw_value or "").strip()
+    if not value or value in seen:
+        return
+    seen.add(value)
+    bucket.append(value)
+
+
+def _merge_breakdown_counts(target: dict[str, int], source: dict[str, Any] | None) -> None:
+    for key, value in dict(source or {}).items():
+        normalized_key = str(key or "").strip()
+        if not normalized_key:
+            continue
+        try:
+            delta = max(0, int(value or 0))
+        except (TypeError, ValueError):
+            continue
+        if delta <= 0:
+            continue
+        target[normalized_key] = int(target.get(normalized_key) or 0) + delta
+
+
 def _build_platform_identifier_plan(
     backend_app,
     platform: str,
@@ -295,6 +367,11 @@ def _build_platform_identifier_plan(
     max_identifiers_per_platform: int,
     existing_bitable_analysis: Any | None = None,
     task_owner_employee_id: str = "",
+    creator_cache_db_path: str = "",
+    force_refresh_creator_cache: bool = False,
+    vision_provider: str = "",
+    skip_visual: bool = False,
+    skip_positioning_card_analysis: bool = False,
 ) -> dict[str, Any]:
     metadata_lookup = dict(backend_app.load_upload_metadata(platform) or {})
     key_field_names = tuple(getattr(existing_bitable_analysis, "key_field_names", ()) or ())
@@ -325,7 +402,47 @@ def _build_platform_identifier_plan(
     existing_entries: list[dict[str, Any]] = []
     existing_screened_entries: list[dict[str, Any]] = []
     existing_unscreened_entries: list[dict[str, Any]] = []
+    mail_only_update_entries: list[dict[str, Any]] = []
+    partial_refresh_entries: list[dict[str, Any]] = []
     full_screening_entries: list[dict[str, Any]] = []
+    partial_refresh_breakdown: dict[str, int] = {}
+    resolved_creator_cache_db_path = creator_cache.resolve_creator_cache_db_path(
+        {"creator_cache_db_path": str(creator_cache_db_path or "").strip()}
+    )
+    creator_cache_enabled = creator_cache.creator_cache_enabled(
+        {"creator_cache_db_path": str(creator_cache_db_path or "").strip()}
+    )
+    scrape_cache_hits: dict[str, list[dict[str, Any]]] = {}
+    visual_cache_hits: dict[str, dict[str, Any]] = {}
+    visual_cache_context_key = ""
+    normalized_planned_identifiers = [
+        _normalize_cache_identifier(backend_app, platform, entry.get("scrape_identifier") or entry.get("creator_id"))
+        for entry in planned_entries
+    ]
+    planned_scrape_identifiers = [
+        str(entry.get("scrape_identifier") or "").strip()
+        for entry in planned_entries
+        if str(entry.get("scrape_identifier") or "").strip()
+    ]
+    if creator_cache_enabled and not force_refresh_creator_cache and resolved_creator_cache_db_path.exists():
+        if planned_scrape_identifiers:
+            scrape_cache_hits = creator_cache.load_scrape_cache_entries(
+                platform,
+                planned_scrape_identifiers,
+                resolved_creator_cache_db_path,
+            )
+        visual_cache_context_key = _resolve_visual_cache_context_key(
+            backend_app,
+            platform,
+            vision_provider=vision_provider,
+        )
+        if visual_cache_context_key and planned_scrape_identifiers:
+            visual_cache_hits = creator_cache.load_visual_cache_entries(
+                platform,
+                planned_scrape_identifiers,
+                resolved_creator_cache_db_path,
+                visual_cache_context_key,
+            )
     if existing_record_index:
         for entry in planned_entries:
             key_parts: list[str] = []
@@ -349,8 +466,40 @@ def _build_platform_identifier_plan(
                 }
                 existing_entries.append(classified_entry)
                 if _extract_existing_ai_status(classified_entry.get("existing_fields") or {}):
-                    classified_entry["execution_mode"] = "mail_only_update"
                     existing_screened_entries.append(classified_entry)
+                    normalized_identifier = _normalize_cache_identifier(
+                        backend_app,
+                        platform,
+                        classified_entry.get("scrape_identifier") or classified_entry.get("creator_id"),
+                    )
+                    scrape_cache_hit = bool(normalized_identifier and list(scrape_cache_hits.get(normalized_identifier) or []))
+                    visual_cache_hit = bool(normalized_identifier and dict(visual_cache_hits.get(normalized_identifier) or {}))
+                    positioning_ready = _existing_record_has_positioning_payload(
+                        classified_entry.get("existing_fields") or {}
+                    )
+                    partial_reasons: list[str] = []
+                    if creator_cache_enabled and not scrape_cache_hit:
+                        partial_reasons.append(f"scrape_missing_{platform}")
+                    if not skip_visual and creator_cache_enabled and visual_cache_context_key and not visual_cache_hit:
+                        partial_reasons.append(f"visual_missing_{platform}")
+                    if not skip_positioning_card_analysis and not positioning_ready:
+                        partial_reasons.append(f"positioning_missing_{platform}")
+                    if partial_reasons:
+                        classified_entry["execution_mode"] = "partial_refresh"
+                        classified_entry["partial_refresh_reasons"] = list(partial_reasons)
+                        classified_entry["needs_scrape"] = not scrape_cache_hit
+                        classified_entry["needs_visual"] = bool(
+                            not skip_visual and creator_cache_enabled and visual_cache_context_key and not visual_cache_hit
+                        )
+                        classified_entry["needs_positioning"] = bool(
+                            not skip_positioning_card_analysis and not positioning_ready
+                        )
+                        partial_refresh_entries.append(classified_entry)
+                        for reason in partial_reasons:
+                            partial_refresh_breakdown[reason] = int(partial_refresh_breakdown.get(reason) or 0) + 1
+                    else:
+                        classified_entry["execution_mode"] = "mail_only_update"
+                        mail_only_update_entries.append(classified_entry)
                 else:
                     classified_entry["execution_mode"] = "full_screening_existing"
                     existing_unscreened_entries.append(classified_entry)
@@ -363,9 +512,33 @@ def _build_platform_identifier_plan(
         new_entries = [{**entry, "execution_mode": "full_screening_new"} for entry in planned_entries]
         full_screening_entries = list(new_entries)
 
-    requested_entries = list(full_screening_entries)
+    scrape_requested_identifiers: list[str] = []
+    visual_requested_identifiers: list[str] = []
+    positioning_requested_identifiers: list[str] = []
+    scrape_seen: set[str] = set()
+    visual_seen: set[str] = set()
+    positioning_seen: set[str] = set()
+    for entry in full_screening_entries:
+        scrape_identifier = str(entry.get("scrape_identifier") or "").strip()
+        _append_unique_identifier(scrape_requested_identifiers, scrape_seen, scrape_identifier)
+        _append_unique_identifier(visual_requested_identifiers, visual_seen, scrape_identifier)
+        _append_unique_identifier(positioning_requested_identifiers, positioning_seen, scrape_identifier)
+    for entry in partial_refresh_entries:
+        scrape_identifier = str(entry.get("scrape_identifier") or "").strip()
+        if any(bool(entry.get(flag)) for flag in ("needs_scrape", "needs_visual", "needs_positioning")):
+            _append_unique_identifier(scrape_requested_identifiers, scrape_seen, scrape_identifier)
+        if any(bool(entry.get(flag)) for flag in ("needs_visual", "needs_positioning")):
+            # Visual stage is also used to materialize cached review artifacts for positioning.
+            _append_unique_identifier(visual_requested_identifiers, visual_seen, scrape_identifier)
+        if bool(entry.get("needs_positioning")):
+            _append_unique_identifier(positioning_requested_identifiers, positioning_seen, scrape_identifier)
+
+    requested_entries = list(scrape_requested_identifiers)
     if max_identifiers_per_platform > 0:
-        requested_entries = requested_entries[: int(max_identifiers_per_platform)]
+        limit = int(max_identifiers_per_platform)
+        requested_entries = requested_entries[:limit]
+        visual_requested_identifiers = visual_requested_identifiers[:limit]
+        positioning_requested_identifiers = positioning_requested_identifiers[:limit]
 
     incremental_prefilter = {
         "enabled": bool(existing_record_index),
@@ -402,24 +575,40 @@ def _build_platform_identifier_plan(
             for item in full_screening_entries[:10]
             if str(item.get("creator_id") or "").strip()
         ],
-        "mail_only_update_count": len(existing_screened_entries),
+        "mail_only_update_count": len(mail_only_update_entries),
         "mail_only_update_preview": [
             str(item.get("creator_id") or "").strip()
-            for item in existing_screened_entries[:10]
+            for item in mail_only_update_entries[:10]
             if str(item.get("creator_id") or "").strip()
         ],
+        "partial_refresh_count": len(partial_refresh_entries),
+        "partial_refresh_preview": [
+            str(item.get("creator_id") or "").strip()
+            for item in partial_refresh_entries[:10]
+            if str(item.get("creator_id") or "").strip()
+        ],
+        "partial_refresh_breakdown": dict(sorted(partial_refresh_breakdown.items())),
         "duplicate_existing_group_count": duplicate_existing_group_count,
         "all_existing": bool(planned_entries) and len(existing_entries) == len(planned_entries),
-        "mail_only_update_only": bool(planned_entries) and len(existing_entries) == len(planned_entries) and bool(existing_screened_entries) and not requested_entries,
+        "mail_only_update_only": bool(planned_entries)
+        and len(existing_entries) == len(planned_entries)
+        and bool(existing_screened_entries)
+        and not requested_entries
+        and not partial_refresh_entries,
+        "scrape_requested_identifier_count": len(requested_entries),
+        "visual_requested_identifier_count": len(visual_requested_identifiers),
+        "positioning_requested_identifier_count": len(positioning_requested_identifiers),
+        "creator_cache_enabled": bool(creator_cache_enabled),
+        "creator_cache_db_path": str(resolved_creator_cache_db_path),
+        "visual_cache_context_key": visual_cache_context_key,
     }
     return {
         "staged_identifier_count": len(planned_entries),
-        "requested_identifiers": [
-            str(item.get("scrape_identifier") or "").strip()
-            for item in requested_entries
-            if str(item.get("scrape_identifier") or "").strip()
-        ],
-        "mail_only_update_entries": [dict(item) for item in existing_screened_entries],
+        "requested_identifiers": list(requested_entries),
+        "visual_requested_identifiers": list(visual_requested_identifiers),
+        "positioning_requested_identifiers": list(positioning_requested_identifiers),
+        "mail_only_update_entries": [dict(item) for item in mail_only_update_entries],
+        "partial_refresh_entries": [dict(item) for item in partial_refresh_entries],
         "incremental_prefilter": incremental_prefilter,
     }
 
@@ -867,6 +1056,7 @@ def _build_cli_output_summary(summary: dict[str, Any]) -> dict[str, Any]:
             "current_stage": str(payload.get("current_stage") or "").strip(),
             "requested_identifier_count": int(payload.get("requested_identifier_count") or 0),
             "mail_only_update_count": int(payload.get("mail_only_update_count") or 0),
+            "partial_refresh_count": int(payload.get("partial_refresh_count") or 0),
             "profile_review_count": int(payload.get("profile_review_count") or 0),
             "prescreen_pass_count": int(payload.get("prescreen_pass_count") or 0),
             "missing_profile_count": int(payload.get("missing_profile_count") or 0),
@@ -1037,9 +1227,12 @@ def _build_incremental_observability_layer(summary: dict[str, Any]) -> dict[str,
     existing_screened_count = 0
     existing_unscreened_count = 0
     mail_only_update_count = 0
+    partial_refresh_count = 0
     all_existing = True
     incremental_candidate_preview: list[str] = []
     mail_only_update_preview: list[str] = []
+    partial_refresh_preview: list[str] = []
+    partial_refresh_breakdown: dict[str, int] = {}
     duplicate_existing_group_count = int(existing_bitable_prefilter.get("duplicate_existing_group_count") or 0)
     for platform_summary in platforms.values():
         if not isinstance(platform_summary, dict):
@@ -1052,6 +1245,7 @@ def _build_incremental_observability_layer(summary: dict[str, Any]) -> dict[str,
         existing_screened_count += int(platform_prefilter.get("existing_screened_count") or 0)
         existing_unscreened_count += int(platform_prefilter.get("existing_unscreened_count") or 0)
         mail_only_update_count += int(platform_prefilter.get("mail_only_update_count") or 0)
+        partial_refresh_count += int(platform_prefilter.get("partial_refresh_count") or 0)
         duplicate_existing_group_count = max(
             duplicate_existing_group_count,
             int(platform_prefilter.get("duplicate_existing_group_count") or 0),
@@ -1063,6 +1257,14 @@ def _build_incremental_observability_layer(summary: dict[str, Any]) -> dict[str,
         mail_only_update_preview.extend(
             [str(item) for item in list(platform_prefilter.get("mail_only_update_preview") or []) if str(item).strip()]
         )
+        partial_refresh_preview.extend(
+            [str(item) for item in list(platform_prefilter.get("partial_refresh_preview") or []) if str(item).strip()]
+        )
+        for reason, count in dict(platform_prefilter.get("partial_refresh_breakdown") or {}).items():
+            normalized_reason = str(reason or "").strip()
+            if not normalized_reason:
+                continue
+            partial_refresh_breakdown[normalized_reason] = int(partial_refresh_breakdown.get(normalized_reason) or 0) + int(count or 0)
     status = "ready" if existing_bitable_prefilter.get("enabled") else str(existing_bitable_prefilter.get("status") or "disabled")
     return {
         "status": status,
@@ -1075,10 +1277,13 @@ def _build_incremental_observability_layer(summary: dict[str, Any]) -> dict[str,
         "existing_screened_count": existing_screened_count,
         "existing_unscreened_count": existing_unscreened_count,
         "mail_only_update_count": mail_only_update_count,
+        "partial_refresh_count": partial_refresh_count,
         "all_existing": bool(staged_identifier_count > 0 and all_existing),
         "duplicate_existing_group_count": duplicate_existing_group_count,
         "incremental_candidate_preview": incremental_candidate_preview[:10],
         "mail_only_update_preview": mail_only_update_preview[:10],
+        "partial_refresh_preview": partial_refresh_preview[:10],
+        "partial_refresh_breakdown": dict(sorted(partial_refresh_breakdown.items())),
         "blocking_reason": str(existing_bitable_prefilter.get("error") or "").strip(),
     }
 
@@ -1098,6 +1303,7 @@ def _build_execution_observability_layer(summary: dict[str, Any]) -> dict[str, A
             "current_stage": str(payload.get("current_stage") or "").strip(),
             "requested_identifier_count": int(payload.get("requested_identifier_count") or 0),
             "mail_only_update_count": int(payload.get("mail_only_update_count") or 0),
+            "partial_refresh_count": int(payload.get("partial_refresh_count") or 0),
             "profile_review_count": int(payload.get("profile_review_count") or 0),
             "prescreen_pass_count": int(payload.get("prescreen_pass_count") or 0),
             "missing_profile_count": int(payload.get("missing_profile_count") or 0),
@@ -1151,6 +1357,9 @@ def _build_dry_run_report(summary: dict[str, Any]) -> dict[str, Any]:
     incremental_candidate_count = 0
     full_screening_candidate_count = 0
     mail_only_update_count = 0
+    partial_refresh_count = 0
+    partial_refresh_preview: list[str] = []
+    partial_refresh_breakdown: dict[str, int] = {}
 
     for platform, payload in platforms.items():
         if not isinstance(payload, dict):
@@ -1164,18 +1373,30 @@ def _build_dry_run_report(summary: dict[str, Any]) -> dict[str, Any]:
         platform_incremental = int(platform_prefilter.get("incremental_candidate_count") or 0)
         platform_full_screening = int(platform_prefilter.get("full_screening_candidate_count") or 0)
         platform_mail_only_update = int(platform_prefilter.get("mail_only_update_count") or 0)
+        platform_partial_refresh = int(platform_prefilter.get("partial_refresh_count") or 0)
         platform_requested = int(payload.get("requested_identifier_count") or 0)
         staged_identifier_count += platform_staged
         existing_bitable_match_count += platform_existing
         incremental_candidate_count += platform_incremental
         full_screening_candidate_count += platform_full_screening
         mail_only_update_count += platform_mail_only_update
-        if platform_requested > 0 or platform_mail_only_update > 0:
+        partial_refresh_count += platform_partial_refresh
+        if platform_requested > 0 or platform_mail_only_update > 0 or platform_partial_refresh > 0:
             estimated_execution_platforms.append(platform_name)
         if bool(platform_prefilter.get("all_existing")):
             all_existing_platforms.append(platform_name)
         elif platform_staged <= 0:
             no_candidate_platforms.append(platform_name)
+        partial_refresh_preview.extend(
+            [str(item) for item in list(platform_prefilter.get("partial_refresh_preview") or []) if str(item).strip()]
+        )
+        for reason, count in dict(platform_prefilter.get("partial_refresh_breakdown") or {}).items():
+            normalized_reason = str(reason or "").strip()
+            if not normalized_reason:
+                continue
+            partial_refresh_breakdown[normalized_reason] = (
+                int(partial_refresh_breakdown.get(normalized_reason) or 0) + int(count or 0)
+            )
         platform_reports[platform_name] = {
             "status": str(payload.get("status") or "").strip(),
             "staged_identifier_count": platform_staged,
@@ -1183,12 +1404,15 @@ def _build_dry_run_report(summary: dict[str, Any]) -> dict[str, Any]:
             "incremental_candidate_count": platform_incremental,
             "full_screening_candidate_count": platform_full_screening,
             "mail_only_update_count": platform_mail_only_update,
+            "partial_refresh_count": platform_partial_refresh,
             "requested_identifier_count": platform_requested,
             "requested_identifier_preview": list(payload.get("requested_identifier_preview") or [])[:10],
             "incremental_candidate_preview": list(platform_prefilter.get("incremental_candidate_preview") or [])[:10],
             "mail_only_update_preview": list(platform_prefilter.get("mail_only_update_preview") or [])[:10],
+            "partial_refresh_preview": list(platform_prefilter.get("partial_refresh_preview") or [])[:10],
+            "partial_refresh_breakdown": dict(platform_prefilter.get("partial_refresh_breakdown") or {}),
             "all_existing": bool(platform_prefilter.get("all_existing")),
-            "would_execute": bool(platform_requested > 0 or platform_mail_only_update > 0),
+            "would_execute": bool(platform_requested > 0 or platform_mail_only_update > 0 or platform_partial_refresh > 0),
         }
 
     return {
@@ -1198,6 +1422,9 @@ def _build_dry_run_report(summary: dict[str, Any]) -> dict[str, Any]:
         "incremental_candidate_count": incremental_candidate_count,
         "full_screening_candidate_count": full_screening_candidate_count,
         "mail_only_update_count": mail_only_update_count,
+        "partial_refresh_count": partial_refresh_count,
+        "partial_refresh_preview": partial_refresh_preview[:10],
+        "partial_refresh_breakdown": dict(sorted(partial_refresh_breakdown.items())),
         "estimated_execution_platform_count": len(estimated_execution_platforms),
         "estimated_execution_platforms": estimated_execution_platforms,
         "all_existing_platforms": all_existing_platforms,
@@ -1315,6 +1542,7 @@ def _build_downstream_observability(summary: dict[str, Any]) -> dict[str, Any]:
                 if isinstance(payload, dict)
             ),
             "mail_only_update_count": int(incremental_layer.get("mail_only_update_count") or 0),
+            "partial_refresh_count": int(incremental_layer.get("partial_refresh_count") or 0),
             "full_screening_candidate_count": int(incremental_layer.get("full_screening_candidate_count") or 0),
         },
         "output_counts": {
@@ -1329,6 +1557,7 @@ def _build_downstream_observability(summary: dict[str, Any]) -> dict[str, Any]:
                 if isinstance(payload, dict)
             ),
             "mail_only_update_count": int(incremental_layer.get("mail_only_update_count") or 0),
+            "partial_refresh_count": int(incremental_layer.get("partial_refresh_count") or 0),
             "upload_created_count": int(upload_layer.get("created_count") or 0),
             "upload_failed_count": int(upload_layer.get("failed_count") or 0),
         },
@@ -1377,6 +1606,7 @@ def _build_downstream_diagnostics(summary: dict[str, Any]) -> dict[str, Any]:
                     f"staged {int(dry_run_report.get('staged_identifier_count') or 0)} 个达人，"
                     f"已存在 {int(dry_run_report.get('existing_bitable_match_count') or 0)} 个，"
                     f"新增 {int(dry_run_report.get('incremental_candidate_count') or 0)} 个，"
+                    f"局部补齐 {int(dry_run_report.get('partial_refresh_count') or 0)} 个，"
                     f"邮件直更 {int(dry_run_report.get('mail_only_update_count') or 0)} 个，"
                     f"预计执行平台 {int(dry_run_report.get('estimated_execution_platform_count') or 0)} 个。"
                 ),
@@ -1396,6 +1626,7 @@ def _build_downstream_diagnostics(summary: dict[str, Any]) -> dict[str, Any]:
         existing_count = int(incremental_layer.get("existing_bitable_match_count") or 0)
         incremental_count = int(incremental_layer.get("incremental_candidate_count") or 0)
         mail_only_update_count = int(incremental_layer.get("mail_only_update_count") or 0)
+        partial_refresh_count = int(incremental_layer.get("partial_refresh_count") or 0)
         if bool(incremental_layer.get("all_existing")):
             conclusions.append(
                 {
@@ -1404,7 +1635,8 @@ def _build_downstream_diagnostics(summary: dict[str, Any]) -> dict[str, Any]:
                     "severity": "info",
                     "message": (
                         f"本次 staged {staged_count} 个达人均已存在于目标飞书表，"
-                        f"其中 {mail_only_update_count} 个会直接走邮件字段更新，无需重跑 scrape / visual。"
+                        f"其中 {mail_only_update_count} 个会直接走邮件字段更新，"
+                        f"{partial_refresh_count} 个只会补抓缺失环节，无需完整重跑。"
                     ),
                 }
             )
@@ -1416,8 +1648,9 @@ def _build_downstream_diagnostics(summary: dict[str, Any]) -> dict[str, Any]:
                     "severity": "info",
                     "message": (
                         f"本次 staged {staged_count} 个达人，已存在 {existing_count} 个，"
-                        f"新增 {incremental_count} 个，邮件直更 {mail_only_update_count} 个，"
-                        "只对需要完整筛号的达人继续执行下游 scrape / visual。"
+                        f"新增 {incremental_count} 个，局部补齐 {partial_refresh_count} 个，"
+                        f"邮件直更 {mail_only_update_count} 个，"
+                        "只对需要的达人继续执行补抓或完整筛号。"
                     ),
                 }
             )
@@ -1428,6 +1661,15 @@ def _build_downstream_diagnostics(summary: dict[str, Any]) -> dict[str, Any]:
                     "code": "mail_only_updates_enabled",
                     "severity": "info",
                     "message": f"已有 {mail_only_update_count} 个已筛达人命中新邮件，本轮会复用飞书已有筛号结果，仅更新邮件字段。",
+                }
+            )
+        if partial_refresh_count > 0:
+            conclusions.append(
+                {
+                    "layer": "incremental_creator",
+                    "code": "partial_refresh_enabled",
+                    "severity": "info",
+                    "message": f"已有 {partial_refresh_count} 个老达人命中本地缓存缺口，本轮只补抓缺失的 scrape / visual / positioning 环节。",
                 }
             )
     elif str(incremental_layer.get("linked_bitable_url") or "").strip():
@@ -1545,6 +1787,10 @@ def _build_downstream_diagnostics(summary: dict[str, Any]) -> dict[str, Any]:
 
 def _refresh_downstream_observability(summary: dict[str, Any]) -> None:
     summary["observability"] = _build_downstream_observability(summary)
+    incremental_layer = dict(((summary.get("observability") or {}).get("layers") or {}).get("incremental_creator") or {})
+    summary["partial_refresh_count"] = int(incremental_layer.get("partial_refresh_count") or 0)
+    summary["partial_refresh_preview"] = list(incremental_layer.get("partial_refresh_preview") or [])[:10]
+    summary["partial_refresh_breakdown"] = dict(incremental_layer.get("partial_refresh_breakdown") or {})
     summary["diagnostics"] = _build_downstream_diagnostics(summary)
 
 
@@ -2873,6 +3119,9 @@ def run_keep_list_screening_pipeline(
                     "requested_identifier_preview": [],
                     "mail_only_update_count": 0,
                     "mail_only_update_preview": [],
+                    "partial_refresh_count": 0,
+                    "partial_refresh_preview": [],
+                    "partial_refresh_breakdown": {},
                     "requested_vision_provider": str(vision_provider or "").strip().lower(),
                     "vision_preflight": backend_app.build_vision_preflight(vision_provider),
                     "incremental_prefilter": {
@@ -2890,6 +3139,9 @@ def run_keep_list_screening_pipeline(
                         "full_screening_candidate_preview": [],
                         "mail_only_update_count": 0,
                         "mail_only_update_preview": [],
+                        "partial_refresh_count": 0,
+                        "partial_refresh_preview": [],
+                        "partial_refresh_breakdown": {},
                         "duplicate_existing_group_count": 0,
                         "all_existing": False,
                         "mail_only_update_only": False,
@@ -2912,9 +3164,22 @@ def run_keep_list_screening_pipeline(
                         max_identifiers_per_platform=max(0, int(max_identifiers_per_platform)),
                         existing_bitable_analysis=existing_bitable_analysis,
                         task_owner_employee_id=normalized_task_owner_employee_id,
+                        creator_cache_db_path=str(creator_cache_db_path or "").strip(),
+                        force_refresh_creator_cache=bool(force_refresh_creator_cache),
+                        vision_provider=str(vision_provider or "").strip().lower(),
+                        skip_visual=bool(skip_visual),
+                        skip_positioning_card_analysis=bool(skip_positioning_card_analysis),
                     )
                     requested_identifiers = list(identifier_plan.get("requested_identifiers") or [])
+                    visual_requested_identifiers = list(identifier_plan.get("visual_requested_identifiers") or [])
+                    positioning_requested_identifiers = list(identifier_plan.get("positioning_requested_identifiers") or [])
                     mail_only_update_entries = [dict(item) for item in list(identifier_plan.get("mail_only_update_entries") or []) if isinstance(item, dict)]
+                    partial_refresh_entries = [dict(item) for item in list(identifier_plan.get("partial_refresh_entries") or []) if isinstance(item, dict)]
+                    has_stage_work = bool(
+                        requested_identifiers
+                        or visual_requested_identifiers
+                        or positioning_requested_identifiers
+                    )
                     platform_summary["staged_identifier_count"] = int(identifier_plan.get("staged_identifier_count") or 0)
                     platform_summary["incremental_prefilter"] = dict(identifier_plan.get("incremental_prefilter") or {})
                     platform_summary["requested_identifier_count"] = len(requested_identifiers)
@@ -2925,6 +3190,15 @@ def run_keep_list_screening_pipeline(
                         for item in mail_only_update_entries[:10]
                         if str(item.get("creator_id") or "").strip()
                     ]
+                    platform_summary["partial_refresh_count"] = len(partial_refresh_entries)
+                    platform_summary["partial_refresh_preview"] = [
+                        str(item.get("creator_id") or "").strip()
+                        for item in partial_refresh_entries[:10]
+                        if str(item.get("creator_id") or "").strip()
+                    ]
+                    platform_summary["partial_refresh_breakdown"] = dict(
+                        (platform_summary.get("incremental_prefilter") or {}).get("partial_refresh_breakdown") or {}
+                    )
                     if mail_only_update_entries:
                         mail_only_updates_by_platform[str(platform)] = mail_only_update_entries
                 except Exception as exc:  # noqa: BLE001
@@ -2941,11 +3215,11 @@ def run_keep_list_screening_pipeline(
                     continue
 
                 if dry_run:
-                    if int(platform_summary.get("mail_only_update_count") or 0) > 0 and not requested_identifiers:
+                    if int(platform_summary.get("mail_only_update_count") or 0) > 0 and not has_stage_work:
                         platform_summary["reason"] = "dry_run planned mail-only updates for already-screened creators"
-                    elif bool((platform_summary.get("incremental_prefilter") or {}).get("all_existing")):
+                    elif bool((platform_summary.get("incremental_prefilter") or {}).get("all_existing")) and not has_stage_work:
                         platform_summary["reason"] = "all staged creators already exist in target bitable"
-                    elif not requested_identifiers:
+                    elif not has_stage_work:
                         platform_summary["reason"] = "no staged identifiers for platform"
                     else:
                         platform_summary["reason"] = "dry_run planned incremental execution only"
@@ -2965,7 +3239,7 @@ def run_keep_list_screening_pipeline(
                     )
                     platform_summary["exports"] = {}
                     platform_summary["dry_run"] = {
-                        "would_execute": bool(requested_identifiers),
+                        "would_execute": bool(has_stage_work),
                         "reason": str(platform_summary.get("reason") or "").strip(),
                     }
                     _persist_platform_summary(
@@ -2979,7 +3253,7 @@ def run_keep_list_screening_pipeline(
                     )
                     continue
 
-                if int(platform_summary.get("mail_only_update_count") or 0) > 0 and not requested_identifiers:
+                if int(platform_summary.get("mail_only_update_count") or 0) > 0 and not has_stage_work:
                     platform_summary["status"] = "completed"
                     platform_summary["reason"] = "screened creators will be updated via mail-only export merge"
                     platform_summary["scrape_job"] = {"status": "skipped", "reason": platform_summary["reason"]}
@@ -3007,7 +3281,7 @@ def run_keep_list_screening_pipeline(
                     )
                     continue
 
-                if bool((platform_summary.get("incremental_prefilter") or {}).get("all_existing")):
+                if bool((platform_summary.get("incremental_prefilter") or {}).get("all_existing")) and not has_stage_work:
                     platform_summary["status"] = "completed"
                     platform_summary["reason"] = "all staged creators already exist in target bitable"
                     platform_summary["scrape_job"] = {"status": "skipped", "reason": platform_summary["reason"]}
@@ -3035,7 +3309,7 @@ def run_keep_list_screening_pipeline(
                     )
                     continue
 
-                if not requested_identifiers:
+                if not has_stage_work:
                     platform_summary["status"] = "skipped"
                     platform_summary["reason"] = "no staged identifiers for platform"
                     _persist_platform_summary(
@@ -3177,6 +3451,10 @@ def run_keep_list_screening_pipeline(
                 fallback_reviews = _extract_fallback_profile_reviews(scrape_job)
                 fallback_profiles = _build_fallback_profile_summary(fallback_reviews)
                 available_identifiers = _extract_available_profile_identifiers(scrape_profile_reviews)
+                visual_target_identifiers = list(visual_requested_identifiers or (available_identifiers or requested_identifiers))
+                positioning_target_identifiers = list(
+                    positioning_requested_identifiers or (available_identifiers or requested_identifiers)
+                )
                 platform_summary["profile_review_count"] = len(scrape_profile_reviews)
                 platform_summary["prescreen_pass_count"] = pass_count
                 platform_summary["missing_profile_count"] = len(missing_profiles)
@@ -3300,7 +3578,7 @@ def run_keep_list_screening_pipeline(
                 elif backend_app.get_available_vision_provider_names(vision_provider):
                     visual_payload_body = build_visual_payload(
                         platform,
-                        available_identifiers or requested_identifiers,
+                        visual_target_identifiers,
                         creator_cache_db_path=str(creator_cache_db_path or "").strip(),
                         force_refresh_creator_cache=bool(force_refresh_creator_cache),
                     )
@@ -3414,7 +3692,7 @@ def run_keep_list_screening_pipeline(
                                 platform,
                                 build_visual_payload(
                                     platform,
-                                    available_identifiers or requested_identifiers,
+                                    positioning_target_identifiers,
                                     creator_cache_db_path=str(creator_cache_db_path or "").strip(),
                                     force_refresh_creator_cache=bool(force_refresh_creator_cache),
                                 ),
@@ -3428,7 +3706,7 @@ def run_keep_list_screening_pipeline(
                     else:
                         positioning_payload_body = build_visual_payload(
                             platform,
-                            available_identifiers or requested_identifiers,
+                            positioning_target_identifiers,
                             creator_cache_db_path=str(creator_cache_db_path or "").strip(),
                             force_refresh_creator_cache=bool(force_refresh_creator_cache),
                         )
