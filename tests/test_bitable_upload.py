@@ -10,6 +10,7 @@ from zoneinfo import ZoneInfo
 
 from feishu_screening_bridge.bitable_export import ResolvedBitableView
 from feishu_screening_bridge.bitable_upload import upload_final_review_payload_to_bitable
+from feishu_screening_bridge.feishu_api import FeishuApiError
 from feishu_screening_bridge.task_upload_sync import TaskUploadEntry
 
 
@@ -19,6 +20,13 @@ class _FakeBitableUploadClient:
         self.updated_records: list[dict[str, object]] = []
         self.uploaded_local_files: list[dict[str, str]] = []
         self.deleted_records: list[str] = []
+        self.record_create_attempt_count = 0
+        self.record_update_attempt_count = 0
+        self.search_attempt_count = 0
+        self.create_record_side_effects: list[object] = []
+        self.update_record_side_effects: list[object] = []
+        self.search_side_effects: list[object] = []
+        self.upload_side_effects: list[object] = []
         self.include_task_name_field = False
         self.search_items = [
             {
@@ -98,8 +106,18 @@ class _FakeBitableUploadClient:
         headers: dict[str, str] | None = None,
     ) -> dict[str, object]:
         if url_path.endswith("/records/search"):
+            self.search_attempt_count += 1
+            if self.search_side_effects:
+                effect = self.search_side_effects.pop(0)
+                if isinstance(effect, Exception):
+                    raise effect
             return {"data": {"items": self.search_items, "has_more": False}}
         if url_path.endswith("/records"):
+            self.record_create_attempt_count += 1
+            if self.create_record_side_effects:
+                effect = self.create_record_side_effects.pop(0)
+                if isinstance(effect, Exception):
+                    raise effect
             fields = dict((body or {}).get("fields") or {})
             record_id = f"rec_{len(self.created_records) + 1}"
             self.created_records.append({"record_id": record_id, "fields": fields})
@@ -115,6 +133,11 @@ class _FakeBitableUploadClient:
     ) -> dict[str, object]:
         if "/records/" not in url_path:
             raise AssertionError(f"unexpected PUT {url_path}")
+        self.record_update_attempt_count += 1
+        if self.update_record_side_effects:
+            effect = self.update_record_side_effects.pop(0)
+            if isinstance(effect, Exception):
+                raise effect
         record_id = url_path.rsplit("/", 1)[-1]
         fields = dict((body or {}).get("fields") or {})
         self.updated_records.append({"record_id": record_id, "fields": fields})
@@ -124,6 +147,10 @@ class _FakeBitableUploadClient:
         from feishu_screening_bridge.feishu_api import UploadedFeishuFile
 
         path = Path(str(local_path))
+        if self.upload_side_effects:
+            effect = self.upload_side_effects.pop(0)
+            if isinstance(effect, Exception):
+                raise effect
         self.uploaded_local_files.append(
             {
                 "local_path": str(path),
@@ -916,6 +943,148 @@ class BitableUploadTests(unittest.TestCase):
             saved_result = json.loads(Path(result["result_json_path"]).read_text(encoding="utf-8"))
             self.assertFalse(saved_result["result_xlsx_written"])
             self.assertEqual(saved_result["report_write_warnings"][0]["artifact"], "result_xlsx")
+
+    def test_upload_retries_transient_create_failures_and_records_retry_summary(self) -> None:
+        client = _FakeBitableUploadClient()
+        client.search_items = []
+        client.create_record_side_effects = [
+            FeishuApiError(
+                "飞书请求失败: status=429 url=https://open.feishu.cn/open-apis/bitable/v1/apps/app_token/tables/tbl/records",
+                status_code=429,
+                retry_after_seconds=0.5,
+                retryable=True,
+            )
+        ]
+        resolved_view = ResolvedBitableView(
+            source_url="https://example.com/base/app?table=tbl&view=vew",
+            source_kind="base",
+            source_token="app_token",
+            app_token="app_token",
+            table_id="tbl",
+            view_id="vew",
+            table_name="达人管理",
+            view_name="总视图",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            payload_path = Path(tmpdir) / "payload.json"
+            payload_path.write_text(
+                json.dumps(
+                    {
+                        "rows": [
+                            {
+                                "达人ID": "alpha",
+                                "平台": "instagram",
+                                "主页链接": "https://www.instagram.com/alpha",
+                                "达人对接人": "陈俊仁",
+                                "ai是否通过": "是",
+                                "__feishu_update_mode": "create_or_update",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            with patch(
+                "feishu_screening_bridge.bitable_upload.resolve_bitable_view_from_url",
+                return_value=resolved_view,
+            ), patch("feishu_screening_bridge.bitable_upload.time.sleep", return_value=None):
+                result = upload_final_review_payload_to_bitable(
+                    client,
+                    payload_json_path=payload_path,
+                    linked_bitable_url="https://example.com/base/app?table=tbl&view=vew",
+                )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["created_count"], 1)
+        self.assertEqual(client.record_create_attempt_count, 2)
+        self.assertEqual(result["retry_summary"]["retried_request_count"], 1)
+        self.assertEqual(result["retry_summary"]["retryable_error_count"], 1)
+        self.assertGreater(result["retry_summary"]["backoff_sleep_seconds"], 0.0)
+        self.assertEqual(result["retry_summary"]["operations"]["create_record"]["retried_request_count"], 1)
+
+    def test_upload_recovers_create_after_retryable_failure_when_record_already_exists_on_server(self) -> None:
+        client = _FakeBitableUploadClient()
+        client.search_items = []
+        resolved_view = ResolvedBitableView(
+            source_url="https://example.com/base/app?table=tbl&view=vew",
+            source_kind="base",
+            source_token="app_token",
+            app_token="app_token",
+            table_id="tbl",
+            view_id="vew",
+            table_name="达人管理",
+            view_name="总视图",
+        )
+
+        original_post_api_json = client.post_api_json
+
+        def flaky_post_api_json(
+            url_path: str,
+            *,
+            body: dict[str, object] | None = None,
+            headers: dict[str, str] | None = None,
+        ) -> dict[str, object]:
+            if url_path.endswith("/records") and client.record_create_attempt_count == 0:
+                client.record_create_attempt_count += 1
+                client.search_items = [
+                    {
+                        "record_id": "rec_server_created",
+                        "fields": {
+                            "达人ID": "alpha",
+                            "平台": "instagram",
+                            "ai 是否通过": "是",
+                        },
+                    }
+                ]
+                raise FeishuApiError(
+                    "飞书请求失败: status=503 url=https://open.feishu.cn/open-apis/bitable/v1/apps/app_token/tables/tbl/records",
+                    status_code=503,
+                    retryable=True,
+                )
+            return original_post_api_json(url_path, body=body, headers=headers)
+
+        client.post_api_json = flaky_post_api_json  # type: ignore[method-assign]
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            payload_path = Path(tmpdir) / "payload.json"
+            payload_path.write_text(
+                json.dumps(
+                    {
+                        "rows": [
+                            {
+                                "达人ID": "alpha",
+                                "平台": "instagram",
+                                "主页链接": "https://www.instagram.com/alpha",
+                                "达人对接人": "陈俊仁",
+                                "ai是否通过": "是",
+                                "__feishu_update_mode": "create_or_update",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            with patch(
+                "feishu_screening_bridge.bitable_upload.resolve_bitable_view_from_url",
+                return_value=resolved_view,
+            ), patch("feishu_screening_bridge.bitable_upload.time.sleep", return_value=None):
+                result = upload_final_review_payload_to_bitable(
+                    client,
+                    payload_json_path=payload_path,
+                    linked_bitable_url="https://example.com/base/app?table=tbl&view=vew",
+                )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["created_count"], 1)
+        self.assertEqual(len(client.created_records), 0)
+        self.assertEqual(result["created_rows"][0]["record_id"], "rec_server_created")
+        self.assertEqual(result["retry_summary"]["recovered_request_count"], 1)
+        self.assertEqual(result["retry_summary"]["operations"]["create_record"]["recovered_request_count"], 1)
 
     def test_upload_prefers_task_upload_resolved_target_over_payload_link(self) -> None:
         client = _FakeBitableUploadClient()

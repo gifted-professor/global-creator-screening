@@ -486,6 +486,85 @@ class TaskUploadToFinalExportRunnerTests(unittest.TestCase):
         self.assertEqual(summary["steps"]["downstream"]["vision_probe"]["provider"], "openai")
         self.assertNotIn("failure", summary)
 
+    def test_runner_forwards_dry_run_and_accepts_dry_run_only_as_successful_terminal_status(self) -> None:
+        observed: dict[str, object] = {}
+
+        def fake_upstream(**kwargs):
+            keep_path = Path(kwargs["output_root"]) / "exports" / "MINISO_final_keep.xlsx"
+            template_path = Path(kwargs["output_root"]) / "downloads" / "template.xlsx"
+            keep_path.parent.mkdir(parents=True, exist_ok=True)
+            keep_path.touch()
+            template_path.parent.mkdir(parents=True, exist_ok=True)
+            template_path.touch()
+            return {
+                "status": "stopped_after_keep-list",
+                "contract": {"canonical_boundary": "keep-list"},
+                "resume_points": {
+                    "keep_list": {
+                        "keep_workbook": str(keep_path),
+                        "template_workbook": str(template_path),
+                    }
+                },
+                "artifacts": {
+                    "keep_workbook": str(keep_path),
+                    "template_workbook": str(template_path),
+                },
+            }
+
+        def fake_downstream(**kwargs):
+            observed["downstream_kwargs"] = kwargs
+            return {
+                "status": "dry_run_only",
+                "dry_run": True,
+                "platforms": {
+                    "instagram": {
+                        "status": "dry_run_only",
+                    }
+                },
+                "dry_run_report": {
+                    "total_keep_row_count": 12,
+                    "existing_bitable_match_count": 8,
+                    "incremental_candidate_count": 4,
+                    "estimated_execution_platforms": ["instagram"],
+                },
+                "artifacts": {},
+            }
+
+        final_runner._load_runtime_dependencies = lambda: {
+            "run_task_upload_to_keep_list_pipeline": fake_upstream,
+            "run_keep_list_screening_pipeline": fake_downstream,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            env_path = temp_root / ".env"
+            env_path.write_text("", encoding="utf-8")
+            summary_path = temp_root / "run" / "summary.json"
+            summary = final_runner.run_task_upload_to_final_export_pipeline(
+                task_name="MINISO",
+                env_file=str(env_path),
+                output_root=temp_root / "run",
+                summary_json=summary_path,
+                task_upload_url="https://example.com/task",
+                employee_info_url="https://example.com/employee",
+                feishu_app_id="app-id",
+                feishu_app_secret="app-secret",
+                platform_filters=["instagram"],
+                dry_run=True,
+            )
+            task_spec = json.loads(Path(summary["task_spec_json"]).read_text(encoding="utf-8"))
+
+        self.assertEqual(summary["status"], "dry_run_only")
+        self.assertEqual(summary["delivery_status"], "dry_run_only")
+        self.assertEqual(summary["verdict"]["outcome"], "completed")
+        self.assertEqual(summary["verdict"]["recommended_action"], "resume_run")
+        self.assertTrue(summary["inputs"]["dry_run"])
+        self.assertTrue(summary["bounded_controls"]["downstream"]["dry_run"])
+        self.assertTrue(task_spec["controls"]["dry_run"])
+        self.assertTrue(observed["downstream_kwargs"]["dry_run"])
+        self.assertIn("--dry-run", summary["resume_points"]["keep_list"]["recommended_command"])
+        self.assertNotIn("failure", summary)
+
     def test_runner_surfaces_positioning_artifacts_and_stage_summaries_without_blocking_delivery(self) -> None:
         def fake_upstream(**kwargs):
             keep_path = Path(kwargs["output_root"]) / "exports" / "MINISO_final_keep.xlsx"

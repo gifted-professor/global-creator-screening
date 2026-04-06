@@ -460,6 +460,13 @@ class TaskUploadToKeepListPipelineTests(unittest.TestCase):
             summary["downstream_handoff"]["task_owner"]["task_upload_url"],
             "https://env.example/task",
         )
+        self.assertEqual(summary["observability"]["run_stage"], "keep-list")
+        self.assertEqual(summary["observability"]["layers"]["task_assets"]["linked_bitable_url"], "https://bitable.example/miniso")
+        self.assertTrue(summary["observability"]["layers"]["task_assets"]["checks"]["template_workbook_exists"])
+        self.assertEqual(summary["observability"]["layers"]["mail_sync"]["keep_row_count"], 2)
+        self.assertEqual(summary["observability"]["layers"]["mail_sync"]["message_fetch_count"], 3)
+        self.assertEqual(summary["diagnostics"]["conclusions"][0]["layer"], "task_assets")
+        self.assertIn("邮件层已产出 2 条 keep", json.dumps(summary["diagnostics"], ensure_ascii=False))
         self.assertIn("--keep-workbook", summary["downstream_handoff"]["recommended_command"])
         self.assertEqual(
             persisted["resume_points"]["llm_candidates"]["llm_review_input_prefix"],

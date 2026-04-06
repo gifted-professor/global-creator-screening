@@ -138,6 +138,33 @@ def _write_summary(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _compute_elapsed_seconds(started_at: Any, finished_at: Any) -> float | None:
+    started = _parse_iso_datetime(started_at)
+    finished = _parse_iso_datetime(finished_at)
+    if started is None or finished is None:
+        return None
+    return max(0.0, round((finished - started).total_seconds(), 3))
+
+
+def _path_exists(path_value: Any) -> bool:
+    text = str(path_value or "").strip()
+    if not text:
+        return False
+    return Path(text).expanduser().exists()
+
+
 def _emit_runtime_progress(scope: str, message: str) -> None:
     print(f"[{iso_now()}] [{scope}] {message}", flush=True)
 
@@ -231,6 +258,275 @@ def _compact_refs(payload: dict[str, Any]) -> dict[str, Any]:
             continue
         refs[key] = value
     return refs
+
+
+def _build_pending_observability_layer(status: str) -> dict[str, Any]:
+    return {
+        "status": str(status or "").strip(),
+        "blocking_reason": "",
+    }
+
+
+def _extract_upstream_blocking_reason(summary: dict[str, Any]) -> dict[str, Any]:
+    failure = dict(summary.get("failure") or {})
+    if failure:
+        return {
+            "stage": str(failure.get("stage") or "").strip(),
+            "error_code": str(failure.get("error_code") or "").strip(),
+            "message": str(failure.get("message") or "").strip(),
+        }
+    return {
+        "stage": "",
+        "error_code": str(summary.get("error_code") or "").strip(),
+        "message": str(summary.get("error") or "").strip(),
+    }
+
+
+def _derive_upstream_run_stage(summary: dict[str, Any]) -> str:
+    explicit_stage = str(summary.get("current_stage") or "").strip()
+    if explicit_stage:
+        return explicit_stage
+    step_order = list(((summary.get("contract") or {}).get("step_order")) or [])
+    steps = dict(summary.get("steps") or {})
+    for step_name in reversed(step_order):
+        if step_name in steps:
+            return str(step_name)
+    return "preflight"
+
+
+def _extract_upstream_keep_row_count(summary: dict[str, Any]) -> int:
+    steps = dict(summary.get("steps") or {})
+    for step_name, stat_key in (
+        ("mail_funnel", "keep_row_count"),
+        ("final_review", "final_keep_row_count"),
+        ("llm_review", "keep_row_count"),
+    ):
+        step_stats = dict((steps.get(step_name) or {}).get("stats") or {})
+        if stat_key in step_stats:
+            return int(step_stats.get(stat_key) or 0)
+    return 0
+
+
+def _extract_upstream_mail_metrics(summary: dict[str, Any]) -> dict[str, Any]:
+    steps = dict(summary.get("steps") or {})
+    mail_sync_step = dict(steps.get("mail_sync") or {})
+    mail_sync_task = dict(mail_sync_step.get("task") or {})
+    brand_match_stats = dict((steps.get("brand_match") or {}).get("stats") or {})
+    mail_funnel_stats = dict((steps.get("mail_funnel") or {}).get("stats") or {})
+    final_review_stats = dict((steps.get("final_review") or {}).get("stats") or {})
+    llm_review_stats = dict((steps.get("llm_review") or {}).get("stats") or {})
+    resolved_mail_sync = dict((summary.get("resolved_inputs") or {}).get("mail_sync") or {})
+    return {
+        "source_mode": str(resolved_mail_sync.get("source_mode") or "").strip(),
+        "sent_since": str(resolved_mail_sync.get("sent_since") or "").strip(),
+        "db_path": str((mail_sync_step.get("artifacts") or {}).get("mail_db_path") or "").strip(),
+        "message_hit_count": int(
+            mail_funnel_stats.get("message_hit_count")
+            or brand_match_stats.get("message_hit_count")
+            or 0
+        ),
+        "external_message_count": int(mail_funnel_stats.get("external_message_count") or 0),
+        "pass0_sending_list_email_count": int(mail_funnel_stats.get("pass0_sending_list_email_count") or 0),
+        "regex_pass1_count": int(mail_funnel_stats.get("regex_pass1_count") or 0),
+        "regex_pass2_count": int(mail_funnel_stats.get("regex_pass2_count") or 0),
+        "llm_high_count": int(mail_funnel_stats.get("llm_high_count") or 0),
+        "manual_row_count": int(
+            mail_funnel_stats.get("manual_row_count")
+            or final_review_stats.get("manual_row_count")
+            or 0
+        ),
+        "keep_row_count": int(
+            mail_funnel_stats.get("keep_row_count")
+            or final_review_stats.get("final_keep_row_count")
+            or llm_review_stats.get("keep_row_count")
+            or 0
+        ),
+        "mail_sync_duration_seconds": float(mail_sync_task.get("mail_sync_duration_seconds") or 0.0),
+        "message_fetch_count": int(mail_sync_task.get("mail_fetched_count") or 0),
+    }
+
+
+def _build_upstream_observability(summary: dict[str, Any]) -> dict[str, Any]:
+    steps = dict(summary.get("steps") or {})
+    artifacts = dict(summary.get("artifacts") or {})
+    resolved_inputs = dict(summary.get("resolved_inputs") or {})
+    resolved_feishu = dict(resolved_inputs.get("feishu") or {})
+    task_assets_step = dict(steps.get("task_assets") or {})
+    task_assets_raw = dict(task_assets_step.get("raw") or {})
+    task_assets_artifacts = dict(task_assets_step.get("artifacts") or {})
+    mail_metrics = _extract_upstream_mail_metrics(summary)
+    task_assets_layer = {
+        "status": (
+            str(task_assets_step.get("status") or "").strip()
+            or ("ready" if steps else "pending")
+        ),
+        "task_name": str(summary.get("task_name") or "").strip(),
+        "task_upload_url": str((summary.get("resolved_urls") or {}).get("task_upload_url") or "").strip(),
+        "employee_info_url": str((summary.get("resolved_urls") or {}).get("employee_info_url") or "").strip(),
+        "template_workbook": str(task_assets_artifacts.get("template_workbook") or "").strip(),
+        "sending_list_workbook": str(task_assets_artifacts.get("sending_list_workbook") or "").strip(),
+        "linked_bitable_url": str(task_assets_step.get("linked_bitable_url") or task_assets_raw.get("linkedBitableUrl") or "").strip(),
+        "task_owner_employee_id": "",
+        "task_owner_name": str(((steps.get("mail_sync") or {}).get("task") or {}).get("employee_name") or "").strip(),
+        "task_start_date": str((resolved_inputs.get("mail_sync") or {}).get("task_start_date") or "").strip(),
+        "checks": {
+            "linked_bitable_url_present": bool(
+                str(task_assets_step.get("linked_bitable_url") or task_assets_raw.get("linkedBitableUrl") or "").strip()
+            ),
+            "template_workbook_exists": _path_exists(task_assets_artifacts.get("template_workbook")),
+            "task_start_date_resolved": bool(str((resolved_inputs.get("mail_sync") or {}).get("task_start_date") or "").strip()),
+            "employee_info_url_present": bool(str(resolved_feishu.get("employee_info_url") or "").strip()),
+        },
+        "blocking_reason": "",
+    }
+    mail_sync_layer = {
+        "status": (
+            str((steps.get("mail_sync") or {}).get("status") or "").strip()
+            or ("pending" if not steps else "unknown")
+        ),
+        **mail_metrics,
+        "blocking_reason": "",
+    }
+    blocking_reason = _extract_upstream_blocking_reason(summary)
+    if blocking_reason.get("error_code") or blocking_reason.get("message"):
+        if task_assets_layer["status"] in {"failed", ""}:
+            task_assets_layer["blocking_reason"] = str(blocking_reason.get("error_code") or blocking_reason.get("message") or "").strip()
+        if mail_sync_layer["status"] in {"failed", ""}:
+            mail_sync_layer["blocking_reason"] = str(blocking_reason.get("error_code") or blocking_reason.get("message") or "").strip()
+    elapsed_seconds = _compute_elapsed_seconds(summary.get("started_at"), summary.get("finished_at"))
+    return {
+        "run_stage": _derive_upstream_run_stage(summary),
+        "stage_status": str(summary.get("status") or "").strip(),
+        "input_counts": {
+            "mail_limit": int(((summary.get("inputs") or {}).get("mail_limit")) or 0),
+            "mail_workers": int(((summary.get("inputs") or {}).get("mail_workers")) or 0),
+        },
+        "output_counts": {
+            "keep_row_count": _extract_upstream_keep_row_count(summary),
+            "message_hit_count": int(mail_metrics.get("message_hit_count") or 0),
+            "manual_row_count": int(mail_metrics.get("manual_row_count") or 0),
+        },
+        "fallback_flags": {
+            "reuse_existing": bool(summary.get("reuse_existing")),
+            "downstream_reuse_allowed": bool(((summary.get("resume_context") or {}).get("downstream_reuse_allowed"))),
+        },
+        "blocking_reason": blocking_reason,
+        "resource_usage": {
+            "elapsed_seconds": elapsed_seconds,
+            "mail_sync_duration_seconds": float(mail_metrics.get("mail_sync_duration_seconds") or 0.0),
+        },
+        "artifact_paths": {
+            "template_workbook": str(artifacts.get("template_workbook") or "").strip(),
+            "sending_list_workbook": str(artifacts.get("sending_list_workbook") or "").strip(),
+            "mail_db_path": str(artifacts.get("mail_db_path") or "").strip(),
+            "keep_workbook": str(artifacts.get("keep_workbook") or "").strip(),
+            "manual_tail_xlsx": str(artifacts.get("manual_tail_xlsx") or "").strip(),
+        },
+        "upload_outcome": {},
+        "layers": {
+            "task_assets": task_assets_layer,
+            "mail_sync": mail_sync_layer,
+            "incremental_creator": _build_pending_observability_layer("pending_downstream"),
+            "screening_execution": _build_pending_observability_layer("pending_downstream"),
+            "exports": _build_pending_observability_layer("pending_downstream"),
+            "upload": _build_pending_observability_layer("pending_downstream"),
+        },
+    }
+
+
+def _build_upstream_diagnostics(summary: dict[str, Any]) -> dict[str, Any]:
+    observability = dict(summary.get("observability") or _build_upstream_observability(summary))
+    layers = dict(observability.get("layers") or {})
+    task_assets = dict(layers.get("task_assets") or {})
+    mail_sync = dict(layers.get("mail_sync") or {})
+    conclusions: list[dict[str, Any]] = []
+
+    missing_checks = [
+        label
+        for label, ok in (
+            ("linked_bitable_url", bool((task_assets.get("checks") or {}).get("linked_bitable_url_present"))),
+            ("template_workbook", bool((task_assets.get("checks") or {}).get("template_workbook_exists"))),
+            ("employee_info_url", bool((task_assets.get("checks") or {}).get("employee_info_url_present"))),
+            ("task_start_date", bool((task_assets.get("checks") or {}).get("task_start_date_resolved"))),
+        )
+        if not ok
+    ]
+    if missing_checks:
+        conclusions.append(
+            {
+                "layer": "task_assets",
+                "code": "task_assets_incomplete",
+                "severity": "warning",
+                "message": f"任务资产层仍有缺口：{', '.join(missing_checks)}。",
+            }
+        )
+    elif task_assets:
+        conclusions.append(
+            {
+                "layer": "task_assets",
+                "code": "task_assets_ready",
+                "severity": "info",
+                "message": "任务资产输入已齐全，可稳定进入邮件与 keep 产出阶段。",
+            }
+        )
+
+    keep_row_count = int(mail_sync.get("keep_row_count") or 0)
+    message_hit_count = int(mail_sync.get("message_hit_count") or 0)
+    if keep_row_count > 0:
+        conclusions.append(
+            {
+                "layer": "mail_sync",
+                "code": "mail_keep_generated",
+                "severity": "info",
+                "message": f"邮件层已产出 {keep_row_count} 条 keep，可继续进入下游筛号。",
+            }
+        )
+    elif message_hit_count > 0:
+        conclusions.append(
+            {
+                "layer": "mail_sync",
+                "code": "mail_hits_but_keep_empty",
+                "severity": "warning",
+                "message": f"邮件层命中 {message_hit_count} 封邮件，但 keep 结果为 0，需优先检查漏斗规则与品牌词配置。",
+            }
+        )
+    elif str(summary.get("status") or "").strip() not in {"running"}:
+        conclusions.append(
+            {
+                "layer": "mail_sync",
+                "code": "mail_hits_empty",
+                "severity": "warning",
+                "message": "邮件层未形成有效 keep 产出，需确认同步范围、发信名单和品牌词是否命中。",
+            }
+        )
+
+    if (
+        int(mail_sync.get("pass0_sending_list_email_count") or 0) == 0
+        and (
+            int(mail_sync.get("regex_pass1_count") or 0) > 0
+            or int(mail_sync.get("regex_pass2_count") or 0) > 0
+            or int(mail_sync.get("llm_high_count") or 0) > 0
+        )
+    ):
+        conclusions.append(
+            {
+                "layer": "mail_sync",
+                "code": "mail_resolution_non_pass0",
+                "severity": "info",
+                "message": "本次 keep 主要依赖 regex / LLM 解析命中，不是直接命中发送名单邮箱。",
+            }
+        )
+
+    headline = conclusions[0]["message"] if conclusions else "上游 summary 观测口径已就绪。"
+    return {
+        "headline": headline,
+        "conclusions": conclusions,
+    }
+
+
+def _refresh_upstream_observability(summary: dict[str, Any]) -> None:
+    summary["observability"] = _build_upstream_observability(summary)
+    summary["diagnostics"] = _build_upstream_diagnostics(summary)
 
 
 def _resolve_cli_env_value(
@@ -713,6 +1009,7 @@ def run_task_upload_to_keep_list_pipeline(
         "started_at": iso_now(),
         "finished_at": "",
         "status": "running" if preflight["ready"] else "failed",
+        "current_stage": "preflight",
         "run_id": runner_paths.run_id,
         "run_root": str(runner_paths.run_root),
         "task_name": normalized_task_name,
@@ -807,8 +1104,11 @@ def run_task_upload_to_keep_list_pipeline(
         "resume_points": {},
         "canonical_artifacts": {},
         "downstream_handoff": {},
+        "observability": {},
+        "diagnostics": {},
     }
     attach_run_contract(summary)
+    _refresh_upstream_observability(summary)
     task_spec = build_keep_list_upstream_task_spec(
         generated_at=summary["started_at"],
         runner_paths=runner_paths,
@@ -840,6 +1140,7 @@ def run_task_upload_to_keep_list_pipeline(
     }
 
     def persist_summary(payload: dict[str, Any]) -> None:
+        _refresh_upstream_observability(payload)
         current_status = str(payload.get("status") or "").strip()
         if current_status and current_status != progress_state["status"]:
             progress_state["status"] = current_status
@@ -896,6 +1197,7 @@ def run_task_upload_to_keep_list_pipeline(
         return summary
 
     def mark_stop(step_name: str) -> dict[str, Any]:
+        summary["current_stage"] = str(step_name or "").strip()
         return finalize(
             f"stopped_after_{step_name}",
             stopped_after=step_name,
@@ -908,6 +1210,7 @@ def run_task_upload_to_keep_list_pipeline(
             failure={**failure, "failure_layer": "preflight"},
         )
 
+    summary["current_stage"] = "setup"
     _emit_runtime_progress(progress_scope, f"starting task={normalized_task_name or 'unknown'}")
 
     setup = materialize_setup(
@@ -968,6 +1271,7 @@ def run_task_upload_to_keep_list_pipeline(
     persist_summary(summary)
 
     try:
+        summary["current_stage"] = "runtime_init"
         runtime = _load_runtime_dependencies()
         resolve_sync_sent_since = runtime["resolve_sync_sent_since"]
         download_task_upload_screening_assets = runtime["download_task_upload_screening_assets"]
@@ -1111,6 +1415,7 @@ def run_task_upload_to_keep_list_pipeline(
             task_assets["status"] = "reused"
             task_assets["reused"] = True
         else:
+            summary["current_stage"] = "task_assets"
             _emit_runtime_progress(progress_scope, "task_assets=running")
             task_assets_result = download_task_upload_screening_assets(
                 client=client,
@@ -1308,6 +1613,7 @@ def run_task_upload_to_keep_list_pipeline(
                 "items": [mail_item],
             }
         else:
+            summary["current_stage"] = "mail_sync"
             _emit_runtime_progress(progress_scope, "mail_sync=running")
             mail_sync_result = sync_task_upload_mailboxes(
                 client=client,
@@ -1424,6 +1730,7 @@ def run_task_upload_to_keep_list_pipeline(
                 brand_match_step["status"] = "reused"
                 brand_match_step["reused"] = True
             else:
+                summary["current_stage"] = "brand_match"
                 _emit_runtime_progress(progress_scope, "brand_match=running")
                 db = Database(Path(mail_sync_step["artifacts"]["mail_db_path"]))
                 try:
@@ -1503,6 +1810,7 @@ def run_task_upload_to_keep_list_pipeline(
                     mail_funnel_step["status"] = "reused"
                     mail_funnel_step["reused"] = True
                 else:
+                    summary["current_stage"] = "mail_funnel"
                     _emit_runtime_progress(progress_scope, "mail_funnel=running")
                     db = Database(Path(mail_sync_step["artifacts"]["mail_db_path"]))
                     try:
@@ -1589,6 +1897,7 @@ def run_task_upload_to_keep_list_pipeline(
                     shared_resolution_step["status"] = "reused"
                     shared_resolution_step["reused"] = True
                 else:
+                    summary["current_stage"] = "shared_resolution"
                     _emit_runtime_progress(progress_scope, "shared_resolution=running")
                     db = Database(Path(mail_sync_step["artifacts"]["mail_db_path"]))
                     try:
@@ -1661,6 +1970,7 @@ def run_task_upload_to_keep_list_pipeline(
                     final_review_step["status"] = "reused"
                     final_review_step["reused"] = True
                 else:
+                    summary["current_stage"] = "final_review"
                     _emit_runtime_progress(progress_scope, "final_review=running")
                     final_review_result = run_shared_email_final_review(
                         input_prefix=shared_resolution_prefix,
@@ -1733,6 +2043,7 @@ def run_task_upload_to_keep_list_pipeline(
                 enrichment_step["status"] = "reused"
                 enrichment_step["reused"] = True
             else:
+                summary["current_stage"] = "enrichment"
                 _emit_runtime_progress(progress_scope, "enrichment=running")
                 db = Database(Path(mail_sync_step["artifacts"]["mail_db_path"]))
                 try:
@@ -1801,6 +2112,7 @@ def run_task_upload_to_keep_list_pipeline(
                 llm_candidates_step["status"] = "reused"
                 llm_candidates_step["reused"] = True
             else:
+                summary["current_stage"] = "llm_candidates"
                 _emit_runtime_progress(progress_scope, "llm_candidates=running")
                 db = Database(Path(mail_sync_step["artifacts"]["mail_db_path"]))
                 try:
@@ -1870,6 +2182,7 @@ def run_task_upload_to_keep_list_pipeline(
                 llm_review_step["status"] = "reused"
                 llm_review_step["reused"] = True
             else:
+                summary["current_stage"] = "llm_review"
                 _emit_runtime_progress(progress_scope, "llm_review=running")
                 llm_review_result = run_and_apply_llm_review(
                     input_prefix=llm_prefix,
@@ -1962,6 +2275,7 @@ def run_task_upload_to_keep_list_pipeline(
             failure=failure,
         )
 
+    summary["current_stage"] = "completed"
     return finalize("completed")
 
 

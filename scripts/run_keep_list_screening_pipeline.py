@@ -117,6 +117,33 @@ def _write_summary(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _compute_elapsed_seconds(started_at: Any, finished_at: Any) -> float | None:
+    started = _parse_iso_datetime(started_at)
+    finished = _parse_iso_datetime(finished_at)
+    if started is None or finished is None:
+        return None
+    return max(0.0, round((finished - started).total_seconds(), 3))
+
+
+def _path_exists(path_value: Any) -> bool:
+    text = str(path_value or "").strip()
+    if not text:
+        return False
+    return Path(text).expanduser().exists()
+
+
 def _emit_runtime_progress(scope: str, message: str) -> None:
     print(f"[{iso_now()}] [{scope}] {message}", flush=True)
 
@@ -471,7 +498,7 @@ def _stage_missing_profiles_for_fallback(
 def summarize_platform_statuses(platforms: dict[str, dict[str, Any]]) -> str:
     statuses = [str((payload or {}).get("status") or "").strip() for payload in (platforms or {}).values()]
     failure_statuses = {"failed", "scrape_failed", "missing_profiles_blocked"}
-    successful_statuses = {"completed", "completed_with_partial_scrape", "fallback_staged", "staged_only"}
+    successful_statuses = {"completed", "completed_with_partial_scrape", "dry_run_only", "fallback_staged", "staged_only"}
     if any(status in failure_statuses for status in statuses) and any(status in successful_statuses for status in statuses):
         return "completed_with_platform_failures"
     if any(status == "failed" for status in statuses):
@@ -482,7 +509,9 @@ def summarize_platform_statuses(platforms: dict[str, dict[str, Any]]) -> str:
         return "missing_profiles_blocked"
     if any(status == "completed_with_partial_scrape" for status in statuses):
         return "completed_with_partial_scrape"
-    if statuses and all(status in {"staged_only", "skipped"} for status in statuses):
+    if "dry_run_only" in statuses and all(status in {"dry_run_only", "skipped"} for status in statuses):
+        return "dry_run_only"
+    if "staged_only" in statuses and all(status in {"staged_only", "skipped"} for status in statuses):
         return "staged_only"
     return "completed"
 
@@ -712,6 +741,8 @@ def _compact_upload_summary(upload_summary: dict[str, Any] | None) -> dict[str, 
             if isinstance(group, dict)
         ],
     }
+    retry_summary = dict(payload.get("retry_summary") or {})
+    retry_operations = dict(retry_summary.get("operations") or {})
     return {
         "ok": bool(payload.get("ok", True)),
         "dry_run": bool(payload.get("dry_run")),
@@ -730,6 +761,32 @@ def _compact_upload_summary(upload_summary: dict[str, Any] | None) -> dict[str, 
         "duplicate_existing_group_count": int(payload.get("duplicate_existing_group_count") or 0),
         "duplicate_payload_group_count": int(payload.get("duplicate_payload_group_count") or 0),
         "deduplicated_row_count": int(payload.get("deduplicated_row_count") or 0),
+        "request_control": dict(payload.get("request_control") or {}),
+        "retry_summary": {
+            "enabled": bool(retry_summary.get("enabled")),
+            "max_retries": int(retry_summary.get("max_retries") or 0),
+            "write_min_interval_seconds": float(retry_summary.get("write_min_interval_seconds") or 0.0),
+            "request_count": int(retry_summary.get("request_count") or 0),
+            "attempt_count": int(retry_summary.get("attempt_count") or 0),
+            "retried_request_count": int(retry_summary.get("retried_request_count") or 0),
+            "retryable_error_count": int(retry_summary.get("retryable_error_count") or 0),
+            "recovered_request_count": int(retry_summary.get("recovered_request_count") or 0),
+            "exhausted_request_count": int(retry_summary.get("exhausted_request_count") or 0),
+            "rate_limit_sleep_seconds": float(retry_summary.get("rate_limit_sleep_seconds") or 0.0),
+            "backoff_sleep_seconds": float(retry_summary.get("backoff_sleep_seconds") or 0.0),
+            "operations": {
+                operation: {
+                    "request_count": int((item or {}).get("request_count") or 0),
+                    "attempt_count": int((item or {}).get("attempt_count") or 0),
+                    "retried_request_count": int((item or {}).get("retried_request_count") or 0),
+                    "retryable_error_count": int((item or {}).get("retryable_error_count") or 0),
+                    "recovered_request_count": int((item or {}).get("recovered_request_count") or 0),
+                    "exhausted_request_count": int((item or {}).get("exhausted_request_count") or 0),
+                }
+                for operation, item in list(retry_operations.items())[:20]
+                if isinstance(item, dict)
+            },
+        },
         "upload_detail": compact_upload_detail,
         "report_write_warnings": list(payload.get("report_write_warnings") or []),
     }
@@ -751,10 +808,12 @@ def _build_cli_output_summary(summary: dict[str, Any]) -> dict[str, Any]:
         }
     return {
         "status": str(summary.get("status") or "").strip(),
+        "dry_run": bool(summary.get("dry_run")),
         "verdict": dict(summary.get("verdict") or {}),
         "run_root": str(summary.get("run_root") or "").strip(),
         "summary_json": str(summary.get("summary_json") or "").strip(),
         "warnings": dict(summary.get("warnings") or {}),
+        "dry_run_report": dict(summary.get("dry_run_report") or {}),
         "quality_report": {
             "status": str(((summary.get("quality_report") or {}).get("status")) or "").strip(),
             "warning_count": int(((summary.get("quality_report") or {}).get("warning_count")) or 0),
@@ -773,6 +832,605 @@ def _build_cli_output_summary(summary: dict[str, Any]) -> dict[str, Any]:
         },
         "upload_summary": dict(summary.get("upload_summary") or {}),
     }
+
+
+def _build_pending_observability_layer(status: str, *, blocking_reason: str = "") -> dict[str, Any]:
+    return {
+        "status": str(status or "").strip(),
+        "blocking_reason": str(blocking_reason or "").strip(),
+    }
+
+
+def _extract_downstream_blocking_reason(summary: dict[str, Any]) -> dict[str, Any]:
+    failure = dict(summary.get("failure") or {})
+    if failure:
+        return {
+            "stage": str(failure.get("stage") or "").strip(),
+            "error_code": str(failure.get("error_code") or "").strip(),
+            "message": str(failure.get("message") or "").strip(),
+        }
+    return {
+        "stage": "",
+        "error_code": str(summary.get("error_code") or "").strip(),
+        "message": str(summary.get("error") or "").strip(),
+    }
+
+
+def _derive_downstream_run_stage(summary: dict[str, Any]) -> str:
+    explicit_stage = str(summary.get("current_stage") or "").strip()
+    if explicit_stage:
+        return explicit_stage
+    for platform in list(summary.get("execution_platforms") or []):
+        payload = dict((summary.get("platforms") or {}).get(platform) or {})
+        current_stage = str(payload.get("current_stage") or "").strip()
+        if current_stage:
+            return current_stage
+    return str(summary.get("status") or "").strip() or "preflight"
+
+
+def _extract_export_mode_counts(platforms: dict[str, dict[str, Any]]) -> dict[str, int]:
+    counts = {
+        "normal": 0,
+        "deferred": 0,
+        "local_missing_profile_fallback": 0,
+        "unknown": 0,
+    }
+    for platform_summary in (platforms or {}).values():
+        if not isinstance(platform_summary, dict):
+            continue
+        export_mode = str(((platform_summary.get("exports") or {}).get("final_review_export_mode")) or "").strip()
+        deferred_status = str(((platform_summary.get("final_review_export") or {}).get("status")) or "").strip()
+        if deferred_status == "deferred":
+            counts["deferred"] += 1
+        elif export_mode == "local_missing_profile_fallback":
+            counts["local_missing_profile_fallback"] += 1
+        elif export_mode == "api" or str(((platform_summary.get("exports") or {}).get("final_review")) or "").strip():
+            counts["normal"] += 1
+        elif str(platform_summary.get("status") or "").strip() not in {"skipped", ""}:
+            counts["unknown"] += 1
+    return counts
+
+
+def _extract_platform_stage_duration_rows(platforms: dict[str, dict[str, Any]]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    for platform, platform_summary in (platforms or {}).items():
+        stage_metrics = dict((platform_summary or {}).get("stage_metrics") or {})
+        for stage_name, payload in stage_metrics.items():
+            if not isinstance(payload, dict):
+                continue
+            duration_seconds = payload.get("duration_seconds")
+            if duration_seconds is None:
+                continue
+            rows.append(
+                {
+                    "platform": str(platform),
+                    "stage": str(stage_name),
+                    "duration_seconds": float(duration_seconds or 0.0),
+                    "started_at": str(payload.get("started_at") or "").strip(),
+                    "finished_at": str(payload.get("finished_at") or "").strip(),
+                    "status": str(payload.get("status") or "").strip(),
+                }
+            )
+    return rows
+
+
+def _build_task_assets_observability_layer(summary: dict[str, Any]) -> dict[str, Any]:
+    staging = dict(summary.get("staging") or {})
+    task_source = dict(staging.get("taskSource") or {})
+    resolved_task_owner = dict(summary.get("resolved_task_owner") or {})
+    linked_bitable_url = str(resolved_task_owner.get("linked_bitable_url") or "").strip()
+    template_workbook = str(summary.get("template_workbook") or "").strip()
+    return {
+        "status": "ready" if str(summary.get("keep_workbook") or "").strip() else "failed",
+        "task_name": str(summary.get("task_name") or "").strip(),
+        "task_upload_url": str(summary.get("task_upload_url") or "").strip(),
+        "employee_info_url": "",
+        "template_workbook": template_workbook,
+        "keep_workbook": str(summary.get("keep_workbook") or "").strip(),
+        "linked_bitable_url": linked_bitable_url,
+        "task_owner_employee_id": str(resolved_task_owner.get("task_owner_employee_id") or "").strip(),
+        "task_owner_name": str(resolved_task_owner.get("task_owner_name") or "").strip(),
+        "task_start_date": str(task_source.get("taskStartDate") or "").strip(),
+        "checks": {
+            "linked_bitable_url_present": bool(linked_bitable_url),
+            "template_workbook_exists": _path_exists(template_workbook),
+            "task_start_date_resolved": bool(str(task_source.get("taskStartDate") or "").strip()),
+            "task_owner_complete": bool(
+                str(resolved_task_owner.get("task_owner_name") or "").strip()
+                and str(resolved_task_owner.get("task_owner_employee_id") or "").strip()
+            ),
+        },
+        "blocking_reason": "",
+    }
+
+
+def _build_mail_observability_layer(summary: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "status": "not_in_scope",
+        "source_mode": "",
+        "sent_since": "",
+        "db_path": "",
+        "message_hit_count": 0,
+        "external_message_count": 0,
+        "pass0_sending_list_email_count": 0,
+        "regex_pass1_count": 0,
+        "regex_pass2_count": 0,
+        "llm_high_count": 0,
+        "manual_row_count": 0,
+        "keep_row_count": 0,
+        "blocking_reason": "mail layer belongs to upstream keep-list summary; downstream starts from keep workbook input",
+    }
+
+
+def _build_incremental_observability_layer(summary: dict[str, Any]) -> dict[str, Any]:
+    platforms = dict(summary.get("platforms") or {})
+    existing_bitable_prefilter = dict(summary.get("existing_bitable_prefilter") or {})
+    staged_identifier_count = 0
+    existing_bitable_match_count = 0
+    incremental_candidate_count = 0
+    all_existing = True
+    incremental_candidate_preview: list[str] = []
+    duplicate_existing_group_count = int(existing_bitable_prefilter.get("duplicate_existing_group_count") or 0)
+    for platform_summary in platforms.values():
+        if not isinstance(platform_summary, dict):
+            continue
+        staged_identifier_count += int(platform_summary.get("staged_identifier_count") or 0)
+        platform_prefilter = dict(platform_summary.get("incremental_prefilter") or {})
+        existing_bitable_match_count += int(platform_prefilter.get("existing_bitable_match_count") or 0)
+        incremental_candidate_count += int(platform_prefilter.get("incremental_candidate_count") or 0)
+        duplicate_existing_group_count = max(
+            duplicate_existing_group_count,
+            int(platform_prefilter.get("duplicate_existing_group_count") or 0),
+        )
+        all_existing = all_existing and bool(platform_prefilter.get("all_existing"))
+        incremental_candidate_preview.extend(
+            [str(item) for item in list(platform_prefilter.get("incremental_candidate_preview") or []) if str(item).strip()]
+        )
+    status = "ready" if existing_bitable_prefilter.get("enabled") else str(existing_bitable_prefilter.get("status") or "disabled")
+    return {
+        "status": status,
+        "linked_bitable_url": str(existing_bitable_prefilter.get("linked_bitable_url") or "").strip(),
+        "enabled": bool(existing_bitable_prefilter.get("enabled")),
+        "staged_identifier_count": staged_identifier_count,
+        "existing_bitable_match_count": existing_bitable_match_count,
+        "incremental_candidate_count": incremental_candidate_count,
+        "all_existing": bool(staged_identifier_count > 0 and all_existing),
+        "duplicate_existing_group_count": duplicate_existing_group_count,
+        "incremental_candidate_preview": incremental_candidate_preview[:10],
+        "blocking_reason": str(existing_bitable_prefilter.get("error") or "").strip(),
+    }
+
+
+def _build_execution_observability_layer(summary: dict[str, Any]) -> dict[str, Any]:
+    platforms = dict(summary.get("platforms") or {})
+    platform_payloads: dict[str, Any] = {}
+    status = "ready"
+    for platform, payload in platforms.items():
+        if not isinstance(payload, dict):
+            continue
+        visual_gate = dict(payload.get("visual_gate") or {})
+        visual_retry = dict(payload.get("visual_retry") or {})
+        positioning = dict(payload.get("positioning_card_analysis") or {})
+        platform_payloads[str(platform)] = {
+            "status": str(payload.get("status") or "").strip(),
+            "current_stage": str(payload.get("current_stage") or "").strip(),
+            "requested_identifier_count": int(payload.get("requested_identifier_count") or 0),
+            "profile_review_count": int(payload.get("profile_review_count") or 0),
+            "prescreen_pass_count": int(payload.get("prescreen_pass_count") or 0),
+            "missing_profile_count": int(payload.get("missing_profile_count") or 0),
+            "fallback_candidate_count": int(payload.get("fallback_candidate_count") or 0),
+            "visual_job_status": str((payload.get("visual_job") or {}).get("status") or "").strip(),
+            "visual_gate": {
+                "executed": bool(visual_gate.get("executed")),
+                "selected_provider": str(visual_gate.get("selected_provider") or "").strip(),
+                "reason": str(visual_gate.get("reason") or "").strip(),
+            },
+            "visual_retry": {
+                "status": str(visual_retry.get("status") or "").strip(),
+                "round_count": len(list(visual_retry.get("rounds") or [])),
+                "final_error_count": int(visual_retry.get("final_error_count") or 0),
+            },
+            "positioning": {
+                "status": str(positioning.get("status") or "").strip(),
+                "started_at": str(((payload.get("stage_metrics") or {}).get("positioning") or {}).get("started_at") or "").strip(),
+                "finished_at": str(((payload.get("stage_metrics") or {}).get("positioning") or {}).get("finished_at") or "").strip(),
+                "duration_seconds": float((((payload.get("stage_metrics") or {}).get("positioning") or {}).get("duration_seconds") or 0.0)),
+            },
+            "stage_metrics": dict(payload.get("stage_metrics") or {}),
+        }
+        if str(payload.get("status") or "").strip() in {"failed", "scrape_failed"}:
+            status = "failed"
+        elif int(payload.get("missing_profile_count") or 0) > 0 and status != "failed":
+            status = "warning"
+    return {
+        "status": status,
+        "platforms": platform_payloads,
+        "blocking_reason": "",
+    }
+
+
+def _build_dry_run_report(summary: dict[str, Any]) -> dict[str, Any]:
+    staging_stats = dict(((summary.get("staging") or {}).get("upload") or {}).get("stats") or {})
+    total_keep_row_count = 0
+    for value in staging_stats.values():
+        try:
+            total_keep_row_count += max(0, int(value or 0))
+        except (TypeError, ValueError):
+            continue
+
+    platforms = dict(summary.get("platforms") or {})
+    estimated_execution_platforms: list[str] = []
+    all_existing_platforms: list[str] = []
+    no_candidate_platforms: list[str] = []
+    platform_reports: dict[str, Any] = {}
+    staged_identifier_count = 0
+    existing_bitable_match_count = 0
+    incremental_candidate_count = 0
+
+    for platform, payload in platforms.items():
+        if not isinstance(payload, dict):
+            continue
+        platform_name = str(platform or "").strip()
+        if not platform_name:
+            continue
+        platform_prefilter = dict(payload.get("incremental_prefilter") or {})
+        platform_staged = int(payload.get("staged_identifier_count") or 0)
+        platform_existing = int(platform_prefilter.get("existing_bitable_match_count") or 0)
+        platform_incremental = int(platform_prefilter.get("incremental_candidate_count") or 0)
+        platform_requested = int(payload.get("requested_identifier_count") or 0)
+        staged_identifier_count += platform_staged
+        existing_bitable_match_count += platform_existing
+        incremental_candidate_count += platform_incremental
+        if platform_requested > 0:
+            estimated_execution_platforms.append(platform_name)
+        if bool(platform_prefilter.get("all_existing")):
+            all_existing_platforms.append(platform_name)
+        elif platform_staged <= 0:
+            no_candidate_platforms.append(platform_name)
+        platform_reports[platform_name] = {
+            "status": str(payload.get("status") or "").strip(),
+            "staged_identifier_count": platform_staged,
+            "existing_bitable_match_count": platform_existing,
+            "incremental_candidate_count": platform_incremental,
+            "requested_identifier_count": platform_requested,
+            "requested_identifier_preview": list(payload.get("requested_identifier_preview") or [])[:10],
+            "incremental_candidate_preview": list(platform_prefilter.get("incremental_candidate_preview") or [])[:10],
+            "all_existing": bool(platform_prefilter.get("all_existing")),
+            "would_execute": bool(platform_requested > 0),
+        }
+
+    return {
+        "total_keep_row_count": total_keep_row_count,
+        "staged_identifier_count": staged_identifier_count,
+        "existing_bitable_match_count": existing_bitable_match_count,
+        "incremental_candidate_count": incremental_candidate_count,
+        "estimated_execution_platform_count": len(estimated_execution_platforms),
+        "estimated_execution_platforms": estimated_execution_platforms,
+        "all_existing_platforms": all_existing_platforms,
+        "no_candidate_platforms": no_candidate_platforms,
+        "duplicate_existing_group_count": int(
+            ((summary.get("existing_bitable_prefilter") or {}).get("duplicate_existing_group_count")) or 0
+        ),
+        "platforms": platform_reports,
+    }
+
+
+def _build_exports_observability_layer(summary: dict[str, Any]) -> dict[str, Any]:
+    artifacts = dict(summary.get("artifacts") or {})
+    platforms = dict(summary.get("platforms") or {})
+    export_modes = _extract_export_mode_counts(platforms)
+    platform_exports: dict[str, Any] = {}
+    status = "skipped" if bool(summary.get("dry_run")) else "ready"
+    for platform, payload in platforms.items():
+        if not isinstance(payload, dict):
+            continue
+        artifact_status = dict(payload.get("artifact_status") or {})
+        exports = dict(payload.get("exports") or {})
+        deferred = dict(payload.get("final_review_export") or {})
+        export_mode = str(exports.get("final_review_export_mode") or "").strip()
+        normalized_mode = (
+            "deferred"
+            if str(deferred.get("status") or "").strip() == "deferred"
+            else ("local_missing_profile_fallback" if export_mode == "local_missing_profile_fallback" else ("normal" if export_mode == "api" or str(exports.get("final_review") or "").strip() else "unknown"))
+        )
+        platform_exports[str(platform)] = {
+            "status": str(payload.get("status") or "").strip(),
+            "final_review_export_available": bool(str(exports.get("final_review") or "").strip()),
+            "final_review_export_blocked": bool(artifact_status.get("final_review_export_blocked")),
+            "final_review_export_mode": normalized_mode,
+            "final_review_path": str(exports.get("final_review") or "").strip(),
+            "positioning_card_review_path": str(exports.get("positioning_card_review") or "").strip(),
+        }
+        if normalized_mode in {"local_missing_profile_fallback", "unknown"} and status == "ready":
+            status = "warning"
+    return {
+        "status": status,
+        "final_review_export_modes": export_modes,
+        "platforms": platform_exports,
+        "artifact_paths": {
+            "all_platforms_final_review": str(artifacts.get("all_platforms_final_review") or "").strip(),
+            "all_platforms_final_review_payload_json": str(artifacts.get("all_platforms_upload_payload_json") or "").strip(),
+            "missing_profiles_xlsx": str(artifacts.get("missing_profiles_xlsx") or "").strip(),
+            "success_report_xlsx": str(artifacts.get("success_report_xlsx") or "").strip(),
+            "error_report_xlsx": str(artifacts.get("error_report_xlsx") or "").strip(),
+        },
+        "blocking_reason": "",
+    }
+
+
+def _build_upload_observability_layer(summary: dict[str, Any]) -> dict[str, Any]:
+    upload_summary = dict(summary.get("upload_summary") or {})
+    artifacts = dict(summary.get("artifacts") or {})
+    retry_summary = dict(upload_summary.get("retry_summary") or {})
+    status = "skipped" if bool(summary.get("dry_run")) else "ready"
+    if bool(upload_summary.get("guard_blocked")):
+        status = "failed"
+    elif int(upload_summary.get("failed_count") or artifacts.get("feishu_upload_failed_count") or 0) > 0:
+        status = "warning"
+    return {
+        "status": status,
+        "source_row_count": int(artifacts.get("all_platforms_upload_source_row_count") or 0),
+        "selected_row_count": int(upload_summary.get("selected_row_count") or 0),
+        "created_count": int(upload_summary.get("created_count") or artifacts.get("feishu_upload_created_count") or 0),
+        "updated_count": int(upload_summary.get("updated_count") or artifacts.get("feishu_upload_updated_count") or 0),
+        "skipped_existing_count": int(upload_summary.get("skipped_existing_count") or artifacts.get("feishu_upload_skipped_existing_count") or 0),
+        "failed_count": int(upload_summary.get("failed_count") or artifacts.get("feishu_upload_failed_count") or 0),
+        "guard_blocked": bool(upload_summary.get("guard_blocked")),
+        "duplicate_existing_group_count": int(upload_summary.get("duplicate_existing_group_count") or 0),
+        "duplicate_payload_group_count": int(upload_summary.get("duplicate_payload_group_count") or 0),
+        "result_json_written": bool(upload_summary.get("result_json_written")),
+        "result_xlsx_written": bool(upload_summary.get("result_xlsx_written")),
+        "retried_request_count": int(retry_summary.get("retried_request_count") or 0),
+        "retryable_error_count": int(retry_summary.get("retryable_error_count") or 0),
+        "recovered_request_count": int(retry_summary.get("recovered_request_count") or 0),
+        "exhausted_request_count": int(retry_summary.get("exhausted_request_count") or 0),
+        "rate_limit_sleep_seconds": float(retry_summary.get("rate_limit_sleep_seconds") or 0.0),
+        "backoff_sleep_seconds": float(retry_summary.get("backoff_sleep_seconds") or 0.0),
+        "target_table_id": str(artifacts.get("feishu_upload_target_table_id") or "").strip(),
+        "target_table_name": str(artifacts.get("feishu_upload_target_table_name") or "").strip(),
+        "blocking_reason": (
+            "dry_run flag set; upload skipped"
+            if bool(summary.get("dry_run"))
+            else str(upload_summary.get("error") or "").strip()
+        ),
+    }
+
+
+def _build_downstream_observability(summary: dict[str, Any]) -> dict[str, Any]:
+    platforms = dict(summary.get("platforms") or {})
+    task_assets_layer = _build_task_assets_observability_layer(summary)
+    mail_layer = _build_mail_observability_layer(summary)
+    incremental_layer = _build_incremental_observability_layer(summary)
+    execution_layer = _build_execution_observability_layer(summary)
+    exports_layer = _build_exports_observability_layer(summary)
+    upload_layer = _build_upload_observability_layer(summary)
+    blocking_reason = _extract_downstream_blocking_reason(summary)
+    return {
+        "run_stage": _derive_downstream_run_stage(summary),
+        "stage_status": str(summary.get("status") or "").strip(),
+        "input_counts": {
+            "platform_count": len(list(summary.get("execution_platforms") or [])),
+            "staged_identifier_count": sum(
+                int((payload or {}).get("staged_identifier_count") or 0)
+                for payload in platforms.values()
+                if isinstance(payload, dict)
+            ),
+            "requested_identifier_count": sum(
+                int((payload or {}).get("requested_identifier_count") or 0)
+                for payload in platforms.values()
+                if isinstance(payload, dict)
+            ),
+        },
+        "output_counts": {
+            "profile_review_count": sum(
+                int((payload or {}).get("profile_review_count") or 0)
+                for payload in platforms.values()
+                if isinstance(payload, dict)
+            ),
+            "missing_profile_count": sum(
+                int((payload or {}).get("missing_profile_count") or 0)
+                for payload in platforms.values()
+                if isinstance(payload, dict)
+            ),
+            "upload_created_count": int(upload_layer.get("created_count") or 0),
+            "upload_failed_count": int(upload_layer.get("failed_count") or 0),
+        },
+        "fallback_flags": {
+            "dry_run": bool(summary.get("dry_run")),
+            "skip_scrape": bool(summary.get("skip_scrape")),
+            "skip_visual": bool(summary.get("skip_visual")),
+            "skip_positioning_card_analysis": bool(summary.get("skip_positioning_card_analysis")),
+            "local_missing_profile_fallback_used": int((exports_layer.get("final_review_export_modes") or {}).get("local_missing_profile_fallback") or 0) > 0,
+        },
+        "blocking_reason": blocking_reason,
+        "resource_usage": {
+            "elapsed_seconds": _compute_elapsed_seconds(summary.get("started_at"), summary.get("finished_at")),
+            "platform_stage_durations": _extract_platform_stage_duration_rows(platforms),
+        },
+        "artifact_paths": dict(exports_layer.get("artifact_paths") or {}),
+        "upload_outcome": dict(upload_layer),
+        "layers": {
+            "task_assets": task_assets_layer,
+            "mail_sync": mail_layer,
+            "incremental_creator": incremental_layer,
+            "screening_execution": execution_layer,
+            "exports": exports_layer,
+            "upload": upload_layer,
+        },
+    }
+
+
+def _build_downstream_diagnostics(summary: dict[str, Any]) -> dict[str, Any]:
+    observability = dict(summary.get("observability") or _build_downstream_observability(summary))
+    layers = dict(observability.get("layers") or {})
+    incremental_layer = dict(layers.get("incremental_creator") or {})
+    exports_layer = dict(layers.get("exports") or {})
+    upload_layer = dict(layers.get("upload") or {})
+    dry_run_report = dict(summary.get("dry_run_report") or {})
+    conclusions: list[dict[str, Any]] = []
+
+    if bool(summary.get("dry_run")):
+        conclusions.append(
+            {
+                "layer": "incremental_creator",
+                "code": "dry_run_scope_resolved",
+                "severity": "info",
+                "message": (
+                    f"本次为 dry-run：keep 共 {int(dry_run_report.get('total_keep_row_count') or 0)} 行，"
+                    f"staged {int(dry_run_report.get('staged_identifier_count') or 0)} 个达人，"
+                    f"已存在 {int(dry_run_report.get('existing_bitable_match_count') or 0)} 个，"
+                    f"新增 {int(dry_run_report.get('incremental_candidate_count') or 0)} 个，"
+                    f"预计执行平台 {int(dry_run_report.get('estimated_execution_platform_count') or 0)} 个。"
+                ),
+            }
+        )
+        conclusions.append(
+            {
+                "layer": "upload",
+                "code": "dry_run_skipped_execution",
+                "severity": "info",
+                "message": "本次 dry-run 未真正执行 scrape / visual / positioning / export / 飞书上传。",
+            }
+        )
+
+    if bool(incremental_layer.get("enabled")):
+        staged_count = int(incremental_layer.get("staged_identifier_count") or 0)
+        existing_count = int(incremental_layer.get("existing_bitable_match_count") or 0)
+        incremental_count = int(incremental_layer.get("incremental_candidate_count") or 0)
+        if bool(incremental_layer.get("all_existing")):
+            conclusions.append(
+                {
+                    "layer": "incremental_creator",
+                    "code": "all_existing_creators",
+                    "severity": "info",
+                    "message": f"本次 staged {staged_count} 个达人均已存在于目标飞书表，本轮无需重跑 scrape / visual。",
+                }
+            )
+        else:
+            conclusions.append(
+                {
+                    "layer": "incremental_creator",
+                    "code": "incremental_scope_resolved",
+                    "severity": "info",
+                    "message": f"本次 staged {staged_count} 个达人，已存在 {existing_count} 个，新增 {incremental_count} 个，只对新增达人继续执行下游筛号。",
+                }
+            )
+    elif str(incremental_layer.get("linked_bitable_url") or "").strip():
+        conclusions.append(
+            {
+                "layer": "incremental_creator",
+                "code": "prefilter_not_available",
+                "severity": "warning",
+                "message": "linked_bitable_url 已提供，但增量达人预过滤未成功启用，需优先检查飞书读取链路。",
+            }
+        )
+
+    export_modes = dict(exports_layer.get("final_review_export_modes") or {})
+    if not bool(summary.get("dry_run")) and int(export_modes.get("local_missing_profile_fallback") or 0) > 0:
+        conclusions.append(
+            {
+                "layer": "exports",
+                "code": "local_final_review_fallback_used",
+                "severity": "warning",
+                "message": f"本次有 {int(export_modes.get('local_missing_profile_fallback') or 0)} 个平台的 final review 走了本地缺号兜底导出，建议后续持续观察是否频繁触发。",
+            }
+        )
+    elif not bool(summary.get("dry_run")) and int(export_modes.get("deferred") or 0) > 0:
+        conclusions.append(
+            {
+                "layer": "exports",
+                "code": "final_review_deferred",
+                "severity": "info",
+                "message": f"本次有 {int(export_modes.get('deferred') or 0)} 个平台因 fallback staging 延迟导出平台级 final review。",
+            }
+        )
+
+    if bool(summary.get("dry_run")):
+        pass
+    elif bool(upload_layer.get("guard_blocked")):
+        conclusions.append(
+            {
+                "layer": "upload",
+                "code": "upload_guard_blocked",
+                "severity": "warning",
+                "message": "飞书上传被 guard_blocked 拦截，需优先检查目标表负责人字段或历史脏数据。",
+            }
+        )
+    else:
+        conclusions.append(
+            {
+                "layer": "upload",
+                "code": "upload_outcome",
+                "severity": "info" if int(upload_layer.get("failed_count") or 0) == 0 else "warning",
+                "message": (
+                    f"飞书上传结果：created {int(upload_layer.get('created_count') or 0)}，"
+                    f"updated {int(upload_layer.get('updated_count') or 0)}，"
+                    f"skipped {int(upload_layer.get('skipped_existing_count') or 0)}，"
+                    f"failed {int(upload_layer.get('failed_count') or 0)}。"
+                ),
+            }
+        )
+        if int(upload_layer.get("duplicate_existing_group_count") or 0) > 0:
+            conclusions.append(
+                {
+                    "layer": "upload",
+                    "code": "duplicate_existing_groups_detected",
+                    "severity": "warning",
+                    "message": f"目标飞书表检测到 {int(upload_layer.get('duplicate_existing_group_count') or 0)} 组历史重复记录，虽然本次未必阻断上传，但建议持续清理。",
+                }
+            )
+        if int(upload_layer.get("retried_request_count") or 0) > 0:
+            conclusions.append(
+                {
+                    "layer": "upload",
+                    "code": "upload_request_retried",
+                    "severity": "warning" if int(upload_layer.get("failed_count") or 0) > 0 else "info",
+                    "message": (
+                        f"飞书上传阶段触发了 {int(upload_layer.get('retried_request_count') or 0)} 次请求重试，"
+                        f"累计暂时性错误 {int(upload_layer.get('retryable_error_count') or 0)} 次，"
+                        f"主动限流等待约 {float(upload_layer.get('rate_limit_sleep_seconds') or 0.0):.2f} 秒。"
+                    ),
+                }
+            )
+        if int(upload_layer.get("exhausted_request_count") or 0) > 0:
+            conclusions.append(
+                {
+                    "layer": "upload",
+                    "code": "upload_retry_exhausted",
+                    "severity": "warning",
+                    "message": f"飞书上传阶段有 {int(upload_layer.get('exhausted_request_count') or 0)} 个请求在重试后仍未恢复，建议优先检查飞书限流或网络稳定性。",
+                }
+            )
+
+    duration_rows = sorted(
+        _extract_platform_stage_duration_rows(dict(summary.get("platforms") or {})),
+        key=lambda item: float(item.get("duration_seconds") or 0.0),
+        reverse=True,
+    )
+    if duration_rows and float(duration_rows[0].get("duration_seconds") or 0.0) > 0:
+        slowest = duration_rows[0]
+        conclusions.append(
+            {
+                "layer": "screening_execution",
+                "code": "slowest_stage_detected",
+                "severity": "info",
+                "message": (
+                    f"当前观测到的主要耗时瓶颈在 {slowest['platform']} / {slowest['stage']}，"
+                    f"耗时约 {round(float(slowest.get('duration_seconds') or 0.0), 1)} 秒。"
+                ),
+            }
+        )
+
+    headline = conclusions[0]["message"] if conclusions else "下游 summary 观测口径已就绪。"
+    return {
+        "headline": headline,
+        "conclusions": conclusions,
+    }
+
+
+def _refresh_downstream_observability(summary: dict[str, Any]) -> None:
+    summary["observability"] = _build_downstream_observability(summary)
+    summary["diagnostics"] = _build_downstream_diagnostics(summary)
 
 
 def _build_feishu_open_client(
@@ -1089,8 +1747,118 @@ def _extract_scrape_apify_metadata(scrape_job: dict[str, Any] | None) -> dict[st
             return dict(apify)
     metadata = payload.get("metadata")
     if isinstance(metadata, dict):
-        return dict(metadata)
+            return dict(metadata)
     return {}
+
+
+def _resolve_platform_stage_group(current_stage: str) -> str:
+    normalized = str(current_stage or "").strip().lower()
+    if not normalized:
+        return ""
+    if normalized in {"platform_preparing", "platform_preparing_failed", "platform_skipped"}:
+        return "platform_prepare"
+    if normalized == "incremental_filter_completed":
+        return "incremental_creator"
+    if normalized.startswith("scrape") or normalized == "fallback_staging_failed":
+        return "scrape"
+    if normalized.startswith("visual"):
+        return "visual"
+    if normalized.startswith("positioning_card_analysis"):
+        return "positioning"
+    if normalized in {"exporting_artifacts", "artifact_export_failed", "completed"}:
+        return "export"
+    return ""
+
+
+def _platform_stage_is_terminal(current_stage: str) -> bool:
+    normalized = str(current_stage or "").strip().lower()
+    return normalized in {
+        "platform_preparing_failed",
+        "platform_skipped",
+        "incremental_filter_completed",
+        "scrape_skipped",
+        "scrape_failed",
+        "scrape_completed",
+        "scrape_partial_ready",
+        "visual_runtime_failed",
+        "visual_retry_failed",
+        "artifact_export_failed",
+        "completed",
+    }
+
+
+def _find_open_platform_stage_group(stage_metrics: dict[str, dict[str, Any]]) -> str:
+    open_group = ""
+    for group_name, payload in stage_metrics.items():
+        if not isinstance(payload, dict):
+            continue
+        if str(payload.get("started_at") or "").strip() and not str(payload.get("finished_at") or "").strip():
+            open_group = str(group_name)
+    return open_group
+
+
+def _close_platform_stage_metric(
+    stage_metrics: dict[str, dict[str, Any]],
+    *,
+    group_name: str,
+    observed_at: str,
+    status: str = "",
+) -> None:
+    entry = stage_metrics.setdefault(group_name, {})
+    if not str(entry.get("started_at") or "").strip():
+        entry["started_at"] = observed_at
+    if not str(entry.get("finished_at") or "").strip():
+        entry["finished_at"] = observed_at
+    duration_seconds = _compute_elapsed_seconds(entry.get("started_at"), entry.get("finished_at"))
+    if duration_seconds is not None:
+        entry["duration_seconds"] = duration_seconds
+    if str(status or "").strip():
+        entry["status"] = str(status).strip()
+
+
+def _update_platform_stage_metrics(
+    platform_summary: dict[str, Any],
+    *,
+    current_stage: str,
+    observed_at: str,
+    status: str = "",
+) -> None:
+    stage_group = _resolve_platform_stage_group(current_stage)
+    if not stage_group:
+        return
+    stage_metrics = platform_summary.setdefault("stage_metrics", {})
+    open_group = _find_open_platform_stage_group(stage_metrics)
+    if open_group and open_group != stage_group:
+        _close_platform_stage_metric(
+            stage_metrics,
+            group_name=open_group,
+            observed_at=observed_at,
+            status=str(platform_summary.get("status") or "").strip(),
+        )
+
+    entry = stage_metrics.setdefault(
+        stage_group,
+        {
+            "started_at": observed_at,
+            "finished_at": "",
+            "duration_seconds": 0.0,
+            "latest_stage": current_stage,
+            "status": "running",
+        },
+    )
+    if not str(entry.get("started_at") or "").strip():
+        entry["started_at"] = observed_at
+    entry["latest_stage"] = current_stage
+    if not str(entry.get("status") or "").strip():
+        entry["status"] = "running"
+
+    if _platform_stage_is_terminal(current_stage):
+        _close_platform_stage_metric(
+            stage_metrics,
+            group_name=stage_group,
+            observed_at=observed_at,
+            status=str(status or platform_summary.get("status") or current_stage).strip(),
+        )
 
 
 def _persist_platform_summary(
@@ -1104,11 +1872,18 @@ def _persist_platform_summary(
     status: str | None = None,
     summary_writer: Callable[[dict[str, Any]], None] | None = None,
 ) -> None:
+    observed_at = backend_app.iso_now()
     if current_stage is not None:
+        _update_platform_stage_metrics(
+            platform_summary,
+            current_stage=current_stage,
+            observed_at=observed_at,
+            status=str(status or platform_summary.get("status") or "").strip(),
+        )
         platform_summary["current_stage"] = current_stage
     if status is not None:
         platform_summary["status"] = status
-    platform_summary["last_updated_at"] = backend_app.iso_now()
+    platform_summary["last_updated_at"] = observed_at
     summary["platforms"][platform] = platform_summary
     if summary_writer is not None:
         summary_writer(summary)
@@ -1162,6 +1937,7 @@ def _build_resolved_config_sources(
     vision_provider: str,
     max_identifiers_per_platform: int,
     poll_interval: float,
+    dry_run: bool,
     probe_vision_provider_only: bool,
     skip_scrape: bool,
     skip_visual: bool,
@@ -1178,6 +1954,7 @@ def _build_resolved_config_sources(
         vision_provider=vision_provider,
         max_identifiers_per_platform=max_identifiers_per_platform,
         poll_interval=poll_interval,
+        dry_run=dry_run,
         probe_vision_provider_only=probe_vision_provider_only,
         skip_scrape=skip_scrape,
         skip_visual=skip_visual,
@@ -1198,6 +1975,7 @@ def _build_downstream_preflight(
     exports_dir: Path,
     downloads_dir: Path,
     requested_platforms: list[str],
+    dry_run: bool,
     skip_scrape: bool,
     skip_visual: bool,
     skip_positioning_card_analysis: bool,
@@ -1258,6 +2036,7 @@ def _build_downstream_preflight(
             "template_input_mode": "template_workbook" if template_workbook else "task_upload_or_none",
             "template_workbook_exists": template_workbook.exists() if template_workbook else False,
             "requested_platforms": requested_platforms,
+            "dry_run": bool(dry_run),
             "skip_scrape": bool(skip_scrape),
             "skip_visual": bool(skip_visual),
             "skip_positioning_card_analysis": bool(skip_positioning_card_analysis),
@@ -1419,6 +2198,7 @@ def run_keep_list_screening_pipeline(
     vision_provider: str = "",
     max_identifiers_per_platform: int = 0,
     poll_interval: float = 5.0,
+    dry_run: bool = False,
     probe_vision_provider_only: bool = False,
     skip_scrape: bool = False,
     skip_visual: bool = False,
@@ -1460,6 +2240,7 @@ def run_keep_list_screening_pipeline(
         vision_provider=vision_provider,
         max_identifiers_per_platform=max_identifiers_per_platform,
         poll_interval=poll_interval,
+        dry_run=dry_run,
         probe_vision_provider_only=probe_vision_provider_only,
         skip_scrape=skip_scrape,
         skip_visual=skip_visual,
@@ -1498,6 +2279,7 @@ def run_keep_list_screening_pipeline(
         exports_dir=exports_dir,
         downloads_dir=downloads_dir,
         requested_platforms=requested_platforms,
+        dry_run=bool(dry_run),
         skip_scrape=skip_scrape,
         skip_visual=skip_visual,
         skip_positioning_card_analysis=skip_positioning_card_analysis,
@@ -1507,6 +2289,8 @@ def run_keep_list_screening_pipeline(
 
     summary: dict[str, Any] = {
         "started_at": iso_now(),
+        "finished_at": "",
+        "current_stage": "preflight",
         "run_id": runner_paths.run_id,
         "run_root": str(runner_paths.run_root),
         "keep_workbook": str(resolved_keep_workbook.resolve()),
@@ -1547,6 +2331,7 @@ def run_keep_list_screening_pipeline(
         "execution_platforms": execution_platforms,
         "requested_vision_provider": str(vision_provider or "").strip().lower(),
         "max_identifiers_per_platform": int(max_identifiers_per_platform),
+        "dry_run": bool(dry_run),
         "skip_scrape": bool(skip_scrape),
         "skip_visual": bool(skip_visual),
         "skip_positioning_card_analysis": bool(skip_positioning_card_analysis),
@@ -1569,6 +2354,7 @@ def run_keep_list_screening_pipeline(
         "staging": {},
         "platforms": {},
         "manual_review_rows": [],
+        "dry_run_report": {},
         "warnings": {},
         "artifacts": {
             "keep_workbook": str(resolved_keep_workbook.resolve()),
@@ -1586,8 +2372,11 @@ def run_keep_list_screening_pipeline(
             "skipped": not preflight["ready"],
             "errors": [],
         },
+        "observability": {},
+        "diagnostics": {},
     }
     attach_run_contract(summary)
+    _refresh_downstream_observability(summary)
     task_spec = build_keep_list_downstream_task_spec(
         generated_at=summary["started_at"],
         runner_paths=runner_paths,
@@ -1602,6 +2391,7 @@ def run_keep_list_screening_pipeline(
         vision_provider=str(vision_provider or "").strip().lower(),
         max_identifiers_per_platform=int(max_identifiers_per_platform),
         poll_interval=float(poll_interval),
+        dry_run=bool(dry_run),
         probe_vision_provider_only=bool(probe_vision_provider_only),
         skip_scrape=bool(skip_scrape),
         skip_visual=bool(skip_visual),
@@ -1623,6 +2413,7 @@ def run_keep_list_screening_pipeline(
     }
 
     def persist_summary(payload: dict[str, Any]) -> None:
+        _refresh_downstream_observability(payload)
         current_status = str(payload.get("status") or "").strip()
         if current_status and current_status != progress_state["status"]:
             progress_state["status"] = current_status
@@ -1713,6 +2504,7 @@ def run_keep_list_screening_pipeline(
         progress_scope,
         f"starting keep workbook={resolved_keep_workbook.resolve()} platforms={','.join(execution_platforms) or 'none'}",
     )
+    summary["current_stage"] = "setup"
 
     setup = materialize_setup(
         scope="keep-list-screening",
@@ -1796,6 +2588,7 @@ def run_keep_list_screening_pipeline(
     }
 
     try:
+        summary["current_stage"] = "runtime_init"
         runtime = _load_runtime_dependencies()
     except Exception as exc:  # noqa: BLE001
         failure = _build_failure_payload(
@@ -1832,6 +2625,7 @@ def run_keep_list_screening_pipeline(
 
     try:
         try:
+            summary["current_stage"] = "staging"
             _emit_runtime_progress(progress_scope, "staging_inputs=running")
             reset_backend_runtime_state()
             staging_summary = prepare_screening_inputs(
@@ -1865,7 +2659,12 @@ def run_keep_list_screening_pipeline(
         _emit_runtime_progress(progress_scope, "staging_inputs=completed")
         summary["vision_providers"] = backend_app.get_available_vision_provider_names()
         summary["vision_preflight"] = backend_app.build_vision_preflight(vision_provider)
-        if skip_scrape and not probe_vision_provider_only:
+        if dry_run:
+            summary["vision_probe"] = {
+                "status": "skipped",
+                "reason": "dry_run flag set",
+            }
+        elif skip_scrape and not probe_vision_provider_only:
             summary["vision_probe"] = {
                 "status": "skipped",
                 "reason": "skip_scrape flag set",
@@ -1880,7 +2679,8 @@ def run_keep_list_screening_pipeline(
             active_routing_strategy = ""
             if callable(resolve_routing_strategy):
                 active_routing_strategy = str(resolve_routing_strategy({}) or "").strip().lower()
-            if (not skip_scrape and not skip_visual) or probe_vision_provider_only:
+            if ((not skip_scrape and not skip_visual) or probe_vision_provider_only) and not dry_run:
+                summary["current_stage"] = "vision_probe"
                 _emit_runtime_progress(progress_scope, "vision_probe=running")
                 if (
                     not str(vision_provider or "").strip()
@@ -1932,13 +2732,14 @@ def run_keep_list_screening_pipeline(
                         status="vision_probe_failed",
                         expose_top_level=False,
                     )
-            if probe_vision_provider_only:
+            if probe_vision_provider_only and not dry_run:
                 summary["status"] = "vision_probe_only"
                 summary["finished_at"] = backend_app.iso_now()
                 attach_run_contract(summary)
                 persist_summary(summary)
                 return summary
 
+            summary["current_stage"] = "incremental_prefilter"
             existing_bitable_prefilter, existing_bitable_analysis = _prepare_existing_bitable_prefilter(
                 runtime=runtime,
                 env_file=env_file,
@@ -1948,6 +2749,7 @@ def run_keep_list_screening_pipeline(
             summary["existing_bitable_prefilter"] = existing_bitable_prefilter
             persist_summary(summary)
 
+            summary["current_stage"] = "screening_execution"
             for platform in execution_platforms:
                 platform_summary: dict[str, Any] = {
                     "staged_identifier_count": 0,
@@ -1998,6 +2800,43 @@ def run_keep_list_screening_pipeline(
                         platform_summary=platform_summary,
                         exc=exc,
                         current_stage="platform_preparing_failed",
+                        summary_writer=persist_summary,
+                    )
+                    continue
+
+                if dry_run:
+                    if bool((platform_summary.get("incremental_prefilter") or {}).get("all_existing")):
+                        platform_summary["reason"] = "all staged creators already exist in target bitable"
+                    elif not requested_identifiers:
+                        platform_summary["reason"] = "no staged identifiers for platform"
+                    else:
+                        platform_summary["reason"] = "dry_run planned incremental execution only"
+                    platform_summary["status"] = "dry_run_only"
+                    platform_summary["scrape_job"] = {"status": "skipped", "reason": "dry_run flag set"}
+                    platform_summary["visual_job"] = {"status": "skipped", "reason": "dry_run flag set"}
+                    platform_summary["visual_gate"] = {
+                        "executed": False,
+                        "reason": "dry_run flag set",
+                        "preflight_status": platform_summary["vision_preflight"]["status"],
+                        "runnable_provider_names": platform_summary["vision_preflight"]["runnable_provider_names"],
+                        "selected_provider": platform_summary["vision_preflight"].get("preferred_provider") or "",
+                    }
+                    platform_summary["positioning_card_analysis"] = _build_positioning_stage_payload(
+                        "skipped",
+                        "dry_run flag set",
+                    )
+                    platform_summary["exports"] = {}
+                    platform_summary["dry_run"] = {
+                        "would_execute": bool(requested_identifiers),
+                        "reason": str(platform_summary.get("reason") or "").strip(),
+                    }
+                    _persist_platform_summary(
+                        summary=summary,
+                        run_summary_path=run_summary_path,
+                        backend_app=backend_app,
+                        platform=platform,
+                        platform_summary=platform_summary,
+                        current_stage="incremental_filter_completed",
                         summary_writer=persist_summary,
                     )
                     continue
@@ -2532,7 +3371,23 @@ def run_keep_list_screening_pipeline(
                 finished_at=backend_app.iso_now(),
             )
 
+        if dry_run:
+            summary["dry_run_report"] = _build_dry_run_report(summary)
+            summary["quality_report"] = {
+                "status": "ok",
+                "warning_count": 0,
+                "warnings": [],
+                "platforms": {},
+            }
+            summary["status"] = summarize_platform_statuses(summary["platforms"])
+            summary["finished_at"] = backend_app.iso_now()
+            summary["current_stage"] = "completed"
+            attach_run_contract(summary)
+            persist_summary(summary)
+            return summary
+
         combined_exports = collect_final_exports(summary.get("platforms"))
+        summary["current_stage"] = "export_merge"
         combined_artifacts = build_all_platforms_final_review_artifacts(
             output_path=exports_dir / "all_platforms_final_review.xlsx",
             payload_json_path=exports_dir / "all_platforms_final_review_payload.json",
@@ -2608,6 +3463,7 @@ def run_keep_list_screening_pipeline(
                 finished_at=backend_app.iso_now(),
             )
         if combined_artifacts["row_count"] > 0:
+            summary["current_stage"] = "upload"
             try:
                 feishu_client = _build_feishu_open_client(
                     runtime=runtime,
@@ -2710,6 +3566,7 @@ def run_keep_list_screening_pipeline(
         if summary["status"] == "completed" and str((summary.get("quality_report") or {}).get("status") or "") == "warning":
             summary["status"] = "completed_with_quality_warnings"
         summary["finished_at"] = backend_app.iso_now()
+        summary["current_stage"] = "completed"
         if summary["status"] == "scrape_failed":
             attach_failure_to_summary(
                 summary,
@@ -2956,6 +3813,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--vision-provider", default="", help="指定视觉 provider，例如 openai / reelx。")
     parser.add_argument("--max-identifiers-per-platform", type=int, default=0, help="每个平台最多跑多少个账号；0 表示不截断。")
     parser.add_argument("--poll-interval", type=float, default=5.0, help="轮询 job 状态的秒数。")
+    parser.add_argument("--dry-run", action="store_true", help="只做增量达人与平台执行预估，不真正触发 scrape / visual / export / upload。")
     parser.add_argument("--probe-vision-provider-only", action="store_true", help="只做视觉 provider live probe，不继续 scrape/visual/export。")
     parser.add_argument(
         "--skip-scrape",
@@ -2992,6 +3850,7 @@ def main(argv: list[str] | None = None) -> int:
         vision_provider=args.vision_provider or "",
         max_identifiers_per_platform=max(0, int(args.max_identifiers_per_platform)),
         poll_interval=max(1.0, float(args.poll_interval)),
+        dry_run=bool(args.dry_run),
         probe_vision_provider_only=bool(args.probe_vision_provider_only),
         skip_scrape=bool(args.skip_scrape),
         skip_visual=bool(args.skip_visual),

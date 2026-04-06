@@ -5,7 +5,8 @@ import json
 import math
 from pathlib import Path
 import re
-from typing import Any
+import time
+from typing import Any, Callable
 from urllib import parse
 
 import pandas as pd
@@ -59,6 +60,24 @@ _UPLOAD_BASE_KEY_FIELDS = ("达人ID", "平台")
 _OWNER_SCOPE_FIELD_CANDIDATES: tuple[str, ...] = ()
 _PREFERRED_TARGET_TABLE_NAMES = ("AI回信管理", "达人管理")
 _PREFERRED_TARGET_VIEW_NAMES = ("表格", "总视图")
+_RETRYABLE_FEISHU_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504}
+_RETRYABLE_FEISHU_ERROR_MARKERS = (
+    "too many requests",
+    "rate limit",
+    "try again later",
+    "timed out",
+    "timeout",
+    "temporarily unavailable",
+    "connection reset",
+    "connection aborted",
+    "connection refused",
+    "remote end closed connection",
+    "eof occurred in violation of protocol",
+)
+_DEFAULT_UPLOAD_REQUEST_MAX_RETRIES = 3
+_DEFAULT_UPLOAD_WRITE_MIN_INTERVAL_SECONDS = 0.2
+_DEFAULT_UPLOAD_RETRY_BACKOFF_BASE_SECONDS = 1.0
+_DEFAULT_UPLOAD_RETRY_BACKOFF_CAP_SECONDS = 8.0
 
 @dataclass(frozen=True)
 class FieldSchema:
@@ -87,6 +106,214 @@ class ExistingRecordAnalysis:
     owner_scope_missing_record_count: int
 
 
+class _UploadRequestController:
+    def __init__(
+        self,
+        *,
+        max_retries: int,
+        write_min_interval_seconds: float,
+        retry_backoff_base_seconds: float,
+        retry_backoff_cap_seconds: float,
+        sleep_func: Callable[[float], None] = time.sleep,
+        monotonic_func: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self.max_retries = max(0, int(max_retries))
+        self.write_min_interval_seconds = max(0.0, float(write_min_interval_seconds))
+        self.retry_backoff_base_seconds = max(0.0, float(retry_backoff_base_seconds))
+        self.retry_backoff_cap_seconds = max(self.retry_backoff_base_seconds, float(retry_backoff_cap_seconds))
+        self._sleep = sleep_func
+        self._monotonic = monotonic_func
+        self._last_write_started_at = 0.0
+        self.summary: dict[str, Any] = {
+            "enabled": True,
+            "max_retries": self.max_retries,
+            "max_attempts_per_request": self.max_retries + 1,
+            "write_min_interval_seconds": self.write_min_interval_seconds,
+            "retry_backoff_base_seconds": self.retry_backoff_base_seconds,
+            "retry_backoff_cap_seconds": self.retry_backoff_cap_seconds,
+            "request_count": 0,
+            "attempt_count": 0,
+            "retried_request_count": 0,
+            "retryable_error_count": 0,
+            "recovered_request_count": 0,
+            "exhausted_request_count": 0,
+            "rate_limit_sleep_count": 0,
+            "rate_limit_sleep_seconds": 0.0,
+            "backoff_sleep_count": 0,
+            "backoff_sleep_seconds": 0.0,
+            "operations": {},
+        }
+
+    def _operation_summary(self, operation: str) -> dict[str, Any]:
+        operations = self.summary["operations"]
+        if operation not in operations:
+            operations[operation] = {
+                "request_count": 0,
+                "attempt_count": 0,
+                "retried_request_count": 0,
+                "retryable_error_count": 0,
+                "recovered_request_count": 0,
+                "exhausted_request_count": 0,
+                "rate_limit_sleep_count": 0,
+                "rate_limit_sleep_seconds": 0.0,
+                "backoff_sleep_count": 0,
+                "backoff_sleep_seconds": 0.0,
+            }
+        return operations[operation]
+
+    def _sleep_seconds(self, operation: str, *, reason: str, seconds: float) -> None:
+        sleep_seconds = max(0.0, float(seconds))
+        if sleep_seconds <= 0:
+            return
+        op_summary = self._operation_summary(operation)
+        if reason == "rate_limit":
+            self.summary["rate_limit_sleep_count"] += 1
+            self.summary["rate_limit_sleep_seconds"] += sleep_seconds
+            op_summary["rate_limit_sleep_count"] += 1
+            op_summary["rate_limit_sleep_seconds"] += sleep_seconds
+        elif reason == "backoff":
+            self.summary["backoff_sleep_count"] += 1
+            self.summary["backoff_sleep_seconds"] += sleep_seconds
+            op_summary["backoff_sleep_count"] += 1
+            op_summary["backoff_sleep_seconds"] += sleep_seconds
+        self._sleep(sleep_seconds)
+
+    def _apply_write_rate_limit(self, operation: str) -> None:
+        if self.write_min_interval_seconds <= 0:
+            self._last_write_started_at = self._monotonic()
+            return
+        now = self._monotonic()
+        elapsed = now - self._last_write_started_at if self._last_write_started_at > 0 else self.write_min_interval_seconds
+        if elapsed < self.write_min_interval_seconds:
+            self._sleep_seconds(operation, reason="rate_limit", seconds=self.write_min_interval_seconds - elapsed)
+        self._last_write_started_at = self._monotonic()
+
+    def call(
+        self,
+        operation: str,
+        func: Callable[..., Any],
+        *args: Any,
+        throttle_write: bool = False,
+        recover: Callable[[Exception, int], Any | None] | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        self.summary["request_count"] += 1
+        op_summary = self._operation_summary(operation)
+        op_summary["request_count"] += 1
+        attempt = 0
+        retried = False
+        while True:
+            attempt += 1
+            self.summary["attempt_count"] += 1
+            op_summary["attempt_count"] += 1
+            if throttle_write:
+                self._apply_write_rate_limit(operation)
+            try:
+                result = func(*args, **kwargs)
+            except Exception as exc:  # noqa: BLE001
+                retry_after_seconds = _extract_retry_after_seconds(getattr(exc, "retry_after_seconds", None))
+                if not _is_retryable_feishu_exception(exc):
+                    raise
+                self.summary["retryable_error_count"] += 1
+                op_summary["retryable_error_count"] += 1
+                recovered = recover(exc, attempt) if recover is not None else None
+                if recovered is not None:
+                    if retried:
+                        self.summary["retried_request_count"] += 1
+                        op_summary["retried_request_count"] += 1
+                    self.summary["recovered_request_count"] += 1
+                    op_summary["recovered_request_count"] += 1
+                    return recovered
+                if attempt > self.max_retries:
+                    self.summary["exhausted_request_count"] += 1
+                    op_summary["exhausted_request_count"] += 1
+                    raise
+                retried = True
+                delay_seconds = _compute_retry_delay_seconds(
+                    attempt_index=attempt,
+                    base_seconds=self.retry_backoff_base_seconds,
+                    cap_seconds=self.retry_backoff_cap_seconds,
+                    retry_after_seconds=retry_after_seconds,
+                )
+                self._sleep_seconds(operation, reason="backoff", seconds=delay_seconds)
+                continue
+            if retried:
+                self.summary["retried_request_count"] += 1
+                op_summary["retried_request_count"] += 1
+            return result
+
+
+class _RetryingFeishuUploadClient:
+    def __init__(self, client: FeishuOpenClient, controller: _UploadRequestController) -> None:
+        self._client = client
+        self._controller = controller
+
+    def get_api_json(self, url_path: str, *, headers: dict[str, str] | None = None) -> dict[str, Any]:
+        return self._controller.call(
+            _classify_feishu_api_operation("GET", url_path),
+            self._client.get_api_json,
+            url_path,
+            headers=headers,
+        )
+
+    def post_api_json(
+        self,
+        url_path: str,
+        *,
+        body: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        recover: Callable[[Exception, int], Any | None] | None = None,
+    ) -> dict[str, Any]:
+        return self._controller.call(
+            _classify_feishu_api_operation("POST", url_path),
+            self._client.post_api_json,
+            url_path,
+            body=body,
+            headers=headers,
+            throttle_write=_is_write_feishu_api_operation("POST", url_path),
+            recover=recover,
+        )
+
+    def put_api_json(
+        self,
+        url_path: str,
+        *,
+        body: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+        recover: Callable[[Exception, int], Any | None] | None = None,
+    ) -> dict[str, Any]:
+        return self._controller.call(
+            _classify_feishu_api_operation("PUT", url_path),
+            self._client.put_api_json,
+            url_path,
+            body=body,
+            headers=headers,
+            throttle_write=_is_write_feishu_api_operation("PUT", url_path),
+            recover=recover,
+        )
+
+    def upload_local_file(
+        self,
+        local_path: str | Path,
+        *,
+        parent_type: str = "bitable_file",
+        parent_node: str = "",
+        file_name: str | None = None,
+    ) -> Any:
+        return self._controller.call(
+            "upload_attachment",
+            self._client.upload_local_file,
+            local_path,
+            parent_type=parent_type,
+            parent_node=parent_node,
+            file_name=file_name,
+            throttle_write=True,
+        )
+
+    def resolve_wiki_node(self, wiki_token: str) -> dict[str, Any]:
+        return self._controller.call("resolve_wiki_node", self._client.resolve_wiki_node, wiki_token)
+
+
 def upload_final_review_payload_to_bitable(
     client: FeishuOpenClient,
     *,
@@ -99,6 +326,10 @@ def upload_final_review_payload_to_bitable(
     dry_run: bool = False,
     limit: int = 0,
     suppress_ai_labels: bool = False,
+    request_max_retries: int = _DEFAULT_UPLOAD_REQUEST_MAX_RETRIES,
+    write_min_interval_seconds: float = _DEFAULT_UPLOAD_WRITE_MIN_INTERVAL_SECONDS,
+    retry_backoff_base_seconds: float = _DEFAULT_UPLOAD_RETRY_BACKOFF_BASE_SECONDS,
+    retry_backoff_cap_seconds: float = _DEFAULT_UPLOAD_RETRY_BACKOFF_CAP_SECONDS,
 ) -> dict[str, Any]:
     payload_path = Path(str(payload_json_path)).expanduser().resolve()
     payload = json.loads(payload_path.read_text(encoding="utf-8"))
@@ -114,19 +345,26 @@ def upload_final_review_payload_to_bitable(
         if result_xlsx_path
         else archive_dir / "feishu_bitable_upload_result.xlsx"
     )
+    request_controller = _UploadRequestController(
+        max_retries=request_max_retries,
+        write_min_interval_seconds=write_min_interval_seconds,
+        retry_backoff_base_seconds=retry_backoff_base_seconds,
+        retry_backoff_cap_seconds=retry_backoff_cap_seconds,
+    )
+    retrying_client = _RetryingFeishuUploadClient(client, request_controller)
 
     target_url, target_url_source = _resolve_target_url(
-        client,
+        retrying_client,
         payload=payload,
         explicit_linked_bitable_url=linked_bitable_url,
         task_name=task_name,
         task_upload_url=task_upload_url,
     )
-    resolved_view = resolve_bitable_view_from_url(client, target_url)
-    field_schemas = _fetch_field_schemas(client, resolved_view)
+    resolved_view = resolve_bitable_view_from_url(retrying_client, target_url)
+    field_schemas = _fetch_field_schemas(retrying_client, resolved_view)
     attachment_schema = _select_attachment_field_schema(field_schemas)
     existing_record_analysis = _build_existing_record_analysis(
-        _fetch_existing_records(client, resolved_view),
+        _fetch_existing_records(retrying_client, resolved_view),
         field_schemas=field_schemas,
     )
     existing_records = existing_record_analysis.index
@@ -213,6 +451,13 @@ def upload_final_review_payload_to_bitable(
             "duplicate_payload_groups": payload_duplicate_groups,
             "deduplicated_row_count": 0,
             "deduplicated_rows": [],
+            "request_control": {
+                "request_max_retries": int(request_controller.max_retries),
+                "write_min_interval_seconds": float(request_controller.write_min_interval_seconds),
+                "retry_backoff_base_seconds": float(request_controller.retry_backoff_base_seconds),
+                "retry_backoff_cap_seconds": float(request_controller.retry_backoff_cap_seconds),
+            },
+            "retry_summary": dict(request_controller.summary),
             "upload_detail": {
                 "created_keys": [],
                 "updated_keys": [],
@@ -334,7 +579,7 @@ def upload_final_review_payload_to_bitable(
                     suppress_ai_labels=bool(suppress_ai_labels),
                 )
             _attach_local_files_to_fields(
-                client,
+                retrying_client,
                 row=row,
                 fields=fields,
                 attachment_schema=attachment_schema,
@@ -366,15 +611,26 @@ def upload_final_review_payload_to_bitable(
             continue
 
         try:
+            recover_create_record = None
+            if not should_update_existing and record_key:
+                recover_create_record = _build_create_record_recover_callback(
+                    client=retrying_client,
+                    resolved_view=resolved_view,
+                    field_schemas=field_schemas,
+                    record_key=record_key,
+                    key_field_names=key_field_names,
+                    existing_records=existing_records,
+                )
             if should_update_existing:
-                response = client.put_api_json(
+                response = retrying_client.put_api_json(
                     f"/bitable/v1/apps/{resolved_view.app_token}/tables/{resolved_view.table_id}/records/{existing_record['record_id']}",
                     body={"fields": fields},
                 )
             else:
-                response = client.post_api_json(
+                response = retrying_client.post_api_json(
                     f"/bitable/v1/apps/{resolved_view.app_token}/tables/{resolved_view.table_id}/records",
                     body={"fields": fields},
+                    recover=recover_create_record,
                 )
         except Exception as exc:  # noqa: BLE001
             if "URLFieldConvFail" in str(exc) and "主页链接" in fields and not use_mail_only_fields:
@@ -382,14 +638,15 @@ def upload_final_review_payload_to_bitable(
                 fallback_fields.pop("主页链接", None)
                 try:
                     if should_update_existing:
-                        response = client.put_api_json(
+                        response = retrying_client.put_api_json(
                             f"/bitable/v1/apps/{resolved_view.app_token}/tables/{resolved_view.table_id}/records/{existing_record['record_id']}",
                             body={"fields": fallback_fields},
                         )
                     else:
-                        response = client.post_api_json(
+                        response = retrying_client.post_api_json(
                             f"/bitable/v1/apps/{resolved_view.app_token}/tables/{resolved_view.table_id}/records",
                             body={"fields": fallback_fields},
+                            recover=recover_create_record,
                         )
                 except Exception as retry_exc:  # noqa: BLE001
                     failed_rows.append(
@@ -477,6 +734,13 @@ def upload_final_review_payload_to_bitable(
         "duplicate_payload_groups": payload_duplicate_groups,
         "deduplicated_row_count": len(deduplicated_rows_log),
         "deduplicated_rows": deduplicated_rows_log,
+        "request_control": {
+            "request_max_retries": int(request_controller.max_retries),
+            "write_min_interval_seconds": float(request_controller.write_min_interval_seconds),
+            "retry_backoff_base_seconds": float(request_controller.retry_backoff_base_seconds),
+            "retry_backoff_cap_seconds": float(request_controller.retry_backoff_cap_seconds),
+        },
+        "retry_summary": dict(request_controller.summary),
         "upload_detail": {
             "created_keys": [item.get("record_key", "") for item in created_rows],
             "updated_keys": [item.get("record_key", "") for item in updated_rows],
@@ -735,6 +999,105 @@ def _fetch_existing_records(client: FeishuOpenClient, resolved: ResolvedBitableV
         if not page_token:
             break
     return collected
+
+
+def _build_create_record_recover_callback(
+    *,
+    client: Any,
+    resolved_view: ResolvedBitableView,
+    field_schemas: dict[str, FieldSchema],
+    record_key: str,
+    key_field_names: tuple[str, ...],
+    existing_records: dict[str, dict[str, Any]],
+) -> Callable[[Exception, int], dict[str, Any] | None]:
+    def recover(_exc: Exception, _attempt: int) -> dict[str, Any] | None:
+        refreshed_analysis = _build_existing_record_analysis(
+            _fetch_existing_records(client, resolved_view),
+            field_schemas=field_schemas,
+        )
+        refreshed = dict(refreshed_analysis.index).get(record_key)
+        if not refreshed:
+            return None
+        existing_records[record_key] = {
+            "record_id": str(refreshed.get("record_id") or "").strip(),
+            "fields": dict(refreshed.get("fields") or {}),
+        }
+        return {
+            "data": {
+                "record": {
+                    "record_id": str(refreshed.get("record_id") or "").strip(),
+                    "fields": dict(refreshed.get("fields") or {}),
+                }
+            },
+            "_recovered_after_retryable_create_failure": True,
+            "_recovered_record_key": record_key,
+            "_recovered_key_field_names": list(key_field_names),
+        }
+
+    return recover
+
+
+def _classify_feishu_api_operation(method: str, url_path: str) -> str:
+    normalized_method = str(method or "").strip().upper()
+    normalized_path = str(url_path or "").strip()
+    if normalized_path.endswith("/fields"):
+        return "fetch_field_schemas"
+    if normalized_path.endswith("/records/search"):
+        return "fetch_existing_records"
+    if normalized_path.endswith("/tables"):
+        return "list_target_tables"
+    if normalized_path.endswith("/views"):
+        return "list_target_views"
+    if normalized_method == "POST" and normalized_path.endswith("/records"):
+        return "create_record"
+    if normalized_method == "PUT" and "/records/" in normalized_path:
+        return "update_record"
+    return f"{normalized_method.lower()}_api"
+
+
+def _is_write_feishu_api_operation(method: str, url_path: str) -> bool:
+    normalized_method = str(method or "").strip().upper()
+    normalized_path = str(url_path or "").strip()
+    if normalized_method == "POST" and normalized_path.endswith("/records"):
+        return True
+    if normalized_method == "PUT" and "/records/" in normalized_path:
+        return True
+    return False
+
+
+def _extract_retry_after_seconds(raw_value: Any) -> float | None:
+    if raw_value is None:
+        return None
+    try:
+        seconds = float(raw_value)
+    except (TypeError, ValueError):
+        return None
+    return seconds if seconds >= 0 else None
+
+
+def _compute_retry_delay_seconds(
+    *,
+    attempt_index: int,
+    base_seconds: float,
+    cap_seconds: float,
+    retry_after_seconds: float | None = None,
+) -> float:
+    if retry_after_seconds is not None and retry_after_seconds >= 0:
+        return retry_after_seconds
+    if base_seconds <= 0:
+        return 0.0
+    return min(cap_seconds, base_seconds * max(1, int(attempt_index)))
+
+
+def _is_retryable_feishu_exception(exc: Exception) -> bool:
+    explicit_retryable = getattr(exc, "retryable", None)
+    if explicit_retryable is not None:
+        return bool(explicit_retryable)
+    status_code = getattr(exc, "status_code", None)
+    if status_code in _RETRYABLE_FEISHU_STATUS_CODES:
+        return True
+    normalized = str(exc or "").strip().lower()
+    return any(marker in normalized for marker in _RETRYABLE_FEISHU_ERROR_MARKERS)
 
 
 def _build_existing_record_index(existing_records: list[tuple[str, dict[str, Any]]]) -> dict[str, dict[str, Any]]:

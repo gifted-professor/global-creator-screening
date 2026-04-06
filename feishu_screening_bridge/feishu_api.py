@@ -11,12 +11,39 @@ from urllib import error, parse, request
 
 DEFAULT_FEISHU_BASE_URL = "https://open.feishu.cn/open-apis"
 _TRUSTED_FEISHU_HOST_SUFFIXES = ("feishu.cn", "larksuite.com")
+_TRANSIENT_FEISHU_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504}
+_RETRYABLE_FEISHU_MESSAGE_MARKERS = (
+    "too many requests",
+    "rate limit",
+    "try again later",
+    "timed out",
+    "timeout",
+    "temporarily unavailable",
+    "connection reset",
+    "connection aborted",
+    "connection refused",
+    "remote end closed connection",
+    "eof occurred in violation of protocol",
+)
 
 _BOX_TOKEN_PATTERN = re.compile(r"(box[a-zA-Z0-9_-]+)")
 
 
 class FeishuApiError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        api_code: int | None = None,
+        retry_after_seconds: float | None = None,
+        retryable: bool | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = int(status_code) if status_code is not None else None
+        self.api_code = int(api_code) if api_code is not None else None
+        self.retry_after_seconds = float(retry_after_seconds) if retry_after_seconds is not None else None
+        self.retryable = bool(retryable) if retryable is not None else False
 
 
 @dataclass(frozen=True)
@@ -188,14 +215,22 @@ class FeishuOpenClient:
             },
         )
         if status != 200:
-            raise FeishuApiError(f"飞书附件上传失败: status={status} url={resolved_url}")
+            raise FeishuApiError(
+                f"飞书附件上传失败: status={status} url={resolved_url}",
+                status_code=status,
+                retryable=status in _TRANSIENT_FEISHU_STATUS_CODES,
+            )
         try:
             payload = json.loads(response_body.decode("utf-8"))
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise FeishuApiError("飞书附件上传返回了非 JSON 响应。") from exc
         if int(payload.get("code") or 0) != 0:
+            api_code = _coerce_api_code(payload.get("code"))
+            message = payload.get("msg") or payload.get("message") or ""
             raise FeishuApiError(
-                f"飞书附件上传失败: code={payload.get('code')} msg={payload.get('msg') or payload.get('message') or ''}"
+                f"飞书附件上传失败: code={payload.get('code')} msg={message}",
+                api_code=api_code,
+                retryable=_is_retryable_feishu_api_failure(api_code=api_code, message=message),
             )
         data = payload.get("data") or {}
         file_token = str(data.get("file_token") or data.get("fileToken") or "").strip()
@@ -289,8 +324,12 @@ class FeishuOpenClient:
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise FeishuApiError("飞书接口返回了非 JSON 响应。") from exc
         if int(parsed.get("code") or 0) != 0:
+            api_code = _coerce_api_code(parsed.get("code"))
+            message = parsed.get("msg") or parsed.get("message") or ""
             raise FeishuApiError(
-                f"飞书接口返回错误: code={parsed.get('code')} msg={parsed.get('msg') or parsed.get('message') or ''}"
+                f"飞书接口返回错误: code={parsed.get('code')} msg={message}",
+                api_code=api_code,
+                retryable=_is_retryable_feishu_api_failure(api_code=api_code, message=message),
             )
         return parsed
 
@@ -318,8 +357,12 @@ class FeishuOpenClient:
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise FeishuApiError("飞书接口返回了非 JSON 响应。") from exc
         if int(parsed.get("code") or 0) != 0:
+            api_code = _coerce_api_code(parsed.get("code"))
+            message = parsed.get("msg") or parsed.get("message") or ""
             raise FeishuApiError(
-                f"飞书接口返回错误: code={parsed.get('code')} msg={parsed.get('msg') or parsed.get('message') or ''}"
+                f"飞书接口返回错误: code={parsed.get('code')} msg={message}",
+                api_code=api_code,
+                retryable=_is_retryable_feishu_api_failure(api_code=api_code, message=message),
             )
         return parsed
 
@@ -349,9 +392,18 @@ class FeishuOpenClient:
         except error.HTTPError as exc:
             body = exc.read()
             detail = _describe_http_error(body)
-            raise FeishuApiError(f"飞书请求失败: status={exc.code} url={url} {detail}".strip()) from exc
+            retry_after_seconds = _extract_retry_after_seconds(exc.headers.get("Retry-After"))
+            raise FeishuApiError(
+                f"飞书请求失败: status={exc.code} url={url} {detail}".strip(),
+                status_code=exc.code,
+                retry_after_seconds=retry_after_seconds,
+                retryable=exc.code in _TRANSIENT_FEISHU_STATUS_CODES,
+            ) from exc
         except error.URLError as exc:
-            raise FeishuApiError(f"飞书请求失败: url={url} reason={exc.reason}") from exc
+            raise FeishuApiError(
+                f"飞书请求失败: url={url} reason={exc.reason}",
+                retryable=True,
+            ) from exc
 
 
 def extract_file_token(file_token_or_url: str) -> str:
@@ -394,6 +446,30 @@ def _describe_http_error(body: bytes) -> str:
     if code is None and not msg:
         return ""
     return f"code={code} msg={msg}".strip()
+
+
+def _coerce_api_code(value: Any) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _extract_retry_after_seconds(raw_value: Any) -> float | None:
+    if raw_value is None:
+        return None
+    try:
+        seconds = float(str(raw_value).strip())
+    except ValueError:
+        return None
+    return seconds if seconds >= 0 else None
+
+
+def _is_retryable_feishu_api_failure(*, api_code: int | None, message: Any) -> bool:
+    if api_code in _TRANSIENT_FEISHU_STATUS_CODES:
+        return True
+    normalized = str(message or "").strip().lower()
+    return any(marker in normalized for marker in _RETRYABLE_FEISHU_MESSAGE_MARKERS)
 
 
 def _extract_filename_from_headers(headers: dict[str, str]) -> str:

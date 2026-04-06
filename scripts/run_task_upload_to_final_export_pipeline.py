@@ -114,6 +114,7 @@ def _build_keep_list_resume_command(
     poll_interval: float,
     creator_cache_db_path: str,
     force_refresh_creator_cache: bool,
+    dry_run: bool,
     probe_vision_provider_only: bool,
     skip_scrape: bool,
     skip_visual: bool,
@@ -145,6 +146,8 @@ def _build_keep_list_resume_command(
         parts.append(f'--creator-cache-db-path "{creator_cache_db_path}"')
     if force_refresh_creator_cache:
         parts.append("--force-refresh-creator-cache")
+    if dry_run:
+        parts.append("--dry-run")
     if probe_vision_provider_only:
         parts.append("--probe-vision-provider-only")
     if skip_scrape:
@@ -237,6 +240,7 @@ def _build_resolved_config_sources(
     sent_since: str,
     reset_state: bool,
     reuse_existing: bool,
+    dry_run: bool,
     probe_vision_provider_only: bool,
     skip_scrape: bool,
     skip_visual: bool,
@@ -261,6 +265,7 @@ def _build_resolved_config_sources(
         sent_since=sent_since,
         reset_state=reset_state,
         reuse_existing=reuse_existing,
+        dry_run=dry_run,
         probe_vision_provider_only=probe_vision_provider_only,
         skip_scrape=skip_scrape,
         skip_visual=skip_visual,
@@ -431,6 +436,8 @@ def _aggregate_fan_out_status(child_runs: list[dict[str, Any]]) -> str:
         return "completed_with_partial_scrape"
     if "completed" in statuses:
         return "completed"
+    if "dry_run_only" in statuses:
+        return "dry_run_only"
     if "staged_only" in statuses:
         return "staged_only"
     if "vision_probe_only" in statuses:
@@ -477,6 +484,7 @@ def _run_single_task_upload_to_final_export_pipeline(
     poll_interval: float = 5.0,
     creator_cache_db_path: str = "",
     force_refresh_creator_cache: bool = False,
+    dry_run: bool = False,
     probe_vision_provider_only: bool = False,
     skip_scrape: bool = False,
     skip_visual: bool = False,
@@ -518,6 +526,7 @@ def _run_single_task_upload_to_final_export_pipeline(
         sent_since=sent_since,
         reset_state=reset_state,
         reuse_existing=reuse_existing,
+        dry_run=dry_run,
         probe_vision_provider_only=probe_vision_provider_only,
         skip_scrape=skip_scrape,
         skip_visual=skip_visual,
@@ -565,6 +574,7 @@ def _run_single_task_upload_to_final_export_pipeline(
         poll_interval=max(1.0, float(poll_interval)),
         creator_cache_db_path=str(creator_cache_db_path or "").strip(),
         force_refresh_creator_cache=bool(force_refresh_creator_cache),
+        dry_run=bool(dry_run),
         probe_vision_provider_only=bool(probe_vision_provider_only),
         skip_scrape=bool(skip_scrape),
         skip_visual=bool(skip_visual),
@@ -603,6 +613,7 @@ def _run_single_task_upload_to_final_export_pipeline(
             "reuse_existing": bool(reuse_existing),
             "creator_cache_db_path": str(creator_cache_db_path or "").strip(),
             "force_refresh_creator_cache": bool(force_refresh_creator_cache),
+            "dry_run": bool(dry_run),
         },
         "resolved_inputs": {
             "env_file": {
@@ -629,6 +640,7 @@ def _run_single_task_upload_to_final_export_pipeline(
                 "poll_interval": max(1.0, float(poll_interval)),
                 "creator_cache_db_path": str(creator_cache_db_path or "").strip(),
                 "force_refresh_creator_cache": bool(force_refresh_creator_cache),
+                "dry_run": bool(dry_run),
                 "probe_vision_provider_only": bool(probe_vision_provider_only),
                 "skip_scrape": bool(skip_scrape),
                 "skip_visual": bool(skip_visual),
@@ -857,6 +869,7 @@ def _run_single_task_upload_to_final_export_pipeline(
             poll_interval=max(1.0, float(poll_interval)),
             creator_cache_db_path=str(creator_cache_db_path or "").strip(),
             force_refresh_creator_cache=bool(force_refresh_creator_cache),
+            dry_run=bool(dry_run),
             probe_vision_provider_only=bool(probe_vision_provider_only),
             skip_scrape=bool(skip_scrape),
             skip_visual=bool(skip_visual),
@@ -903,6 +916,7 @@ def _run_single_task_upload_to_final_export_pipeline(
             poll_interval=max(1.0, float(poll_interval)),
             creator_cache_db_path=str(creator_cache_db_path or "").strip(),
             force_refresh_creator_cache=bool(force_refresh_creator_cache),
+            dry_run=bool(dry_run),
             probe_vision_provider_only=bool(probe_vision_provider_only),
             skip_scrape=bool(skip_scrape),
             skip_visual=bool(skip_visual),
@@ -1028,6 +1042,7 @@ def run_task_upload_to_final_export_pipeline(
     poll_interval: float = 5.0,
     creator_cache_db_path: str = "",
     force_refresh_creator_cache: bool = False,
+    dry_run: bool = False,
     probe_vision_provider_only: bool = False,
     skip_scrape: bool = False,
     skip_visual: bool = False,
@@ -1074,6 +1089,7 @@ def run_task_upload_to_final_export_pipeline(
             poll_interval=poll_interval,
             creator_cache_db_path=creator_cache_db_path,
             force_refresh_creator_cache=force_refresh_creator_cache,
+            dry_run=dry_run,
             probe_vision_provider_only=probe_vision_provider_only,
             skip_scrape=skip_scrape,
             skip_visual=skip_visual,
@@ -1104,6 +1120,7 @@ def run_task_upload_to_final_export_pipeline(
         sent_since=sent_since,
         reset_state=reset_state,
         reuse_existing=reuse_existing,
+        dry_run=dry_run,
         probe_vision_provider_only=probe_vision_provider_only,
         skip_scrape=skip_scrape,
         skip_visual=skip_visual,
@@ -1163,6 +1180,7 @@ def run_task_upload_to_final_export_pipeline(
             poll_interval=poll_interval,
             creator_cache_db_path=creator_cache_db_path,
             force_refresh_creator_cache=force_refresh_creator_cache,
+            dry_run=dry_run,
             probe_vision_provider_only=probe_vision_provider_only,
             skip_scrape=skip_scrape,
             skip_visual=skip_visual,
@@ -1213,6 +1231,7 @@ def run_task_upload_to_final_export_pipeline(
                 poll_interval=poll_interval,
                 creator_cache_db_path=creator_cache_db_path,
                 force_refresh_creator_cache=force_refresh_creator_cache,
+                dry_run=dry_run,
                 probe_vision_provider_only=probe_vision_provider_only,
                 skip_scrape=skip_scrape,
                 skip_visual=skip_visual,
@@ -1267,6 +1286,7 @@ def run_task_upload_to_final_export_pipeline(
             poll_interval=poll_interval,
             creator_cache_db_path=creator_cache_db_path,
             force_refresh_creator_cache=force_refresh_creator_cache,
+            dry_run=dry_run,
             probe_vision_provider_only=probe_vision_provider_only,
             skip_scrape=skip_scrape,
             skip_visual=skip_visual,
@@ -1309,6 +1329,7 @@ def run_task_upload_to_final_export_pipeline(
         poll_interval=max(1.0, float(poll_interval)),
         creator_cache_db_path=str(creator_cache_db_path or "").strip(),
         force_refresh_creator_cache=bool(force_refresh_creator_cache),
+        dry_run=bool(dry_run),
         probe_vision_provider_only=bool(probe_vision_provider_only),
         skip_scrape=bool(skip_scrape),
         skip_visual=bool(skip_visual),
@@ -1346,6 +1367,7 @@ def run_task_upload_to_final_export_pipeline(
             "reuse_existing": bool(reuse_existing),
             "creator_cache_db_path": str(creator_cache_db_path or "").strip(),
             "force_refresh_creator_cache": bool(force_refresh_creator_cache),
+            "dry_run": bool(dry_run),
         },
         "resolved_inputs": {
             "env_file": {
@@ -1370,6 +1392,7 @@ def run_task_upload_to_final_export_pipeline(
                 "vision_provider": str(vision_provider or "").strip().lower(),
                 "max_identifiers_per_platform": int(max(0, int(max_identifiers_per_platform))),
                 "poll_interval": max(1.0, float(poll_interval)),
+                "dry_run": bool(dry_run),
                 "probe_vision_provider_only": bool(probe_vision_provider_only),
                 "skip_scrape": bool(skip_scrape),
                 "skip_visual": bool(skip_visual),
@@ -1511,6 +1534,7 @@ def run_task_upload_to_final_export_pipeline(
             poll_interval=poll_interval,
             creator_cache_db_path=creator_cache_db_path,
             force_refresh_creator_cache=force_refresh_creator_cache,
+            dry_run=dry_run,
             probe_vision_provider_only=probe_vision_provider_only,
             skip_scrape=skip_scrape,
             skip_visual=skip_visual,
@@ -1606,6 +1630,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--poll-interval", type=float, default=5.0, help="轮询 job 状态的秒数。")
     parser.add_argument("--creator-cache-db-path", default="", help="Creator DB SQLite 路径；默认使用仓库内共享缓存库。")
     parser.add_argument("--force-refresh-creator-cache", action="store_true", help="忽略 Creator DB 历史结果，强制重新抓取和视觉审核。")
+    parser.add_argument("--dry-run", action="store_true", help="只做增量与平台执行预估，不真正触发 scrape / visual / export / upload。")
     parser.add_argument("--probe-vision-provider-only", action="store_true", help="只做视觉 provider live probe，不继续 scrape/visual/export。")
     parser.add_argument("--skip-scrape", action="store_true", help="只做 staging，不触发 scrape/visual/export。")
     parser.add_argument("--skip-visual", action="store_true", help="跑 scrape 和导出，但跳过视觉复核。")
@@ -1663,6 +1688,7 @@ def main(argv: list[str] | None = None) -> int:
         poll_interval=max(1.0, float(args.poll_interval)),
         creator_cache_db_path=args.creator_cache_db_path or "",
         force_refresh_creator_cache=bool(args.force_refresh_creator_cache),
+        dry_run=bool(args.dry_run),
         probe_vision_provider_only=bool(args.probe_vision_provider_only),
         skip_scrape=bool(args.skip_scrape),
         skip_visual=bool(args.skip_visual),

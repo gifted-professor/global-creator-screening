@@ -11,6 +11,7 @@ SUCCESSFUL_TERMINAL_STATUSES = {
     "completed_with_quality_warnings",
     "completed_with_partial_scrape",
     "completed_with_platform_failures",
+    "dry_run_only",
     "staged_only",
     "vision_probe_only",
 }
@@ -68,6 +69,18 @@ def build_run_verdict(
             "requires_manual_intervention": False,
             "recommended_action": "inspect_summary",
             "conclusion": "本次 run 已完成，但至少一个平台在执行中失败，请先检查 summary 里的平台失败详情再消费产物。",
+        }
+    if normalized_status == "dry_run_only":
+        return {
+            "outcome": "completed",
+            "status": normalized_status,
+            "failure_layer": "",
+            "category": "",
+            "resolution_mode": "",
+            "retryable": False,
+            "requires_manual_intervention": False,
+            "recommended_action": "resume_run",
+            "conclusion": "本次 run 仅执行 dry-run 预估，已生成增量与平台计划摘要，但未真正执行 scrape/visual/upload。",
         }
     if normalized_status in SUCCESSFUL_TERMINAL_STATUSES:
         return {
