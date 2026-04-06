@@ -29,6 +29,7 @@ class _FakeBitableUploadClient:
         self.search_side_effects: list[object] = []
         self.upload_side_effects: list[object] = []
         self.include_task_name_field = False
+        self.include_mail_idempotency_fields = False
         self.record_pages: list[dict[str, object]] | None = None
         self.search_items = [
             {
@@ -113,6 +114,14 @@ class _FakeBitableUploadClient:
             ]
             if self.include_task_name_field:
                 items.insert(0, {"field_id": "fld0", "field_name": "任务名", "type": 1, "property": None})
+            if self.include_mail_idempotency_fields:
+                items.extend(
+                    [
+                        {"field_id": "fld17", "field_name": "last_mail_message_id", "type": 1, "property": None},
+                        {"field_id": "fld18", "field_name": "last_mail_sent_at", "type": 1, "property": None},
+                        {"field_id": "fld19", "field_name": "mail_update_revision", "type": 2, "property": {"formatter": "0"}},
+                    ]
+                )
             return {"data": {"items": items}}
         raise AssertionError(f"unexpected GET {url_path}")
 
@@ -582,6 +591,148 @@ class BitableUploadTests(unittest.TestCase):
         self.assertEqual(created_fields["达人ID"], "epsilon")
         self.assertEqual(created_fields["ai 是否通过"], "是")
         self.assertEqual(created_fields["Followers(K)"], 301)
+
+    def test_upload_mail_only_update_skips_when_last_mail_message_is_already_written(self) -> None:
+        client = _FakeBitableUploadClient()
+        client.include_mail_idempotency_fields = True
+        client.search_items = [
+            {
+                "record_id": "rec_existing",
+                "fields": {
+                    "达人ID": "beta",
+                    "平台": "tiktok",
+                    "达人对接人": [{"id": "ou_beta", "name": "陈俊仁"}],
+                    "当前网红报价": "$180",
+                    "last_mail_message_id": "msg-101",
+                    "last_mail_sent_at": "2026-04-05T10:00:00+08:00",
+                    "mail_update_revision": 4,
+                },
+            }
+        ]
+        resolved_view = ResolvedBitableView(
+            source_url="https://example.com/base/app?table=tbl&view=vew",
+            source_kind="base",
+            source_token="app_token",
+            app_token="app_token",
+            table_id="tbl",
+            view_id="vew",
+            table_name="达人管理",
+            view_name="总视图",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            payload_path = Path(tmpdir) / "payload.json"
+            payload_path.write_text(
+                json.dumps(
+                    {
+                        "rows": [
+                            {
+                                "达人ID": "beta",
+                                "平台": "tiktok",
+                                "达人对接人": "陈俊仁",
+                                "达人对接人_employee_id": "ou_beta",
+                                "当前网红报价": "$200",
+                                "达人最后一次回复邮件时间": "2026/04/05",
+                                "达人回复的最后一封邮件内容": "same reply",
+                                "last_mail_message_id": "msg-101",
+                                "last_mail_sent_at": "2026-04-05T10:00:00+08:00",
+                                "mail_update_revision": 4,
+                                "__feishu_update_mode": "mail_only_update",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            with patch(
+                "feishu_screening_bridge.bitable_upload.resolve_bitable_view_from_url",
+                return_value=resolved_view,
+            ):
+                result = upload_final_review_payload_to_bitable(
+                    client,
+                    payload_json_path=payload_path,
+                    linked_bitable_url="https://example.com/base/app?table=tbl&view=vew",
+                )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["updated_count"], 0)
+        self.assertEqual(result["skipped_existing_count"], 1)
+        self.assertEqual(result["mail_idempotency_skip_count"], 1)
+        self.assertEqual(result["mail_idempotency_supported_field_names"]["last_mail_message_id"], "last_mail_message_id")
+        self.assertEqual(client.updated_records, [])
+        self.assertEqual(
+            result["mail_idempotency_skipped_rows"][0]["reason"],
+            "last_mail_message_id 已存在于飞书，跳过重复邮件更新。",
+        )
+
+    def test_upload_mail_only_update_skips_older_revision_even_when_message_id_differs(self) -> None:
+        client = _FakeBitableUploadClient()
+        client.include_mail_idempotency_fields = True
+        client.search_items = [
+            {
+                "record_id": "rec_existing",
+                "fields": {
+                    "达人ID": "beta",
+                    "平台": "tiktok",
+                    "达人对接人": [{"id": "ou_beta", "name": "陈俊仁"}],
+                    "last_mail_message_id": "msg-105",
+                    "last_mail_sent_at": "2026-04-06T10:00:00+08:00",
+                    "mail_update_revision": 5,
+                },
+            }
+        ]
+        resolved_view = ResolvedBitableView(
+            source_url="https://example.com/base/app?table=tbl&view=vew",
+            source_kind="base",
+            source_token="app_token",
+            app_token="app_token",
+            table_id="tbl",
+            view_id="vew",
+            table_name="达人管理",
+            view_name="总视图",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            payload_path = Path(tmpdir) / "payload.json"
+            payload_path.write_text(
+                json.dumps(
+                    {
+                        "rows": [
+                            {
+                                "达人ID": "beta",
+                                "平台": "tiktok",
+                                "达人对接人": "陈俊仁",
+                                "达人对接人_employee_id": "ou_beta",
+                                "当前网红报价": "$190",
+                                "last_mail_message_id": "msg-104",
+                                "last_mail_sent_at": "2026-04-05T22:00:00+08:00",
+                                "mail_update_revision": 4,
+                                "__feishu_update_mode": "mail_only_update",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            with patch(
+                "feishu_screening_bridge.bitable_upload.resolve_bitable_view_from_url",
+                return_value=resolved_view,
+            ):
+                result = upload_final_review_payload_to_bitable(
+                    client,
+                    payload_json_path=payload_path,
+                    linked_bitable_url="https://example.com/base/app?table=tbl&view=vew",
+                )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["updated_count"], 0)
+        self.assertEqual(result["mail_idempotency_skip_count"], 1)
+        self.assertEqual(client.updated_records, [])
+        self.assertIn("payload mail_update_revision=4 早于飞书现有 revision=5", result["mail_idempotency_skipped_rows"][0]["reason"])
 
     def test_upload_payload_can_suppress_ai_labels(self) -> None:
         client = _FakeBitableUploadClient()

@@ -11,7 +11,7 @@ from urllib import parse
 
 import pandas as pd
 
-from backend.timezone_utils import shanghai_day_start_ms
+from backend.timezone_utils import coerce_datetime_to_shanghai, shanghai_day_start_ms
 from .bitable_export import ResolvedBitableView, resolve_bitable_view_from_url
 from .feishu_api import FeishuApiError, FeishuOpenClient
 from .task_upload_sync import resolve_task_upload_entry
@@ -54,6 +54,14 @@ _MAIL_ONLY_FIELD_NAMES = (
     "达人最后一次回复邮件时间",
     "达人回复的最后一封邮件内容",
     "full body",
+    "last_mail_message_id",
+    "last_mail_sent_at",
+    "mail_update_revision",
+)
+_MAIL_IDEMPOTENCY_FIELD_NAMES = (
+    "last_mail_message_id",
+    "last_mail_sent_at",
+    "mail_update_revision",
 )
 
 _UPLOAD_BASE_KEY_FIELDS = ("达人ID", "平台")
@@ -375,10 +383,12 @@ def upload_final_review_payload_to_bitable(
     if limit > 0:
         rows = rows[: int(limit)]
     selected_row_count = len(rows)
+    mail_idempotency_field_names = _resolve_mail_idempotency_field_names(field_schemas)
 
     created_rows: list[dict[str, Any]] = []
     updated_rows: list[dict[str, Any]] = []
     skipped_existing_rows: list[dict[str, Any]] = []
+    mail_idempotency_skipped_rows: list[dict[str, Any]] = []
     failed_rows: list[dict[str, Any]] = []
     deduplicated_rows_log: list[dict[str, Any]] = []
     duplicate_existing_warning_rows: list[dict[str, Any]] = []
@@ -445,6 +455,9 @@ def upload_final_review_payload_to_bitable(
             "key_display_name": key_display_name,
             "owner_scope_field_name": existing_record_analysis.owner_scope_field_name,
             "owner_scope_missing_record_count": existing_record_analysis.owner_scope_missing_record_count,
+            "mail_idempotency_supported_field_names": dict(mail_idempotency_field_names),
+            "mail_idempotency_skip_count": 0,
+            "mail_idempotency_skipped_rows": [],
             "duplicate_existing_group_count": len(duplicate_existing_groups),
             "duplicate_payload_group_count": len(payload_duplicate_groups),
             "duplicate_existing_groups": duplicate_existing_groups,
@@ -564,6 +577,24 @@ def upload_final_review_payload_to_bitable(
                 }
             )
             continue
+        if should_update_existing and use_mail_only_fields:
+            should_skip_by_idempotency, skip_reason = _should_skip_mail_idempotent_update(
+                row=row,
+                existing_record=existing_record or {},
+                mail_idempotency_field_names=mail_idempotency_field_names,
+            )
+            if should_skip_by_idempotency:
+                skipped_row = {
+                    "status": "skipped_mail_idempotent_update",
+                    "record_key": record_key,
+                    "record_id": existing_record["record_id"] if existing_record else "",
+                    "existing_record_id": existing_record["record_id"] if existing_record else "",
+                    "row": row,
+                    "reason": skip_reason,
+                }
+                skipped_existing_rows.append(skipped_row)
+                mail_idempotency_skipped_rows.append(skipped_row)
+                continue
 
         try:
             if use_mail_only_fields:
@@ -728,6 +759,9 @@ def upload_final_review_payload_to_bitable(
         "updated_count": len(updated_rows),
         "skipped_existing_count": len(skipped_existing_rows),
         "failed_count": len(failed_rows),
+        "mail_idempotency_supported_field_names": dict(mail_idempotency_field_names),
+        "mail_idempotency_skip_count": len(mail_idempotency_skipped_rows),
+        "mail_idempotency_skipped_rows": mail_idempotency_skipped_rows,
         "duplicate_existing_group_count": len(duplicate_existing_groups),
         "duplicate_payload_group_count": len(payload_duplicate_groups),
         "duplicate_existing_groups": duplicate_existing_groups,
@@ -745,6 +779,10 @@ def upload_final_review_payload_to_bitable(
             "created_keys": [item.get("record_key", "") for item in created_rows],
             "updated_keys": [item.get("record_key", "") for item in updated_rows],
             "failed_detail": [{"key": item.get("record_key", ""), "error": item.get("error", "")} for item in failed_rows],
+            "mail_idempotency_skipped_detail": [
+                {"key": item.get("record_key", ""), "reason": item.get("reason", "")}
+                for item in mail_idempotency_skipped_rows
+            ],
             "deduplicated_detail": [
                 {"key": item.get("record_key", ""), "error": item.get("error", "")}
                 for item in deduplicated_rows_log
@@ -1292,6 +1330,16 @@ def _resolve_key_field_names(owner_scope_field_name: str) -> tuple[str, ...]:
     return _UPLOAD_BASE_KEY_FIELDS
 
 
+def _resolve_mail_idempotency_field_names(field_schemas: dict[str, FieldSchema]) -> dict[str, str]:
+    resolved: dict[str, str] = {}
+    for field_name in _MAIL_IDEMPOTENCY_FIELD_NAMES:
+        schema = _lookup_field_schema(field_schemas, field_name)
+        if schema is None:
+            continue
+        resolved[field_name] = schema.field_name
+    return resolved
+
+
 def _format_key_field_names(key_field_names: tuple[str, ...]) -> str:
     return "+".join(str(name).strip() for name in key_field_names if str(name).strip())
 
@@ -1394,6 +1442,88 @@ def _build_mail_only_feishu_fields(
         if include:
             fields[schema.field_name] = converted
     return fields
+
+
+def _extract_mail_idempotency_state(
+    values: dict[str, Any],
+    *,
+    mail_idempotency_field_names: dict[str, str],
+) -> dict[str, Any]:
+    return {
+        "last_mail_message_id": _clean_text(
+            _get_field_value_by_candidates(values, mail_idempotency_field_names.get("last_mail_message_id", "last_mail_message_id"))
+        ),
+        "last_mail_sent_at": _clean_text(
+            _get_field_value_by_candidates(values, mail_idempotency_field_names.get("last_mail_sent_at", "last_mail_sent_at"))
+        ),
+        "mail_update_revision": _coerce_non_negative_int(
+            _get_field_value_by_candidates(values, mail_idempotency_field_names.get("mail_update_revision", "mail_update_revision"))
+        ),
+    }
+
+
+def _coerce_non_negative_int(value: Any) -> int:
+    try:
+        numeric = int(float(value))
+    except (TypeError, ValueError):
+        return 0
+    return max(0, numeric)
+
+
+def _coerce_datetime_sort_key(value: Any) -> int | None:
+    parsed = coerce_datetime_to_shanghai(value)
+    if parsed is None:
+        return None
+    return int(parsed.timestamp())
+
+
+def _should_skip_mail_idempotent_update(
+    *,
+    row: dict[str, Any],
+    existing_record: dict[str, Any],
+    mail_idempotency_field_names: dict[str, str],
+) -> tuple[bool, str]:
+    if not mail_idempotency_field_names:
+        return False, ""
+    incoming_state = _extract_mail_idempotency_state(row, mail_idempotency_field_names=mail_idempotency_field_names)
+    if not any(
+        (
+            incoming_state["last_mail_message_id"],
+            incoming_state["last_mail_sent_at"],
+            incoming_state["mail_update_revision"],
+        )
+    ):
+        return False, ""
+    existing_state = _extract_mail_idempotency_state(
+        dict(existing_record.get("fields") or {}),
+        mail_idempotency_field_names=mail_idempotency_field_names,
+    )
+    incoming_message_id = _clean_text(incoming_state["last_mail_message_id"])
+    existing_message_id = _clean_text(existing_state["last_mail_message_id"])
+    if incoming_message_id and existing_message_id and incoming_message_id == existing_message_id:
+        return True, "last_mail_message_id 已存在于飞书，跳过重复邮件更新。"
+    incoming_revision = _coerce_non_negative_int(incoming_state["mail_update_revision"])
+    existing_revision = _coerce_non_negative_int(existing_state["mail_update_revision"])
+    if incoming_revision and existing_revision and incoming_revision < existing_revision:
+        return True, (
+            f"payload mail_update_revision={incoming_revision} 早于飞书现有 revision={existing_revision}，"
+            "跳过旧邮件更新。"
+        )
+    incoming_sent_at = _coerce_datetime_sort_key(incoming_state["last_mail_sent_at"])
+    existing_sent_at = _coerce_datetime_sort_key(existing_state["last_mail_sent_at"])
+    if incoming_revision and existing_revision and incoming_revision == existing_revision:
+        if incoming_sent_at is not None and existing_sent_at is not None and incoming_sent_at <= existing_sent_at:
+            return True, "mail_update_revision 未变且 last_mail_sent_at 不更新，跳过重复邮件更新。"
+        return False, ""
+    if (
+        not incoming_message_id
+        and not existing_message_id
+        and incoming_sent_at is not None
+        and existing_sent_at is not None
+        and incoming_sent_at <= existing_sent_at
+    ):
+        return True, "last_mail_sent_at 未晚于飞书现有时间，跳过旧邮件更新。"
+    return False, ""
 
 
 def _attach_local_files_to_fields(
