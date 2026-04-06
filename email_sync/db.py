@@ -186,6 +186,24 @@ class Database:
                 FOREIGN KEY (contact_id) REFERENCES contacts(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS thread_assignments (
+                thread_key TEXT NOT NULL,
+                owner_scope TEXT NOT NULL DEFAULT '',
+                creator_id TEXT NOT NULL,
+                platform TEXT NOT NULL DEFAULT '',
+                brand TEXT NOT NULL DEFAULT '',
+                matched_contact_email TEXT NOT NULL DEFAULT '',
+                normalized_subject TEXT NOT NULL DEFAULT '',
+                source_stage TEXT NOT NULL DEFAULT '',
+                source_run_id TEXT NOT NULL DEFAULT '',
+                last_mail_message_id TEXT NOT NULL DEFAULT '',
+                last_mail_sent_at TEXT NOT NULL DEFAULT '',
+                mail_update_revision INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (thread_key, owner_scope)
+            );
+
             CREATE INDEX IF NOT EXISTS idx_messages_folder ON messages(folder_name, sent_at);
             CREATE INDEX IF NOT EXISTS idx_messages_message_id ON messages(message_id);
             CREATE INDEX IF NOT EXISTS idx_messages_subject ON messages(subject);
@@ -197,6 +215,10 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_threads_last_sent_at ON threads(last_sent_at DESC);
             CREATE INDEX IF NOT EXISTS idx_thread_contacts_contact_id ON thread_contacts(contact_id, last_sent_at DESC);
             CREATE INDEX IF NOT EXISTS idx_message_contacts_contact_id ON message_contacts(contact_id);
+            CREATE INDEX IF NOT EXISTS idx_thread_assignments_creator
+                ON thread_assignments(owner_scope, creator_id, platform);
+            CREATE INDEX IF NOT EXISTS idx_thread_assignments_brand
+                ON thread_assignments(brand, owner_scope, creator_id);
             """
         )
         self.conn.commit()

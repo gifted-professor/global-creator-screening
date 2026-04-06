@@ -21,6 +21,7 @@ from email_sync.config import Settings, _load_dotenv, _get_value  # type: ignore
 from email_sync.db import Database
 from email_sync.date_windows import resolve_sync_sent_since
 from email_sync.imap_sync import sync_mailboxes
+from email_sync.relation_index import rebuild_relation_index
 
 
 DEFAULT_FOLDER = "其他文件夹/达人回信"
@@ -185,6 +186,8 @@ def run_shared_mailbox_sync(args: argparse.Namespace) -> dict[str, Any]:
         "message_count_before": before_count,
         "message_count_after": before_count,
         "fetched_count": 0,
+        "relation_index_rebuilt": False,
+        "relation_index_stats": {},
         "results": [],
         "error": "",
     }
@@ -204,6 +207,10 @@ def run_shared_mailbox_sync(args: argparse.Namespace) -> dict[str, Any]:
                     workers=max(1, int(args.workers)),
                     sent_since=effective_sent_since,
                 )
+                fetched_count = sum(max(0, int(getattr(result, "fetched", 0) or 0)) for result in results)
+                if fetched_count > 0:
+                    summary["relation_index_stats"] = rebuild_relation_index(db)
+                    summary["relation_index_rebuilt"] = True
             finally:
                 db.close()
     except BlockingIOError as exc:

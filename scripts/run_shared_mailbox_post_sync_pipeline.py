@@ -27,6 +27,7 @@ from backend.final_export_merge import (
     _normalize_url,
     _resolve_existing_local_paths,
 )
+from email_sync.thread_assignments import lookup_thread_assignment
 
 
 SUCCESSFUL_DOWNSTREAM_STATUSES = {"completed", "completed_with_partial_scrape"}
@@ -116,6 +117,14 @@ def _emit_runtime_progress(scope: str, message: str) -> None:
 
 def _normalize_email(value: Any) -> str:
     return _clean_text(value).lower()
+
+
+def _first_non_blank(*values: Any) -> str:
+    for value in values:
+        cleaned = _clean_text(value)
+        if cleaned:
+            return cleaned
+    return ""
 
 
 def _extract_emails_from_text(value: Any) -> list[str]:
@@ -270,6 +279,13 @@ def _extract_platform(keep_row: dict[str, Any]) -> str:
     return _normalize_platform(keep_row.get("Platform") or keep_row.get("平台"))
 
 
+def _coerce_non_negative_int(value: Any) -> int:
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _extract_ai_status(fields: dict[str, Any]) -> str:
     return _flatten_field_value(_get_field_value(fields, "ai是否通过", "ai 是否通过"))
 
@@ -411,6 +427,9 @@ def _build_mail_only_rows(
             "__last_mail_raw_path": _clean_text(keep_row.get("brand_message_raw_path") or keep_row.get("last_mail_raw_path")),
             "__feishu_attachment_local_paths": attachment_paths,
             "__feishu_update_mode": MAIL_ONLY_UPDATE_MODE,
+            "last_mail_message_id": _clean_text(keep_row.get("last_mail_message_id")),
+            "last_mail_sent_at": _first_non_blank(keep_row.get("last_mail_time"), keep_row.get("brand_message_sent_at")),
+            "mail_update_revision": _coerce_non_negative_int(keep_row.get("mail_update_revision")),
         }
     )
     return display_row, payload_row
@@ -1183,6 +1202,59 @@ def _apply_creator_reply_context(
         "creator_replied": False,
         "latest_message": dict(snapshot.get("latest_message") or {}),
         "creator_target_emails": sorted(creator_target_emails),
+    }
+
+
+def _apply_thread_assignment_cache(
+    keep_row: dict[str, Any],
+    *,
+    shared_mail_db_path: Path,
+    owner_scope: str,
+    task_name: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    updated = dict(keep_row)
+    if _clean_text(updated.get("evidence_thread_key")):
+        return updated, {"status": "skipped_existing_thread_key"}
+    normalized_owner_scope = _clean_text(owner_scope)
+    creator_id = _extract_creator_id(updated)
+    platform = _extract_platform(updated)
+    if not normalized_owner_scope or not creator_id or not platform:
+        return updated, {
+            "status": "skipped_insufficient_identity",
+            "owner_scope": normalized_owner_scope,
+            "creator_id": creator_id,
+            "platform": platform,
+        }
+    assignment = lookup_thread_assignment(
+        db_path=shared_mail_db_path,
+        owner_scope=normalized_owner_scope,
+        creator_id=creator_id,
+        platform=platform,
+        brand=task_name,
+        matched_contact_email=_first_non_blank(updated.get("matched_contact_email"), updated.get("matched_email")),
+        subject=_first_non_blank(updated.get("evidence_subject"), updated.get("last_mail_subject"), updated.get("subject")),
+    )
+    if not assignment:
+        return updated, {
+            "status": "cache_miss",
+            "owner_scope": normalized_owner_scope,
+            "creator_id": creator_id,
+            "platform": platform,
+        }
+    updated["evidence_thread_key"] = _clean_text(assignment.get("thread_key"))
+    if not _clean_text(updated.get("matched_contact_email")) and _clean_text(assignment.get("matched_contact_email")):
+        updated["matched_contact_email"] = _clean_text(assignment.get("matched_contact_email"))
+    if not _clean_text(updated.get("last_mail_message_id")) and _clean_text(assignment.get("last_mail_message_id")):
+        updated["last_mail_message_id"] = _clean_text(assignment.get("last_mail_message_id"))
+    if not _clean_text(updated.get("last_mail_time")) and _clean_text(assignment.get("last_mail_sent_at")):
+        updated["last_mail_time"] = _clean_text(assignment.get("last_mail_sent_at"))
+    if _clean_text(assignment.get("normalized_subject")) and not _clean_text(updated.get("last_mail_subject")):
+        updated["last_mail_subject"] = _clean_text(assignment.get("normalized_subject"))
+    updated["mail_update_revision"] = _coerce_non_negative_int(assignment.get("mail_update_revision"))
+    return updated, {
+        "status": "cache_hit",
+        "thread_key": _clean_text(assignment.get("thread_key")),
+        "match_reason": _clean_text(assignment.get("match_reason")),
     }
 
 
@@ -2045,14 +2117,21 @@ def run_shared_mailbox_post_sync_pipeline(
             new_creator_count = 0
 
             for keep_row in keep_frame.to_dict(orient="records"):
-                keep_row, reply_resolution = _apply_creator_reply_context(
-                    keep_row,
-                    shared_mail_db_path=resolved_mail_db_path,
-                )
                 row_owner_context = _build_owner_context_from_keep_row(keep_row, owner_context)
                 row_owner_scope_value = _clean_text(row_owner_context.get("employee_id")) or _clean_text(
                     row_owner_context.get("responsible_name")
                 )
+                keep_row, thread_assignment_resolution = _apply_thread_assignment_cache(
+                    keep_row,
+                    shared_mail_db_path=resolved_mail_db_path,
+                    owner_scope=row_owner_scope_value,
+                    task_name=task_name,
+                )
+                keep_row, reply_resolution = _apply_creator_reply_context(
+                    keep_row,
+                    shared_mail_db_path=resolved_mail_db_path,
+                )
+                reply_resolution["thread_assignment_cache"] = thread_assignment_resolution
                 if bool(item.get("rowLevelOwnerRouting")) and not row_owner_scope_value:
                     owner_status = _clean_text(keep_row.get(_KEEP_OWNER_STATUS_FIELD))
                     alias_text = _clean_text(keep_row.get(_KEEP_OWNER_ALIAS_FIELD))

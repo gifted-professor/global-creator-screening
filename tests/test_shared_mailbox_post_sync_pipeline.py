@@ -404,6 +404,57 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
             self.assertEqual(keep_row["last_mail_snippet"], "")
             self.assertEqual(keep_row["last_mail_raw_path"], "")
 
+    def test_apply_thread_assignment_cache_fills_missing_thread_key_when_guard_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "email_sync.db"
+            db = Database(db_path)
+            db.init_schema()
+            db.conn.execute(
+                """
+                INSERT INTO thread_assignments (
+                    thread_key, owner_scope, creator_id, platform, brand,
+                    matched_contact_email, normalized_subject, source_stage, source_run_id,
+                    last_mail_message_id, last_mail_sent_at, mail_update_revision, created_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    "mid:<alpha-root>",
+                    "ou_owner",
+                    "alpha",
+                    "instagram",
+                    "MINISO",
+                    "alpha@example.com",
+                    "alpha outreach",
+                    "final_keep",
+                    "run-1",
+                    "101",
+                    "2026-04-05T10:00:00+08:00",
+                    3,
+                    "2026-04-05T10:00:00+08:00",
+                    "2026-04-05T10:00:00+08:00",
+                ),
+            )
+            db.conn.commit()
+            db.close()
+
+            updated_row, resolution = pipeline._apply_thread_assignment_cache(
+                {
+                    "Platform": "Instagram",
+                    "@username": "alpha",
+                    "matched_contact_email": "alpha@example.com",
+                    "subject": "Re: Alpha outreach",
+                },
+                shared_mail_db_path=db_path,
+                owner_scope="ou_owner",
+                task_name="MINISO",
+            )
+
+        self.assertEqual(resolution["status"], "cache_hit")
+        self.assertEqual(updated_row["evidence_thread_key"], "mid:<alpha-root>")
+        self.assertEqual(updated_row["last_mail_message_id"], "101")
+        self.assertEqual(updated_row["last_mail_time"], "2026-04-05T10:00:00+08:00")
+        self.assertEqual(updated_row["mail_update_revision"], 3)
+
     def test_apply_creator_reply_context_to_export_row_uses_explicit_creator_email_for_multi_recipient_threads(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "email_sync.db"

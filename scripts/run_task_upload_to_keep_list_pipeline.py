@@ -12,6 +12,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from email_sync.db import Database as MailDatabase
+from email_sync.thread_assignments import persist_thread_assignments_from_keep_workbook
 from harness.contract import attach_run_contract
 from harness.config import (
     RequiredConfigSpec,
@@ -1653,6 +1655,11 @@ def run_task_upload_to_keep_list_pipeline(
                 "task_name": mail_item.get("taskName", ""),
                 "task_start_date": resolved_task_start_date,
                 "employee_name": mail_item.get("employeeName", ""),
+                "employee_id": mail_item.get("employeeId", ""),
+                "employee_record_id": mail_item.get("employeeRecordId", ""),
+                "employee_email": mail_item.get("employeeEmail", ""),
+                "responsible_name": mail_item.get("responsibleName", ""),
+                "owner_name": mail_item.get("ownerName", ""),
                 "credential_source": mail_item.get("mailCredentialSource", ""),
                 "login_email": mail_item.get("mailLoginEmail", ""),
                 "sync_strategy": mail_item.get("mailSyncStrategy", ""),
@@ -2227,11 +2234,66 @@ def run_task_upload_to_keep_list_pipeline(
             summary["steps"]["llm_review"] = llm_review_step
             summary["artifacts"]["keep_workbook"] = llm_review_step["artifacts"]["keep_xlsx"]
 
+        mail_task_context = dict((summary.get("steps", {}).get("mail_sync") or {}).get("task") or {})
+        owner_scope = (
+            str(mail_task_context.get("employee_id") or "").strip()
+            or str(mail_task_context.get("responsible_name") or "").strip()
+            or str(mail_task_context.get("employee_name") or "").strip()
+            or normalized_task_name
+        )
+        keep_workbook_path = Path(summary["artifacts"]["keep_workbook"]).expanduser().resolve()
+        mail_db_path = Path(mail_sync_step["artifacts"]["mail_db_path"]).expanduser().resolve()
+        thread_assignment_cache: dict[str, Any]
+        if not owner_scope:
+            thread_assignment_cache = {
+                "status": "skipped_missing_owner_scope",
+                "keep_workbook_path": str(keep_workbook_path),
+                "mail_db_path": str(mail_db_path),
+            }
+        elif not keep_workbook_path.exists():
+            thread_assignment_cache = {
+                "status": "skipped_missing_keep_workbook",
+                "keep_workbook_path": str(keep_workbook_path),
+                "mail_db_path": str(mail_db_path),
+            }
+        elif not mail_db_path.exists():
+            thread_assignment_cache = {
+                "status": "skipped_missing_mail_db",
+                "keep_workbook_path": str(keep_workbook_path),
+                "mail_db_path": str(mail_db_path),
+            }
+        else:
+            try:
+                cache_db = MailDatabase(mail_db_path)
+                try:
+                    thread_assignment_cache = {
+                        "status": "completed",
+                        **persist_thread_assignments_from_keep_workbook(
+                            db=cache_db,
+                            keep_workbook_path=keep_workbook_path,
+                            brand=normalized_task_name,
+                            owner_scope=owner_scope,
+                            source_run_id=summary["run_id"],
+                            default_source_stage="final_keep",
+                        ),
+                    }
+                finally:
+                    cache_db.close()
+            except Exception as exc:  # noqa: BLE001
+                thread_assignment_cache = {
+                    "status": "best_effort_failed",
+                    "keep_workbook_path": str(keep_workbook_path),
+                    "mail_db_path": str(mail_db_path),
+                    "error": str(exc) or exc.__class__.__name__,
+                }
+        summary["artifacts"]["thread_assignment_cache"] = thread_assignment_cache
+
         keep_list_resume_point = dict(summary["resume_points"].get("keep_list") or {})
         keep_list_resume_point.update(
             {
                 "keep_workbook": summary["artifacts"]["keep_workbook"],
                 "template_workbook": summary["artifacts"]["template_workbook"],
+                "thread_assignment_cache": summary["artifacts"]["thread_assignment_cache"],
             }
         )
         summary["resume_points"]["keep_list"] = keep_list_resume_point

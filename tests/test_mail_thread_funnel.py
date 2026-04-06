@@ -239,8 +239,10 @@ class MailThreadFunnelTests(unittest.TestCase):
 
         review_headers = list(review_rows[0])
         keep_headers = list(keep_rows[0])
+        review_thread_index = review_headers.index("thread_key")
         review_stage_index = review_headers.index("resolution_stage_final")
         review_id_index = review_headers.index("final_id_final")
+        keep_thread_index = keep_headers.index("thread_key")
         keep_platform_index = keep_headers.index("Platform")
         keep_stage_index = keep_headers.index("resolution_stage_final")
         keep_id_index = keep_headers.index("final_id_final")
@@ -257,6 +259,8 @@ class MailThreadFunnelTests(unittest.TestCase):
         self.assertIn(("llm", "llmresolvedcreator"), keep_pairs)
         keep_platform_by_id = {row[keep_id_index]: row[keep_platform_index] for row in keep_rows[1:]}
         self.assertEqual(keep_platform_by_id["creatoralpha"], "TikTok")
+        self.assertTrue(all(str(row[review_thread_index]).startswith("mid:<m") for row in review_rows[1:]))
+        self.assertTrue(all(str(row[keep_thread_index]).startswith("mid:<m") for row in keep_rows[1:]))
 
 
 if __name__ == "__main__":

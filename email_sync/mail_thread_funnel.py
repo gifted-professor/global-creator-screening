@@ -30,6 +30,7 @@ from .llm_review import (
     is_retryable_llm_transport_failure,
     resolve_llm_review_config_chain,
 )
+from .relation_index import rebuild_relation_index
 
 
 FUNNEL_HEADERS = [
@@ -289,6 +290,15 @@ def _matches_auto_reply(subject: str, body: str) -> bool:
     return any(pattern.search(subject or "") or pattern.search(body or "") for pattern in _AUTO_REPLY_PATTERNS)
 
 
+def _ensure_relation_index(db: Database) -> None:
+    message_count = int(db.conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0])
+    indexed_count = int(db.conn.execute("SELECT COUNT(*) FROM message_index").fetchone()[0])
+    if message_count == 0:
+        raise RuntimeError("本地邮件库为空，先运行 python3 -m email_sync sync")
+    if indexed_count != message_count:
+        rebuild_relation_index(db)
+
+
 def _build_row(
     *,
     message_row: Any,
@@ -518,6 +528,7 @@ def build_mail_thread_funnel_keep_workbook(
         raise ValueError("缺少 keyword。")
 
     db.init_schema()
+    _ensure_relation_index(db)
     _, candidate_rows = _load_candidate_rows(input_path)
     messages = _query_keyword_messages(
         db,
