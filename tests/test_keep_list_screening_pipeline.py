@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
 from backend import creator_cache
 from harness.contract import RUN_CONTRACT_VERSION
@@ -4235,6 +4236,190 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         self.assertEqual(summary["platforms"]["tiktok"]["status"], "failed")
         self.assertEqual(summary["platforms"]["instagram"]["status"], "failed")
         self.assertEqual(summary["platforms"]["youtube"]["status"], "failed")
+
+    def test_runner_batches_visual_jobs_and_writes_progress_checkpoint(self) -> None:
+        preflight = {
+            "status": "configured",
+            "error_code": "",
+            "message": "视觉模型已就绪：openai",
+            "configured_provider_names": ["openai"],
+            "runnable_provider_names": ["openai"],
+            "providers": [{"name": "openai", "runnable": True}],
+        }
+        backend_app = FakeBackendApp(
+            preflight,
+            metadata={
+                "tiktok": {
+                    "alpha": {"handle": "alpha", "url": "https://www.tiktok.com/@alpha"},
+                    "beta": {"handle": "beta", "url": "https://www.tiktok.com/@beta"},
+                    "gamma": {"handle": "gamma", "url": "https://www.tiktok.com/@gamma"},
+                    "delta": {"handle": "delta", "url": "https://www.tiktok.com/@delta"},
+                }
+            },
+        )
+
+        def fake_prepare_screening_inputs(**kwargs):
+            return {
+                "prepared_at": "2026-03-28T01:02:03Z",
+                "upload": {"stats": {"TikTok": 4}},
+            }
+
+        scrape_reviews = [
+            {
+                "username": identifier,
+                "status": "Pass",
+                "upload_metadata": {
+                    "handle": identifier,
+                    "url": f"https://www.tiktok.com/@{identifier}",
+                },
+            }
+            for identifier in ("alpha", "beta", "gamma", "delta")
+        ]
+
+        def fake_poll_job(client, job_id, label, interval):
+            if job_id == "scrape-job-1":
+                return {
+                    "status": "completed",
+                    "result": {"profile_reviews": list(scrape_reviews)},
+                }
+            if str(job_id).startswith("visual-job-"):
+                return {
+                    "status": "completed",
+                    "result": {"visual_results": {}},
+                }
+            raise AssertionError(f"unexpected job id: {job_id}")
+
+        def fake_export_platform_artifacts(client, platform, export_dir, final_review_profile_reviews=None):
+            export_dir.mkdir(parents=True, exist_ok=True)
+            final_review_path = export_dir / f"{platform}_final_review.xlsx"
+            final_review_path.write_text("placeholder", encoding="utf-8")
+            return {"final_review": str(final_review_path)}
+
+        def fake_build_all_platforms_final_review_artifacts(**kwargs):
+            payload_json_path = Path(kwargs["payload_json_path"])
+            payload_json_path.parent.mkdir(parents=True, exist_ok=True)
+            payload_json_path.write_text(json.dumps({"rows": []}, ensure_ascii=False), encoding="utf-8")
+            workbook_path = Path(kwargs["output_path"])
+            workbook_path.write_text("placeholder", encoding="utf-8")
+            return {
+                "all_platforms_final_review": str(workbook_path),
+                "all_platforms_upload_payload_json": str(payload_json_path),
+                "all_platforms_upload_local_archive_dir": "",
+                "all_platforms_upload_skipped_archive_json": "",
+                "all_platforms_upload_skipped_archive_xlsx": "",
+                "row_count": 0,
+                "source_row_count": 0,
+                "skipped_row_count": 0,
+            }
+
+        keep_list_runner._load_runtime_dependencies = lambda: {
+            "backend_app": backend_app,
+            "build_all_platforms_final_review_artifacts": fake_build_all_platforms_final_review_artifacts,
+            "collect_final_exports": lambda platforms: {},
+            "prepare_screening_inputs": fake_prepare_screening_inputs,
+            "count_passed_profiles": lambda scrape_job: 4,
+            "export_platform_artifacts": fake_export_platform_artifacts,
+            "poll_job": fake_poll_job,
+            "require_success": lambda response, label: response.get_json(),
+            "reset_backend_runtime_state": lambda: None,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.dict(
+            "os.environ",
+            {"TIKTOK_VISUAL_BATCH_SIZE": "2"},
+            clear=False,
+        ):
+            temp_root = Path(temp_dir)
+            keep_path = temp_root / "keep.xlsx"
+            template_path = temp_root / "template.xlsx"
+            keep_path.touch()
+            template_path.touch()
+            env_path = self._write_env_file(temp_root)
+            summary = keep_list_runner.run_keep_list_screening_pipeline(
+                keep_workbook=keep_path,
+                template_workbook=template_path,
+                env_file=env_path,
+                output_root=temp_root / "run",
+                platform_filters=["tiktok"],
+                skip_positioning_card_analysis=True,
+                visual_postcheck_max_rounds=0,
+            )
+
+            progress_payload = json.loads(Path(summary["artifacts"]["progress_json"]).read_text(encoding="utf-8"))
+            checkpoint_path = Path(summary["platforms"]["tiktok"]["visual_batching"]["checkpoint_path"])
+            checkpoint_payload = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(summary["status"], "completed")
+        self.assertEqual(len(backend_app._client.visual_start_calls), 2)
+        self.assertEqual(
+            summary["platforms"]["tiktok"]["visual_batching"]["batch_count"],
+            2,
+        )
+        self.assertEqual(checkpoint_payload["completed_batches"], [1, 2])
+        self.assertEqual(progress_payload["status"], "completed")
+        self.assertEqual(progress_payload["stage"], "completed")
+        self.assertEqual(progress_payload["phase"], "completed")
+
+    def test_visual_batch_runner_resumes_from_checkpoint(self) -> None:
+        preflight = {
+            "status": "configured",
+            "error_code": "",
+            "message": "视觉模型已就绪：openai",
+            "configured_provider_names": ["openai"],
+            "runnable_provider_names": ["openai"],
+            "providers": [{"name": "openai", "runnable": True}],
+        }
+        backend_app = FakeBackendApp(preflight)
+        progress_events: list[dict[str, Any]] = []
+
+        def fake_poll_job(client, job_id, label, interval):
+            return {"status": "completed", "result": {"visual_results": {}}}
+
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.dict(
+            "os.environ",
+            {"TIKTOK_VISUAL_BATCH_SIZE": "2"},
+            clear=False,
+        ):
+            run_root = Path(temp_dir)
+            checkpoint_path = keep_list_runner._build_visual_checkpoint_path(run_root, "tiktok")
+            identifiers = ["alpha", "beta", "gamma", "delta"]
+            keep_list_runner._persist_visual_checkpoint(
+                checkpoint_path,
+                platform="tiktok",
+                batch_size=2,
+                batch_count=2,
+                identifiers=identifiers,
+                completed_batches=[1],
+                observed_at="2026-03-28T01:02:03Z",
+            )
+
+            result = keep_list_runner._run_visual_review_batches(
+                client=backend_app.app.test_client(),
+                backend_app=backend_app,
+                platform="tiktok",
+                identifiers=identifiers,
+                vision_provider="",
+                creator_cache_db_path="",
+                force_refresh_creator_cache=False,
+                poll_job=fake_poll_job,
+                require_success=lambda response, label: response.get_json(),
+                poll_interval=1.0,
+                run_root=run_root,
+                observed_at_func=lambda: "2026-03-28T01:02:03Z",
+                progress_callback=lambda **kwargs: progress_events.append(dict(kwargs)),
+            )
+
+            checkpoint_payload = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(len(backend_app._client.visual_start_calls), 1)
+        self.assertEqual(
+            backend_app._client.visual_start_calls[0]["payload"]["identifiers"],
+            ["gamma", "delta"],
+        )
+        self.assertEqual(result["batching"]["resumed_batch_count"], 1)
+        self.assertEqual(result["batching"]["completed_batch_count"], 2)
+        self.assertEqual(checkpoint_payload["completed_batches"], [1, 2])
+        self.assertTrue(any("跳过已完成的视觉 batch 1/2" == item["last_log_line"] for item in progress_events))
 
 
 if __name__ == "__main__":

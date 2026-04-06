@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import inspect
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -41,6 +43,11 @@ DEFAULT_TEMPLATE_WORKBOOK = (
     / "miniso-星战红人筛号需求模板(1).xlsx"
 )
 DEFAULT_PLATFORM_ORDER = ("tiktok", "instagram", "youtube")
+DEFAULT_VISUAL_BATCH_SIZES = {
+    "tiktok": 50,
+    "instagram": 50,
+    "youtube": 20,
+}
 
 
 def _load_runtime_dependencies():
@@ -147,6 +154,102 @@ def _path_exists(path_value: Any) -> bool:
 
 def _emit_runtime_progress(scope: str, message: str) -> None:
     print(f"[{iso_now()}] [{scope}] {message}", flush=True)
+
+
+def _write_json_snapshot(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _resolve_visual_batch_size(platform: str) -> int:
+    normalized_platform = str(platform or "").strip().lower()
+    env_candidates = [
+        f"{normalized_platform.upper()}_VISUAL_BATCH_SIZE",
+        "VISUAL_BATCH_SIZE",
+    ]
+    default_value = int(DEFAULT_VISUAL_BATCH_SIZES.get(normalized_platform, 50) or 50)
+    for env_key in env_candidates:
+        raw_value = str(os.getenv(env_key, "") or "").strip()
+        if not raw_value:
+            continue
+        try:
+            return max(1, int(raw_value))
+        except ValueError:
+            continue
+    return max(1, default_value)
+
+
+def _chunk_identifiers(identifiers: list[str], batch_size: int) -> list[list[str]]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in identifiers:
+        value = str(item or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        cleaned.append(value)
+    size = max(1, int(batch_size or 1))
+    return [cleaned[index : index + size] for index in range(0, len(cleaned), size)]
+
+
+def _build_identifier_signature(identifiers: list[str]) -> str:
+    normalized = [str(item or "").strip() for item in identifiers if str(item or "").strip()]
+    payload = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def _build_visual_checkpoint_path(run_root: Path, platform: str) -> Path:
+    normalized_platform = str(platform or "").strip().lower() or "platform"
+    return (run_root / "checkpoints" / f"{normalized_platform}_visual_batches.json").resolve()
+
+
+def _load_visual_checkpoint(
+    checkpoint_path: Path,
+    *,
+    identifier_signature: str,
+    batch_size: int,
+) -> dict[str, Any]:
+    if not checkpoint_path.exists():
+        return {}
+    try:
+        payload = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if str(payload.get("identifier_signature") or "").strip() != str(identifier_signature or "").strip():
+        return {}
+    if int(payload.get("batch_size") or 0) != int(batch_size or 0):
+        return {}
+    return dict(payload)
+
+
+def _persist_visual_checkpoint(
+    checkpoint_path: Path,
+    *,
+    platform: str,
+    batch_size: int,
+    batch_count: int,
+    identifiers: list[str],
+    completed_batches: list[int],
+    observed_at: str,
+) -> dict[str, Any]:
+    normalized_completed_batches = sorted({max(1, int(item)) for item in completed_batches if int(item) > 0})
+    payload = {
+        "platform": str(platform or "").strip().lower(),
+        "phase": "visual",
+        "batch_size": int(batch_size),
+        "batch_count": int(batch_count),
+        "identifier_count": len(list(identifiers or [])),
+        "identifier_signature": _build_identifier_signature(list(identifiers or [])),
+        "completed_batches": normalized_completed_batches,
+        "last_completed_batch": normalized_completed_batches[-1] if normalized_completed_batches else 0,
+        "completed_identifier_count": sum(
+            len(list((list(identifiers or []))[max(0, (batch_index - 1) * int(batch_size)): batch_index * int(batch_size)]))
+            for batch_index in normalized_completed_batches
+        ),
+        "updated_at": str(observed_at or "").strip(),
+    }
+    _write_json_snapshot(checkpoint_path, payload)
+    return payload
 
 
 def _path_summary(path: Path | None, *, source: str, kind: str) -> dict[str, Any]:
@@ -2420,6 +2523,7 @@ def _persist_platform_summary(
     current_stage: str | None = None,
     status: str | None = None,
     summary_writer: Callable[[dict[str, Any]], None] | None = None,
+    progress_writer: Callable[[str, dict[str, Any], str, str], None] | None = None,
 ) -> None:
     observed_at = backend_app.iso_now()
     if current_stage is not None:
@@ -2434,6 +2538,13 @@ def _persist_platform_summary(
         platform_summary["status"] = status
     platform_summary["last_updated_at"] = observed_at
     summary["platforms"][platform] = platform_summary
+    if progress_writer is not None and current_stage is not None:
+        progress_writer(
+            str(platform or "").strip(),
+            platform_summary,
+            str(current_stage or "").strip(),
+            observed_at,
+        )
     if summary_writer is not None:
         summary_writer(summary)
     else:
@@ -2459,6 +2570,7 @@ def _mark_platform_runtime_failure(
     exc: Exception,
     current_stage: str,
     summary_writer: Callable[[dict[str, Any]], None] | None = None,
+    progress_writer: Callable[[str, dict[str, Any], str, str], None] | None = None,
 ) -> None:
     platform_summary["status"] = "failed"
     platform_summary["error_code"] = "PLATFORM_RUNTIME_FAILED"
@@ -2472,6 +2584,7 @@ def _mark_platform_runtime_failure(
         platform_summary=platform_summary,
         current_stage=current_stage,
         summary_writer=summary_writer,
+        progress_writer=progress_writer,
     )
 
 
@@ -2734,6 +2847,232 @@ def _run_visual_postcheck_retries(
     return retry_summary
 
 
+def _run_visual_review_batches(
+    *,
+    client,
+    backend_app,
+    platform: str,
+    identifiers: list[str],
+    vision_provider: str,
+    creator_cache_db_path: str,
+    force_refresh_creator_cache: bool,
+    poll_job,
+    require_success,
+    poll_interval: float,
+    run_root: Path,
+    observed_at_func: Callable[[], str],
+    progress_callback: Callable[..., None] | None = None,
+) -> dict[str, Any]:
+    batches = _chunk_identifiers(list(identifiers or []), _resolve_visual_batch_size(platform))
+    batch_size = _resolve_visual_batch_size(platform)
+    checkpoint_path = _build_visual_checkpoint_path(run_root, platform)
+    normalized_identifiers = [item for batch in batches for item in batch]
+    checkpoint = _load_visual_checkpoint(
+        checkpoint_path,
+        identifier_signature=_build_identifier_signature(normalized_identifiers),
+        batch_size=batch_size,
+    )
+    completed_batches = sorted(
+        {
+            int(item)
+            for item in list(checkpoint.get("completed_batches") or [])
+            if isinstance(item, int) or (isinstance(item, str) and str(item).isdigit())
+        }
+    )
+    completed_batch_set = {
+        batch_index
+        for batch_index in completed_batches
+        if 1 <= batch_index <= len(batches)
+    }
+    completed_identifier_count = sum(len(batches[batch_index - 1]) for batch_index in completed_batch_set)
+    resumed_batch_count = len(completed_batch_set)
+    batch_summaries: list[dict[str, Any]] = []
+    aggregated_visual_results: dict[str, dict[str, Any]] = {}
+
+    for batch_index, batch_identifiers in enumerate(batches, start=1):
+        if batch_index in completed_batch_set:
+            if progress_callback is not None:
+                progress_callback(
+                    stage=f"{platform}.visual_running",
+                    platform=platform,
+                    phase="visual",
+                    current_batch=batch_index,
+                    batch_count=len(batches),
+                    batch_size=batch_size,
+                    processed=completed_identifier_count,
+                    total=len(normalized_identifiers),
+                    last_item=batch_identifiers[-1] if batch_identifiers else "",
+                    last_log_line=f"跳过已完成的视觉 batch {batch_index}/{len(batches)}",
+                    checkpoint_path=str(checkpoint_path),
+                    resume_available=True,
+                )
+            continue
+
+        if progress_callback is not None:
+            progress_callback(
+                stage=f"{platform}.visual_running",
+                platform=platform,
+                phase="visual",
+                current_batch=batch_index,
+                batch_count=len(batches),
+                batch_size=batch_size,
+                processed=completed_identifier_count,
+                total=len(normalized_identifiers),
+                last_item=batch_identifiers[0] if batch_identifiers else "",
+                last_log_line=f"开始视觉 batch {batch_index}/{len(batches)}",
+                checkpoint_path=str(checkpoint_path),
+                resume_available=bool(completed_batch_set),
+            )
+
+        visual_payload_body = build_visual_payload(
+            platform,
+            batch_identifiers,
+            creator_cache_db_path=creator_cache_db_path,
+            force_refresh_creator_cache=force_refresh_creator_cache,
+        )
+        if vision_provider:
+            visual_payload_body["provider"] = str(vision_provider).strip().lower()
+        visual_payload = require_success(
+            client.post("/api/jobs/visual-review", json={"platform": platform, "payload": visual_payload_body}),
+            f"{platform} visual batch {batch_index} start",
+        )
+        visual_job = poll_job(
+            client,
+            visual_payload["job"]["id"],
+            f"{platform} visual batch {batch_index} poll",
+            max(1.0, float(poll_interval)),
+        )
+        batch_status = str(visual_job.get("status") or "").strip().lower()
+        batch_summaries.append(
+            {
+                "batch_index": batch_index,
+                "identifier_count": len(batch_identifiers),
+                "identifier_preview": list(batch_identifiers[:10]),
+                "job": dict(visual_job or {}),
+            }
+        )
+        aggregated_visual_results.update(_extract_visual_results_map(platform, visual_job, backend_app))
+        if batch_status != "completed":
+            if progress_callback is not None:
+                progress_callback(
+                    stage=f"{platform}.visual_running",
+                    platform=platform,
+                    phase="visual",
+                    current_batch=batch_index,
+                    batch_count=len(batches),
+                    batch_size=batch_size,
+                    processed=completed_identifier_count,
+                    total=len(normalized_identifiers),
+                    last_item=batch_identifiers[-1] if batch_identifiers else "",
+                    last_log_line=f"视觉 batch {batch_index}/{len(batches)} 结束于 {batch_status or 'unknown'}",
+                    checkpoint_path=str(checkpoint_path),
+                    resume_available=bool(completed_batch_set),
+                )
+            visual_results_loader = getattr(backend_app, "load_visual_results", None)
+            loaded_visual_results = visual_results_loader(platform) if callable(visual_results_loader) else {}
+            if isinstance(loaded_visual_results, dict):
+                aggregated_visual_results.update(
+                    {
+                        str(key or (value or {}).get("username") or "").strip(): dict(value)
+                        for key, value in loaded_visual_results.items()
+                        if isinstance(value, dict) and str(key or (value or {}).get("username") or "").strip()
+                    }
+                )
+            total_identifiers = len(normalized_identifiers)
+            completed_percent = int((completed_identifier_count / total_identifiers) * 100) if total_identifiers > 0 else 0
+            return {
+                "status": batch_status or "failed",
+                "stage": batch_status or "failed",
+                "message": f"{platform} visual batch {batch_index} 未成功完成",
+                "progress": {
+                    "determinate": True,
+                    "done": completed_identifier_count,
+                    "total": total_identifiers,
+                    "percent": completed_percent,
+                },
+                "result": {
+                    "success": False,
+                    "visual_results": dict(aggregated_visual_results),
+                },
+                "batching": {
+                    "enabled": True,
+                    "batch_size": batch_size,
+                    "batch_count": len(batches),
+                    "completed_batch_count": len(completed_batch_set),
+                    "completed_identifier_count": completed_identifier_count,
+                    "resumed_batch_count": resumed_batch_count,
+                    "checkpoint_path": str(checkpoint_path),
+                    "failed_batch_index": batch_index,
+                    "batches": batch_summaries,
+                    "checkpoint": dict(checkpoint or {}),
+                },
+            }
+
+        completed_batch_set.add(batch_index)
+        completed_identifier_count += len(batch_identifiers)
+        checkpoint = _persist_visual_checkpoint(
+            checkpoint_path,
+            platform=platform,
+            batch_size=batch_size,
+            batch_count=len(batches),
+            identifiers=normalized_identifiers,
+            completed_batches=sorted(completed_batch_set),
+            observed_at=observed_at_func(),
+        )
+        if progress_callback is not None:
+            progress_callback(
+                stage=f"{platform}.visual_running",
+                platform=platform,
+                phase="visual",
+                current_batch=batch_index,
+                batch_count=len(batches),
+                batch_size=batch_size,
+                processed=completed_identifier_count,
+                total=len(normalized_identifiers),
+                last_item=batch_identifiers[-1] if batch_identifiers else "",
+                last_log_line=f"完成视觉 batch {batch_index}/{len(batches)}",
+                checkpoint_path=str(checkpoint_path),
+                resume_available=batch_index < len(batches),
+            )
+
+    visual_results_loader = getattr(backend_app, "load_visual_results", None)
+    visual_results = visual_results_loader(platform) if callable(visual_results_loader) else {}
+    if isinstance(visual_results, dict):
+        aggregated_visual_results.update(
+            {
+                str(key or (value or {}).get("username") or "").strip(): dict(value)
+                for key, value in visual_results.items()
+                if isinstance(value, dict) and str(key or (value or {}).get("username") or "").strip()
+            }
+        )
+    return {
+        "status": "completed",
+        "stage": "completed",
+        "message": f"{platform} visual review completed in {len(batches)} batch(es)",
+        "progress": {
+            "determinate": True,
+            "done": len(normalized_identifiers),
+            "total": len(normalized_identifiers),
+            "percent": 100,
+        },
+        "result": {
+            "success": True,
+            "visual_results": dict(aggregated_visual_results),
+        },
+        "batching": {
+            "enabled": True,
+            "batch_size": batch_size,
+            "batch_count": len(batches),
+            "completed_batch_count": len(completed_batch_set),
+            "completed_identifier_count": completed_identifier_count,
+            "resumed_batch_count": resumed_batch_count,
+            "checkpoint_path": str(checkpoint_path),
+            "batches": batch_summaries,
+            "checkpoint": dict(checkpoint or {}),
+        },
+    }
+
+
 def run_keep_list_screening_pipeline(
     *,
     keep_workbook: Path,
@@ -2914,6 +3253,8 @@ def run_keep_list_screening_pipeline(
             "missing_profiles_xlsx": "",
             "success_report_xlsx": "",
             "error_report_xlsx": "",
+            "progress_json": str((runner_paths.run_root / "progress.json").resolve()),
+            "checkpoint_root": str((runner_paths.run_root / "checkpoints").resolve()),
         },
         "setup": {
             "scope": "keep-list-screening",
@@ -2955,11 +3296,107 @@ def run_keep_list_screening_pipeline(
         linked_bitable_url=normalized_linked_bitable_url,
     )
     progress_scope = f"keep-list:{normalized_task_name or runner_paths.run_id}"
+    progress_path = (runner_paths.run_root / "progress.json").resolve()
     progress_state: dict[str, Any] = {
         "status": "",
         "vision_probe_signature": "",
         "platform_signatures": {},
+        "stage": "preflight",
+        "platform": "",
+        "phase": "preflight",
+        "current_batch": 0,
+        "batch_count": 0,
+        "batch_size": 0,
+        "processed": 0,
+        "total": 0,
+        "last_item": "",
+        "last_log_line": "preflight",
+        "checkpoint_path": "",
+        "resume_available": False,
     }
+    _progress_unset = object()
+
+    def persist_progress(
+        *,
+        observed_at: str = "",
+        stage: Any = _progress_unset,
+        platform: Any = _progress_unset,
+        phase: Any = _progress_unset,
+        status: Any = _progress_unset,
+        current_batch: Any = _progress_unset,
+        batch_count: Any = _progress_unset,
+        batch_size: Any = _progress_unset,
+        processed: Any = _progress_unset,
+        total: Any = _progress_unset,
+        last_item: Any = _progress_unset,
+        last_log_line: Any = _progress_unset,
+        checkpoint_path: Any = _progress_unset,
+        resume_available: Any = _progress_unset,
+    ) -> None:
+        for key, value in (
+            ("stage", stage),
+            ("platform", platform),
+            ("phase", phase),
+            ("status", status),
+            ("current_batch", current_batch),
+            ("batch_count", batch_count),
+            ("batch_size", batch_size),
+            ("processed", processed),
+            ("total", total),
+            ("last_item", last_item),
+            ("last_log_line", last_log_line),
+            ("checkpoint_path", checkpoint_path),
+            ("resume_available", resume_available),
+        ):
+            if value is _progress_unset:
+                continue
+            progress_state[key] = value
+        heartbeat_at = str(observed_at or summary.get("finished_at") or iso_now()).strip()
+        normalized_status = str(progress_state.get("status") or summary.get("status") or "").strip()
+        if not normalized_status:
+            normalized_status = "completed" if str(summary.get("finished_at") or "").strip() else "running"
+        payload = {
+            "run_id": str(summary.get("run_id") or "").strip(),
+            "task_name": str(summary.get("task_name") or "").strip(),
+            "status": normalized_status,
+            "stage": str(progress_state.get("stage") or summary.get("current_stage") or "").strip(),
+            "started_at": str(summary.get("started_at") or "").strip(),
+            "finished_at": str(summary.get("finished_at") or "").strip(),
+            "last_heartbeat_at": heartbeat_at,
+            "platform": str(progress_state.get("platform") or "").strip(),
+            "phase": str(progress_state.get("phase") or "").strip(),
+            "current_batch": int(progress_state.get("current_batch") or 0),
+            "batch_count": int(progress_state.get("batch_count") or 0),
+            "batch_size": int(progress_state.get("batch_size") or 0),
+            "processed": int(progress_state.get("processed") or 0),
+            "total": int(progress_state.get("total") or 0),
+            "last_item": str(progress_state.get("last_item") or "").strip(),
+            "last_log_line": str(progress_state.get("last_log_line") or "").strip(),
+            "warning_count": len(dict(summary.get("warnings") or {})),
+            "summary_json": str(run_summary_path),
+            "workflow_handoff_json": str(runner_paths.workflow_handoff_json),
+            "checkpoint_path": str(progress_state.get("checkpoint_path") or "").strip(),
+            "resume_available": bool(progress_state.get("resume_available")),
+        }
+        _write_json_snapshot(progress_path, payload)
+
+    def persist_platform_progress(
+        platform_name: str,
+        platform_payload: dict[str, Any],
+        current_stage: str,
+        observed_at: str,
+    ) -> None:
+        stage_group = _resolve_platform_stage_group(current_stage) or str(current_stage or "").strip()
+        persist_progress(
+            observed_at=observed_at,
+            stage=f"{platform_name}.{current_stage}",
+            platform=platform_name,
+            phase=stage_group,
+            status=str(platform_payload.get("status") or "running").strip() or "running",
+            processed=int(platform_payload.get("profile_review_count") or 0),
+            total=int(platform_payload.get("requested_identifier_count") or 0),
+            last_log_line=f"{platform_name} {current_stage}",
+        )
 
     def persist_summary(payload: dict[str, Any]) -> None:
         _refresh_downstream_observability(payload)
@@ -3021,11 +3458,56 @@ def run_keep_list_screening_pipeline(
             _emit_runtime_progress(progress_scope, f"{platform} " + " ".join(detail_parts or ["updated"]))
 
         _write_summary(run_summary_path, payload)
+        persist_progress(
+            observed_at=str(payload.get("finished_at") or "").strip() or iso_now(),
+            status=str(payload.get("status") or "").strip() or (
+                "completed" if str(payload.get("finished_at") or "").strip() else "running"
+            ),
+            last_log_line=str(progress_state.get("last_log_line") or payload.get("current_stage") or "").strip(),
+        )
         write_workflow_handoff(
             runner_paths.workflow_handoff_json,
             summary=payload,
             task_spec=task_spec,
             task_spec_available=bool(payload.get("setup", {}).get("completed")),
+        )
+
+    def persist_platform_state(
+        platform_name: str,
+        platform_payload: dict[str, Any],
+        *,
+        current_stage: str | None = None,
+        status: str | None = None,
+    ) -> None:
+        _persist_platform_summary(
+            summary=summary,
+            run_summary_path=run_summary_path,
+            backend_app=backend_app,
+            platform=platform_name,
+            platform_summary=platform_payload,
+            current_stage=current_stage,
+            status=status,
+            summary_writer=persist_summary,
+            progress_writer=persist_platform_progress,
+        )
+
+    def mark_platform_runtime_failure(
+        platform_name: str,
+        platform_payload: dict[str, Any],
+        *,
+        exc: Exception,
+        current_stage: str,
+    ) -> None:
+        _mark_platform_runtime_failure(
+            summary=summary,
+            run_summary_path=run_summary_path,
+            backend_app=backend_app,
+            platform=platform_name,
+            platform_summary=platform_payload,
+            exc=exc,
+            current_stage=current_stage,
+            summary_writer=persist_summary,
+            progress_writer=persist_platform_progress,
         )
 
     def _finalize_failure(
@@ -3042,7 +3524,25 @@ def run_keep_list_screening_pipeline(
         persist_summary(summary)
         return summary
 
+    persist_progress(
+        observed_at=str(summary.get("started_at") or "").strip() or iso_now(),
+        stage="preflight",
+        platform="",
+        phase="preflight",
+        status="running",
+        last_log_line="preflight",
+        current_batch=0,
+        batch_count=0,
+        batch_size=0,
+        processed=0,
+        total=0,
+        last_item="",
+        checkpoint_path="",
+        resume_available=False,
+    )
+
     if not preflight["ready"]:
+        persist_progress(status="failed", last_log_line="preflight failed")
         failure = preflight["errors"][0]
         return _finalize_failure(
             failure={**failure, "failure_layer": "preflight"},
@@ -3054,6 +3554,7 @@ def run_keep_list_screening_pipeline(
         f"starting keep workbook={resolved_keep_workbook.resolve()} platforms={','.join(execution_platforms) or 'none'}",
     )
     summary["current_stage"] = "setup"
+    persist_progress(stage="setup", phase="setup", status="running", last_log_line="setup")
 
     setup = materialize_setup(
         scope="keep-list-screening",
@@ -3138,6 +3639,7 @@ def run_keep_list_screening_pipeline(
 
     try:
         summary["current_stage"] = "runtime_init"
+        persist_progress(stage="runtime_init", phase="runtime_init", last_log_line="runtime_init")
         runtime = _load_runtime_dependencies()
     except Exception as exc:  # noqa: BLE001
         failure = _build_failure_payload(
@@ -3175,6 +3677,7 @@ def run_keep_list_screening_pipeline(
     try:
         try:
             summary["current_stage"] = "staging"
+            persist_progress(stage="staging", phase="staging", last_log_line="staging")
             _emit_runtime_progress(progress_scope, "staging_inputs=running")
             reset_backend_runtime_state()
             staging_summary = prepare_screening_inputs(
@@ -3230,6 +3733,7 @@ def run_keep_list_screening_pipeline(
                 active_routing_strategy = str(resolve_routing_strategy({}) or "").strip().lower()
             if ((not skip_scrape and not skip_visual) or probe_vision_provider_only) and not dry_run:
                 summary["current_stage"] = "vision_probe"
+                persist_progress(stage="vision_probe", phase="vision_probe", last_log_line="vision_probe")
                 _emit_runtime_progress(progress_scope, "vision_probe=running")
                 if (
                     not str(vision_provider or "").strip()
@@ -3289,6 +3793,7 @@ def run_keep_list_screening_pipeline(
                 return summary
 
             summary["current_stage"] = "incremental_prefilter"
+            persist_progress(stage="incremental_prefilter", phase="incremental_prefilter", last_log_line="incremental_prefilter")
             existing_bitable_prefilter, existing_bitable_analysis = _prepare_existing_bitable_prefilter(
                 runtime=runtime,
                 env_file=env_file,
@@ -3299,6 +3804,7 @@ def run_keep_list_screening_pipeline(
             persist_summary(summary)
 
             summary["current_stage"] = "screening_execution"
+            persist_progress(stage="screening_execution", phase="screening_execution", last_log_line="screening_execution")
             mail_only_updates_by_platform: dict[str, list[dict[str, Any]]] = {}
             for platform in execution_platforms:
                 platform_summary: dict[str, Any] = {
@@ -3341,14 +3847,7 @@ def run_keep_list_screening_pipeline(
                     "status": "running",
                     "current_stage": "platform_preparing",
                 }
-                _persist_platform_summary(
-                    summary=summary,
-                    run_summary_path=run_summary_path,
-                    backend_app=backend_app,
-                    platform=platform,
-                    platform_summary=platform_summary,
-                    summary_writer=persist_summary,
-                )
+                persist_platform_state(platform, platform_summary)
                 try:
                     identifier_plan = _build_platform_identifier_plan(
                         backend_app,
@@ -3401,15 +3900,11 @@ def run_keep_list_screening_pipeline(
                     if mail_only_update_entries:
                         mail_only_updates_by_platform[str(platform)] = mail_only_update_entries
                 except Exception as exc:  # noqa: BLE001
-                    _mark_platform_runtime_failure(
-                        summary=summary,
-                        run_summary_path=run_summary_path,
-                        backend_app=backend_app,
-                        platform=platform,
-                        platform_summary=platform_summary,
+                    mark_platform_runtime_failure(
+                        platform,
+                        platform_summary,
                         exc=exc,
                         current_stage="platform_preparing_failed",
-                        summary_writer=persist_summary,
                     )
                     continue
 
@@ -3441,14 +3936,10 @@ def run_keep_list_screening_pipeline(
                         "would_execute": bool(has_stage_work),
                         "reason": str(platform_summary.get("reason") or "").strip(),
                     }
-                    _persist_platform_summary(
-                        summary=summary,
-                        run_summary_path=run_summary_path,
-                        backend_app=backend_app,
-                        platform=platform,
-                        platform_summary=platform_summary,
+                    persist_platform_state(
+                        platform,
+                        platform_summary,
                         current_stage="incremental_filter_completed",
-                        summary_writer=persist_summary,
                     )
                     continue
 
@@ -3469,14 +3960,10 @@ def run_keep_list_screening_pipeline(
                         "mail-only updates reuse existing screening result",
                     )
                     platform_summary["exports"] = {}
-                    _persist_platform_summary(
-                        summary=summary,
-                        run_summary_path=run_summary_path,
-                        backend_app=backend_app,
-                        platform=platform,
-                        platform_summary=platform_summary,
+                    persist_platform_state(
+                        platform,
+                        platform_summary,
                         current_stage="incremental_filter_completed",
-                        summary_writer=persist_summary,
                     )
                     continue
 
@@ -3497,28 +3984,20 @@ def run_keep_list_screening_pipeline(
                         "incremental filter found no new creators",
                     )
                     platform_summary["exports"] = {}
-                    _persist_platform_summary(
-                        summary=summary,
-                        run_summary_path=run_summary_path,
-                        backend_app=backend_app,
-                        platform=platform,
-                        platform_summary=platform_summary,
+                    persist_platform_state(
+                        platform,
+                        platform_summary,
                         current_stage="incremental_filter_completed",
-                        summary_writer=persist_summary,
                     )
                     continue
 
                 if not has_stage_work:
                     platform_summary["status"] = "skipped"
                     platform_summary["reason"] = "no staged identifiers for platform"
-                    _persist_platform_summary(
-                        summary=summary,
-                        run_summary_path=run_summary_path,
-                        backend_app=backend_app,
-                        platform=platform,
-                        platform_summary=platform_summary,
+                    persist_platform_state(
+                        platform,
+                        platform_summary,
                         current_stage="platform_skipped",
-                        summary_writer=persist_summary,
                     )
                     continue
 
@@ -3536,25 +4015,17 @@ def run_keep_list_screening_pipeline(
                         "skipped",
                         "scrape skipped before positioning analysis",
                     )
-                    _persist_platform_summary(
-                        summary=summary,
-                        run_summary_path=run_summary_path,
-                        backend_app=backend_app,
-                        platform=platform,
-                        platform_summary=platform_summary,
+                    persist_platform_state(
+                        platform,
+                        platform_summary,
                         current_stage="scrape_skipped",
-                        summary_writer=persist_summary,
                     )
                     continue
 
-                _persist_platform_summary(
-                    summary=summary,
-                    run_summary_path=run_summary_path,
-                    backend_app=backend_app,
-                    platform=platform,
-                    platform_summary=platform_summary,
+                persist_platform_state(
+                    platform,
+                    platform_summary,
                     current_stage="scrape_starting",
-                    summary_writer=persist_summary,
                 )
                 scrape_payload_body = build_scrape_payload(
                     platform,
@@ -3569,14 +4040,10 @@ def run_keep_list_screening_pipeline(
                         f"{platform} scrape start",
                     )
                     platform_summary["scrape_job"] = dict(scrape_payload.get("job") or {})
-                    _persist_platform_summary(
-                        summary=summary,
-                        run_summary_path=run_summary_path,
-                        backend_app=backend_app,
-                        platform=platform,
-                        platform_summary=platform_summary,
+                    persist_platform_state(
+                        platform,
+                        platform_summary,
                         current_stage="scrape_running",
-                        summary_writer=persist_summary,
                     )
                     scrape_job = poll_job(
                         client,
@@ -3585,15 +4052,11 @@ def run_keep_list_screening_pipeline(
                         max(1.0, float(poll_interval)),
                     )
                 except Exception as exc:  # noqa: BLE001
-                    _mark_platform_runtime_failure(
-                        summary=summary,
-                        run_summary_path=run_summary_path,
-                        backend_app=backend_app,
-                        platform=platform,
-                        platform_summary=platform_summary,
+                    mark_platform_runtime_failure(
+                        platform,
+                        platform_summary,
                         exc=exc,
                         current_stage="scrape_runtime_failed",
-                        summary_writer=persist_summary,
                     )
                     continue
                 platform_summary["scrape_job"] = scrape_job
@@ -3607,39 +4070,27 @@ def run_keep_list_screening_pipeline(
                 scrape_partial_result = _extract_scrape_partial_result(scrape_job)
                 if scrape_partial_result:
                     platform_summary["scrape_job"]["partial_result"] = scrape_partial_result
-                _persist_platform_summary(
-                    summary=summary,
-                    run_summary_path=run_summary_path,
-                    backend_app=backend_app,
-                    platform=platform,
-                    platform_summary=platform_summary,
+                persist_platform_state(
+                    platform,
+                    platform_summary,
                     current_stage="scrape_completed" if scrape_job["status"] == "completed" else "scrape_poll_finished",
-                    summary_writer=persist_summary,
                 )
                 scrape_was_salvaged = False
                 if scrape_job["status"] != "completed":
                     if _scrape_has_partial_result(scrape_job):
                         scrape_was_salvaged = True
                         platform_summary["scrape_job"]["salvaged"] = True
-                        _persist_platform_summary(
-                            summary=summary,
-                            run_summary_path=run_summary_path,
-                            backend_app=backend_app,
-                            platform=platform,
-                            platform_summary=platform_summary,
+                        persist_platform_state(
+                            platform,
+                            platform_summary,
                             current_stage="scrape_partial_ready",
-                            summary_writer=persist_summary,
                         )
                     else:
                         platform_summary["status"] = "scrape_failed"
-                        _persist_platform_summary(
-                            summary=summary,
-                            run_summary_path=run_summary_path,
-                            backend_app=backend_app,
-                            platform=platform,
-                            platform_summary=platform_summary,
+                        persist_platform_state(
+                            platform,
+                            platform_summary,
                             current_stage="scrape_failed",
-                            summary_writer=persist_summary,
                         )
                         continue
 
@@ -3704,15 +4155,11 @@ def run_keep_list_screening_pipeline(
                                 missing_profiles=fallback_profiles,
                             )
                         except Exception as exc:  # noqa: BLE001
-                            _mark_platform_runtime_failure(
-                                summary=summary,
-                                run_summary_path=run_summary_path,
-                                backend_app=backend_app,
-                                platform=platform,
-                                platform_summary=platform_summary,
+                            mark_platform_runtime_failure(
+                                platform,
+                                platform_summary,
                                 exc=exc,
                                 current_stage="fallback_staging_failed",
-                                summary_writer=persist_summary,
                             )
                             continue
                         platform_summary["fallback"] = {
@@ -3784,55 +4231,49 @@ def run_keep_list_screening_pipeline(
                 elif pass_count <= 0:
                     platform_summary["visual_job"] = {"status": "skipped", "reason": "no Prescreen=Pass targets"}
                 elif backend_app.get_available_vision_provider_names(vision_provider):
-                    visual_payload_body = build_visual_payload(
+                    persist_platform_state(
                         platform,
-                        visual_target_identifiers,
-                        creator_cache_db_path=str(creator_cache_db_path or "").strip(),
-                        force_refresh_creator_cache=bool(force_refresh_creator_cache),
-                    )
-                    if vision_provider:
-                        visual_payload_body["provider"] = str(vision_provider).strip().lower()
-                    _persist_platform_summary(
-                        summary=summary,
-                        run_summary_path=run_summary_path,
-                        backend_app=backend_app,
-                        platform=platform,
-                        platform_summary=platform_summary,
+                        platform_summary,
                         current_stage="visual_starting",
-                        summary_writer=persist_summary,
                     )
                     try:
-                        visual_payload = require_success(
-                            client.post("/api/jobs/visual-review", json={"platform": platform, "payload": visual_payload_body}),
-                            f"{platform} visual start",
+                        platform_summary["visual_job"] = {
+                            "status": "running",
+                            "stage": "starting",
+                            "message": "visual review batching in progress",
+                        }
+                        persist_platform_state(
+                            platform,
+                            platform_summary,
+                            current_stage="visual_running",
                         )
-                        platform_summary["visual_job"] = dict(visual_payload.get("job") or {})
-                        _persist_platform_summary(
-                            summary=summary,
-                            run_summary_path=run_summary_path,
+                        platform_summary["visual_job"] = _run_visual_review_batches(
+                            client=client,
                             backend_app=backend_app,
                             platform=platform,
-                            platform_summary=platform_summary,
-                            current_stage="visual_running",
-                            summary_writer=persist_summary,
+                            identifiers=visual_target_identifiers,
+                            vision_provider=vision_provider,
+                            creator_cache_db_path=str(creator_cache_db_path or "").strip(),
+                            force_refresh_creator_cache=bool(force_refresh_creator_cache),
+                            poll_job=poll_job,
+                            require_success=require_success,
+                            poll_interval=poll_interval,
+                            run_root=runner_paths.run_root,
+                            observed_at_func=backend_app.iso_now,
+                            progress_callback=lambda **progress_kwargs: persist_progress(
+                                observed_at=backend_app.iso_now(),
+                                status="running",
+                                **progress_kwargs,
+                            ),
                         )
-                        platform_summary["visual_job"] = poll_job(
-                            client,
-                            visual_payload["job"]["id"],
-                            f"{platform} visual poll",
-                            max(1.0, float(poll_interval)),
-                        )
+                        platform_summary["visual_batching"] = dict(platform_summary["visual_job"].get("batching") or {})
                         platform_summary["visual_gate"]["executed"] = True
                     except Exception as exc:  # noqa: BLE001
-                        _mark_platform_runtime_failure(
-                            summary=summary,
-                            run_summary_path=run_summary_path,
-                            backend_app=backend_app,
-                            platform=platform,
-                            platform_summary=platform_summary,
+                        mark_platform_runtime_failure(
+                            platform,
+                            platform_summary,
                             exc=exc,
                             current_stage="visual_runtime_failed",
-                            summary_writer=persist_summary,
                         )
                         continue
                 else:
@@ -3859,15 +4300,11 @@ def run_keep_list_screening_pipeline(
                             max_rounds=visual_postcheck_max_rounds,
                         )
                     except Exception as exc:  # noqa: BLE001
-                        _mark_platform_runtime_failure(
-                            summary=summary,
-                            run_summary_path=run_summary_path,
-                            backend_app=backend_app,
-                            platform=platform,
-                            platform_summary=platform_summary,
+                        mark_platform_runtime_failure(
+                            platform,
+                            platform_summary,
                             exc=exc,
                             current_stage="visual_retry_failed",
-                            summary_writer=persist_summary,
                         )
                         continue
                 else:
@@ -3921,14 +4358,10 @@ def run_keep_list_screening_pipeline(
                         if vision_provider:
                             positioning_payload_body["provider"] = str(vision_provider).strip().lower()
                         try:
-                            _persist_platform_summary(
-                                summary=summary,
-                                run_summary_path=run_summary_path,
-                                backend_app=backend_app,
-                                platform=platform,
-                                platform_summary=platform_summary,
+                            persist_platform_state(
+                                platform,
+                                platform_summary,
                                 current_stage="positioning_card_analysis_starting",
-                                summary_writer=persist_summary,
                             )
                             positioning_payload = require_success(
                                 client.post(
@@ -3938,14 +4371,10 @@ def run_keep_list_screening_pipeline(
                                 f"{platform} positioning card start",
                             )
                             platform_summary["positioning_card_analysis"] = dict(positioning_payload.get("job") or {})
-                            _persist_platform_summary(
-                                summary=summary,
-                                run_summary_path=run_summary_path,
-                                backend_app=backend_app,
-                                platform=platform,
-                                platform_summary=platform_summary,
+                            persist_platform_state(
+                                platform,
+                                platform_summary,
                                 current_stage="positioning_card_analysis_running",
-                                summary_writer=persist_summary,
                             )
                             platform_summary["positioning_card_analysis"] = poll_job(
                                 client,
@@ -3961,14 +4390,10 @@ def run_keep_list_screening_pipeline(
                                 non_blocking=True,
                             )
 
-                _persist_platform_summary(
-                    summary=summary,
-                    run_summary_path=run_summary_path,
-                    backend_app=backend_app,
-                    platform=platform,
-                    platform_summary=platform_summary,
+                persist_platform_state(
+                    platform,
+                    platform_summary,
                     current_stage="exporting_artifacts",
-                    summary_writer=persist_summary,
                 )
                 try:
                     platform_summary["artifact_status"] = require_success(
@@ -4014,14 +4439,10 @@ def run_keep_list_screening_pipeline(
                                     platform_summary["status"] = (
                                         "completed_with_partial_scrape" if scrape_was_salvaged else "completed"
                                     )
-                                _persist_platform_summary(
-                                    summary=summary,
-                                    run_summary_path=run_summary_path,
-                                    backend_app=backend_app,
-                                    platform=platform,
-                                    platform_summary=platform_summary,
+                                persist_platform_state(
+                                    platform,
+                                    platform_summary,
                                     current_stage="completed",
-                                    summary_writer=persist_summary,
                                 )
                                 continue
                         platform_summary["exports"] = _export_platform_artifacts_with_optional_final_review_subset(
@@ -4035,25 +4456,17 @@ def run_keep_list_screening_pipeline(
                         platform_summary["status"] = "fallback_staged"
                     else:
                         platform_summary["status"] = "completed_with_partial_scrape" if scrape_was_salvaged else "completed"
-                    _persist_platform_summary(
-                        summary=summary,
-                        run_summary_path=run_summary_path,
-                        backend_app=backend_app,
-                        platform=platform,
-                        platform_summary=platform_summary,
+                    persist_platform_state(
+                        platform,
+                        platform_summary,
                         current_stage="completed",
-                        summary_writer=persist_summary,
                     )
                 except Exception as exc:  # noqa: BLE001
-                    _mark_platform_runtime_failure(
-                        summary=summary,
-                        run_summary_path=run_summary_path,
-                        backend_app=backend_app,
-                        platform=platform,
-                        platform_summary=platform_summary,
+                    mark_platform_runtime_failure(
+                        platform,
+                        platform_summary,
                         exc=exc,
                         current_stage="artifact_export_failed",
-                        summary_writer=persist_summary,
                     )
                     continue
         except Exception as exc:  # noqa: BLE001
@@ -4080,12 +4493,43 @@ def run_keep_list_screening_pipeline(
             summary["status"] = summarize_platform_statuses(summary["platforms"])
             summary["finished_at"] = backend_app.iso_now()
             summary["current_stage"] = "completed"
+            persist_progress(
+                observed_at=summary["finished_at"],
+                stage="completed",
+                platform="",
+                phase="completed",
+                status=str(summary["status"] or "completed"),
+                current_batch=0,
+                batch_count=0,
+                batch_size=0,
+                processed=0,
+                total=0,
+                last_item="",
+                checkpoint_path="",
+                resume_available=False,
+                last_log_line="completed",
+            )
             attach_run_contract(summary)
             persist_summary(summary)
             return summary
 
         combined_exports = collect_final_exports(summary.get("platforms"))
         summary["current_stage"] = "export_merge"
+        persist_progress(
+            stage="export_merge",
+            platform="",
+            phase="export_merge",
+            status="running",
+            current_batch=0,
+            batch_count=0,
+            batch_size=0,
+            processed=0,
+            total=0,
+            last_item="",
+            checkpoint_path="",
+            resume_available=False,
+            last_log_line="export_merge",
+        )
         combined_artifacts = build_all_platforms_final_review_artifacts(
             output_path=exports_dir / "all_platforms_final_review.xlsx",
             payload_json_path=exports_dir / "all_platforms_final_review_payload.json",
@@ -4164,6 +4608,21 @@ def run_keep_list_screening_pipeline(
             )
         if combined_artifacts["row_count"] > 0:
             summary["current_stage"] = "upload"
+            persist_progress(
+                stage="upload",
+                platform="",
+                phase="upload",
+                status="running",
+                current_batch=0,
+                batch_count=0,
+                batch_size=0,
+                processed=0,
+                total=int(combined_artifacts["row_count"] or 0),
+                last_item="",
+                checkpoint_path="",
+                resume_available=False,
+                last_log_line="upload",
+            )
             try:
                 feishu_client = _build_feishu_open_client(
                     runtime=runtime,
@@ -4267,6 +4726,22 @@ def run_keep_list_screening_pipeline(
             summary["status"] = "completed_with_quality_warnings"
         summary["finished_at"] = backend_app.iso_now()
         summary["current_stage"] = "completed"
+        persist_progress(
+            observed_at=summary["finished_at"],
+            stage="completed",
+            platform="",
+            phase="completed",
+            status=str(summary["status"] or "completed"),
+            current_batch=0,
+            batch_count=0,
+            batch_size=0,
+            processed=0,
+            total=0,
+            last_item="",
+            checkpoint_path="",
+            resume_available=False,
+            last_log_line="completed",
+        )
         if summary["status"] == "scrape_failed":
             attach_failure_to_summary(
                 summary,
