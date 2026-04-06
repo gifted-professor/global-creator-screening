@@ -27,6 +27,7 @@ from backend.final_export_merge import (
     _normalize_url,
     _resolve_existing_local_paths,
 )
+from email_sync.known_thread_update import process_known_thread_updates
 from email_sync.thread_assignments import lookup_thread_assignment
 
 
@@ -1840,6 +1841,8 @@ def run_shared_mailbox_post_sync_pipeline(
         "new_creator_count": 0,
         "existing_screened_count": 0,
         "existing_unscreened_count": 0,
+        "known_thread_hit_count": 0,
+        "thread_assignment_cache_hit_count": 0,
         "full_screening_count": 0,
         "mail_only_update_count": 0,
         "skipped_existing_count": 0,
@@ -1924,6 +1927,8 @@ def run_shared_mailbox_post_sync_pipeline(
             "representative_task_name": _clean_text(item.get("representativeTaskName")) or task_name,
             "linked_bitable_url": _clean_text(item.get("linkedBitableUrl")),
             "matched_mail_count": 0,
+            "known_thread_hit_count": 0,
+            "thread_assignment_cache_hit_count": 0,
             "full_screening_count": 0,
             "mail_only_update_count": 0,
             "skipped_existing_count": 0,
@@ -2111,10 +2116,7 @@ def run_shared_mailbox_post_sync_pipeline(
             mail_only_display_rows: list[dict[str, Any]] = []
             mail_only_payload_rows: list[dict[str, Any]] = []
             combined_skipped_rows: list[dict[str, Any]] = []
-            full_screening_rows: list[dict[str, Any]] = []
-            existing_screened_count = 0
-            existing_unscreened_count = 0
-            new_creator_count = 0
+            prepared_candidates: list[dict[str, Any]] = []
 
             for keep_row in keep_frame.to_dict(orient="records"):
                 row_owner_context = _build_owner_context_from_keep_row(keep_row, owner_context)
@@ -2172,36 +2174,50 @@ def run_shared_mailbox_post_sync_pipeline(
                         }
                     )
                     continue
-                creator_id = _extract_creator_id(keep_row)
-                platform = _extract_platform(keep_row)
-                record_key = (
-                    _build_record_key(row_owner_scope_value, creator_id, platform)
-                    if owner_scope_enabled
-                    else _build_record_key(creator_id, platform)
+                prepared_candidates.append(
+                    {
+                        "keep_row": dict(keep_row),
+                        "owner_context": dict(row_owner_context),
+                        "owner_scope": row_owner_scope_value,
+                        "creator_id": _extract_creator_id(keep_row),
+                        "platform": _extract_platform(keep_row),
+                        "thread_key": _clean_text(keep_row.get("evidence_thread_key")),
+                        "thread_assignment_resolution": dict(thread_assignment_resolution or {}),
+                        "reply_resolution": dict(reply_resolution or {}),
+                    }
                 )
-                existing_record = existing_index.get(record_key) if record_key else None
-                if existing_record is None:
-                    new_creator_count += 1
-                    full_screening_rows.append(dict(keep_row))
-                    continue
-                ai_status = _extract_ai_status(existing_record.get("fields") or {})
-                if ai_status:
-                    existing_screened_count += 1
-                    display_row, payload_row = _build_mail_only_rows(
-                        keep_row=keep_row,
-                        existing_fields=dict(existing_record.get("fields") or {}),
-                        owner_context=row_owner_context,
-                        linked_bitable_url=linked_bitable_url,
-                        shared_mail_db_path=resolved_mail_db_path,
-                        shared_mail_raw_dir=resolved_mail_raw_dir,
-                        shared_mail_data_dir=resolved_mail_data_dir,
-                        keep_workbook=keep_workbook,
-                    )
-                    mail_only_display_rows.append(display_row)
-                    mail_only_payload_rows.append(payload_row)
-                    continue
-                existing_unscreened_count += 1
-                full_screening_rows.append(dict(keep_row))
+
+            known_thread_routing = process_known_thread_updates(
+                prepared_candidates,
+                existing_index=existing_index,
+                owner_scope_enabled=owner_scope_enabled,
+            )
+            known_thread_stats = dict(known_thread_routing.get("stats") or {})
+            existing_screened_count = int(known_thread_stats.get("existing_screened_count") or 0)
+            existing_unscreened_count = int(known_thread_stats.get("existing_unscreened_count") or 0)
+            new_creator_count = int(known_thread_stats.get("new_creator_count") or 0)
+
+            for candidate in known_thread_routing.get("mail_only_candidates") or []:
+                keep_row = dict((candidate or {}).get("keep_row") or {})
+                row_owner_context = dict((candidate or {}).get("owner_context") or {})
+                existing_record = dict(((candidate or {}).get("existing_record") or {}))
+                display_row, payload_row = _build_mail_only_rows(
+                    keep_row=keep_row,
+                    existing_fields=dict(existing_record.get("fields") or {}),
+                    owner_context=row_owner_context,
+                    linked_bitable_url=linked_bitable_url,
+                    shared_mail_db_path=resolved_mail_db_path,
+                    shared_mail_raw_dir=resolved_mail_raw_dir,
+                    shared_mail_data_dir=resolved_mail_data_dir,
+                    keep_workbook=keep_workbook,
+                )
+                mail_only_display_rows.append(display_row)
+                mail_only_payload_rows.append(payload_row)
+
+            full_screening_rows = [
+                dict((candidate or {}).get("keep_row") or {})
+                for candidate in (known_thread_routing.get("full_screening_candidates") or [])
+            ]
 
             full_screening_frame = pd.DataFrame(full_screening_rows, columns=list(keep_frame.columns))
             full_screening_display_rows: list[dict[str, Any]] = []
@@ -2342,6 +2358,10 @@ def run_shared_mailbox_post_sync_pipeline(
                     "new_creator_count": new_creator_count,
                     "existing_screened_count": existing_screened_count,
                     "existing_unscreened_count": existing_unscreened_count,
+                    "known_thread_hit_count": int(known_thread_stats.get("known_thread_hit_count") or 0),
+                    "thread_assignment_cache_hit_count": int(
+                        known_thread_stats.get("thread_assignment_cache_hit_count") or 0
+                    ),
                 }
             )
             if task_failed_count > 0:
@@ -2385,6 +2405,10 @@ def run_shared_mailbox_post_sync_pipeline(
             summary["new_creator_count"] += int(new_creator_count)
             summary["existing_screened_count"] += int(existing_screened_count)
             summary["existing_unscreened_count"] += int(existing_unscreened_count)
+            summary["known_thread_hit_count"] += int(known_thread_stats.get("known_thread_hit_count") or 0)
+            summary["thread_assignment_cache_hit_count"] += int(
+                known_thread_stats.get("thread_assignment_cache_hit_count") or 0
+            )
             summary["full_screening_count"] += int(len(full_screening_frame.index))
             summary["mail_only_update_count"] += int(len(mail_only_payload_rows))
             summary["skipped_existing_count"] += skipped_existing_count

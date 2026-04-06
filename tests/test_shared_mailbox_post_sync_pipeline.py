@@ -2821,6 +2821,8 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
         self.assertEqual(summary["new_creator_count"], 2)
         self.assertEqual(summary["existing_screened_count"], 1)
         self.assertEqual(summary["existing_unscreened_count"], 1)
+        self.assertEqual(summary["known_thread_hit_count"], 0)
+        self.assertEqual(summary["thread_assignment_cache_hit_count"], 0)
         self.assertEqual(summary["full_screening_count"], 3)
         self.assertEqual(summary["mail_only_update_count"], 1)
         self.assertEqual(summary["created_record_count"], 2)
@@ -2843,6 +2845,8 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
         self.assertTrue(alpha_row["__feishu_attachment_local_paths"][0].endswith("alpha.eml"))
 
         miniso_result = next(item for item in summary["task_results"] if item["task_name"] == "MINISO")
+        self.assertEqual(miniso_result["known_thread_hit_count"], 0)
+        self.assertEqual(miniso_result["thread_assignment_cache_hit_count"], 0)
         self.assertEqual(miniso_result["mail_only_update_count"], 1)
         self.assertEqual(miniso_result["full_screening_count"], 2)
         self.assertEqual(miniso_result["created_count"], 1)
