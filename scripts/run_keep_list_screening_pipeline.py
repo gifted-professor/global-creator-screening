@@ -339,6 +339,20 @@ def _resolve_visual_cache_context_key(backend_app, platform: str, *, vision_prov
     return str((context or {}).get("context_key") or "").strip()
 
 
+def _resolve_positioning_cache_context_key(backend_app, platform: str, *, vision_provider: str) -> str:
+    context_builder = getattr(backend_app, "build_positioning_card_cache_context", None)
+    if not callable(context_builder):
+        return ""
+    try:
+        context = context_builder(
+            platform,
+            requested_provider=str(vision_provider or "").strip().lower(),
+        )
+    except Exception:
+        return ""
+    return str((context or {}).get("context_key") or "").strip()
+
+
 def _append_unique_identifier(bucket: list[str], seen: set[str], raw_value: Any) -> None:
     value = str(raw_value or "").strip()
     if not value or value in seen:
@@ -485,7 +499,9 @@ def _build_platform_identifier_plan(
     )
     scrape_cache_hits: dict[str, list[dict[str, Any]]] = {}
     visual_cache_hits: dict[str, dict[str, Any]] = {}
+    positioning_cache_hits: dict[str, dict[str, Any]] = {}
     visual_cache_context_key = ""
+    positioning_cache_context_key = ""
     normalized_planned_identifiers = [
         _normalize_cache_identifier(backend_app, platform, entry.get("scrape_identifier") or entry.get("creator_id"))
         for entry in planned_entries
@@ -513,6 +529,18 @@ def _build_platform_identifier_plan(
                 planned_scrape_identifiers,
                 resolved_creator_cache_db_path,
                 visual_cache_context_key,
+            )
+        positioning_cache_context_key = _resolve_positioning_cache_context_key(
+            backend_app,
+            platform,
+            vision_provider=vision_provider,
+        )
+        if positioning_cache_context_key and planned_scrape_identifiers:
+            positioning_cache_hits = creator_cache.load_positioning_cache_entries(
+                platform,
+                planned_scrape_identifiers,
+                resolved_creator_cache_db_path,
+                positioning_cache_context_key,
             )
     if existing_record_index:
         for entry in planned_entries:
@@ -545,9 +573,10 @@ def _build_platform_identifier_plan(
                     )
                     scrape_cache_hit = bool(normalized_identifier and list(scrape_cache_hits.get(normalized_identifier) or []))
                     visual_cache_hit = bool(normalized_identifier and dict(visual_cache_hits.get(normalized_identifier) or {}))
-                    positioning_ready = _existing_record_has_positioning_payload(
-                        classified_entry.get("existing_fields") or {}
+                    positioning_cache_hit = bool(
+                        normalized_identifier and dict(positioning_cache_hits.get(normalized_identifier) or {})
                     )
+                    positioning_ready = positioning_cache_hit
                     has_any_local_cache = bool(scrape_cache_hit or visual_cache_hit)
                     partial_reasons: list[str] = []
                     if creator_cache_enabled and not scrape_cache_hit:
@@ -678,6 +707,12 @@ def _build_platform_identifier_plan(
         "creator_cache_enabled": bool(creator_cache_enabled),
         "creator_cache_db_path": str(resolved_creator_cache_db_path),
         "visual_cache_context_key": visual_cache_context_key,
+        "positioning_cache_context_key": positioning_cache_context_key,
+        "positioning_cache_hit_count": len(positioning_cache_hits),
+        "positioning_cache_miss_count": max(
+            0,
+            len({identifier for identifier in normalized_planned_identifiers if identifier}) - len(positioning_cache_hits),
+        ),
     }
     return {
         "staged_identifier_count": len(planned_entries),
@@ -1312,6 +1347,8 @@ def _build_incremental_observability_layer(summary: dict[str, Any]) -> dict[str,
     mail_only_update_count = 0
     skippable_count = 0
     partial_refresh_count = 0
+    positioning_cache_hit_count = 0
+    positioning_cache_miss_count = 0
     all_existing = True
     incremental_candidate_preview: list[str] = []
     mail_only_update_preview: list[str] = []
@@ -1332,6 +1369,8 @@ def _build_incremental_observability_layer(summary: dict[str, Any]) -> dict[str,
         mail_only_update_count += int(platform_prefilter.get("mail_only_update_count") or 0)
         skippable_count += int(platform_prefilter.get("skippable_count") or 0)
         partial_refresh_count += int(platform_prefilter.get("partial_refresh_count") or 0)
+        positioning_cache_hit_count += int(platform_prefilter.get("positioning_cache_hit_count") or 0)
+        positioning_cache_miss_count += int(platform_prefilter.get("positioning_cache_miss_count") or 0)
         duplicate_existing_group_count = max(
             duplicate_existing_group_count,
             int(platform_prefilter.get("duplicate_existing_group_count") or 0),
@@ -1368,6 +1407,8 @@ def _build_incremental_observability_layer(summary: dict[str, Any]) -> dict[str,
         "mail_only_update_count": mail_only_update_count,
         "skippable_count": skippable_count,
         "partial_refresh_count": partial_refresh_count,
+        "positioning_cache_hit_count": positioning_cache_hit_count,
+        "positioning_cache_miss_count": positioning_cache_miss_count,
         "all_existing": bool(staged_identifier_count > 0 and all_existing),
         "duplicate_existing_group_count": duplicate_existing_group_count,
         "incremental_candidate_preview": incremental_candidate_preview[:10],
@@ -1910,6 +1951,8 @@ def _refresh_downstream_observability(summary: dict[str, Any]) -> None:
     summary["partial_refresh_count"] = int(incremental_layer.get("partial_refresh_count") or 0)
     summary["partial_refresh_preview"] = list(incremental_layer.get("partial_refresh_preview") or [])[:10]
     summary["partial_refresh_breakdown"] = dict(incremental_layer.get("partial_refresh_breakdown") or {})
+    summary["positioning_cache_hit_count"] = int(incremental_layer.get("positioning_cache_hit_count") or 0)
+    summary["positioning_cache_miss_count"] = int(incremental_layer.get("positioning_cache_miss_count") or 0)
     summary["diagnostics"] = _build_downstream_diagnostics(summary)
 
 

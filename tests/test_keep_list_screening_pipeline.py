@@ -136,6 +136,11 @@ class FakeBackendApp:
             "context_key": f"ctx::{str(platform or '').strip().lower()}::{str(requested_provider or '').strip().lower() or 'default'}",
         }
 
+    def build_positioning_card_cache_context(self, platform, requested_provider="", providers=None, active_rulespec=None):
+        return {
+            "context_key": f"ctx-positioning::{str(platform or '').strip().lower()}::{str(requested_provider or '').strip().lower() or 'default'}",
+        }
+
     def resolve_visual_review_routing_strategy(self, payload=None):
         return self._routing_strategy
 
@@ -2790,6 +2795,7 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             template_path.touch()
             env_path = self._write_env_file(temp_root)
             visual_context_key = backend_app.build_visual_review_cache_context("instagram")["context_key"]
+            positioning_context_key = backend_app.build_positioning_card_cache_context("instagram")["context_key"]
             creator_cache.persist_scrape_cache_entries(
                 "instagram",
                 [{"url": "https://www.instagram.com/alpha", "username": "alpha"}],
@@ -2803,6 +2809,15 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
                 cache_db_path,
                 updated_at="2026-03-28T01:02:03Z",
                 context_key=visual_context_key,
+                context_payload={"platform": "instagram"},
+            )
+            creator_cache.persist_positioning_cache_entry(
+                "instagram",
+                "alpha",
+                {"username": "alpha", "success": True, "fit_recommendation": "High Fit", "fit_summary": "cached"},
+                cache_db_path,
+                updated_at="2026-03-28T01:02:03Z",
+                context_key=positioning_context_key,
                 context_payload={"platform": "instagram"},
             )
 
@@ -2828,9 +2843,150 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         self.assertTrue(platform_summary["incremental_prefilter"]["all_existing"])
         self.assertEqual(platform_summary["incremental_prefilter"]["mail_only_update_count"], 1)
         self.assertEqual(platform_summary["incremental_prefilter"]["partial_refresh_count"], 0)
+        self.assertEqual(summary["positioning_cache_hit_count"], 1)
+        self.assertEqual(summary["positioning_cache_miss_count"], 0)
         self.assertEqual(summary["artifacts"]["feishu_upload_updated_count"], 1)
         self.assertEqual(observed["mail_only_updates"]["instagram"][0]["creator_id"], "alpha")
         self.assertIn("邮件直更 1 个", json.dumps(summary["diagnostics"], ensure_ascii=False))
+
+    def test_incremental_prefilter_uses_local_positioning_cache_not_feishu_proxy(self) -> None:
+        backend_app = FakeBackendApp(
+            {
+                "status": "configured",
+                "error_code": "",
+                "message": "视觉模型已就绪：openai",
+                "configured_provider_names": ["openai"],
+                "runnable_provider_names": ["openai"],
+                "preferred_provider": "openai",
+                "providers": [{"name": "openai", "runnable": True}],
+            },
+            metadata={"instagram": {"alpha": {"handle": "alpha"}}},
+        )
+        existing_bitable_analysis = SimpleNamespace(
+            index={
+                "alpha::instagram": {
+                    "record_id": "rec_alpha",
+                    "fields": {
+                        "ai 是否通过": "是",
+                    },
+                }
+            },
+            duplicate_groups=[],
+            key_field_names=("达人ID", "平台"),
+            owner_scope_field_name="",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_db_path = Path(temp_dir) / "creator_cache.db"
+            visual_context_key = backend_app.build_visual_review_cache_context("instagram", requested_provider="openai")["context_key"]
+            positioning_context_key = backend_app.build_positioning_card_cache_context("instagram", requested_provider="openai")["context_key"]
+            creator_cache.persist_scrape_cache_entries(
+                "instagram",
+                [{"url": "https://www.instagram.com/alpha", "username": "alpha"}],
+                cache_db_path,
+                updated_at="2026-03-28T01:02:03Z",
+            )
+            creator_cache.persist_visual_cache_entry(
+                "instagram",
+                "alpha",
+                {"username": "alpha", "decision": "Pass", "reason": "cached", "reviewed_at": "2026-03-28T01:02:03Z"},
+                cache_db_path,
+                updated_at="2026-03-28T01:02:03Z",
+                context_key=visual_context_key,
+                context_payload={"platform": "instagram"},
+            )
+            creator_cache.persist_positioning_cache_entry(
+                "instagram",
+                "alpha",
+                {"username": "alpha", "success": True, "fit_recommendation": "High Fit", "fit_summary": "cached"},
+                cache_db_path,
+                updated_at="2026-03-28T01:02:03Z",
+                context_key=positioning_context_key,
+                context_payload={"platform": "instagram"},
+            )
+
+            identifier_plan = keep_list_runner._build_platform_identifier_plan(
+                backend_app,
+                "instagram",
+                max_identifiers_per_platform=100,
+                existing_bitable_analysis=existing_bitable_analysis,
+                creator_cache_db_path=str(cache_db_path),
+                vision_provider="openai",
+            )
+
+        platform_prefilter = identifier_plan["incremental_prefilter"]
+        self.assertEqual(platform_prefilter["mail_only_update_count"], 1)
+        self.assertEqual(platform_prefilter["partial_refresh_breakdown"], {})
+        self.assertEqual(platform_prefilter["positioning_cache_hit_count"], 1)
+        self.assertEqual(platform_prefilter["positioning_cache_miss_count"], 0)
+        self.assertEqual(identifier_plan["mail_only_update_entries"][0].get("partial_refresh_reasons") or [], [])
+
+    def test_incremental_prefilter_flags_positioning_missing_when_local_cache_is_absent(self) -> None:
+        backend_app = FakeBackendApp(
+            {
+                "status": "configured",
+                "error_code": "",
+                "message": "视觉模型已就绪：openai",
+                "configured_provider_names": ["openai"],
+                "runnable_provider_names": ["openai"],
+                "preferred_provider": "openai",
+                "providers": [{"name": "openai", "runnable": True}],
+            },
+            metadata={"instagram": {"alpha": {"handle": "alpha"}}},
+        )
+        existing_bitable_analysis = SimpleNamespace(
+            index={
+                "alpha::instagram": {
+                    "record_id": "rec_alpha",
+                    "fields": {
+                        "ai 是否通过": "是",
+                        "标签(ai)": "家庭用品",
+                        "ai评价": "existing good fit",
+                    },
+                }
+            },
+            duplicate_groups=[],
+            key_field_names=("达人ID", "平台"),
+            owner_scope_field_name="",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_db_path = Path(temp_dir) / "creator_cache.db"
+            visual_context_key = backend_app.build_visual_review_cache_context("instagram", requested_provider="openai")["context_key"]
+            creator_cache.persist_scrape_cache_entries(
+                "instagram",
+                [{"url": "https://www.instagram.com/alpha", "username": "alpha"}],
+                cache_db_path,
+                updated_at="2026-03-28T01:02:03Z",
+            )
+            creator_cache.persist_visual_cache_entry(
+                "instagram",
+                "alpha",
+                {"username": "alpha", "decision": "Pass", "reason": "cached", "reviewed_at": "2026-03-28T01:02:03Z"},
+                cache_db_path,
+                updated_at="2026-03-28T01:02:03Z",
+                context_key=visual_context_key,
+                context_payload={"platform": "instagram"},
+            )
+
+            identifier_plan = keep_list_runner._build_platform_identifier_plan(
+                backend_app,
+                "instagram",
+                max_identifiers_per_platform=100,
+                existing_bitable_analysis=existing_bitable_analysis,
+                creator_cache_db_path=str(cache_db_path),
+                vision_provider="openai",
+            )
+
+        platform_prefilter = identifier_plan["incremental_prefilter"]
+        self.assertEqual(platform_prefilter["mail_only_update_count"], 1)
+        self.assertEqual(platform_prefilter["partial_refresh_breakdown"], {})
+        self.assertEqual(platform_prefilter["positioning_cache_hit_count"], 0)
+        self.assertEqual(platform_prefilter["positioning_cache_miss_count"], 1)
+        self.assertEqual(
+            identifier_plan["mail_only_update_entries"][0].get("partial_refresh_reasons"),
+            ["positioning_missing_instagram"],
+        )
 
     def test_runner_forwards_creator_cache_controls_to_scrape_and_visual_payloads(self) -> None:
         preflight = {
