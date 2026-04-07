@@ -230,6 +230,17 @@ NOWCODING_BASE_URL=https://nowcoding.ai/v1
 NOWCODING_MODEL=gpt-5.4-openai-compact
 ```
 
+如果你手上有一批真实图片，直接给目录就行。脚本会把目录里的图片逐张并发打一遍，并在 summary 里列出失败图片：
+
+```bash
+python3 scripts/test_nowcoding_vision.py \
+  --env-file .env \
+  --image-dir /absolute/path/to/images \
+  --recursive \
+  --concurrency 10 \
+  --output-json temp/nowcoding-batch-result.json
+```
+
 邮件抓取如果不显式传 `--sent-since`，默认从“今天”开始抓；当前共享邮箱主线默认优先走 `partnerships@amagency.biz` 的 `其他文件夹/邮件备份`。如果要改窗口，显式传 `--sent-since YYYY-MM-DD` 即可覆盖默认值。
 
 以后达人匹配默认应直接使用任务上传里的飞书 `发信名单`，而不是本地测试达人库 workbook。可以直接按任务名下载 `发信名单` 并做匹配：

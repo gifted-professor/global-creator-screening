@@ -17,6 +17,7 @@ DEFAULT_BASE_URL = "https://nowcoding.ai/v1"
 DEFAULT_MODEL = "gpt-5.4-openai-compact"
 DEFAULT_PROMPT = "请用一句话描述这张图片里最主要的内容。"
 DEFAULT_TEXT_PROMPT = "只回复：测试成功"
+SUPPORTED_IMAGE_SUFFIXES = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".heic", ".heif", ".avif")
 
 
 def parse_dotenv_file(path: Path) -> dict[str, str]:
@@ -140,8 +141,76 @@ def clip_text(value: str, limit: int = 240) -> str:
     return text[: limit - 3] + "..."
 
 
-def run_probe(index: int, args: argparse.Namespace, payload_bytes: bytes) -> dict[str, Any]:
+def collect_image_paths(args: argparse.Namespace) -> list[Path]:
+    if args.image_path and args.image_dir:
+        raise ValueError("--image-path 和 --image-dir 不能同时使用")
+
+    if args.image_path:
+        image_path = Path(args.image_path).expanduser().resolve()
+        if not image_path.exists():
+            raise ValueError(f"图片不存在: {image_path}")
+        return [image_path]
+
+    if not args.image_dir:
+        return []
+
+    image_dir = Path(args.image_dir).expanduser().resolve()
+    if not image_dir.exists():
+        raise ValueError(f"图片目录不存在: {image_dir}")
+    if not image_dir.is_dir():
+        raise ValueError(f"不是目录: {image_dir}")
+
+    iterator = image_dir.rglob("*") if args.recursive else image_dir.iterdir()
+    image_paths = sorted(
+        path.resolve()
+        for path in iterator
+        if path.is_file() and path.suffix.lower() in SUPPORTED_IMAGE_SUFFIXES
+    )
+    if not image_paths:
+        suffixes = ", ".join(SUPPORTED_IMAGE_SUFFIXES)
+        raise ValueError(f"目录里没有找到可测试图片: {image_dir}；当前支持后缀: {suffixes}")
+    return image_paths
+
+
+def build_tasks(image_paths: list[Path], repeat: int) -> list[dict[str, Any]]:
+    tasks: list[dict[str, Any]] = []
+    index = 1
+    if image_paths:
+        for round_index in range(repeat):
+            for image_path in image_paths:
+                tasks.append(
+                    {
+                        "index": index,
+                        "round": round_index + 1,
+                        "image_path": image_path,
+                        "input_label": str(image_path),
+                    }
+                )
+                index += 1
+        return tasks
+
+    for round_index in range(repeat):
+        tasks.append(
+            {
+                "index": index,
+                "round": round_index + 1,
+                "image_path": None,
+                "input_label": "text-smoke",
+            }
+        )
+        index += 1
+    return tasks
+
+
+def build_task_payload(args: argparse.Namespace, image_path: Path | None) -> bytes:
+    image_data_url = build_image_data_url(image_path) if image_path else None
+    payload = build_payload(args, image_data_url)
+    return json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+
+def run_probe(task: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     endpoint = args.base_url.rstrip("/") + "/chat/completions"
+    payload_bytes = build_task_payload(args, task["image_path"])
     req = request.Request(
         endpoint,
         data=payload_bytes,
@@ -184,7 +253,10 @@ def run_probe(index: int, args: argparse.Namespace, payload_bytes: bytes) -> dic
         error_message = f"HTTP {status_code}"
 
     return {
-        "index": index,
+        "index": task["index"],
+        "round": task["round"],
+        "input_label": task["input_label"],
+        "image_path": str(task["image_path"]) if task["image_path"] else None,
         "ok": ok,
         "status_code": status_code,
         "elapsed_seconds": round(elapsed, 3),
@@ -199,15 +271,19 @@ def build_summary(results: list[dict[str, Any]]) -> dict[str, Any]:
     ok_count = sum(1 for result in results if result["ok"])
     avg_elapsed = round(sum(result["elapsed_seconds"] for result in results) / len(results), 3) if results else 0.0
     status_counts: dict[str, int] = {}
+    failed_inputs: list[str] = []
     for result in results:
         key = str(result["status_code"])
         status_counts[key] = status_counts.get(key, 0) + 1
+        if not result["ok"] and result["input_label"] not in failed_inputs:
+            failed_inputs.append(result["input_label"])
     return {
         "total_requests": len(results),
         "ok_requests": ok_count,
         "failed_requests": len(results) - ok_count,
         "average_elapsed_seconds": avg_elapsed,
         "status_counts": status_counts,
+        "failed_inputs": failed_inputs,
     }
 
 
@@ -219,9 +295,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", help=f"覆盖 NOWCODING_MODEL，默认 {DEFAULT_MODEL}")
     parser.add_argument("--prompt", help="要发送的 prompt；带图片时默认是图片描述 prompt，纯文本时默认是文本 smoke prompt")
     parser.add_argument("--image-path", help="本地图片路径；传入后会自动转成 data URL")
+    parser.add_argument("--image-dir", help="本地图片目录；会把目录里的图片逐张发请求")
+    parser.add_argument("--recursive", action="store_true", help="配合 --image-dir 递归扫描子目录")
     parser.add_argument("--max-tokens", type=int, default=120, help="max_tokens，默认 120")
     parser.add_argument("--timeout", type=float, default=60, help="单请求超时秒数，默认 60")
-    parser.add_argument("--repeat", type=int, default=1, help="总请求数，默认 1")
+    parser.add_argument("--repeat", type=int, default=1, help="重复轮数；纯文本模式表示总请求数，目录模式表示整批图片重复多少轮")
     parser.add_argument("--concurrency", type=int, default=1, help="并发 worker 数，默认 1")
     parser.add_argument("--require-substring", help="如果设置，则返回内容里必须包含这个子串才算成功")
     parser.add_argument("--output-json", help="把完整结果写到 JSON 文件")
@@ -250,19 +328,16 @@ def main() -> int:
         print("--concurrency 必须大于 0", file=sys.stderr)
         return 2
 
-    image_data_url = None
-    if args.image_path:
-        image_path = Path(args.image_path).expanduser().resolve()
-        if not image_path.exists():
-            print(f"图片不存在: {image_path}", file=sys.stderr)
-            return 2
-        image_data_url = build_image_data_url(image_path)
+    try:
+        image_paths = collect_image_paths(args)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
 
     if not args.prompt:
-        args.prompt = DEFAULT_PROMPT if image_data_url else DEFAULT_TEXT_PROMPT
+        args.prompt = DEFAULT_PROMPT if image_paths else DEFAULT_TEXT_PROMPT
 
-    payload = build_payload(args, image_data_url)
-    payload_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    tasks = build_tasks(image_paths, args.repeat)
 
     print(
         json.dumps(
@@ -270,8 +345,10 @@ def main() -> int:
                 "endpoint": args.base_url.rstrip("/") + "/chat/completions",
                 "model": args.model,
                 "stream": args.stream,
-                "has_image": bool(image_data_url),
+                "has_image": bool(image_paths),
+                "image_inputs": len(image_paths),
                 "repeat": args.repeat,
+                "total_requests": len(tasks),
                 "concurrency": args.concurrency,
             },
             ensure_ascii=False,
@@ -280,11 +357,13 @@ def main() -> int:
 
     results: list[dict[str, Any]] = []
     with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
-        futures = [executor.submit(run_probe, index + 1, args, payload_bytes) for index in range(args.repeat)]
+        futures = [executor.submit(run_probe, task, args) for task in tasks]
         for future in as_completed(futures):
             result = future.result()
             results.append(result)
-            line = f"[{result['index']}/{args.repeat}] ok={result['ok']} status={result['status_code']} elapsed={result['elapsed_seconds']}s"
+            line = f"[{result['index']}/{len(tasks)}] ok={result['ok']} status={result['status_code']} elapsed={result['elapsed_seconds']}s"
+            if result["input_label"] != "text-smoke":
+                line += f" input={result['input_label']!r}"
             if result["content"]:
                 line += f" content={result['content']!r}"
             if result["error"]:
@@ -301,7 +380,20 @@ def main() -> int:
         output_path = Path(args.output_json).expanduser().resolve()
         output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(
-            json.dumps({"request": payload, "summary": summary, "results": results}, ensure_ascii=False, indent=2),
+            json.dumps(
+                {
+                    "request_template": {
+                        "model": args.model,
+                        "stream": args.stream,
+                        "max_tokens": args.max_tokens,
+                        "prompt": args.prompt,
+                    },
+                    "summary": summary,
+                    "results": results,
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
             encoding="utf-8",
         )
         print(f"wrote {output_path}")
