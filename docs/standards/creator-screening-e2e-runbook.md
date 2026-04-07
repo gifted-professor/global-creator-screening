@@ -35,6 +35,13 @@ Current note:
 - the official upstream matching logic is now the mail funnel described in this document
 - operationally, that funnel is: brand filter -> sending-list match -> regex match -> LLM tail
 - the keep workbook remains the canonical downstream handoff artifact
+- for the dedicated mail-only `AI回信管理` rewrite path introduced on `2026-04-07`, the default is now:
+  - brand filter -> regex match -> LLM tail
+  - no sending-list match unless explicitly re-enabled
+  - high-confidence keep rows write back directly
+  - manual-tail rows also write back by default as:
+    - `达人ID = <任务名><月>/<日>转人工<n>`
+    - `平台 = 转人工`
 
 ## Canonical Entry Points
 
@@ -801,6 +808,12 @@ Current safeguards added in this round:
 - `Cc` recipients are included during creator-target inference
 - ambiguous multi-recipient legacy threads are marked `creator_identity_unresolved` instead of being falsely kept or falsely removed
 - rewrite mode now also supports `FEISHU_SOURCE_URL` fallback for owner inspection
+
+## MINISO Direct Mail Path
+
+For the concrete `2026-04-07 / MINISO / AI回信管理` direct-write path that was run end-to-end in this repo, see:
+
+- `docs/standards/miniso-ai-reply-mail-only-path-2026-04-07.md`
 
 ## Recommended Commands
 
