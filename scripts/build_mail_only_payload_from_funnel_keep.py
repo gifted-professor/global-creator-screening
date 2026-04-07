@@ -19,6 +19,7 @@ from backend.final_export_merge import _build_quote_text, _clean_text, _format_d
 UPLOAD_COLUMNS = [
     "达人ID",
     "平台",
+    "主页链接",
     "当前网红报价",
     "达人最后一次回复邮件时间",
     "full body",
@@ -66,6 +67,27 @@ def _infer_platform_from_full_body(full_body: str) -> str:
     return ""
 
 
+def _normalize_creator_id_for_url(creator_id: str) -> str:
+    normalized = _clean_text(creator_id)
+    while normalized.startswith("@"):
+        normalized = normalized[1:]
+    return normalized
+
+
+def _build_profile_url(creator_id: str, platform: str) -> str:
+    normalized_creator_id = _normalize_creator_id_for_url(creator_id)
+    normalized_platform = _clean_text(platform).strip().lower()
+    if not normalized_creator_id:
+        return ""
+    if normalized_platform == "tiktok":
+        return f"https://www.tiktok.com/@{normalized_creator_id}"
+    if normalized_platform == "instagram":
+        return f"https://www.instagram.com/{normalized_creator_id}"
+    if normalized_platform == "youtube":
+        return f"https://www.youtube.com/@{normalized_creator_id}"
+    return ""
+
+
 def _build_workbook(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     wb = Workbook()
@@ -110,6 +132,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         workbook_row = {
             "达人ID": creator_id,
             "平台": platform,
+            "主页链接": _build_profile_url(creator_id, platform),
             "当前网红报价": quote_text,
             "达人最后一次回复邮件时间": last_mail_time,
             "full body": full_body,

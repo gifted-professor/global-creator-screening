@@ -50,6 +50,7 @@ _UPDATE_MODE_CREATE_OR_UPDATE = "create_or_update"
 _UPDATE_MODE_MAIL_ONLY = "mail_only_update"
 _UPDATE_MODE_CREATE_OR_MAIL_ONLY = "create_or_mail_only_update"
 _MAIL_ONLY_FIELD_NAMES = (
+    "主页链接",
     "当前网红报价",
     "达人最后一次回复邮件时间",
     "达人回复的最后一封邮件内容",
@@ -633,7 +634,7 @@ def upload_final_review_payload_to_bitable(
                     recover=recover_create_record,
                 )
         except Exception as exc:  # noqa: BLE001
-            if "URLFieldConvFail" in str(exc) and "主页链接" in fields and not use_mail_only_fields:
+            if "URLFieldConvFail" in str(exc) and "主页链接" in fields:
                 fallback_fields = dict(fields)
                 fallback_fields.pop("主页链接", None)
                 try:

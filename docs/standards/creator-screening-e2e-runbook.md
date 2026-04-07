@@ -754,11 +754,19 @@ That means:
 
 - if the row does not exist in Feishu, create it
 - if the row already exists, only update:
+  - `主页链接`
   - `当前网红报价`
   - `达人最后一次回复邮件时间`
   - `full body`
 
 This avoids re-creating duplicate creator rows while still allowing the latest mail context to refresh.
+
+Mail-only homepage URL generation now follows the same canonical rule:
+
+- `TikTok -> https://www.tiktok.com/@<达人ID>`
+- `Instagram -> https://www.instagram.com/<达人ID>`
+- `YouTube -> https://www.youtube.com/@<达人ID>`
+- empty platform or `转人工` -> blank homepage URL
 
 Important guardrails:
 

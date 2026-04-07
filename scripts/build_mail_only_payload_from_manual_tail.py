@@ -20,6 +20,7 @@ from backend.final_export_merge import _build_quote_text, _clean_text, _format_d
 UPLOAD_COLUMNS = [
     "达人ID",
     "平台",
+    "主页链接",
     "当前网红报价",
     "达人最后一次回复邮件时间",
     "full body",
@@ -86,6 +87,12 @@ def _build_manual_creator_id(task_name: str, local_day: date, index: int) -> str
     return f"{task_name}{local_day.month}/{local_day.day}转人工{index}"
 
 
+def _build_profile_url(_creator_id: str, platform: str) -> str:
+    if _clean_text(platform) == "转人工":
+        return ""
+    return ""
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     manual_tail_workbook = Path(args.manual_tail_workbook).expanduser().resolve()
     task_owner_payload_json = Path(args.task_owner_payload_json).expanduser().resolve()
@@ -112,6 +119,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         workbook_row = {
             "达人ID": creator_id,
             "平台": "转人工",
+            "主页链接": _build_profile_url(creator_id, "转人工"),
             "当前网红报价": quote_text,
             "达人最后一次回复邮件时间": last_mail_time,
             "full body": full_body,
