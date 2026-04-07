@@ -9,6 +9,7 @@ import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
+from urllib import parse
 
 import pandas as pd
 
@@ -59,6 +60,7 @@ def _load_runtime_dependencies():
     )
     from feishu_screening_bridge.feishu_api import DEFAULT_FEISHU_BASE_URL, FeishuOpenClient
     from feishu_screening_bridge.local_env import get_preferred_value, load_local_env
+    from feishu_screening_bridge.task_upload_sync import resolve_task_upload_entry
     from scripts.prepare_screening_inputs import (
         prepare_screening_inputs,
         restore_backend_runtime_state,
@@ -80,6 +82,7 @@ def _load_runtime_dependencies():
         "FeishuOpenClient": FeishuOpenClient,
         "get_preferred_value": get_preferred_value,
         "load_local_env": load_local_env,
+        "resolve_task_upload_entry": resolve_task_upload_entry,
         "prepare_screening_inputs": prepare_screening_inputs,
         "restore_backend_runtime_state": restore_backend_runtime_state,
         "snapshot_backend_runtime_state": snapshot_backend_runtime_state,
@@ -2113,6 +2116,40 @@ def _build_feishu_open_client(
     )
 
 
+def _resolve_task_upload_task_owner_context(
+    *,
+    runtime: dict[str, Any],
+    env_file: str | Path,
+    task_name: str,
+    task_upload_url: str,
+) -> dict[str, str]:
+    normalized_task_name = _clean_text(task_name)
+    normalized_task_upload_url = _clean_text(task_upload_url)
+    if not normalized_task_name or not normalized_task_upload_url:
+        return {}
+    resolve_task_upload_entry = runtime.get("resolve_task_upload_entry")
+    if resolve_task_upload_entry is None:
+        return {}
+
+    client = _build_feishu_open_client(runtime=runtime, env_file=env_file)
+    entry = resolve_task_upload_entry(
+        client=client,
+        task_upload_url=normalized_task_upload_url,
+        task_name=normalized_task_name,
+    )
+    return {
+        "task_name": _clean_text(getattr(entry, "task_name", "")) or normalized_task_name,
+        "task_upload_url": normalized_task_upload_url,
+        "task_record_id": _clean_text(getattr(entry, "record_id", "")),
+        "task_owner_name": _clean_text(getattr(entry, "responsible_name", "")),
+        "task_owner_employee_id": _clean_text(getattr(entry, "employee_id", "")),
+        "task_owner_owner_name": _clean_text(getattr(entry, "owner_name", "")),
+        "task_owner_employee_email": _clean_text(getattr(entry, "owner_email", "")),
+        "linked_bitable_url": _clean_text(getattr(entry, "linked_bitable_url", "")),
+        "source": "task_upload_entry",
+    }
+
+
 def _prepare_existing_bitable_prefilter(
     *,
     runtime: dict[str, Any],
@@ -3138,6 +3175,14 @@ def run_keep_list_screening_pipeline(
     resolved_keep_workbook = keep_workbook.expanduser()
     resolved_template_workbook = template_workbook.expanduser() if template_workbook else None
     inferred_task_owner = _infer_task_owner_from_adjacent_task_spec(keep_workbook=resolved_keep_workbook.resolve())
+    explicit_linked_bitable_url = str(linked_bitable_url or "").strip()
+    inferred_linked_bitable_url = str(inferred_task_owner.get("linked_bitable_url") or "").strip()
+    initial_linked_bitable_url_source = "cli" if explicit_linked_bitable_url else ("adjacent_task_context" if inferred_linked_bitable_url else "")
+    initial_linked_bitable_url_source_path = (
+        ""
+        if explicit_linked_bitable_url
+        else str(inferred_task_owner.get("task_spec_path") or "").strip()
+    )
     normalized_task_owner_name = str(task_owner_name or inferred_task_owner.get("task_owner_name") or "").strip()
     normalized_task_owner_employee_id = str(
         task_owner_employee_id or inferred_task_owner.get("task_owner_employee_id") or ""
@@ -3151,7 +3196,7 @@ def run_keep_list_screening_pipeline(
     normalized_task_owner_owner_name = str(
         task_owner_owner_name or inferred_task_owner.get("task_owner_owner_name") or ""
     ).strip()
-    normalized_linked_bitable_url = str(linked_bitable_url or inferred_task_owner.get("linked_bitable_url") or "").strip()
+    normalized_linked_bitable_url = str(explicit_linked_bitable_url or inferred_linked_bitable_url or "").strip()
     if not normalized_task_name:
         normalized_task_name = str(inferred_task_owner.get("task_name") or "").strip()
     if not task_upload_url:
@@ -3233,6 +3278,8 @@ def run_keep_list_screening_pipeline(
             "task_owner_employee_email": normalized_task_owner_employee_email,
             "task_owner_owner_name": normalized_task_owner_owner_name,
             "linked_bitable_url": normalized_linked_bitable_url,
+            "linked_bitable_url_source": initial_linked_bitable_url_source,
+            "linked_bitable_url_source_path": initial_linked_bitable_url_source_path,
             "inferred_from_task_spec": str(inferred_task_owner.get("task_spec_path") or ""),
         },
         "probe_vision_provider_only": bool(probe_vision_provider_only),
@@ -3524,6 +3571,35 @@ def run_keep_list_screening_pipeline(
         persist_summary(summary)
         return summary
 
+    if explicit_linked_bitable_url and inferred_linked_bitable_url and _linked_bitable_urls_conflict(
+        inferred_linked_bitable_url,
+        explicit_linked_bitable_url,
+    ):
+        failure = _build_failure_payload(
+            stage="preflight",
+            error_code="LINKED_BITABLE_URL_CONFLICT",
+            message=(
+                "显式传入的 linked_bitable_url 与 keep workbook 邻接上游解析出的达人管理表链接不一致，"
+                "已阻断本次下游运行。"
+            ),
+            remediation="移除错误的 --linked-bitable-url，或修正为与任务上传表一致的达人管理表链接后重试。",
+            details={
+                "provided_linked_bitable_url": explicit_linked_bitable_url,
+                "inferred_linked_bitable_url": inferred_linked_bitable_url,
+                "inferred_linked_bitable_url_source_path": str(inferred_task_owner.get("task_spec_path") or "").strip(),
+            },
+            failure_layer="preflight",
+        )
+        summary["preflight"]["ready"] = False
+        summary["preflight"]["errors"] = [failure]
+        summary["setup"]["skipped"] = True
+        attach_run_contract(summary)
+        persist_progress(status="failed", last_log_line="linked_bitable_url conflict")
+        return _finalize_failure(
+            failure=failure,
+            finished_at=iso_now(),
+        )
+
     persist_progress(
         observed_at=str(summary.get("started_at") or "").strip() or iso_now(),
         stage="preflight",
@@ -3653,6 +3729,125 @@ def run_keep_list_screening_pipeline(
             failure=failure,
             finished_at=iso_now(),
         )
+
+    try:
+        task_upload_task_owner = _resolve_task_upload_task_owner_context(
+            runtime=runtime,
+            env_file=env_file,
+            task_name=normalized_task_name,
+            task_upload_url=str(task_upload_url or "").strip(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        summary.setdefault("warnings", {})["task_upload_task_owner_resolution"] = {
+            "status": "best_effort_failed",
+            "task_name": normalized_task_name,
+            "task_upload_url": str(task_upload_url or "").strip(),
+            "error": str(exc) or exc.__class__.__name__,
+        }
+    else:
+        authoritative_linked_bitable_url = str(task_upload_task_owner.get("linked_bitable_url") or "").strip()
+        if authoritative_linked_bitable_url:
+            if normalized_linked_bitable_url and _linked_bitable_urls_conflict(
+                authoritative_linked_bitable_url,
+                normalized_linked_bitable_url,
+            ):
+                if initial_linked_bitable_url_source != "adjacent_task_context":
+                    failure = _build_failure_payload(
+                        stage="runtime_init",
+                        error_code="LINKED_BITABLE_URL_TASK_UPLOAD_MISMATCH",
+                        message=(
+                            "任务上传表回查出的达人管理表链接与当前下游准备使用的 linked_bitable_url 不一致，"
+                            "已阻断本次运行。"
+                        ),
+                        remediation="确认任务名对应的任务上传记录后，使用任务上传表解析出的达人管理表链接重新执行。",
+                        details={
+                            "task_name": normalized_task_name,
+                            "task_upload_url": str(task_upload_url or "").strip(),
+                            "authoritative_linked_bitable_url": authoritative_linked_bitable_url,
+                            "resolved_linked_bitable_url": normalized_linked_bitable_url,
+                            "resolved_linked_bitable_url_source": initial_linked_bitable_url_source,
+                            "task_upload_record_id": str(task_upload_task_owner.get("task_record_id") or "").strip(),
+                        },
+                        failure_layer="input",
+                    )
+                    return _finalize_failure(
+                        failure=failure,
+                        finished_at=iso_now(),
+                    )
+                summary.setdefault("warnings", {})["linked_bitable_url_adjacent_override"] = {
+                    "status": "task_upload_entry_overrode_adjacent_fallback",
+                    "task_name": normalized_task_name,
+                    "adjacent_linked_bitable_url": normalized_linked_bitable_url,
+                    "authoritative_linked_bitable_url": authoritative_linked_bitable_url,
+                    "adjacent_source_path": initial_linked_bitable_url_source_path,
+                    "task_upload_record_id": str(task_upload_task_owner.get("task_record_id") or "").strip(),
+                }
+
+            normalized_task_name = str(task_upload_task_owner.get("task_name") or normalized_task_name).strip()
+            normalized_task_owner_name = (
+                normalized_task_owner_name or str(task_upload_task_owner.get("task_owner_name") or "").strip()
+            )
+            normalized_task_owner_employee_id = (
+                normalized_task_owner_employee_id
+                or str(task_upload_task_owner.get("task_owner_employee_id") or "").strip()
+            )
+            normalized_task_owner_employee_email = (
+                normalized_task_owner_employee_email
+                or str(task_upload_task_owner.get("task_owner_employee_email") or "").strip()
+            )
+            normalized_task_owner_owner_name = (
+                normalized_task_owner_owner_name
+                or str(task_upload_task_owner.get("task_owner_owner_name") or "").strip()
+            )
+            normalized_linked_bitable_url = authoritative_linked_bitable_url
+            initial_linked_bitable_url_source = str(task_upload_task_owner.get("source") or "task_upload_entry")
+            initial_linked_bitable_url_source_path = (
+                str(task_upload_task_owner.get("task_record_id") or "").strip()
+                or str(task_upload_url or "").strip()
+            )
+            summary["task_name"] = normalized_task_name
+            summary["task_upload_url"] = str(task_upload_url or "").strip()
+            summary["resolved_task_owner"] = {
+                "task_owner_name": normalized_task_owner_name,
+                "task_owner_employee_id": normalized_task_owner_employee_id,
+                "task_owner_employee_record_id": normalized_task_owner_employee_record_id,
+                "task_owner_employee_email": normalized_task_owner_employee_email,
+                "task_owner_owner_name": normalized_task_owner_owner_name,
+                "linked_bitable_url": normalized_linked_bitable_url,
+                "linked_bitable_url_source": initial_linked_bitable_url_source,
+                "linked_bitable_url_source_path": initial_linked_bitable_url_source_path,
+                "task_upload_record_id": str(task_upload_task_owner.get("task_record_id") or "").strip(),
+                "inferred_from_task_spec": str(inferred_task_owner.get("task_spec_path") or ""),
+            }
+            task_spec = build_keep_list_downstream_task_spec(
+                generated_at=summary["started_at"],
+                runner_paths=runner_paths,
+                env_snapshot=resolved_config["env_snapshot"],
+                env_file_raw=str(env_file),
+                resolved_config_sources=resolved_config_sources,
+                keep_workbook=resolved_keep_workbook.resolve(),
+                template_workbook=resolved_template_workbook.resolve() if resolved_template_workbook else None,
+                task_name=normalized_task_name,
+                task_upload_url=resolved_config["task_upload_url"].value,
+                requested_platforms=requested_platforms,
+                vision_provider=str(vision_provider or "").strip().lower(),
+                max_identifiers_per_platform=int(max_identifiers_per_platform),
+                poll_interval=float(poll_interval),
+                dry_run=bool(dry_run),
+                probe_vision_provider_only=bool(probe_vision_provider_only),
+                skip_scrape=bool(skip_scrape),
+                skip_visual=bool(skip_visual),
+                skip_positioning_card_analysis=bool(skip_positioning_card_analysis),
+                creator_cache_db_path=str(creator_cache_db_path or "").strip(),
+                force_refresh_creator_cache=bool(force_refresh_creator_cache),
+                task_owner_name=normalized_task_owner_name,
+                task_owner_employee_id=normalized_task_owner_employee_id,
+                task_owner_employee_record_id=normalized_task_owner_employee_record_id,
+                task_owner_employee_email=normalized_task_owner_employee_email,
+                task_owner_owner_name=normalized_task_owner_owner_name,
+                linked_bitable_url=normalized_linked_bitable_url,
+            )
+            write_task_spec(runner_paths.task_spec_json, task_spec)
 
     backend_app = runtime["backend_app"]
     if "build_all_platforms_final_review_artifacts" in runtime and "collect_final_exports" in runtime:
@@ -4530,6 +4725,7 @@ def run_keep_list_screening_pipeline(
             resume_available=False,
             last_log_line="export_merge",
         )
+        persist_summary(summary)
         combined_artifacts = build_all_platforms_final_review_artifacts(
             output_path=exports_dir / "all_platforms_final_review.xlsx",
             payload_json_path=exports_dir / "all_platforms_final_review_payload.json",
@@ -4581,6 +4777,7 @@ def run_keep_list_screening_pipeline(
         summary["artifacts"]["feishu_upload_updated_count"] = 0
         summary["artifacts"]["feishu_upload_failed_count"] = 0
         summary["artifacts"]["feishu_upload_skipped_existing_count"] = 0
+        persist_summary(summary)
         if combined_artifacts["source_row_count"] > 0 and combined_artifacts["row_count"] <= 0:
             skip_archive = summary["artifacts"]["all_platforms_upload_skipped_archive_json"]
             summary["artifacts"]["error_report_xlsx"] = _write_report_xlsx_best_effort(
@@ -4623,6 +4820,7 @@ def run_keep_list_screening_pipeline(
                 resume_available=False,
                 last_log_line="upload",
             )
+            persist_summary(summary)
             try:
                 feishu_client = _build_feishu_open_client(
                     runtime=runtime,
@@ -4657,6 +4855,8 @@ def run_keep_list_screening_pipeline(
             summary["artifacts"]["feishu_upload_updated_count"] = int(upload_summary.get("updated_count") or 0)
             summary["artifacts"]["feishu_upload_failed_count"] = int(upload_summary.get("failed_count") or 0)
             summary["artifacts"]["feishu_upload_skipped_existing_count"] = int(upload_summary.get("skipped_existing_count") or 0)
+            summary["upload_summary"] = _compact_upload_summary(full_upload_summary)
+            persist_summary(summary)
             summary["artifacts"]["success_report_xlsx"] = _write_report_xlsx_best_effort(
                 exports_dir / "success_report.xlsx",
                 _build_success_report_rows(full_upload_summary),
@@ -4828,6 +5028,47 @@ def _first_non_empty(*values: Any) -> str:
         if normalized:
             return normalized
     return ""
+
+
+def _parse_linked_bitable_identity(url: Any) -> dict[str, str]:
+    normalized = _clean_text(url)
+    if not normalized:
+        return {
+            "raw_url": "",
+            "app_token": "",
+            "table_id": "",
+            "view_id": "",
+        }
+    parsed = parse.urlparse(normalized)
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    query = parse.parse_qs(parsed.query)
+    app_token = ""
+    if len(segments) >= 2 and segments[0] == "base":
+        app_token = str(segments[1] or "").strip()
+    return {
+        "raw_url": normalized,
+        "app_token": app_token,
+        "table_id": str(query.get("table", [""])[0] or "").strip(),
+        "view_id": str(query.get("view", [""])[0] or "").strip(),
+    }
+
+
+def _linked_bitable_urls_conflict(expected_url: Any, candidate_url: Any) -> bool:
+    expected = _parse_linked_bitable_identity(expected_url)
+    candidate = _parse_linked_bitable_identity(candidate_url)
+    if not expected["raw_url"] or not candidate["raw_url"]:
+        return False
+    if expected["raw_url"] == candidate["raw_url"]:
+        return False
+    if expected["app_token"] and candidate["app_token"]:
+        if expected["app_token"] != candidate["app_token"]:
+            return True
+        if expected["table_id"] and candidate["table_id"] and expected["table_id"] != candidate["table_id"]:
+            return True
+        if bool(expected["table_id"]) != bool(candidate["table_id"]):
+            return True
+        return False
+    return True
 
 
 def _extract_task_owner_context_from_payload(
