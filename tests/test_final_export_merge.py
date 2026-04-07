@@ -1826,8 +1826,71 @@ class FinalExportMergeTests(unittest.TestCase):
             rows = pd.read_excel(output_path).fillna("")
             tiktok_row = rows.loc[rows["达人ID"] == "lowviews_creator"].iloc[0].to_dict()
             self.assertEqual(tiktok_row["ai是否通过"], "否")
+            self.assertEqual(tiktok_row["标签(ai)"], "视觉复核未完成")
             self.assertIn("播放量不达标", tiktok_row["ai筛号反馈理由"])
+            self.assertIn("视觉复核未完成，定位卡未完成，需人工确认", tiktok_row["ai筛号反馈理由"])
+
+    def test_visual_pass_with_positioning_not_reviewed_keeps_visual_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            exports_dir = root / "exports"
+            tiktok_export = exports_dir / "tiktok" / "tiktok_final_review.xlsx"
+            tiktok_positioning = exports_dir / "tiktok" / "tiktok_positioning_card_review.xlsx"
+            tiktok_export.parent.mkdir(parents=True, exist_ok=True)
+
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "visual_done_creator",
+                        "username": "visual_done_creator",
+                        "profile_url": "https://www.tiktok.com/@visual_done_creator",
+                        "upload_handle": "visual_done_creator",
+                        "visual_status": "Pass",
+                        "visual_reason": "近 30 天有更新；播放量达标（均值 25570，中位数 21000）；已提取 18 张封面",
+                        "final_status": "Pass",
+                        "final_reason": "近 30 天有更新；播放量达标（均值 25570，中位数 21000）；已提取 18 张封面",
+                    }
+                ]
+            ).to_excel(tiktok_export, index=False)
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "visual_done_creator",
+                        "username": "visual_done_creator",
+                        "profile_url": "https://www.tiktok.com/@visual_done_creator",
+                        "upload_handle": "visual_done_creator",
+                        "visual_status": "Pass",
+                        "positioning_stage_status": "Not Reviewed",
+                        "positioning_labels": "",
+                        "fit_summary": "",
+                        "positioning_error": "",
+                    }
+                ]
+            ).to_excel(tiktok_positioning, index=False)
+
+            tiktok_data_path = root / "data" / "tiktok" / "tiktok_data.json"
+            tiktok_data_path.parent.mkdir(parents=True, exist_ok=True)
+            tiktok_data_path.write_text("[]", encoding="utf-8")
+
+            output_path = exports_dir / "all_platforms_final_review.xlsx"
+            build_all_platforms_final_review_artifacts(
+                output_path=output_path,
+                final_exports={
+                    "tiktok": {
+                        "final_review": str(tiktok_export),
+                        "positioning_card_review": str(tiktok_positioning),
+                    },
+                },
+                task_owner={"responsible_name": "陈俊仁"},
+            )
+
+            rows = pd.read_excel(output_path).fillna("")
+            tiktok_row = rows.loc[rows["达人ID"] == "visual_done_creator"].iloc[0].to_dict()
+            self.assertEqual(tiktok_row["ai是否通过"], "是")
+            self.assertEqual(tiktok_row["标签(ai)"], "定位卡未完成（视觉已完成）")
+            self.assertIn("视觉复核已完成：近 30 天有更新", tiktok_row["ai筛号反馈理由"])
             self.assertIn("定位卡未完成，需人工确认", tiktok_row["ai筛号反馈理由"])
+            self.assertIn("视觉复核已完成：近 30 天有更新", tiktok_row["ai评价"])
 
     def test_visual_provider_timeout_is_sanitized_to_manual_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

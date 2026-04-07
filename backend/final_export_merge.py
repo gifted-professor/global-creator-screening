@@ -235,6 +235,25 @@ def _combine_reason_with_note(base_text: Any, note: str) -> str:
     return f"{cleaned_base}；{cleaned_note}"
 
 
+def _prefix_visual_review_context(
+    base_text: Any,
+    record: dict[str, Any],
+    positioning_row: dict[str, Any],
+) -> str:
+    cleaned_base = _clean_text(base_text)
+    if not cleaned_base:
+        return ""
+    stage_status = _clean_text((positioning_row or {}).get("positioning_stage_status"))
+    if stage_status != "Not Reviewed":
+        return cleaned_base
+    if not _has_completed_visual_review(record, positioning_row):
+        return cleaned_base
+    prefix = "视觉复核已完成："
+    if cleaned_base.startswith(prefix):
+        return cleaned_base
+    return f"{prefix}{cleaned_base}"
+
+
 def _build_quote_text(keep_row: dict[str, Any], *, mail_body_text: Any = "") -> str:
     latest_quote_text = _clean_text(keep_row.get("latest_quote_text"))
     for candidate in (
@@ -440,7 +459,20 @@ def _resolve_visual_manual_reason(*values: Any) -> str:
     return ""
 
 
-def _resolve_positioning_stage_note(positioning_row: dict[str, Any]) -> tuple[str, str]:
+def _has_completed_visual_review(record: dict[str, Any], positioning_row: dict[str, Any]) -> bool:
+    visual_status = _clean_text(
+        _first_non_blank(
+            (positioning_row or {}).get("visual_status"),
+            (record or {}).get("visual_status"),
+        )
+    ).casefold()
+    return visual_status in {"pass", "reject", "completed"}
+
+
+def _resolve_positioning_stage_note(
+    record: dict[str, Any],
+    positioning_row: dict[str, Any],
+) -> tuple[str, str]:
     stage_status = _clean_text((positioning_row or {}).get("positioning_stage_status"))
     if not stage_status:
         return "", ""
@@ -449,7 +481,9 @@ def _resolve_positioning_stage_note(positioning_row: dict[str, Any]) -> tuple[st
     if stage_status == "Error":
         return "定位卡处理失败", "定位卡处理失败，需人工确认"
     if stage_status == "Not Reviewed":
-        return "定位卡未完成", "定位卡未完成，需人工确认"
+        if _has_completed_visual_review(record, positioning_row):
+            return "定位卡未完成（视觉已完成）", "定位卡未完成，需人工确认"
+        return "视觉复核未完成", "视觉复核未完成，定位卡未完成，需人工确认"
     return "", ""
 
 
@@ -1369,7 +1403,7 @@ def build_all_platforms_final_review_artifacts(
                     positioning_row.get("positioning_error"),
                 ],
             )
-            positioning_label_note, positioning_comment_note = _resolve_positioning_stage_note(positioning_row)
+            positioning_label_note, positioning_comment_note = _resolve_positioning_stage_note(record, positioning_row)
             if visual_manual_reason:
                 positioning_label_note = ""
                 positioning_comment_note = ""
@@ -1384,6 +1418,7 @@ def build_all_platforms_final_review_artifacts(
                 record.get("visual_reason"),
                 positioning_row.get("positioning_error"),
             )
+            base_reason = _prefix_visual_review_context(base_reason, record, positioning_row)
             screening_reason = _combine_reason_with_note(base_reason, metric_note)
             screening_reason = _combine_reason_with_note(screening_reason, positioning_comment_note)
             base_comment = _first_non_blank(
@@ -1395,6 +1430,7 @@ def build_all_platforms_final_review_artifacts(
                 record.get("final_reason"),
                 record.get("reason"),
             )
+            base_comment = _prefix_visual_review_context(base_comment, record, positioning_row)
             screening_comment = _combine_reason_with_note(base_comment, metric_note)
             screening_comment = _combine_reason_with_note(screening_comment, positioning_comment_note)
             ai_label_value = _clean_text(positioning_row.get("positioning_labels")) or positioning_label_note
