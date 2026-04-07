@@ -197,6 +197,39 @@ python3 -m feishu_screening_bridge --help
 python3 -m email_sync --help
 ```
 
+如果只想单独验证 nowcoding 这条文本 / 图片通道，可以直接跑 repo-local 探针：
+
+```bash
+python3 scripts/test_nowcoding_vision.py \
+  --env-file .env
+```
+
+带本地图片时，脚本会自动转成 `data:image/...;base64,...` 再发到 `chat/completions`：
+
+```bash
+python3 scripts/test_nowcoding_vision.py \
+  --env-file .env \
+  --image-path /absolute/path/to/sample.png
+```
+
+如果要粗测并发，可以直接加 `--repeat` 和 `--concurrency`：
+
+```bash
+python3 scripts/test_nowcoding_vision.py \
+  --env-file .env \
+  --image-path /absolute/path/to/sample.png \
+  --repeat 10 \
+  --concurrency 5
+```
+
+对应 env：
+
+```bash
+NOWCODING_API_KEY=...
+NOWCODING_BASE_URL=https://nowcoding.ai/v1
+NOWCODING_MODEL=gpt-5.4-openai-compact
+```
+
 邮件抓取如果不显式传 `--sent-since`，默认从“今天”开始抓；当前共享邮箱主线默认优先走 `partnerships@amagency.biz` 的 `其他文件夹/邮件备份`。如果要改窗口，显式传 `--sent-since YYYY-MM-DD` 即可覆盖默认值。
 
 以后达人匹配默认应直接使用任务上传里的飞书 `发信名单`，而不是本地测试达人库 workbook。可以直接按任务名下载 `发信名单` 并做匹配：
