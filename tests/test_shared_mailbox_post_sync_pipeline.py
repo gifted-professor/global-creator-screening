@@ -30,6 +30,15 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
         pipeline._read_thread_reply_snapshot_cached.cache_clear()
         pipeline._lookup_thread_key_for_raw_path_cached.cache_clear()
 
+    def test_build_parser_accepts_positioning_provider(self) -> None:
+        parser = pipeline.build_parser()
+
+        args = parser.parse_args(["--shared-mail-db-path", "/tmp/email_sync.db"])
+        self.assertEqual(args.positioning_provider, "")
+
+        args = parser.parse_args(["--shared-mail-db-path", "/tmp/email_sync.db", "--positioning-provider", "reelx"])
+        self.assertEqual(args.positioning_provider, "reelx")
+
     def test_read_thread_text_excerpt_cache_invalidates_when_db_changes(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "email_sync.db"
@@ -1509,6 +1518,7 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
 
             upstream_calls: list[dict[str, object]] = []
             upload_calls: list[dict[str, object]] = []
+            downstream_calls: list[dict[str, object]] = []
 
             class FakeClient:
                 pass
@@ -1571,6 +1581,12 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
                 return object(), {}
 
             def fake_run_keep_list_screening_pipeline(**kwargs):
+                downstream_calls.append(
+                    {
+                        "vision_provider": kwargs["vision_provider"],
+                        "positioning_provider": kwargs["positioning_provider"],
+                    }
+                )
                 output_root = Path(kwargs["output_root"])
                 output_root.mkdir(parents=True, exist_ok=True)
                 exports_dir = output_root / "exports"
@@ -1713,6 +1729,8 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
                 shared_mail_raw_dir=shared_raw_dir,
                 task_name_filters=["SKG"],
                 matching_strategy="brand-keyword-fast-path",
+                vision_provider="openai",
+                positioning_provider="reelx",
                 upload_dry_run=False,
             )
 
@@ -1724,6 +1742,10 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
             )
             self.assertEqual(len(upload_calls), 1)
             self.assertTrue(upload_calls[0]["suppress_ai_labels"])
+            self.assertEqual(
+                downstream_calls,
+                [{"vision_provider": "openai", "positioning_provider": "reelx"}],
+            )
 
     def test_parser_defaults_brand_match_include_from_to_true_for_shared_mailbox(self) -> None:
         parser = pipeline.build_parser()

@@ -445,18 +445,22 @@ def _resolve_visual_cache_context_key(backend_app, platform: str, *, vision_prov
     return str((context or {}).get("context_key") or "").strip()
 
 
-def _resolve_positioning_cache_context_key(backend_app, platform: str, *, vision_provider: str) -> str:
+def _resolve_positioning_cache_context_key(backend_app, platform: str, *, positioning_provider: str) -> str:
     context_builder = getattr(backend_app, "build_positioning_card_cache_context", None)
     if not callable(context_builder):
         return ""
     try:
         context = context_builder(
             platform,
-            requested_provider=str(vision_provider or "").strip().lower(),
+            requested_provider=str(positioning_provider or "").strip().lower(),
         )
     except Exception:
         return ""
     return str((context or {}).get("context_key") or "").strip()
+
+
+def _resolve_effective_positioning_provider(*, positioning_provider: str, vision_provider: str) -> str:
+    return str(positioning_provider or "").strip().lower() or str(vision_provider or "").strip().lower()
 
 
 def _append_unique_identifier(bucket: list[str], seen: set[str], raw_value: Any) -> None:
@@ -560,6 +564,7 @@ def _build_platform_identifier_plan(
     creator_cache_db_path: str = "",
     force_refresh_creator_cache: bool = False,
     vision_provider: str = "",
+    positioning_provider: str = "",
     skip_visual: bool = False,
     skip_positioning_card_analysis: bool = False,
 ) -> dict[str, Any]:
@@ -608,6 +613,10 @@ def _build_platform_identifier_plan(
     positioning_cache_hits: dict[str, dict[str, Any]] = {}
     visual_cache_context_key = ""
     positioning_cache_context_key = ""
+    effective_positioning_provider = _resolve_effective_positioning_provider(
+        positioning_provider=positioning_provider,
+        vision_provider=vision_provider,
+    )
     normalized_planned_identifiers = [
         _normalize_cache_identifier(backend_app, platform, entry.get("scrape_identifier") or entry.get("creator_id"))
         for entry in planned_entries
@@ -639,7 +648,7 @@ def _build_platform_identifier_plan(
         positioning_cache_context_key = _resolve_positioning_cache_context_key(
             backend_app,
             platform,
-            vision_provider=vision_provider,
+            positioning_provider=effective_positioning_provider,
         )
         if positioning_cache_context_key and planned_scrape_identifiers:
             positioning_cache_hits = creator_cache.load_positioning_cache_entries(
@@ -3121,6 +3130,7 @@ def run_keep_list_screening_pipeline(
     summary_json: Path | None = None,
     platform_filters: list[str] | None = None,
     vision_provider: str = "",
+    positioning_provider: str = "",
     max_identifiers_per_platform: int = 0,
     poll_interval: float = 5.0,
     dry_run: bool = False,
@@ -3139,6 +3149,10 @@ def run_keep_list_screening_pipeline(
     task_owner_owner_name: str = "",
     linked_bitable_url: str = "",
 ) -> dict[str, Any]:
+    resolved_positioning_provider = _resolve_effective_positioning_provider(
+        positioning_provider=positioning_provider,
+        vision_provider=vision_provider,
+    )
     normalized_task_name = str(task_name or "").strip()
     runner_paths = resolve_keep_list_downstream_paths(
         task_name=normalized_task_name or "task",
@@ -4053,6 +4067,7 @@ def run_keep_list_screening_pipeline(
                         creator_cache_db_path=str(creator_cache_db_path or "").strip(),
                         force_refresh_creator_cache=bool(force_refresh_creator_cache),
                         vision_provider=str(vision_provider or "").strip().lower(),
+                        positioning_provider=resolved_positioning_provider,
                         skip_visual=bool(skip_visual),
                         skip_positioning_card_analysis=bool(skip_positioning_card_analysis),
                     )
@@ -4550,8 +4565,8 @@ def run_keep_list_screening_pipeline(
                             creator_cache_db_path=str(creator_cache_db_path or "").strip(),
                             force_refresh_creator_cache=bool(force_refresh_creator_cache),
                         )
-                        if vision_provider:
-                            positioning_payload_body["provider"] = str(vision_provider).strip().lower()
+                        if resolved_positioning_provider:
+                            positioning_payload_body["provider"] = resolved_positioning_provider
                         try:
                             persist_platform_state(
                                 platform,
@@ -5251,6 +5266,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--summary-json", default="", help="最终 run summary.json 输出路径。")
     parser.add_argument("--platform", action="append", help="只跑指定平台，可重复传入：tiktok / instagram / youtube。")
     parser.add_argument("--vision-provider", default="", help="指定视觉 provider，例如 openai / reelx。")
+    parser.add_argument("--positioning-provider", default="", help="指定定位卡 provider，例如 reelx。")
     parser.add_argument("--max-identifiers-per-platform", type=int, default=0, help="每个平台最多跑多少个账号；0 表示不截断。")
     parser.add_argument("--poll-interval", type=float, default=5.0, help="轮询 job 状态的秒数。")
     parser.add_argument("--dry-run", action="store_true", help="只做增量达人与平台执行预估，不真正触发 scrape / visual / export / upload。")
@@ -5288,6 +5304,7 @@ def main(argv: list[str] | None = None) -> int:
         summary_json=Path(args.summary_json) if args.summary_json else None,
         platform_filters=args.platform,
         vision_provider=args.vision_provider or "",
+        positioning_provider=args.positioning_provider or "",
         max_identifiers_per_platform=max(0, int(args.max_identifiers_per_platform)),
         poll_interval=max(1.0, float(args.poll_interval)),
         dry_run=bool(args.dry_run),

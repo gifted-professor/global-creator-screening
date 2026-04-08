@@ -1804,6 +1804,7 @@ def run_shared_mailbox_post_sync_pipeline(
     brand_match_include_from: bool = True,
     platform_filters: list[str] | None = None,
     vision_provider: str = "",
+    positioning_provider: str = "",
     max_identifiers_per_platform: int = 0,
     poll_interval: float = 5.0,
     skip_scrape: bool = False,
@@ -2268,6 +2269,7 @@ def run_shared_mailbox_post_sync_pipeline(
                     summary_json=downstream_summary_path,
                     platform_filters=platform_filters,
                     vision_provider=vision_provider,
+                    positioning_provider=positioning_provider,
                     max_identifiers_per_platform=max(0, int(max_identifiers_per_platform)),
                     poll_interval=max(1.0, float(poll_interval)),
                     skip_scrape=bool(skip_scrape),
@@ -2760,6 +2762,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--platform", action="append", help="只跑指定平台，可重复传入：tiktok / instagram / youtube。")
     parser.add_argument("--vision-provider", default="", help="指定视觉 provider。")
+    parser.add_argument("--positioning-provider", default="", help="指定定位卡 provider。")
     parser.add_argument("--max-identifiers-per-platform", type=int, default=0, help="每个平台最多跑多少个账号；0 表示不截断。")
     parser.add_argument("--poll-interval", type=float, default=5.0, help="轮询 job 状态的秒数。")
     parser.add_argument("--skip-scrape", action="store_true", help="跳过 scrape。")
@@ -2825,6 +2828,7 @@ def main(argv: list[str] | None = None) -> int:
             brand_match_include_from=True if args.brand_match_include_from is None else bool(args.brand_match_include_from),
             platform_filters=args.platform,
             vision_provider=args.vision_provider or "",
+            positioning_provider=args.positioning_provider or "",
             max_identifiers_per_platform=max(0, int(args.max_identifiers_per_platform)),
             poll_interval=max(1.0, float(args.poll_interval)),
             skip_scrape=bool(args.skip_scrape),
