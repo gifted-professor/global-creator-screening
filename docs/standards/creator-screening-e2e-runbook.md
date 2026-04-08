@@ -829,6 +829,10 @@ For the concrete `2026-04-07 / MINISO / AI回信管理` direct-write path that w
 
 - `docs/standards/miniso-ai-reply-mail-only-path-2026-04-07.md`
 
+For the current operator-facing integration guide for the generalized mail-only `AI回信管理` path, see:
+
+- `docs/standards/ai-reply-mail-only-integration-guide.md`
+
 ## Recommended Commands
 
 ### Run the full chain
