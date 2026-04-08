@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import html
 import sqlite3
 from collections import defaultdict
 from dataclasses import dataclass
@@ -66,6 +67,22 @@ MATCH_HEADERS = BASE_HEADERS + [
     "shared_email_candidate_count",
     "shared_email_distinct_profile_count",
 ]
+THREAD_HEADERS = [
+    "thread_key",
+    "brand_keyword",
+    "keyword_hit_message_count",
+    "latest_external_message_id",
+    "latest_external_sent_at",
+    "latest_external_from",
+    "latest_external_sender_emails",
+    "latest_external_subject",
+    "latest_external_folder",
+    "latest_external_raw_path",
+    "latest_external_snippet",
+    "latest_external_clean_body",
+    "latest_external_full_body",
+    "thread_has_external_message",
+]
 
 
 @dataclass(frozen=True)
@@ -78,6 +95,62 @@ class MessageHit:
     folder_name: str
     raw_path: str
     snippet: str
+
+
+def _first_sender_email(message_row: sqlite3.Row) -> str:
+    for key in ("from_json", "reply_to_json", "sender_json"):
+        for item in _load_addresses(str(message_row[key] or "[]")):
+            email = _clean_text(item.get("address")).lower()
+            if email:
+                return email
+    return ""
+
+
+def _all_sender_emails(message_row: sqlite3.Row) -> list[str]:
+    seen: set[str] = set()
+    result: list[str] = []
+    for key in ("from_json", "reply_to_json", "sender_json"):
+        for item in _load_addresses(str(message_row[key] or "[]")):
+            email = _clean_text(item.get("address")).lower()
+            if not email or email in seen:
+                continue
+            seen.add(email)
+            result.append(email)
+    return result
+
+
+def _is_external_sender(message_row: sqlite3.Row) -> bool:
+    sender_emails = _all_sender_emails(message_row)
+    if not sender_emails:
+        return False
+    return any(not email.endswith("@amagency.biz") for email in sender_emails)
+
+
+def _build_full_body(message_row: sqlite3.Row) -> str:
+    for value in (message_row["body_text"], message_row["snippet"], message_row["body_html"]):
+        if value is None:
+            continue
+        text = html.unescape(str(value)).replace("\xa0", " ")
+        text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if text:
+            return text
+    return ""
+
+
+def _build_clean_body(full_body: str) -> str:
+    if not full_body:
+        return ""
+    lines: list[str] = []
+    for raw_line in str(full_body or "").splitlines():
+        line = raw_line.rstrip()
+        normalized = line.strip().lower()
+        if normalized.startswith(">") or normalized.startswith("on ") and normalized.endswith(" wrote:"):
+            break
+        if normalized.startswith("from:") or normalized.startswith("de:"):
+            break
+        lines.append(line)
+    cleaned = _clean_text("\n".join(lines))
+    return cleaned or _clean_text(full_body)[:2000]
 
 
 def _normalize_platform(value: Any) -> str:
@@ -450,6 +523,64 @@ def _write_match_outputs(output_prefix: Path, rows: Sequence[dict[str, Any]]) ->
     return str(csv_path), str(xlsx_path)
 
 
+def build_keyword_hit_threads(
+    messages: Sequence[sqlite3.Row],
+    *,
+    keyword: str,
+) -> list[dict[str, Any]]:
+    grouped: dict[str, list[sqlite3.Row]] = defaultdict(list)
+    for row in messages:
+        thread_key = _clean_text(row["thread_key"]) or f"message:{int(row['id'])}"
+        grouped[thread_key].append(row)
+
+    thread_rows: list[dict[str, Any]] = []
+    for thread_key, group_rows in grouped.items():
+        sorted_rows = sorted(
+            group_rows,
+            key=lambda item: (_timestamp(item["sent_at"]), int(item["id"])),
+            reverse=True,
+        )
+        external_rows = [row for row in sorted_rows if _is_external_sender(row)]
+        selected_row = external_rows[0] if external_rows else sorted_rows[0]
+        full_body = _build_full_body(selected_row)
+        sender_emails = _all_sender_emails(selected_row)
+        thread_rows.append(
+            {
+                "thread_key": thread_key,
+                "brand_keyword": keyword,
+                "keyword_hit_message_count": len(group_rows),
+                "latest_external_message_id": int(selected_row["id"]),
+                "latest_external_sent_at": _clean_text(selected_row["sent_at"]),
+                "latest_external_from": _first_sender_email(selected_row),
+                "latest_external_sender_emails": " | ".join(sender_emails),
+                "latest_external_subject": _clean_text(selected_row["subject"]),
+                "latest_external_folder": _clean_text(selected_row["folder_name"]),
+                "latest_external_raw_path": _clean_text(selected_row["raw_path"]),
+                "latest_external_snippet": _clean_text(selected_row["snippet"]),
+                "latest_external_clean_body": _build_clean_body(full_body),
+                "latest_external_full_body": full_body,
+                "thread_has_external_message": 1 if external_rows else 0,
+            }
+        )
+
+    thread_rows.sort(
+        key=lambda row: (
+            _timestamp(row.get("latest_external_sent_at")),
+            int(row.get("latest_external_message_id") or 0),
+        ),
+        reverse=True,
+    )
+    return thread_rows
+
+
+def _write_thread_outputs(output_prefix: Path, rows: Sequence[dict[str, Any]]) -> tuple[str, str]:
+    csv_path = output_prefix.with_suffix(".csv")
+    xlsx_path = output_prefix.with_suffix(".xlsx")
+    _write_csv(csv_path, THREAD_HEADERS, rows)
+    _write_xlsx(xlsx_path, THREAD_HEADERS, rows)
+    return str(csv_path), str(xlsx_path)
+
+
 def match_brand_keyword(
     *,
     db: Database,
@@ -490,11 +621,16 @@ def match_brand_keyword(
         keyword=normalized_keyword,
         address_hits=address_hits,
     )
+    thread_rows = build_keyword_hit_threads(messages, keyword=normalized_keyword)
     deduped_rows = dedupe_brand_match_rows(matched_rows)
     unique_rows, shared_rows, shared_group_count = split_shared_email_rows(deduped_rows)
 
     output_prefix.parent.mkdir(parents=True, exist_ok=True)
     all_csv_path, all_xlsx_path = _write_match_outputs(output_prefix, matched_rows)
+    thread_csv_path, thread_xlsx_path = _write_thread_outputs(
+        output_prefix.with_name(f"{output_prefix.name}_threads"),
+        thread_rows,
+    )
     deduped_csv_path, deduped_xlsx_path = _write_match_outputs(
         output_prefix.with_name(f"{output_prefix.name}_deduped"),
         deduped_rows,
@@ -513,6 +649,7 @@ def match_brand_keyword(
         "keyword": normalized_keyword,
         "sent_since": sent_since.isoformat() if sent_since else "",
         "message_hit_count": len(messages),
+        "thread_hit_count": len(thread_rows),
         "matched_email_count": len(address_hits),
         "email_direct_match_row_count": len(matched_rows),
         "profile_deduped_row_count": len(deduped_rows),
@@ -521,6 +658,8 @@ def match_brand_keyword(
         "shared_email_group_count": shared_group_count,
         "csv_path": all_csv_path,
         "xlsx_path": all_xlsx_path,
+        "thread_csv_path": thread_csv_path,
+        "thread_xlsx_path": thread_xlsx_path,
         "deduped_csv_path": deduped_csv_path,
         "deduped_xlsx_path": deduped_xlsx_path,
         "unique_csv_path": unique_csv_path,

@@ -223,6 +223,12 @@ class MailThreadFunnelTests(unittest.TestCase):
         self.assertEqual(result["pass0_sending_list_email_count"], 1)
         self.assertEqual(result["regex_pass1_count"], 1)
         self.assertEqual(result["regex_pass2_count"], 0)
+        self.assertEqual(result["regex_pass1_rescued_count"], 1)
+        self.assertEqual(result["regex_pass2_rescued_count"], 0)
+        self.assertEqual(result["full_body_only_hit_count"], 1)
+        self.assertEqual(result["beacons_linktree_hit_count"], 0)
+        self.assertEqual(result["llm_invocation_count_before"], 2)
+        self.assertEqual(result["llm_invocation_count_after"], 1)
         self.assertEqual(result["llm_high_count"], 1)
         self.assertEqual(result["filtered_auto_reply_count"], 1)
         self.assertEqual(result["manual_row_count"], 0)
@@ -242,6 +248,8 @@ class MailThreadFunnelTests(unittest.TestCase):
         review_thread_index = review_headers.index("thread_key")
         review_stage_index = review_headers.index("resolution_stage_final")
         review_id_index = review_headers.index("final_id_final")
+        review_sources_index = review_headers.index("candidate_sources")
+        review_business_signal_index = review_headers.index("business_signal_detected")
         keep_thread_index = keep_headers.index("thread_key")
         keep_platform_index = keep_headers.index("Platform")
         keep_stage_index = keep_headers.index("resolution_stage_final")
@@ -259,8 +267,237 @@ class MailThreadFunnelTests(unittest.TestCase):
         self.assertIn(("llm", "llmresolvedcreator"), keep_pairs)
         keep_platform_by_id = {row[keep_id_index]: row[keep_platform_index] for row in keep_rows[1:]}
         self.assertEqual(keep_platform_by_id["creatoralpha"], "TikTok")
+        quoted_row = next(row for row in review_rows[1:] if row[review_id_index] == "downwithopc0")
+        self.assertEqual(quoted_row[review_sources_index], '["greeting_quoted"]')
+        llm_row = next(row for row in review_rows[1:] if row[review_id_index] == "llmresolvedcreator")
+        self.assertEqual(llm_row[review_business_signal_index], "true")
         self.assertTrue(all(str(row[review_thread_index]).startswith("mid:<m") for row in review_rows[1:]))
         self.assertTrue(all(str(row[keep_thread_index]).startswith("mid:<m") for row in keep_rows[1:]))
+
+    def test_build_mail_thread_funnel_keep_workbook_thread_first_resolves_single_creator_per_thread(self) -> None:
+        self._make_sending_list_workbook()
+        db = Database(self.db_path)
+        db.init_schema()
+        rows = [
+            (
+                "partnerships@amagency.biz",
+                "INBOX",
+                11,
+                1,
+                "<m11>",
+                "Re: Paid collab with SKG",
+                None,
+                None,
+                "2026-04-02T10:00:00+00:00",
+                "2026-04-02T10:00:00+00:00",
+                "2026-04-02T10:00:00+00:00",
+                "2026-04-02T10:00:00+00:00",
+                "[]",
+                100,
+                _addresses(("Astrid", "astrid@amagency.biz")),
+                _addresses(("Creator Alpha", "creatoralpha@mgmt.com")),
+                "[]",
+                "[]",
+                "[]",
+                "[]",
+                "Hi creatoralpha, this SKG campaign sounds great.",
+                "",
+                "Hi creatoralpha, this SKG campaign sounds great.",
+                "{}",
+                "raw/11.eml",
+                "sha11",
+                100,
+                0,
+                0,
+                "2026-04-02T10:00:00+00:00",
+                "2026-04-02T10:00:00+00:00",
+            ),
+            (
+                "partnerships@amagency.biz",
+                "INBOX",
+                12,
+                1,
+                "<m12>",
+                "Re: Paid collab with SKG",
+                None,
+                None,
+                "2026-04-02T12:00:00+00:00",
+                "2026-04-02T12:00:00+00:00",
+                "2026-04-02T12:00:00+00:00",
+                "2026-04-02T12:00:00+00:00",
+                "[]",
+                100,
+                _addresses(("Creator Alpha", "creatoralpha@mgmt.com")),
+                _addresses(("Astrid", "astrid@amagency.biz")),
+                "[]",
+                "[]",
+                "[]",
+                "[]",
+                "Thanks Astrid, happy to collaborate with SKG.",
+                "",
+                "Thanks Astrid, happy to collaborate with SKG.",
+                "{}",
+                "raw/12.eml",
+                "sha12",
+                100,
+                0,
+                0,
+                "2026-04-02T12:00:00+00:00",
+                "2026-04-02T12:00:00+00:00",
+            ),
+            (
+                "partnerships@amagency.biz",
+                "INBOX",
+                13,
+                1,
+                "<m13>",
+                "Re: Paid collab with SKG",
+                None,
+                None,
+                "2026-04-02T13:00:00+00:00",
+                "2026-04-02T13:00:00+00:00",
+                "2026-04-02T13:00:00+00:00",
+                "2026-04-02T13:00:00+00:00",
+                "[]",
+                100,
+                _addresses(("Manager", "manager@example.com")),
+                _addresses(("Astrid", "astrid@amagency.biz")),
+                "[]",
+                "[]",
+                "[]",
+                "[]",
+                "Hallo Astrid,\n\nvielen Dank.\n\n> Hi @ downwithopc0 ,\n\nThis SKG campaign sounds great.",
+                "",
+                "Hallo Astrid,\n\nvielen Dank.\n\n> Hi @ downwithopc0 ,\n\nThis SKG campaign sounds great.",
+                "{}",
+                "raw/13.eml",
+                "sha13",
+                100,
+                0,
+                0,
+                "2026-04-02T13:00:00+00:00",
+                "2026-04-02T13:00:00+00:00",
+            ),
+            (
+                "partnerships@amagency.biz",
+                "INBOX",
+                14,
+                1,
+                "<m14>",
+                "Re: Paid collab with SKG",
+                None,
+                None,
+                "2026-04-02T14:00:00+00:00",
+                "2026-04-02T14:00:00+00:00",
+                "2026-04-02T14:00:00+00:00",
+                "2026-04-02T14:00:00+00:00",
+                "[]",
+                100,
+                _addresses(("Manager", "multi@example.com")),
+                _addresses(("Astrid", "astrid@amagency.biz")),
+                "[]",
+                "[]",
+                "[]",
+                "[]",
+                "Hi Astrid, both @creatoralpha and @creatorbeta are available for the SKG campaign.",
+                "",
+                "Hi Astrid, both @creatoralpha and @creatorbeta are available for the SKG campaign.",
+                "{}",
+                "raw/14.eml",
+                "sha14",
+                100,
+                0,
+                0,
+                "2026-04-02T14:00:00+00:00",
+                "2026-04-02T14:00:00+00:00",
+            ),
+        ]
+        db.conn.executemany(
+            """
+            INSERT INTO messages (
+                account_email, folder_name, uid, uidvalidity, message_id, subject, in_reply_to, references_header,
+                sent_at, sent_at_raw, internal_date, internal_date_raw, flags_json, size_bytes,
+                from_json, to_json, cc_json, bcc_json, reply_to_json, sender_json,
+                body_text, body_html, snippet, headers_json, raw_path, raw_sha256, raw_size_bytes,
+                has_attachments, attachment_count, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        now = "2026-04-02T15:00:00+00:00"
+        message_ids = [row[0] for row in db.conn.execute("SELECT id FROM messages ORDER BY id").fetchall()]
+        db.conn.executemany(
+            """
+            INSERT INTO message_index (
+                message_row_id, normalized_subject, direction, thread_key, thread_root_message_id,
+                thread_parent_message_id, thread_depth, sent_sort_at, external_contact_count, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (message_ids[0], "paid collab with skg", "outbound", "thread-alpha", "<m11>", "", 0, "2026-04-02T10:00:00+00:00", 1, now),
+                (message_ids[1], "paid collab with skg", "inbound", "thread-alpha", "<m11>", "<m11>", 1, "2026-04-02T12:00:00+00:00", 1, now),
+                (message_ids[2], "paid collab with skg", "inbound", "thread-beta", "<m13>", "", 0, "2026-04-02T13:00:00+00:00", 1, now),
+                (message_ids[3], "paid collab with skg", "inbound", "thread-gamma", "<m14>", "", 0, "2026-04-02T14:00:00+00:00", 1, now),
+            ],
+        )
+        db.conn.commit()
+
+        def fake_llm_runner(records):
+            return [
+                {
+                    **record,
+                    "llm_handle": "",
+                    "resolution_confidence_final": "low",
+                    "llm_evidence": "multiple handles mentioned",
+                    "llm_reason": "ambiguous",
+                }
+                for record in records
+            ]
+
+        try:
+            result = build_mail_thread_funnel_keep_workbook(
+                db=db,
+                input_path=self.input_path,
+                output_prefix=self.output_prefix,
+                keyword="SKG",
+                sent_since=date(2026, 4, 1),
+                llm_runner=fake_llm_runner,
+                thread_first_resolution=True,
+            )
+        finally:
+            db.close()
+
+        self.assertEqual(result["message_hit_count"], 4)
+        self.assertEqual(result["thread_hit_count"], 3)
+        self.assertEqual(result["pass0_sending_list_email_count"], 1)
+        self.assertEqual(result["regex_pass1_count"], 1)
+        self.assertEqual(result["regex_pass1_rescued_count"], 1)
+        self.assertEqual(result["full_body_only_hit_count"], 1)
+        self.assertEqual(result["keep_row_count"], 2)
+        self.assertEqual(result["resolved_thread_count"], 2)
+        self.assertEqual(result["manual_row_count"], 1)
+
+        review_book = load_workbook(result["review_xlsx_path"], read_only=True, data_only=True)
+        keep_book = load_workbook(result["keep_xlsx_path"], read_only=True, data_only=True)
+        unresolved_book = load_workbook(result["unresolved_threads_xlsx_path"], read_only=True, data_only=True)
+        try:
+            review_rows = list(review_book.active.iter_rows(values_only=True))
+            keep_rows = list(keep_book.active.iter_rows(values_only=True))
+            unresolved_rows = list(unresolved_book.active.iter_rows(values_only=True))
+        finally:
+            review_book.close()
+            keep_book.close()
+            unresolved_book.close()
+
+        self.assertEqual(len(review_rows) - 1, 3)
+        self.assertEqual(len(keep_rows) - 1, 2)
+        self.assertEqual(len(unresolved_rows) - 1, 1)
+
+        keep_headers = list(keep_rows[0])
+        status_index = keep_headers.index("thread_resolution_status")
+        final_index = keep_headers.index("final_creator_id")
+        self.assertEqual({row[status_index] for row in keep_rows[1:]}, {"resolved"})
+        self.assertEqual({row[final_index] for row in keep_rows[1:]}, {"creatoralpha", "downwithopc0"})
 
 
 if __name__ == "__main__":

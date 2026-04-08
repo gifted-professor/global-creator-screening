@@ -264,10 +264,21 @@ UPLOAD_METADATA_FIELD_ALIASES = {
     "mailresolutionconfidence": "mail_resolution_confidence",
     "mailapifygate": "mail_apify_gate",
     "mailevidence": "mail_evidence",
+    "resolutionevidence": "resolution_evidence",
     "mailrawpath": "mail_raw_path",
     "latestexternalfrom": "latest_external_from",
     "latestexternalsentat": "latest_external_sent_at",
     "subject": "subject",
+    "candidatesources": "candidate_sources",
+    "originaldecision": "original_decision",
+    "finaldecision": "final_decision",
+    "originalrejectreason": "original_reject_reason",
+    "businesssignaldetected": "business_signal_detected",
+    "reviewpriority": "review_priority",
+    "rescueruleapplied": "rescue_rule_applied",
+    "confidencebeforerescue": "confidence_before_rescue",
+    "confidenceafterrescue": "confidence_after_rescue",
+    "hardrejectblockedrescue": "hard_reject_blocked_rescue",
 }
 UPLOAD_METADATA_EXPORT_FIELDS = (
     ("upload_nickname", "nickname"),
@@ -288,6 +299,7 @@ DEFAULT_QIANDAO_FALLBACK_VISION_MODEL = "gemini-3-flash-preview-S"
 QIANDAO_25P_VISION_MODEL = "gemini-2.5-pro-preview-p"
 DEFAULT_QIANDAO_25P_VISUAL_REVIEW_MAX_WORKERS = 2
 MAX_QIANDAO_25P_VISUAL_REVIEW_MAX_WORKERS = 3
+DEFAULT_CLIPROXY_VISUAL_REVIEW_MAX_WORKERS = 2
 DEFAULT_QIANDAO_MAX_TOKENS = 900
 DEFAULT_QIANDAO_TEMPERATURE = 0.2
 DEFAULT_MIMO_VISION_MODEL = "mimo-v2-omni"
@@ -356,6 +368,32 @@ VISION_PROVIDER_CONFIGS = (
         "default_reasoning_effort": "medium",
     },
     {
+        "name": "cliproxy",
+        "base_url_env_key": "VISION_CLIPROXY_BASE_URL",
+        "default_base_url": "http://127.0.0.1:8317/v1",
+        "env_key": "VISION_CLIPROXY_API_KEY",
+        "api_style": VISION_API_STYLE_CHAT_COMPLETIONS,
+        "model_env_key": "VISION_CLIPROXY_MODEL",
+        "default_model": "gpt-5.4",
+        "stream_env_key": "VISION_CLIPROXY_STREAM",
+        "default_stream": True,
+        "max_inflight_env_key": "VISION_CLIPROXY_MAX_INFLIGHT_REQUESTS",
+        "default_max_inflight_requests": 2,
+    },
+    {
+        "name": "nowcoding",
+        "base_url_env_key": "VISION_NOWCODING_BASE_URL",
+        "default_base_url": "https://nowcoding.ai/v1",
+        "env_key": "VISION_NOWCODING_API_KEY",
+        "api_style": VISION_API_STYLE_CHAT_COMPLETIONS,
+        "model_env_key": "VISION_NOWCODING_MODEL",
+        "default_model": "gpt-5.4-openai-compact",
+        "stream_env_key": "VISION_NOWCODING_STREAM",
+        "default_stream": True,
+        "max_inflight_env_key": "VISION_NOWCODING_MAX_INFLIGHT_REQUESTS",
+        "default_max_inflight_requests": 6,
+    },
+    {
         "name": "reelx",
         "base_url_env_key": "VISION_REELX_BASE_URL",
         "default_base_url": DEFAULT_REELX_BASE_URL,
@@ -416,6 +454,7 @@ VISION_PROVIDER_CONFIGS = (
 )
 VISUAL_REVIEW_ROUTING_TIERED = "tiered"
 VISUAL_REVIEW_ROUTING_PROBE_RANKED = "probe_ranked"
+DEFAULT_REQUESTED_VISION_PROVIDER = "reelx"
 DEFAULT_VISUAL_REVIEW_ROUTING_PRIMARY_PROVIDER = "998code"
 DEFAULT_VISUAL_REVIEW_ROUTING_PRIMARY_MODEL = "gpt-5.4"
 DEFAULT_VISUAL_REVIEW_ROUTING_PRIMARY_TIMEOUT_SECONDS = 20
@@ -2149,6 +2188,14 @@ def resolve_vision_provider_temperature(provider):
         return None
 
 
+def resolve_vision_provider_stream(provider):
+    default_value = bool((provider or {}).get("default_stream"))
+    env_key = str((provider or {}).get("stream_env_key") or "").strip()
+    if env_key and os.getenv(env_key) is not None:
+        return parse_env_flag(env_key, default=default_value)
+    return default_value
+
+
 def resolve_vision_provider_request_timeout(provider):
     value = (provider or {}).get("request_timeout_seconds")
     if value not in (None, ""):
@@ -2225,6 +2272,8 @@ def build_vision_provider_chat_body(provider, messages, model_override=""):
             body["temperature"] = temperature
         body["stream"] = False
         return body
+    if resolve_vision_provider_stream(provider):
+        body["stream"] = True
     max_completion_tokens = resolve_vision_provider_max_completion_tokens(provider)
     if max_completion_tokens:
         body["max_completion_tokens"] = max_completion_tokens
@@ -4742,6 +4791,10 @@ def should_use_qiandao_25p_visual_worker_profile(payload=None, requested_provide
 def resolve_visual_review_max_workers(payload, target_count, requested_provider="", requested_model="", routing_strategy=""):
     default_value = DEFAULT_VISUAL_REVIEW_MAX_WORKERS
     max_allowed = None
+    normalized_requested_provider = normalize_vision_provider_name(requested_provider)
+    if normalized_requested_provider == "cliproxy":
+        default_value = DEFAULT_CLIPROXY_VISUAL_REVIEW_MAX_WORKERS
+        max_allowed = DEFAULT_CLIPROXY_VISUAL_REVIEW_MAX_WORKERS
     if should_use_qiandao_25p_visual_worker_profile(
         payload,
         requested_provider=requested_provider,
@@ -5958,7 +6011,10 @@ def resolve_positioning_card_analysis_targets(platform, payload):
 
 
 def perform_visual_review(platform, payload, progress_callback=None, cancel_check=None):
-    requested_provider = normalize_vision_provider_name((payload or {}).get("provider"))
+    requested_provider = (
+        normalize_vision_provider_name((payload or {}).get("provider"))
+        or DEFAULT_REQUESTED_VISION_PROVIDER
+    )
     routing_strategy = resolve_visual_review_routing_strategy(payload)
     if requested_provider and requested_provider in {item["name"] for item in VISION_PROVIDER_CONFIGS}:
         routing_strategy = ""
@@ -6286,7 +6342,10 @@ def perform_visual_review(platform, payload, progress_callback=None, cancel_chec
 
 
 def perform_positioning_card_analysis(platform, payload, progress_callback=None, cancel_check=None):
-    requested_provider = normalize_vision_provider_name((payload or {}).get("provider"))
+    requested_provider = (
+        normalize_vision_provider_name((payload or {}).get("provider"))
+        or DEFAULT_REQUESTED_VISION_PROVIDER
+    )
     preflight = build_vision_preflight(requested_provider)
     providers = get_available_vision_providers(requested_provider)
     if not providers:
