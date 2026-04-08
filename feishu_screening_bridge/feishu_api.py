@@ -12,9 +12,12 @@ from urllib import error, parse, request
 DEFAULT_FEISHU_BASE_URL = "https://open.feishu.cn/open-apis"
 _TRUSTED_FEISHU_HOST_SUFFIXES = ("feishu.cn", "larksuite.com")
 _TRANSIENT_FEISHU_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504}
+_RETRYABLE_FEISHU_API_CODES = {99991400}
 _RETRYABLE_FEISHU_MESSAGE_MARKERS = (
     "too many requests",
     "rate limit",
+    "frequency limit",
+    "request trigger frequency limit",
     "try again later",
     "timed out",
     "timeout",
@@ -392,12 +395,19 @@ class FeishuOpenClient:
         except error.HTTPError as exc:
             body = exc.read()
             detail = _describe_http_error(body)
-            retry_after_seconds = _extract_retry_after_seconds(exc.headers.get("Retry-After"))
+            parsed_error = _parse_api_error_payload(body)
+            retry_after_seconds = _extract_retry_after_seconds(exc.headers.get("Retry-After")) or _extract_retry_after_seconds(
+                exc.headers.get("x-ogw-ratelimit-reset") or exc.headers.get("X-OGW-Ratelimit-Reset")
+            )
+            api_code = _coerce_api_code(parsed_error.get("code"))
+            api_message = parsed_error.get("msg") or parsed_error.get("message") or ""
             raise FeishuApiError(
                 f"飞书请求失败: status={exc.code} url={url} {detail}".strip(),
                 status_code=exc.code,
+                api_code=api_code,
                 retry_after_seconds=retry_after_seconds,
-                retryable=exc.code in _TRANSIENT_FEISHU_STATUS_CODES,
+                retryable=bool(exc.code in _TRANSIENT_FEISHU_STATUS_CODES)
+                or _is_retryable_feishu_api_failure(api_code=api_code, message=api_message or detail),
             ) from exc
         except error.URLError as exc:
             raise FeishuApiError(
@@ -465,8 +475,16 @@ def _extract_retry_after_seconds(raw_value: Any) -> float | None:
     return seconds if seconds >= 0 else None
 
 
+def _parse_api_error_payload(body: bytes) -> dict[str, Any]:
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
 def _is_retryable_feishu_api_failure(*, api_code: int | None, message: Any) -> bool:
-    if api_code in _TRANSIENT_FEISHU_STATUS_CODES:
+    if api_code in _TRANSIENT_FEISHU_STATUS_CODES or api_code in _RETRYABLE_FEISHU_API_CODES:
         return True
     normalized = str(message or "").strip().lower()
     return any(marker in normalized for marker in _RETRYABLE_FEISHU_MESSAGE_MARKERS)

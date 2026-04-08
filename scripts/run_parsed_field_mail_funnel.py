@@ -27,6 +27,7 @@ from email_sync.mail_thread_funnel import (  # type: ignore
     _extract_platform_handle_pairs,
     _is_external_sender,
     _matches_auto_reply,
+    _platform_label,
     _resolve_platform_for_handle,
     _run_default_llm_review,
     _write_xlsx,
@@ -429,7 +430,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             review_rows.append(
                 {
                     **llm_row,
-                    "Platform": llm_row.get("Platform") or "",
+                    "Platform": _platform_label(platform) if platform else _clean_text(llm_row.get("Platform")),
                     "final_id_final": llm_handle,
                     "resolution_stage_final": "llm",
                     "resolution_confidence_final": "high",
@@ -440,7 +441,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             review_rows.append(
                 {
                     **llm_row,
-                    "Platform": llm_row.get("Platform") or "",
+                    "Platform": _platform_label(platform) if platform else _clean_text(llm_row.get("Platform")),
                     "final_id_final": llm_handle,
                     "resolution_stage_final": "llm",
                     "resolution_confidence_final": "medium",
@@ -451,7 +452,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             review_rows.append(
                 {
                     **llm_row,
-                    "Platform": llm_row.get("Platform") or "",
+                    "Platform": _platform_label(platform) if platform else _clean_text(llm_row.get("Platform")),
                     "final_id_final": llm_handle,
                     "resolution_stage_final": "uncertain" if not llm_handle else "llm",
                     "resolution_confidence_final": confidence or "low",

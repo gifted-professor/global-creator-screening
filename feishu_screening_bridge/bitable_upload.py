@@ -56,15 +56,20 @@ _MAIL_ONLY_FIELD_NAMES = (
     "达人回复的最后一封邮件内容",
     "full body",
 )
+_MANUAL_POOL_PLATFORM_VALUE = "转人工"
+_MANUAL_POOL_ID_PATTERN = re.compile(r"^(?P<prefix>.+?转人工)(?P<index>\d+)$")
 
 _UPLOAD_BASE_KEY_FIELDS = ("达人ID", "平台")
 _OWNER_SCOPE_FIELD_CANDIDATES: tuple[str, ...] = ()
 _PREFERRED_TARGET_TABLE_NAMES = ("AI回信管理", "达人管理")
 _PREFERRED_TARGET_VIEW_NAMES = ("表格", "总视图")
 _RETRYABLE_FEISHU_STATUS_CODES = {408, 409, 429, 500, 502, 503, 504}
+_RETRYABLE_FEISHU_API_CODES = {99991400}
 _RETRYABLE_FEISHU_ERROR_MARKERS = (
     "too many requests",
     "rate limit",
+    "frequency limit",
+    "request trigger frequency limit",
     "try again later",
     "timed out",
     "timeout",
@@ -311,6 +316,22 @@ class _RetryingFeishuUploadClient:
             throttle_write=True,
         )
 
+    def delete_api_json(
+        self,
+        url_path: str,
+        *,
+        body: dict[str, Any] | None = None,
+        headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
+        return self._controller.call(
+            _classify_feishu_api_operation("DELETE", url_path),
+            self._client.delete_api_json,
+            url_path,
+            body=body,
+            headers=headers,
+            throttle_write=_is_write_feishu_api_operation("DELETE", url_path),
+        )
+
     def resolve_wiki_node(self, wiki_token: str) -> dict[str, Any]:
         return self._controller.call("resolve_wiki_node", self._client.resolve_wiki_node, wiki_token)
 
@@ -364,11 +385,14 @@ def upload_final_review_payload_to_bitable(
     resolved_view = resolve_bitable_view_from_url(retrying_client, target_url)
     field_schemas = _fetch_field_schemas(retrying_client, resolved_view)
     attachment_schema = _select_attachment_field_schema(field_schemas)
+    fetched_existing_records = _fetch_existing_records(retrying_client, resolved_view)
     existing_record_analysis = _build_existing_record_analysis(
-        _fetch_existing_records(retrying_client, resolved_view),
+        fetched_existing_records,
         field_schemas=field_schemas,
     )
     existing_records = existing_record_analysis.index
+    manual_pool_existing_records = _build_manual_pool_existing_record_index(fetched_existing_records)
+    manual_pool_used_id_registry = _build_manual_pool_used_id_registry(fetched_existing_records)
     key_field_names = existing_record_analysis.key_field_names
     key_display_name = existing_record_analysis.key_display_name or "达人ID+平台"
 
@@ -531,9 +555,18 @@ def upload_final_review_payload_to_bitable(
     for row in rows:
         if not isinstance(row, dict):
             continue
-        record_key = _build_payload_record_key(row, key_field_names=key_field_names)
-        existing_record = existing_records.get(record_key) if record_key else None
         update_mode = _resolve_row_update_mode(row)
+        is_manual_pool_mail_row = _is_manual_pool_platform(row.get("平台")) and update_mode in {
+            _UPDATE_MODE_MAIL_ONLY,
+            _UPDATE_MODE_CREATE_OR_MAIL_ONLY,
+        }
+        manual_pool_mail_match_key = _build_manual_pool_mail_match_key_from_row(row) if is_manual_pool_mail_row else ""
+        existing_record = manual_pool_existing_records.get(manual_pool_mail_match_key) if manual_pool_mail_match_key else None
+        if existing_record is None and is_manual_pool_mail_row:
+            row["达人ID"] = _reserve_manual_pool_creator_id(_flatten_field_value(row.get("达人ID")), manual_pool_used_id_registry)
+        record_key = _build_payload_record_key(row, key_field_names=key_field_names)
+        if existing_record is None:
+            existing_record = existing_records.get(record_key) if record_key else None
         should_update_existing = existing_record is not None and update_mode in {
             _UPDATE_MODE_CREATE_OR_UPDATE,
             _UPDATE_MODE_MAIL_ONLY,
@@ -678,6 +711,11 @@ def upload_final_review_payload_to_bitable(
                         "record_id": record_id or (existing_record["record_id"] if existing_record else ""),
                         "fields": dict(existing_record.get("fields") or {}) if existing_record else {},
                     }
+                if manual_pool_mail_match_key:
+                    manual_pool_existing_records[manual_pool_mail_match_key] = {
+                        "record_id": record_id or (existing_record["record_id"] if existing_record else ""),
+                        "fields": dict(row),
+                    }
                 continue
             failed_rows.append(
                 {
@@ -706,6 +744,11 @@ def upload_final_review_payload_to_bitable(
             existing_records[record_key] = {
                 "record_id": record_id or (existing_record["record_id"] if existing_record else ""),
                 "fields": dict(existing_record.get("fields") or {}) if existing_record else {},
+            }
+        if manual_pool_mail_match_key:
+            manual_pool_existing_records[manual_pool_mail_match_key] = {
+                "record_id": record_id or (existing_record["record_id"] if existing_record else ""),
+                "fields": dict(row),
             }
 
     summary = {
@@ -1057,6 +1100,8 @@ def _classify_feishu_api_operation(method: str, url_path: str) -> str:
         return "create_record"
     if normalized_method == "PUT" and "/records/" in normalized_path:
         return "update_record"
+    if normalized_method == "DELETE" and "/drive/v1/files/" in normalized_path:
+        return "delete_attachment"
     return f"{normalized_method.lower()}_api"
 
 
@@ -1066,6 +1111,8 @@ def _is_write_feishu_api_operation(method: str, url_path: str) -> bool:
     if normalized_method == "POST" and normalized_path.endswith("/records"):
         return True
     if normalized_method == "PUT" and "/records/" in normalized_path:
+        return True
+    if normalized_method == "DELETE" and "/drive/v1/files/" in normalized_path:
         return True
     return False
 
@@ -1096,13 +1143,18 @@ def _compute_retry_delay_seconds(
 
 def _is_retryable_feishu_exception(exc: Exception) -> bool:
     explicit_retryable = getattr(exc, "retryable", None)
-    if explicit_retryable is not None:
-        return bool(explicit_retryable)
+    if explicit_retryable is True:
+        return True
     status_code = getattr(exc, "status_code", None)
     if status_code in _RETRYABLE_FEISHU_STATUS_CODES:
         return True
+    api_code = getattr(exc, "api_code", None)
+    if api_code in _RETRYABLE_FEISHU_API_CODES:
+        return True
     normalized = str(exc or "").strip().lower()
-    return any(marker in normalized for marker in _RETRYABLE_FEISHU_ERROR_MARKERS)
+    if any(marker in normalized for marker in _RETRYABLE_FEISHU_ERROR_MARKERS):
+        return True
+    return bool(explicit_retryable)
 
 
 def _build_existing_record_index(existing_records: list[tuple[str, dict[str, Any]]]) -> dict[str, dict[str, Any]]:
@@ -1339,6 +1391,96 @@ def _extract_existing_owner_scope(fields: dict[str, Any], owner_scope_field_name
     return _clean_text(value)
 
 
+def _is_manual_pool_platform(value: Any) -> bool:
+    return _flatten_field_value(value) == _MANUAL_POOL_PLATFORM_VALUE
+
+
+def _normalize_manual_pool_match_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", _clean_text(value)).strip()
+
+
+def _build_manual_pool_mail_match_key(platform: Any, reply_time: Any, full_body: Any) -> str:
+    if not _is_manual_pool_platform(platform):
+        return ""
+    reply_time_ms = _coerce_date_to_ms(reply_time)
+    normalized_body = _normalize_manual_pool_match_text(full_body)
+    if reply_time_ms is None or not normalized_body:
+        return ""
+    return _build_record_key(_MANUAL_POOL_PLATFORM_VALUE, str(reply_time_ms), normalized_body)
+
+
+def _build_manual_pool_mail_match_key_from_fields(fields: dict[str, Any]) -> str:
+    return _build_manual_pool_mail_match_key(
+        fields.get("平台"),
+        fields.get("达人最后一次回复邮件时间"),
+        fields.get("full body") or fields.get("达人回复的最后一封邮件内容"),
+    )
+
+
+def _build_manual_pool_mail_match_key_from_row(row: dict[str, Any]) -> str:
+    return _build_manual_pool_mail_match_key(
+        row.get("平台"),
+        row.get("达人最后一次回复邮件时间"),
+        row.get("full body") or row.get("达人回复的最后一封邮件内容"),
+    )
+
+
+def _build_manual_pool_existing_record_index(existing_records: list[tuple[str, dict[str, Any]]]) -> dict[str, dict[str, Any]]:
+    grouped: dict[str, list[ExistingRecordSnapshot]] = {}
+    for record_id, fields in existing_records:
+        key = _build_manual_pool_mail_match_key_from_fields(fields)
+        if not key:
+            continue
+        grouped.setdefault(key, []).append(
+            ExistingRecordSnapshot(
+                record_id=record_id,
+                fields=dict(fields or {}),
+                owner_scope_value="",
+                creator_id=_flatten_field_value(fields.get("达人ID")),
+                platform=_flatten_field_value(fields.get("平台")),
+            )
+        )
+    result: dict[str, dict[str, Any]] = {}
+    for key, snapshots in grouped.items():
+        keep = sorted(snapshots, key=_existing_record_sort_key, reverse=True)[0]
+        result[key] = {
+            "record_id": keep.record_id,
+            "fields": dict(keep.fields or {}),
+        }
+    return result
+
+
+def _build_manual_pool_used_id_registry(existing_records: list[tuple[str, dict[str, Any]]]) -> dict[str, set[int]]:
+    registry: dict[str, set[int]] = {}
+    for _record_id, fields in existing_records:
+        if not _is_manual_pool_platform(fields.get("平台")):
+            continue
+        creator_id = _flatten_field_value(fields.get("达人ID"))
+        match = _MANUAL_POOL_ID_PATTERN.match(creator_id)
+        if not match:
+            continue
+        prefix = _clean_text(match.group("prefix"))
+        index = int(match.group("index"))
+        registry.setdefault(prefix, set()).add(index)
+    return registry
+
+
+def _reserve_manual_pool_creator_id(creator_id: str, used_id_registry: dict[str, set[int]]) -> str:
+    cleaned_creator_id = _clean_text(creator_id)
+    match = _MANUAL_POOL_ID_PATTERN.match(cleaned_creator_id)
+    if not match:
+        return cleaned_creator_id
+    prefix = _clean_text(match.group("prefix"))
+    requested_index = int(match.group("index"))
+    used_indexes = used_id_registry.setdefault(prefix, set())
+    if requested_index > 0 and requested_index not in used_indexes:
+        used_indexes.add(requested_index)
+        return cleaned_creator_id
+    next_index = (max(used_indexes) + 1) if used_indexes else 1
+    used_indexes.add(next_index)
+    return f"{prefix}{next_index}"
+
+
 def _normalize_field_key(name: str) -> str:
     normalized = str(name or "").strip()
     if not normalized:
@@ -1397,6 +1539,30 @@ def _build_mail_only_feishu_fields(
     return fields
 
 
+def _delete_uploaded_attachment(client: FeishuOpenClient, *, file_token: str) -> None:
+    normalized_token = _clean_text(file_token)
+    if not normalized_token:
+        return
+    client.delete_api_json(f"/drive/v1/files/{parse.quote(normalized_token, safe='')}?type=file")
+
+
+def _rollback_uploaded_attachment_items(
+    client: FeishuOpenClient,
+    *,
+    uploaded_items: list[dict[str, str]],
+) -> list[str]:
+    rollback_errors: list[str] = []
+    for item in reversed(uploaded_items):
+        file_token = _clean_text(item.get("file_token"))
+        if not file_token:
+            continue
+        try:
+            _delete_uploaded_attachment(client, file_token=file_token)
+        except Exception as exc:  # noqa: BLE001
+            rollback_errors.append(f"{file_token}: {str(exc) or exc.__class__.__name__}")
+    return rollback_errors
+
+
 def _attach_local_files_to_fields(
     client: FeishuOpenClient,
     *,
@@ -1408,18 +1574,26 @@ def _attach_local_files_to_fields(
     if attachment_schema is None:
         return
     upload_items: list[dict[str, str]] = []
-    for local_path in _normalize_attachment_local_paths(row.get("__feishu_attachment_local_paths")):
-        uploaded = client.upload_local_file(
-            local_path,
-            parent_type="bitable_file",
-            parent_node=app_token,
-        )
-        upload_items.append(
-            {
-                "file_token": uploaded.file_token,
-                "name": uploaded.file_name,
-            }
-        )
+    try:
+        for local_path in _normalize_attachment_local_paths(row.get("__feishu_attachment_local_paths")):
+            uploaded = client.upload_local_file(
+                local_path,
+                parent_type="bitable_file",
+                parent_node=app_token,
+            )
+            upload_items.append(
+                {
+                    "file_token": uploaded.file_token,
+                    "name": uploaded.file_name,
+                }
+            )
+    except Exception as exc:  # noqa: BLE001
+        rollback_errors = _rollback_uploaded_attachment_items(client, uploaded_items=upload_items)
+        if rollback_errors:
+            raise RuntimeError(
+                f"{str(exc) or exc.__class__.__name__}; 附件上传失败后回滚不完整: {'; '.join(rollback_errors)}"
+            ) from exc
+        raise
     if upload_items:
         fields[attachment_schema.field_name] = upload_items
 

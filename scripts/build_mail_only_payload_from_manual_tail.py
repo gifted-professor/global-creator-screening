@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -93,6 +93,27 @@ def _build_profile_url(_creator_id: str, platform: str) -> str:
     return ""
 
 
+def _parse_sent_at(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _manual_tail_sort_key(row: dict[str, Any]) -> tuple[float, str, str, str]:
+    sent_at = _parse_sent_at(row.get("latest_external_sent_at"))
+    sent_at_timestamp = sent_at.timestamp() if sent_at is not None else float("-inf")
+    return (
+        -sent_at_timestamp,
+        _clean_text(row.get("thread_key")),
+        _clean_text(row.get("raw_path")),
+        _clean_text(row.get("latest_external_full_body")),
+    )
+
+
 def _resolve_row_attachment_paths(raw_path: Any, *, source_workbook: Path) -> list[str]:
     return _resolve_existing_local_paths(
         raw_path,
@@ -113,6 +134,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     task_name = _clean_text(args.task_name)
 
     _headers, source_rows = _load_rows(manual_tail_workbook)
+    source_rows = sorted(source_rows, key=_manual_tail_sort_key)
     task_owner_payload = json.loads(task_owner_payload_json.read_text(encoding="utf-8"))
     task_owner = dict(task_owner_payload.get("task_owner") or {})
 

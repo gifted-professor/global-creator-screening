@@ -9,6 +9,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 from email_sync.imap_sync import MailboxInfo, SyncResult
 from openpyxl import Workbook
@@ -24,7 +25,7 @@ from feishu_screening_bridge import (
     sync_task_upload_view_to_email_project,
 )
 from feishu_screening_bridge.bitable_export import export_bitable_view
-from feishu_screening_bridge.feishu_api import FeishuOpenClient
+from feishu_screening_bridge.feishu_api import FeishuApiError, FeishuOpenClient, _is_retryable_feishu_api_failure
 from feishu_screening_bridge.local_env import get_preferred_value, load_local_env
 
 
@@ -954,6 +955,66 @@ class FeishuScreeningBridgeTests(unittest.TestCase):
             [
                 ("POST", "https://unit-test.feishu.mock/open-apis/auth/v3/tenant_access_token/internal"),
                 ("GET", "https://unit-test.feishu.mock/open-apis/drive/v1/files/YyJLbZ1F3oIOPMxrqZjcnJ4wnUe/download"),
+            ],
+        )
+
+    def test_retryable_failure_helper_treats_99991400_and_frequency_limit_as_retryable(self) -> None:
+        self.assertTrue(_is_retryable_feishu_api_failure(api_code=99991400, message="limit"))
+        self.assertTrue(_is_retryable_feishu_api_failure(api_code=None, message="request trigger frequency limit"))
+
+    def test_post_api_json_marks_http_400_99991400_as_retryable_and_reads_rate_limit_reset_header(self) -> None:
+        client = FeishuOpenClient(
+            app_id="cli_test",
+            app_secret="secret_test",
+            base_url=self.feishu_base_url,
+        )
+
+        def fake_urlopen(req: Any, timeout: float | None = None):
+            method = str(getattr(req, "method", None) or req.get_method())
+            full_url = str(req.full_url)
+            self.request_log.append((method, full_url))
+            if full_url == "https://unit-test.feishu.mock/open-apis/auth/v3/tenant_access_token/internal":
+                return _FakeUrlopenResponse(
+                    url=full_url,
+                    status=200,
+                    headers={"Content-Type": "application/json; charset=utf-8"},
+                    body=json.dumps(
+                        {
+                            "code": 0,
+                            "msg": "success",
+                            "tenant_access_token": "tenant-access-token",
+                            "expire": 7140,
+                        },
+                        ensure_ascii=False,
+                    ).encode("utf-8"),
+                )
+            if full_url == "https://unit-test.feishu.mock/open-apis/bitable/v1/apps/app_token/tables/tbl/records":
+                raise HTTPError(
+                    url=full_url,
+                    code=400,
+                    msg="Bad Request",
+                    hdrs={"x-ogw-ratelimit-reset": "2"},
+                    fp=BytesIO(
+                        json.dumps(
+                            {"code": 99991400, "msg": "request trigger frequency limit"},
+                            ensure_ascii=False,
+                        ).encode("utf-8")
+                    ),
+                )
+            raise AssertionError(f"unexpected urlopen request: method={method} url={full_url} timeout={timeout}")
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+            with self.assertRaises(FeishuApiError) as ctx:
+                client.post_api_json("/bitable/v1/apps/app_token/tables/tbl/records", body={"fields": {"达人ID": "alpha"}})
+
+        self.assertTrue(ctx.exception.retryable)
+        self.assertEqual(ctx.exception.api_code, 99991400)
+        self.assertEqual(ctx.exception.retry_after_seconds, 2.0)
+        self.assertEqual(
+            self.request_log,
+            [
+                ("POST", "https://unit-test.feishu.mock/open-apis/auth/v3/tenant_access_token/internal"),
+                ("POST", "https://unit-test.feishu.mock/open-apis/bitable/v1/apps/app_token/tables/tbl/records"),
             ],
         )
 

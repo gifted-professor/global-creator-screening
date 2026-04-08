@@ -42,6 +42,11 @@ Current note:
   - manual-tail rows also write back by default as:
     - `达人ID = <任务名><月>/<日>转人工<n>`
     - `平台 = 转人工`
+  - same-day reruns now prefer matching existing `转人工` rows by:
+    - `平台=转人工`
+    - `达人最后一次回复邮件时间`
+    - `full body`
+  - only unmatched manual rows allocate a new `转人工<n>`
 
 ## Canonical Entry Points
 

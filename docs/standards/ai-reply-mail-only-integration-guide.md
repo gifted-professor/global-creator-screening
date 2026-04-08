@@ -112,6 +112,12 @@ python3 scripts/run_task_to_ai_reply_mail_only_pipeline.py \
 - `Duet4/8转人工3`
 - `MINISO4/8转人工6`
 
+补充：
+
+- 同一天重跑时，不再只按当前批次里的顺序号硬匹配旧行
+- 现在会优先按 `平台=转人工 + 达人最后一次回复邮件时间 + full body` 命中已有人工池记录后做 mail-only update
+- 只有命不中旧记录的新样本，才会继续分配新的 `转人工<n>`
+
 ## 飞书写入字段
 
 这条链路当前默认写入这些字段：
