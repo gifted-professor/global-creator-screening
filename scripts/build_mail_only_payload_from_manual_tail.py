@@ -14,7 +14,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from backend.final_export_merge import _build_quote_text, _clean_text, _format_date  # type: ignore
+from backend.final_export_merge import _build_quote_text, _clean_text, _format_date, _resolve_existing_local_paths  # type: ignore
 
 
 UPLOAD_COLUMNS = [
@@ -93,6 +93,18 @@ def _build_profile_url(_creator_id: str, platform: str) -> str:
     return ""
 
 
+def _resolve_row_attachment_paths(raw_path: Any, *, source_workbook: Path) -> list[str]:
+    return _resolve_existing_local_paths(
+        raw_path,
+        base_dirs=[
+            source_workbook.parent,
+            REPO_ROOT / "data" / "shared_mailbox" / "raw",
+            REPO_ROOT / "data" / "shared_mailbox",
+            REPO_ROOT,
+        ],
+    )
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     manual_tail_workbook = Path(args.manual_tail_workbook).expanduser().resolve()
     task_owner_payload_json = Path(args.task_owner_payload_json).expanduser().resolve()
@@ -107,6 +119,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     workbook_rows: list[dict[str, Any]] = []
     payload_rows: list[dict[str, Any]] = []
     quote_count = 0
+    attachment_row_count = 0
 
     for index, row in enumerate(source_rows, start=1):
         full_body = _clean_text(row.get("latest_external_full_body"))
@@ -115,6 +128,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             quote_count += 1
         last_mail_time = _format_date(row.get("latest_external_sent_at"))
         creator_id = _build_manual_creator_id(task_name, local_day, index)
+        raw_path = _clean_text(row.get("raw_path"))
+        attachment_paths = _resolve_row_attachment_paths(raw_path, source_workbook=manual_tail_workbook)
+        if attachment_paths:
+            attachment_row_count += 1
 
         workbook_row = {
             "达人ID": creator_id,
@@ -128,7 +145,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "resolution_stage_final": _clean_text(row.get("resolution_stage_final")),
             "resolution_confidence_final": _clean_text(row.get("resolution_confidence_final")),
             "thread_key": _clean_text(row.get("thread_key")),
-            "raw_path": _clean_text(row.get("raw_path")),
+            "raw_path": raw_path,
             "brand_keyword": _clean_text(row.get("brand_keyword")) or task_name,
             "原达人ID候选": _clean_text(row.get("final_id_final")),
         }
@@ -136,6 +153,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
         payload_row = {column: workbook_row.get(column, "") for column in UPLOAD_COLUMNS}
         payload_row["__feishu_update_mode"] = "create_or_mail_only_update"
+        payload_row["__last_mail_raw_path"] = raw_path
+        payload_row["__feishu_attachment_local_paths"] = attachment_paths
         payload_rows.append(payload_row)
 
     workbook_path = output_prefix.with_name(f"{output_prefix.name}_with_mail_fields").with_suffix(".xlsx")
@@ -159,6 +178,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "source_row_count": len(source_rows),
         "output_row_count": len(payload_rows),
         "quote_count": quote_count,
+        "attachment_row_count": attachment_row_count,
         "manual_platform_value": "转人工",
         "manual_id_pattern_preview": _build_manual_creator_id(task_name, local_day, 1),
         "workbook_path": str(workbook_path),

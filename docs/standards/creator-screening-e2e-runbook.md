@@ -768,6 +768,12 @@ Mail-only homepage URL generation now follows the same canonical rule:
 - `YouTube -> https://www.youtube.com/@<达人ID>`
 - empty platform or `转人工` -> blank homepage URL
 
+Mail-only upload can also attach the raw `.eml` file for each matched reply row:
+
+- when the payload includes a resolvable local `raw_path`, the uploader forwards it through `__feishu_attachment_local_paths`
+- if the target Feishu table has an attachment field (for example `eml`), the raw mail is uploaded alongside the row
+- if the target table has no attachment field, the upload continues without error and simply skips the `.eml` attachment
+
 Important guardrails:
 
 - if the target Feishu table lacks `达人对接人`, upload is blocked
