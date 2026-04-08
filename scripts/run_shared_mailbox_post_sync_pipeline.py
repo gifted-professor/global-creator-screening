@@ -110,6 +110,20 @@ _RESCUE_SUMMARY_KEYS = (
     "llm_invocation_count_before",
     "llm_invocation_count_after",
 )
+_MAIL_ONLY_BUCKET_SUMMARY_KEYS = (
+    "mail_only_creator_replied_count",
+    "mail_only_outbound_only_skip_count",
+    "mail_only_creator_identity_unresolved_count",
+    "mail_only_thread_key_missing_count",
+    "mail_only_candidate_count_before_source_dedup",
+    "mail_only_candidate_count_after_source_dedup",
+    "mail_only_source_identity_deduped_count",
+    "mail_only_routed_mail_only_candidate_count",
+    "mail_only_routed_full_screening_candidate_count",
+    "mail_only_upload_decision_count",
+    "mail_only_upload_live_existing_hit_count",
+    "mail_only_upload_mail_idempotency_skip_count",
+)
 
 
 def _load_runtime_dependencies() -> dict[str, Any]:
@@ -353,6 +367,10 @@ def _extract_ai_status(fields: dict[str, Any]) -> str:
 
 def _empty_rescue_stats() -> dict[str, int]:
     return {key: 0 for key in _RESCUE_SUMMARY_KEYS}
+
+
+def _empty_mail_only_bucket_summary() -> dict[str, int]:
+    return {key: 0 for key in _MAIL_ONLY_BUCKET_SUMMARY_KEYS}
 
 
 def _normalize_compact_text(value: Any) -> str:
@@ -935,6 +953,137 @@ def _extract_matched_mail_count(upstream_summary: dict[str, Any], keep_frame: pd
     return int(len(keep_frame.index))
 
 
+def _build_prepared_candidate_mail_identity_key(candidate: dict[str, Any]) -> tuple[str, str]:
+    keep_row = dict(candidate.get("keep_row") or {})
+    creator_id = _clean_text(candidate.get("creator_id")) or _extract_creator_id(keep_row)
+    platform = _clean_text(candidate.get("platform")) or _extract_platform(keep_row)
+    record_key = _build_record_key(creator_id, platform)
+    last_mail_message_id = _clean_text(candidate.get("last_mail_message_id")) or _clean_text(keep_row.get("last_mail_message_id"))
+    thread_key = _clean_text(candidate.get("thread_key")) or _clean_text(keep_row.get("evidence_thread_key"))
+    mail_update_revision = _coerce_non_negative_int(candidate.get("mail_update_revision") or keep_row.get("mail_update_revision"))
+
+    source_key = ""
+    source_label = ""
+    if last_mail_message_id:
+        source_key = f"message:{last_mail_message_id}"
+        source_label = f"last_mail_message_id={last_mail_message_id}"
+    elif thread_key and mail_update_revision > 0:
+        source_key = f"thread_revision:{thread_key}:{mail_update_revision}"
+        source_label = f"thread_key={thread_key} revision={mail_update_revision}"
+    elif thread_key:
+        source_key = f"thread:{thread_key}"
+        source_label = f"thread_key={thread_key}"
+
+    if source_key and record_key:
+        return f"{source_key}::{record_key}", f"{source_label} + 达人ID+平台={creator_id}/{platform}"
+    if source_key:
+        return source_key, source_label
+    if record_key:
+        return record_key, f"达人ID+平台={creator_id}/{platform}"
+    return "", ""
+
+
+def _deduplicate_prepared_candidates_by_mail_identity(
+    candidates: Sequence[dict[str, Any]],
+    *,
+    seen_identity_keys: set[str],
+    deduplicate_within_batch: bool = True,
+) -> dict[str, Any]:
+    deduplicated_candidates: list[dict[str, Any]] = []
+    duplicate_rows: list[dict[str, Any]] = []
+    stats = {
+        "candidate_count": 0,
+        "deduplicated_count": 0,
+    }
+    starting_seen_identity_keys = set(seen_identity_keys)
+    batch_seen_identity_keys: set[str] = set()
+    newly_seen_identity_keys: set[str] = set()
+
+    for raw_candidate in candidates:
+        candidate = dict(raw_candidate or {})
+        stats["candidate_count"] += 1
+        identity_key, identity_label = _build_prepared_candidate_mail_identity_key(candidate)
+        already_seen = identity_key in starting_seen_identity_keys
+        seen_in_batch = identity_key in batch_seen_identity_keys if deduplicate_within_batch else False
+        if identity_key and (already_seen or seen_in_batch):
+            stats["deduplicated_count"] += 1
+            duplicate_rows.append(
+                {
+                    "candidate": candidate,
+                    "identity_key": identity_key,
+                    "identity_label": identity_label,
+                }
+            )
+            continue
+        if identity_key:
+            batch_seen_identity_keys.add(identity_key)
+            newly_seen_identity_keys.add(identity_key)
+        deduplicated_candidates.append(candidate)
+
+    seen_identity_keys.update(newly_seen_identity_keys)
+    return {
+        "candidates": deduplicated_candidates,
+        "duplicate_rows": duplicate_rows,
+        "stats": stats,
+    }
+
+
+def _build_mail_only_candidate_log_entry(
+    *,
+    task_name: str,
+    keep_row: dict[str, Any],
+    owner_context: dict[str, Any] | None = None,
+    candidate: dict[str, Any] | None = None,
+    route_decision: str,
+    reason: str = "",
+    existing_record: dict[str, Any] | None = None,
+    reply_resolution: dict[str, Any] | None = None,
+    thread_assignment_resolution: dict[str, Any] | None = None,
+    next_update_mode: str = "",
+) -> dict[str, Any]:
+    resolved_candidate = dict(candidate or {})
+    resolved_keep_row = dict(keep_row or {})
+    resolved_owner_context = dict(owner_context or resolved_candidate.get("owner_context") or {})
+    resolved_existing_record = dict(existing_record or resolved_candidate.get("existing_record") or {})
+    resolved_reply = dict(reply_resolution or resolved_candidate.get("reply_resolution") or {})
+    resolved_thread_assignment = dict(
+        thread_assignment_resolution or resolved_candidate.get("thread_assignment_resolution") or {}
+    )
+    creator_id = _clean_text(resolved_candidate.get("creator_id")) or _extract_creator_id(resolved_keep_row)
+    platform = _clean_text(resolved_candidate.get("platform")) or _extract_platform(resolved_keep_row)
+    thread_key = _clean_text(resolved_candidate.get("thread_key")) or _clean_text(resolved_keep_row.get("evidence_thread_key"))
+    last_mail_message_id = _clean_text(resolved_candidate.get("last_mail_message_id")) or _clean_text(
+        resolved_keep_row.get("last_mail_message_id")
+    )
+    mail_update_revision = _coerce_non_negative_int(
+        resolved_candidate.get("mail_update_revision") or resolved_keep_row.get("mail_update_revision")
+    )
+    return {
+        "task_name": _clean_text(task_name),
+        "creator_id": creator_id,
+        "platform": platform,
+        "record_key": _build_record_key(creator_id, platform),
+        "owner_scope": _clean_text(resolved_candidate.get("owner_scope")),
+        "owner_employee_id": _clean_text(resolved_owner_context.get("employee_id")),
+        "thread_key": thread_key,
+        "last_mail_message_id": last_mail_message_id,
+        "mail_update_revision": mail_update_revision,
+        "reply_status": _clean_text(resolved_reply.get("status")),
+        "creator_replied": resolved_reply.get("creator_replied"),
+        "thread_assignment_status": _clean_text(resolved_thread_assignment.get("status")),
+        "existing_record_id": _clean_text(resolved_existing_record.get("record_id")),
+        "existing_ai_status": _extract_ai_status(dict(resolved_existing_record.get("fields") or {})),
+        "route_decision": _clean_text(route_decision),
+        "next_update_mode": _clean_text(next_update_mode),
+        "reason": _clean_text(reason),
+        "source_raw_path": _clean_text(
+            resolved_keep_row.get("last_mail_raw_path")
+            or resolved_keep_row.get("brand_message_raw_path")
+            or resolved_keep_row.get("__last_mail_raw_path")
+        ),
+    }
+
+
 def _write_combined_workbook(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     frame = pd.DataFrame(rows, columns=FINAL_UPLOAD_COLUMNS)
@@ -964,6 +1113,34 @@ def _write_unresolved_threads_archive(
     frame = pd.DataFrame(rows)
     with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
         frame.to_excel(writer, index=False, sheet_name="unresolved_threads")
+    return str(json_path), str(xlsx_path)
+
+
+def _write_rows_archive(
+    output_dir: Path,
+    *,
+    stem: str,
+    rows: list[dict[str, Any]],
+    sheet_name: str,
+) -> tuple[str, str]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    json_path = output_dir / f"{stem}.json"
+    xlsx_path = output_dir / f"{stem}.xlsx"
+    json_path.write_text(
+        json.dumps(
+            {
+                "row_count": len(rows),
+                "rows": rows,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    frame = pd.DataFrame(rows)
+    with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+        frame.to_excel(writer, index=False, sheet_name=sheet_name)
     return str(json_path), str(xlsx_path)
 
 
@@ -2363,6 +2540,7 @@ def run_shared_mailbox_post_sync_pipeline(
         "partial_refresh_count": 0,
         "known_thread_hit_count": 0,
         "thread_assignment_cache_hit_count": 0,
+        "source_identity_deduped_count": 0,
         "full_screening_count": 0,
         "mail_only_update_count": 0,
         "mail_first_only_count": 0,
@@ -2374,6 +2552,7 @@ def run_shared_mailbox_post_sync_pipeline(
         "updated_record_count": 0,
         "failed_record_count": 0,
         **_empty_rescue_stats(),
+        **_empty_mail_only_bucket_summary(),
         "mail_first_only_enabled": bool(mail_first_only),
         "thread_first_mail_resolution_enabled": bool(thread_first_mail_resolution),
         "local_archive_path": str(aggregate_archive_dir),
@@ -2440,6 +2619,7 @@ def run_shared_mailbox_post_sync_pipeline(
     aggregate_failed_rows: list[dict[str, Any]] = []
     aggregate_existing_skip_rows: list[dict[str, Any]] = []
     any_task_failed = False
+    seen_mail_identity_keys_by_target: dict[str, set[str]] = {}
 
     for item in inspection_items:
         task_name = _clean_text(item.get("taskName"))
@@ -2458,6 +2638,7 @@ def run_shared_mailbox_post_sync_pipeline(
             "partial_refresh_count": 0,
             "known_thread_hit_count": 0,
             "thread_assignment_cache_hit_count": 0,
+            "source_identity_deduped_count": 0,
             "full_screening_count": 0,
             "mail_only_update_count": 0,
             "mail_first_only_count": 0,
@@ -2469,11 +2650,16 @@ def run_shared_mailbox_post_sync_pipeline(
             "updated_count": 0,
             "failed_count": 0,
             **_empty_rescue_stats(),
+            **_empty_mail_only_bucket_summary(),
             "thread_first_mail_resolution_enabled": bool(thread_first_mail_resolution),
             "summary_path": str(task_summary_path),
             "all_platforms_final_review": "",
             "all_platforms_upload_payload_json": "",
             "feishu_upload_result_json": "",
+            "mail_only_candidate_log_json": "",
+            "mail_only_candidate_log_xlsx": "",
+            "mail_only_upload_decision_json": "",
+            "mail_only_upload_decision_xlsx": "",
             "unresolved_threads_json": "",
             "unresolved_threads_xlsx": "",
             "status": "running",
@@ -2653,7 +2839,7 @@ def run_shared_mailbox_post_sync_pipeline(
                     shared_mail_data_dir=resolved_mail_data_dir,
                     keep_workbook=pre_keep_mail_only_workbook,
                 )
-            _, existing_analysis = fetch_existing_bitable_record_analysis(
+            resolved_target_view, existing_analysis = fetch_existing_bitable_record_analysis(
                 client,
                 linked_bitable_url=linked_bitable_url,
             )
@@ -2689,12 +2875,20 @@ def run_shared_mailbox_post_sync_pipeline(
                 _write_json(run_summary_path, summary)
                 continue
             existing_index = existing_analysis.index
+            target_upload_scope = _build_record_key(
+                getattr(resolved_target_view, "app_token", ""),
+                getattr(resolved_target_view, "table_id", ""),
+            ) or _clean_text(linked_bitable_url)
+            seen_mail_identity_keys = seen_mail_identity_keys_by_target.setdefault(target_upload_scope, set())
             owner_scope_enabled = bool(_clean_text(getattr(existing_analysis, "owner_scope_field_name", "")))
 
             matched_mail_count = _extract_matched_mail_count(upstream_summary, keep_frame)
             mail_only_display_rows: list[dict[str, Any]] = []
             mail_only_payload_rows: list[dict[str, Any]] = []
             combined_skipped_rows: list[dict[str, Any]] = []
+            source_dedup_skipped_rows: list[dict[str, Any]] = []
+            mail_only_candidate_log_rows: list[dict[str, Any]] = []
+            mail_only_bucket_summary = _empty_mail_only_bucket_summary()
             prepared_candidates: list[dict[str, Any]] = []
             pre_keep_mail_only_count = int(len(pre_keep_mail_only_frame.index))
             combined_prepared_rows = [
@@ -2718,6 +2912,15 @@ def run_shared_mailbox_post_sync_pipeline(
                     shared_mail_db_path=resolved_mail_db_path,
                 )
                 reply_resolution["thread_assignment_cache"] = thread_assignment_resolution
+                reply_status = _clean_text(reply_resolution.get("status"))
+                if reply_status == "creator_replied":
+                    mail_only_bucket_summary["mail_only_creator_replied_count"] += 1
+                elif reply_status == "outbound_only_or_no_reply":
+                    mail_only_bucket_summary["mail_only_outbound_only_skip_count"] += 1
+                elif reply_status == "creator_identity_unresolved":
+                    mail_only_bucket_summary["mail_only_creator_identity_unresolved_count"] += 1
+                elif reply_status == "thread_key_missing":
+                    mail_only_bucket_summary["mail_only_thread_key_missing_count"] += 1
                 if bool(item.get("rowLevelOwnerRouting")) and not row_owner_scope_value:
                     owner_status = _clean_text(keep_row.get(_KEEP_OWNER_STATUS_FIELD))
                     alias_text = _clean_text(keep_row.get(_KEEP_OWNER_ALIAS_FIELD))
@@ -2740,6 +2943,17 @@ def run_shared_mailbox_post_sync_pipeline(
                             ),
                         }
                     )
+                    mail_only_candidate_log_rows.append(
+                        _build_mail_only_candidate_log_entry(
+                            task_name=task_name,
+                            keep_row=keep_row,
+                            owner_context=row_owner_context,
+                            route_decision="skipped_owner_routing",
+                            reason=reason,
+                            reply_resolution=reply_resolution,
+                            thread_assignment_resolution=thread_assignment_resolution,
+                        )
+                    )
                     continue
                 if reply_resolution.get("creator_replied") is False:
                     reason = "仅命中负责人发信，达人未回复，已跳过筛选。"
@@ -2757,6 +2971,17 @@ def run_shared_mailbox_post_sync_pipeline(
                             ),
                         }
                     )
+                    mail_only_candidate_log_rows.append(
+                        _build_mail_only_candidate_log_entry(
+                            task_name=task_name,
+                            keep_row=keep_row,
+                            owner_context=row_owner_context,
+                            route_decision="skipped_outbound_only_or_no_reply",
+                            reason=reason,
+                            reply_resolution=reply_resolution,
+                            thread_assignment_resolution=thread_assignment_resolution,
+                        )
+                    )
                     continue
                 prepared_candidates.append(
                     {
@@ -2766,9 +2991,54 @@ def run_shared_mailbox_post_sync_pipeline(
                         "creator_id": _extract_creator_id(keep_row),
                         "platform": _extract_platform(keep_row),
                         "thread_key": _clean_text(keep_row.get("evidence_thread_key")),
+                        "last_mail_message_id": _clean_text(keep_row.get("last_mail_message_id")),
+                        "mail_update_revision": _coerce_non_negative_int(keep_row.get("mail_update_revision")),
                         "thread_assignment_resolution": dict(thread_assignment_resolution or {}),
                         "reply_resolution": dict(reply_resolution or {}),
                     }
+                )
+
+            mail_only_bucket_summary["mail_only_candidate_count_before_source_dedup"] = len(prepared_candidates)
+            source_identity_dedup = _deduplicate_prepared_candidates_by_mail_identity(
+                prepared_candidates,
+                seen_identity_keys=seen_mail_identity_keys,
+                deduplicate_within_batch=False,
+            )
+            prepared_candidates = list(source_identity_dedup.get("candidates") or [])
+            source_identity_deduped_count = int(((source_identity_dedup.get("stats") or {}).get("deduplicated_count")) or 0)
+            mail_only_bucket_summary["mail_only_candidate_count_after_source_dedup"] = len(prepared_candidates)
+            mail_only_bucket_summary["mail_only_source_identity_deduped_count"] = source_identity_deduped_count
+            for duplicate in list(source_identity_dedup.get("duplicate_rows") or []):
+                candidate = dict(duplicate.get("candidate") or {})
+                keep_row = dict(candidate.get("keep_row") or {})
+                row_owner_context = dict(candidate.get("owner_context") or {})
+                identity_label = _clean_text(duplicate.get("identity_label")) or _clean_text(duplicate.get("identity_key"))
+                reason = f"同一源邮件已在当前 run 命中（{identity_label}），已跳过重复上传候选。"
+                source_dedup_skipped_rows.append(
+                    {
+                        "skip_reasons": [reason],
+                        "row": _build_skipped_row_from_keep_record(
+                            keep_row,
+                            owner_context=row_owner_context,
+                            reason=reason,
+                            shared_mail_db_path=resolved_mail_db_path,
+                            shared_mail_raw_dir=resolved_mail_raw_dir,
+                            shared_mail_data_dir=resolved_mail_data_dir,
+                            keep_workbook=keep_workbook,
+                        ),
+                    }
+                )
+                mail_only_candidate_log_rows.append(
+                    _build_mail_only_candidate_log_entry(
+                        task_name=task_name,
+                        keep_row=keep_row,
+                        owner_context=row_owner_context,
+                        candidate=candidate,
+                        route_decision="skipped_source_identity_duplicate",
+                        reason=reason,
+                        reply_resolution=dict(candidate.get("reply_resolution") or {}),
+                        thread_assignment_resolution=dict(candidate.get("thread_assignment_resolution") or {}),
+                    )
                 )
 
             known_thread_routing = process_known_thread_updates(
@@ -2780,11 +3050,30 @@ def run_shared_mailbox_post_sync_pipeline(
             existing_screened_count = int(known_thread_stats.get("existing_screened_count") or 0)
             existing_unscreened_count = int(known_thread_stats.get("existing_unscreened_count") or 0)
             new_creator_count = int(known_thread_stats.get("new_creator_count") or 0)
+            mail_only_bucket_summary["mail_only_routed_mail_only_candidate_count"] = len(
+                list(known_thread_routing.get("mail_only_candidates") or [])
+            )
+            mail_only_bucket_summary["mail_only_routed_full_screening_candidate_count"] = len(
+                list(known_thread_routing.get("full_screening_candidates") or [])
+            )
 
             for candidate in known_thread_routing.get("mail_only_candidates") or []:
                 keep_row = dict((candidate or {}).get("keep_row") or {})
                 row_owner_context = dict((candidate or {}).get("owner_context") or {})
                 existing_record = dict(((candidate or {}).get("existing_record") or {}))
+                mail_only_candidate_log_rows.append(
+                    _build_mail_only_candidate_log_entry(
+                        task_name=task_name,
+                        keep_row=keep_row,
+                        owner_context=row_owner_context,
+                        candidate=dict(candidate or {}),
+                        route_decision="mail_only_candidate",
+                        existing_record=existing_record,
+                        reply_resolution=dict((candidate or {}).get("reply_resolution") or {}),
+                        thread_assignment_resolution=dict((candidate or {}).get("thread_assignment_resolution") or {}),
+                        next_update_mode=MAIL_ONLY_UPDATE_MODE if not bool(mail_first_only) else CREATE_OR_MAIL_ONLY_UPDATE_MODE,
+                    )
+                )
                 display_row, payload_row = _build_mail_only_rows(
                     keep_row=keep_row,
                     existing_fields=dict(existing_record.get("fields") or {}),
@@ -2804,6 +3093,23 @@ def run_shared_mailbox_post_sync_pipeline(
                 dict((candidate or {}).get("keep_row") or {})
                 for candidate in (known_thread_routing.get("full_screening_candidates") or [])
             ]
+            for candidate in known_thread_routing.get("full_screening_candidates") or []:
+                keep_row = dict((candidate or {}).get("keep_row") or {})
+                row_owner_context = dict((candidate or {}).get("owner_context") or {})
+                existing_record = dict(((candidate or {}).get("existing_record") or {}))
+                mail_only_candidate_log_rows.append(
+                    _build_mail_only_candidate_log_entry(
+                        task_name=task_name,
+                        keep_row=keep_row,
+                        owner_context=row_owner_context,
+                        candidate=dict(candidate or {}),
+                        route_decision="full_screening_candidate",
+                        existing_record=existing_record,
+                        reply_resolution=dict((candidate or {}).get("reply_resolution") or {}),
+                        thread_assignment_resolution=dict((candidate or {}).get("thread_assignment_resolution") or {}),
+                        next_update_mode=CREATE_OR_MAIL_ONLY_UPDATE_MODE if bool(mail_first_only) else "",
+                    )
+                )
 
             full_screening_frame = pd.DataFrame(full_screening_rows, columns=list(keep_frame.columns))
             full_screening_display_rows: list[dict[str, Any]] = []
@@ -2959,6 +3265,32 @@ def run_shared_mailbox_post_sync_pipeline(
                 dry_run=bool(upload_dry_run),
                 suppress_ai_labels=True,
             )
+            candidate_log_json, candidate_log_xlsx = _write_rows_archive(
+                exports_dir,
+                stem="mail_only_candidate_log",
+                rows=mail_only_candidate_log_rows,
+                sheet_name="mail_only_candidate_log",
+            )
+            upload_decision_rows = [
+                dict(row)
+                for row in list(upload_summary.get("mail_only_upload_decision_rows") or [])
+                if isinstance(row, dict)
+            ]
+            upload_decision_json, upload_decision_xlsx = _write_rows_archive(
+                exports_dir,
+                stem="mail_only_upload_decisions",
+                rows=upload_decision_rows,
+                sheet_name="mail_only_upload_decisions",
+            )
+            mail_only_bucket_summary["mail_only_upload_decision_count"] = int(
+                upload_summary.get("mail_only_upload_decision_count") or 0
+            )
+            mail_only_bucket_summary["mail_only_upload_live_existing_hit_count"] = int(
+                upload_summary.get("mail_only_upload_live_existing_hit_count") or 0
+            )
+            mail_only_bucket_summary["mail_only_upload_mail_idempotency_skip_count"] = int(
+                upload_summary.get("mail_only_upload_mail_idempotency_skip_count") or 0
+            )
 
             task_failed_count = int(combined_payload_artifacts["payload"]["skipped_row_count"]) + int(
                 upload_summary.get("failed_count") or 0
@@ -2980,6 +3312,10 @@ def run_shared_mailbox_post_sync_pipeline(
                     "all_platforms_final_review": str(combined_workbook_path),
                     "all_platforms_upload_payload_json": str(combined_payload_artifacts["payload_json_path"]),
                     "feishu_upload_result_json": str(upload_summary.get("result_json_path") or ""),
+                    "mail_only_candidate_log_json": candidate_log_json,
+                    "mail_only_candidate_log_xlsx": candidate_log_xlsx,
+                    "mail_only_upload_decision_json": upload_decision_json,
+                    "mail_only_upload_decision_xlsx": upload_decision_xlsx,
                     "local_archive_path": str(combined_payload_artifacts["archive_dir"]),
                     "status": "completed_with_failures" if task_failed_count > 0 else "completed",
                     "new_creator_count": new_creator_count,
@@ -2989,6 +3325,8 @@ def run_shared_mailbox_post_sync_pipeline(
                     "thread_assignment_cache_hit_count": int(
                         known_thread_stats.get("thread_assignment_cache_hit_count") or 0
                     ),
+                    "source_identity_deduped_count": source_identity_deduped_count,
+                    **mail_only_bucket_summary,
                     **rescue_stats,
                 }
             )
@@ -3021,6 +3359,19 @@ def run_shared_mailbox_post_sync_pipeline(
                         "row": dict(skipped.get("row") or {}),
                     }
                 )
+            for skipped in source_dedup_skipped_rows:
+                aggregate_existing_skip_rows.append(
+                    {
+                        "task_name": task_name,
+                        "stage": "source_identity_dedup",
+                        "reason": "；".join(
+                            str(reason).strip()
+                            for reason in (skipped.get("skip_reasons") or [])
+                            if str(reason).strip()
+                        ),
+                        "row": dict(skipped.get("row") or {}),
+                    }
+                )
             _emit_runtime_progress(
                 task_scope,
                 "feishu_upload=completed "
@@ -3039,6 +3390,7 @@ def run_shared_mailbox_post_sync_pipeline(
             summary["thread_assignment_cache_hit_count"] += int(
                 known_thread_stats.get("thread_assignment_cache_hit_count") or 0
             )
+            summary["source_identity_deduped_count"] += int(source_identity_deduped_count)
             summary["full_screening_count"] += int(len(full_screening_frame.index))
             summary["mail_only_update_count"] += int(len(mail_only_payload_rows))
             summary["mail_first_only_count"] += int(len(mail_first_only_payload_rows))
@@ -3049,6 +3401,8 @@ def run_shared_mailbox_post_sync_pipeline(
             summary["created_record_count"] += int(upload_summary.get("created_count") or 0)
             summary["updated_record_count"] += int(upload_summary.get("updated_count") or 0)
             summary["failed_record_count"] += int(task_failed_count)
+            for key in _MAIL_ONLY_BUCKET_SUMMARY_KEYS:
+                summary[key] += int(task_result.get(key) or 0)
             for key in _RESCUE_SUMMARY_KEYS:
                 summary[key] += int(task_result.get(key) or 0)
         except Exception as exc:  # noqa: BLE001

@@ -90,6 +90,7 @@ _DEFAULT_UPLOAD_WRITE_MIN_INTERVAL_SECONDS = 0.2
 _DEFAULT_UPLOAD_RETRY_BACKOFF_BASE_SECONDS = 1.0
 _DEFAULT_UPLOAD_RETRY_BACKOFF_CAP_SECONDS = 8.0
 
+
 @dataclass(frozen=True)
 class FieldSchema:
     field_id: str
@@ -420,6 +421,9 @@ def upload_final_review_payload_to_bitable(
     failed_rows: list[dict[str, Any]] = []
     deduplicated_rows_log: list[dict[str, Any]] = []
     duplicate_existing_warning_rows: list[dict[str, Any]] = []
+    mail_only_upload_decision_rows: list[dict[str, Any]] = []
+    live_existing_check_count = 0
+    live_existing_check_hit_count = 0
     if not preflight.ready:
         failed_rows.extend(_build_preflight_failed_rows(preflight))
         summary = {
@@ -453,6 +457,12 @@ def upload_final_review_payload_to_bitable(
             "mail_idempotency_supported_field_names": dict(mail_idempotency_field_names),
             "mail_idempotency_skip_count": 0,
             "mail_idempotency_skipped_rows": [],
+            "mail_only_upload_decision_count": 0,
+            "mail_only_upload_live_existing_hit_count": 0,
+            "mail_only_upload_mail_idempotency_skip_count": 0,
+            "mail_only_upload_decision_rows": [],
+            "live_existing_check_count": 0,
+            "live_existing_check_hit_count": 0,
             "duplicate_existing_group_count": len(duplicate_existing_groups),
             "duplicate_payload_group_count": len(payload_duplicate_groups),
             "duplicate_existing_groups": duplicate_existing_groups,
@@ -541,6 +551,20 @@ def upload_final_review_payload_to_bitable(
         record_key = _build_payload_record_key(row, key_field_names=key_field_names)
         existing_record = existing_records.get(record_key) if record_key else None
         update_mode = _resolve_row_update_mode(row)
+        is_mail_only_upload_row = _is_mail_only_upload_mode(update_mode)
+        live_existing_check_hit = False
+        if record_key and existing_record is None:
+            live_existing_check_count += 1
+            existing_record = _refresh_existing_record_for_key(
+                client=retrying_client,
+                resolved_view=resolved_view,
+                field_schemas=field_schemas,
+                record_key=record_key,
+                existing_records=existing_records,
+            )
+            if existing_record is not None:
+                live_existing_check_hit_count += 1
+                live_existing_check_hit = True
         should_update_existing = existing_record is not None and update_mode in {
             _UPDATE_MODE_CREATE_OR_UPDATE,
             _UPDATE_MODE_MAIL_ONLY,
@@ -551,6 +575,18 @@ def upload_final_review_payload_to_bitable(
             _UPDATE_MODE_CREATE_OR_MAIL_ONLY,
         }
         if update_mode == _UPDATE_MODE_MAIL_ONLY and existing_record is None:
+            if is_mail_only_upload_row:
+                mail_only_upload_decision_rows.append(
+                    _build_mail_only_upload_decision_row(
+                        row=row,
+                        record_key=record_key,
+                        update_mode=update_mode,
+                        decision="skipped_missing_existing_for_mail_only_update",
+                        existing_record=existing_record,
+                        reason=f"邮件字段更新模式要求飞书中已存在同 {key_display_name} 记录",
+                        live_existing_check_hit=live_existing_check_hit,
+                    )
+                )
             skipped_existing_rows.append(
                 {
                     "status": "skipped_missing_existing_for_mail_only_update",
@@ -562,6 +598,18 @@ def upload_final_review_payload_to_bitable(
             )
             continue
         if existing_record is not None and not should_update_existing:
+            if is_mail_only_upload_row:
+                mail_only_upload_decision_rows.append(
+                    _build_mail_only_upload_decision_row(
+                        row=row,
+                        record_key=record_key,
+                        update_mode=update_mode,
+                        decision="skipped_existing",
+                        existing_record=existing_record,
+                        reason=f"飞书表已存在同 {key_display_name} 记录",
+                        live_existing_check_hit=live_existing_check_hit,
+                    )
+                )
             skipped_existing_rows.append(
                 {
                     "status": "skipped_existing",
@@ -579,6 +627,18 @@ def upload_final_review_payload_to_bitable(
                 mail_idempotency_field_names=mail_idempotency_field_names,
             )
             if should_skip_by_idempotency:
+                if is_mail_only_upload_row:
+                    mail_only_upload_decision_rows.append(
+                        _build_mail_only_upload_decision_row(
+                            row=row,
+                            record_key=record_key,
+                            update_mode=update_mode,
+                            decision="skipped_mail_idempotent_update",
+                            existing_record=existing_record,
+                            reason=skip_reason,
+                            live_existing_check_hit=live_existing_check_hit,
+                        )
+                    )
                 skipped_row = {
                     "status": "skipped_mail_idempotent_update",
                     "record_key": record_key,
@@ -612,6 +672,18 @@ def upload_final_review_payload_to_bitable(
                 app_token=resolved_view.app_token,
             )
         except Exception as exc:  # noqa: BLE001
+            if is_mail_only_upload_row:
+                mail_only_upload_decision_rows.append(
+                    _build_mail_only_upload_decision_row(
+                        row=row,
+                        record_key=record_key,
+                        update_mode=update_mode,
+                        decision="failed_build_fields",
+                        existing_record=existing_record,
+                        reason=str(exc) or exc.__class__.__name__,
+                        live_existing_check_hit=live_existing_check_hit,
+                    )
+                )
             failed_rows.append(
                 {
                     "status": "failed",
@@ -623,6 +695,18 @@ def upload_final_review_payload_to_bitable(
             continue
 
         if dry_run:
+            if is_mail_only_upload_row:
+                mail_only_upload_decision_rows.append(
+                    _build_mail_only_upload_decision_row(
+                        row=row,
+                        record_key=record_key,
+                        update_mode=update_mode,
+                        decision="dry_run_ready_update" if should_update_existing else "dry_run_ready_create",
+                        existing_record=existing_record,
+                        reason="dry_run",
+                        live_existing_check_hit=live_existing_check_hit,
+                    )
+                )
             bucket = updated_rows if should_update_existing else created_rows
             bucket.append(
                 {
@@ -675,6 +759,18 @@ def upload_final_review_payload_to_bitable(
                             recover=recover_create_record,
                         )
                 except Exception as retry_exc:  # noqa: BLE001
+                    if is_mail_only_upload_row:
+                        mail_only_upload_decision_rows.append(
+                            _build_mail_only_upload_decision_row(
+                                row=row,
+                                record_key=record_key,
+                                update_mode=update_mode,
+                                decision="failed_write_after_url_fallback",
+                                existing_record=existing_record,
+                                reason=str(retry_exc) or retry_exc.__class__.__name__,
+                                live_existing_check_hit=live_existing_check_hit,
+                            )
+                        )
                     failed_rows.append(
                         {
                             "status": "failed",
@@ -686,6 +782,19 @@ def upload_final_review_payload_to_bitable(
                     )
                     continue
                 record_id = str((((response.get("data") or {}).get("record") or {}).get("record_id")) or "").strip()
+                if is_mail_only_upload_row:
+                    mail_only_upload_decision_rows.append(
+                        _build_mail_only_upload_decision_row(
+                            row=row,
+                            record_key=record_key,
+                            update_mode=update_mode,
+                            decision="updated_after_url_fallback" if should_update_existing else "created_after_url_fallback",
+                            existing_record=existing_record,
+                            reason="主页链接字段触发 URLFieldConvFail，已自动省略该列后重试成功",
+                            live_existing_check_hit=live_existing_check_hit,
+                            resolved_record_id=record_id or (existing_record["record_id"] if existing_record else ""),
+                        )
+                    )
                 bucket = updated_rows if should_update_existing else created_rows
                 bucket.append(
                     {
@@ -704,6 +813,18 @@ def upload_final_review_payload_to_bitable(
                         "fields": dict(existing_record.get("fields") or {}) if existing_record else {},
                     }
                 continue
+            if is_mail_only_upload_row:
+                mail_only_upload_decision_rows.append(
+                    _build_mail_only_upload_decision_row(
+                        row=row,
+                        record_key=record_key,
+                        update_mode=update_mode,
+                        decision="failed_write",
+                        existing_record=existing_record,
+                        reason=str(exc) or exc.__class__.__name__,
+                        live_existing_check_hit=live_existing_check_hit,
+                    )
+                )
             failed_rows.append(
                 {
                     "status": "failed",
@@ -716,6 +837,18 @@ def upload_final_review_payload_to_bitable(
             continue
 
         record_id = str((((response.get("data") or {}).get("record") or {}).get("record_id")) or "").strip()
+        if is_mail_only_upload_row:
+            mail_only_upload_decision_rows.append(
+                _build_mail_only_upload_decision_row(
+                    row=row,
+                    record_key=record_key,
+                    update_mode=update_mode,
+                    decision="updated" if should_update_existing else "created",
+                    existing_record=existing_record,
+                    live_existing_check_hit=live_existing_check_hit,
+                    resolved_record_id=record_id or (existing_record["record_id"] if existing_record else ""),
+                )
+            )
         bucket = updated_rows if should_update_existing else created_rows
         bucket.append(
             {
@@ -758,6 +891,16 @@ def upload_final_review_payload_to_bitable(
         "mail_idempotency_supported_field_names": dict(mail_idempotency_field_names),
         "mail_idempotency_skip_count": len(mail_idempotency_skipped_rows),
         "mail_idempotency_skipped_rows": mail_idempotency_skipped_rows,
+        "mail_only_upload_decision_count": len(mail_only_upload_decision_rows),
+        "mail_only_upload_live_existing_hit_count": sum(
+            1 for item in mail_only_upload_decision_rows if bool(item.get("live_existing_check_hit"))
+        ),
+        "mail_only_upload_mail_idempotency_skip_count": sum(
+            1 for item in mail_only_upload_decision_rows if _clean_text(item.get("decision")) == "skipped_mail_idempotent_update"
+        ),
+        "mail_only_upload_decision_rows": mail_only_upload_decision_rows,
+        "live_existing_check_count": live_existing_check_count,
+        "live_existing_check_hit_count": live_existing_check_hit_count,
         "duplicate_existing_group_count": len(duplicate_existing_groups),
         "duplicate_payload_group_count": len(payload_duplicate_groups),
         "duplicate_existing_groups": duplicate_existing_groups,
@@ -778,6 +921,15 @@ def upload_final_review_payload_to_bitable(
             "mail_idempotency_skipped_detail": [
                 {"key": item.get("record_key", ""), "reason": item.get("reason", "")}
                 for item in mail_idempotency_skipped_rows
+            ],
+            "mail_only_upload_decision_detail": [
+                {
+                    "key": item.get("record_key", ""),
+                    "decision": item.get("decision", ""),
+                    "update_mode": item.get("update_mode", ""),
+                    "reason": item.get("reason", ""),
+                }
+                for item in mail_only_upload_decision_rows
             ],
             "deduplicated_detail": [
                 {"key": item.get("record_key", ""), "error": item.get("error", "")}
@@ -1312,17 +1464,15 @@ def _build_create_record_recover_callback(
     existing_records: dict[str, dict[str, Any]],
 ) -> Callable[[Exception, int], dict[str, Any] | None]:
     def recover(_exc: Exception, _attempt: int) -> dict[str, Any] | None:
-        refreshed_analysis = _build_existing_record_analysis(
-            _fetch_existing_records(client, resolved_view),
+        refreshed = _refresh_existing_record_for_key(
+            client=client,
+            resolved_view=resolved_view,
             field_schemas=field_schemas,
+            record_key=record_key,
+            existing_records=existing_records,
         )
-        refreshed = dict(refreshed_analysis.index).get(record_key)
         if not refreshed:
             return None
-        existing_records[record_key] = {
-            "record_id": str(refreshed.get("record_id") or "").strip(),
-            "fields": dict(refreshed.get("fields") or {}),
-        }
         return {
             "data": {
                 "record": {
@@ -1336,6 +1486,72 @@ def _build_create_record_recover_callback(
         }
 
     return recover
+
+
+def _refresh_existing_record_for_key(
+    *,
+    client: Any,
+    resolved_view: ResolvedBitableView,
+    field_schemas: dict[str, FieldSchema],
+    record_key: str,
+    existing_records: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    if not _clean_text(record_key):
+        return None
+    refreshed_analysis = _build_existing_record_analysis(
+        _fetch_existing_records(client, resolved_view),
+        field_schemas=field_schemas,
+    )
+    refreshed = dict(refreshed_analysis.index).get(record_key)
+    if not refreshed:
+        return None
+    resolved_snapshot = {
+        "record_id": str(refreshed.get("record_id") or "").strip(),
+        "fields": dict(refreshed.get("fields") or {}),
+    }
+    existing_records[record_key] = resolved_snapshot
+    return resolved_snapshot
+
+
+def _is_mail_only_upload_mode(update_mode: str) -> bool:
+    normalized = _clean_text(update_mode)
+    return normalized in {
+        _UPDATE_MODE_MAIL_ONLY,
+        _UPDATE_MODE_CREATE_OR_MAIL_ONLY,
+    }
+
+
+def _build_mail_only_upload_decision_row(
+    *,
+    row: dict[str, Any],
+    record_key: str,
+    update_mode: str,
+    decision: str,
+    existing_record: dict[str, Any] | None,
+    reason: str = "",
+    live_existing_check_hit: bool = False,
+    resolved_record_id: str = "",
+) -> dict[str, Any]:
+    resolved_existing_record = dict(existing_record or {})
+    existing_fields = dict(resolved_existing_record.get("fields") or {})
+    return {
+        "record_key": _clean_text(record_key),
+        "decision": _clean_text(decision),
+        "update_mode": _clean_text(update_mode),
+        "creator_id": _flatten_field_value(row.get("达人ID")),
+        "platform": _flatten_field_value(row.get("平台")),
+        "last_mail_message_id": _clean_text(row.get("last_mail_message_id")),
+        "last_mail_sent_at": _clean_text(row.get("last_mail_sent_at")),
+        "mail_update_revision": _coerce_non_negative_int(row.get("mail_update_revision")),
+        "source_raw_path": _clean_text(row.get("__last_mail_raw_path")),
+        "existing_record_id": _clean_text(resolved_existing_record.get("record_id")),
+        "resolved_record_id": _clean_text(resolved_record_id) or _clean_text(resolved_existing_record.get("record_id")),
+        "existing_ai_status": _flatten_field_value(
+            _get_field_value_by_candidates(existing_fields, "ai 是否通过", "ai是否通过")
+        ),
+        "live_existing_check_hit": bool(live_existing_check_hit),
+        "reason": _clean_text(reason),
+    }
 
 
 def _classify_feishu_api_operation(method: str, url_path: str) -> str:

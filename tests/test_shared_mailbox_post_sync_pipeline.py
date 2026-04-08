@@ -53,6 +53,62 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
         )
         self.assertEqual(args.positioning_provider, "reelx")
 
+    def test_deduplicate_prepared_candidates_by_mail_identity_skips_same_source_same_creator_across_batches(self) -> None:
+        seen_identity_keys: set[str] = set()
+        first_batch = pipeline._deduplicate_prepared_candidates_by_mail_identity(
+            [
+                {
+                    "keep_row": {
+                        "evidence_thread_key": "thread-alpha",
+                        "last_mail_message_id": "msg-101",
+                        "mail_update_revision": 2,
+                    },
+                    "creator_id": "alpha",
+                    "platform": "instagram",
+                    "thread_key": "thread-alpha",
+                    "last_mail_message_id": "msg-101",
+                    "mail_update_revision": 2,
+                }
+            ],
+            seen_identity_keys=seen_identity_keys,
+        )
+        second_batch = pipeline._deduplicate_prepared_candidates_by_mail_identity(
+            [
+                {
+                    "keep_row": {
+                        "evidence_thread_key": "thread-alpha",
+                        "last_mail_message_id": "msg-101",
+                        "mail_update_revision": 2,
+                    },
+                    "creator_id": "alpha",
+                    "platform": "instagram",
+                    "thread_key": "thread-alpha",
+                    "last_mail_message_id": "msg-101",
+                    "mail_update_revision": 2,
+                },
+                {
+                    "keep_row": {
+                        "evidence_thread_key": "thread-alpha",
+                        "last_mail_message_id": "msg-101",
+                        "mail_update_revision": 2,
+                    },
+                    "creator_id": "beta",
+                    "platform": "instagram",
+                    "thread_key": "thread-alpha",
+                    "last_mail_message_id": "msg-101",
+                    "mail_update_revision": 2,
+                },
+            ],
+            seen_identity_keys=seen_identity_keys,
+        )
+
+        self.assertEqual(first_batch["stats"]["deduplicated_count"], 0)
+        self.assertEqual(len(first_batch["candidates"]), 1)
+        self.assertEqual(second_batch["stats"]["deduplicated_count"], 1)
+        self.assertEqual(len(second_batch["candidates"]), 1)
+        self.assertEqual(second_batch["candidates"][0]["creator_id"], "beta")
+        self.assertIn("last_mail_message_id=msg-101", second_batch["duplicate_rows"][0]["identity_label"])
+
     def test_apply_conservative_rescue_layer_upgrades_llm_medium_with_supporting_evidence(self) -> None:
         display_rows = [
             {
@@ -3465,6 +3521,12 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
         self.assertEqual(task_result["mail_first_only_count"], 3)
         self.assertEqual(task_result["full_screening_count"], 2)
         self.assertEqual(task_result["mail_only_update_count"], 1)
+        self.assertEqual(task_result["mail_only_candidate_count_before_source_dedup"], 3)
+        self.assertEqual(task_result["mail_only_candidate_count_after_source_dedup"], 3)
+        self.assertEqual(task_result["mail_only_routed_mail_only_candidate_count"], 1)
+        self.assertEqual(task_result["mail_only_routed_full_screening_candidate_count"], 2)
+        self.assertTrue(task_result["mail_only_candidate_log_json"].endswith("mail_only_candidate_log.json"))
+        self.assertTrue(task_result["mail_only_upload_decision_json"].endswith("mail_only_upload_decisions.json"))
 
         payload_rows = uploaded_payloads[0]["rows"]
         self.assertEqual({row["达人ID"] for row in payload_rows}, {"alpha", "beta", "gamma"})

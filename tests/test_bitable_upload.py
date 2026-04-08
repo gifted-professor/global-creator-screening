@@ -581,6 +581,11 @@ class BitableUploadTests(unittest.TestCase):
         self.assertEqual(result["created_count"], 1)
         self.assertEqual(result["updated_count"], 1)
         self.assertEqual(result["failed_count"], 0)
+        self.assertEqual(result["mail_only_upload_decision_count"], 2)
+        self.assertEqual(
+            {item["decision"] for item in result["mail_only_upload_decision_rows"]},
+            {"updated", "created"},
+        )
         beta_update = client.updated_records[0]
         self.assertEqual(beta_update["record_id"], "rec_existing")
         self.assertEqual(
@@ -592,6 +597,79 @@ class BitableUploadTests(unittest.TestCase):
         self.assertEqual(created_fields["达人ID"], "epsilon")
         self.assertEqual(created_fields["ai 是否通过"], "是")
         self.assertEqual(created_fields["Followers(K)"], 301)
+
+    def test_upload_live_existing_check_converts_create_to_update_when_row_appears_after_initial_snapshot(self) -> None:
+        client = _FakeBitableUploadClient()
+        resolved_view = ResolvedBitableView(
+            source_url="https://example.com/base/app?table=tbl&view=vew",
+            source_kind="base",
+            source_token="app_token",
+            app_token="app_token",
+            table_id="tbl",
+            view_id="vew",
+            table_name="达人管理",
+            view_name="总视图",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            payload_path = Path(tmpdir) / "payload.json"
+            payload_path.write_text(
+                json.dumps(
+                    {
+                        "rows": [
+                            {
+                                "达人ID": "theta",
+                                "平台": "instagram",
+                                "主页链接": "https://www.instagram.com/theta",
+                                "达人对接人": "陈俊仁",
+                                "达人对接人_employee_id": "ou_theta",
+                                "ai是否通过": "是",
+                                "__feishu_update_mode": "create_or_update",
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            with (
+                patch(
+                    "feishu_screening_bridge.bitable_upload.resolve_bitable_view_from_url",
+                    return_value=resolved_view,
+                ),
+                patch(
+                    "feishu_screening_bridge.bitable_upload._fetch_existing_records",
+                    side_effect=[
+                        [],
+                        [
+                            (
+                                "rec_theta_live",
+                                {
+                                    "达人ID": "theta",
+                                    "平台": "instagram",
+                                    "达人对接人": [{"id": "ou_theta", "name": "陈俊仁"}],
+                                    "ai 是否通过": "是",
+                                },
+                            )
+                        ],
+                    ],
+                ),
+            ):
+                result = upload_final_review_payload_to_bitable(
+                    client,
+                    payload_json_path=payload_path,
+                    linked_bitable_url="https://example.com/base/app?table=tbl&view=vew",
+                )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["created_count"], 0)
+        self.assertEqual(result["updated_count"], 1)
+        self.assertEqual(result["live_existing_check_count"], 1)
+        self.assertEqual(result["live_existing_check_hit_count"], 1)
+        self.assertEqual(client.record_create_attempt_count, 0)
+        self.assertEqual(client.record_update_attempt_count, 1)
+        self.assertEqual(client.updated_records[0]["record_id"], "rec_theta_live")
 
     def test_upload_mail_only_update_skips_when_last_mail_message_is_already_written(self) -> None:
         client = _FakeBitableUploadClient()
