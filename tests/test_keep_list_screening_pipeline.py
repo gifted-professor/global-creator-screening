@@ -6,7 +6,9 @@ import unittest
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
+from unittest import mock
 
+from backend import creator_cache
 from harness.contract import RUN_CONTRACT_VERSION
 import scripts.run_keep_list_screening_pipeline as keep_list_runner
 
@@ -130,6 +132,16 @@ class FakeBackendApp:
             payload["preferred_provider"] = requested
         return payload
 
+    def build_visual_review_cache_context(self, platform, requested_provider="", routing_strategy=""):
+        return {
+            "context_key": f"ctx::{str(platform or '').strip().lower()}::{str(requested_provider or '').strip().lower() or 'default'}",
+        }
+
+    def build_positioning_card_cache_context(self, platform, requested_provider="", providers=None, active_rulespec=None):
+        return {
+            "context_key": f"ctx-positioning::{str(platform or '').strip().lower()}::{str(requested_provider or '').strip().lower() or 'default'}",
+        }
+
     def resolve_visual_review_routing_strategy(self, payload=None):
         return self._routing_strategy
 
@@ -157,6 +169,198 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         env_path = root / ".env"
         env_path.write_text("TEST_ONLY=1\n", encoding="utf-8")
         return env_path
+
+    def test_infer_task_owner_from_adjacent_final_runner_summary_uses_nested_upstream_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            keep_workbook = root / "downstream" / "exports" / "MINISO_final_keep.xlsx"
+            keep_workbook.parent.mkdir(parents=True, exist_ok=True)
+            keep_workbook.touch()
+            summary_path = root / "summary.json"
+            summary_path.write_text(
+                json.dumps(
+                    {
+                        "steps": {
+                            "upstream": {
+                                "downstream_handoff": {
+                                    "linked_bitable_url": "https://bitable.example/miniso",
+                                    "task_owner": {
+                                        "task_name": "MINISO",
+                                        "task_upload_url": "https://task.example/miniso",
+                                    },
+                                }
+                            }
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            inferred = keep_list_runner._infer_task_owner_from_adjacent_task_spec(
+                keep_workbook=keep_workbook,
+            )
+
+        self.assertEqual(inferred["linked_bitable_url"], "https://bitable.example/miniso")
+        self.assertEqual(inferred["task_name"], "MINISO")
+        self.assertEqual(inferred["task_upload_url"], "https://task.example/miniso")
+
+    def test_runner_fails_when_explicit_linked_bitable_url_conflicts_with_adjacent_context(self) -> None:
+        keep_list_runner._load_runtime_dependencies = lambda: (_ for _ in ()).throw(
+            AssertionError("runtime should not load when linked_bitable_url conflicts")
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            env_path = self._write_env_file(temp_root)
+            keep_path = temp_root / "task" / "upstream" / "exports" / "keep.xlsx"
+            keep_path.parent.mkdir(parents=True, exist_ok=True)
+            keep_path.touch()
+            summary_path = temp_root / "task" / "upstream" / "summary.json"
+            summary_path.parent.mkdir(parents=True, exist_ok=True)
+            summary_path.write_text(
+                json.dumps(
+                    {
+                        "steps": {
+                            "task_assets": {
+                                "linked_bitable_url": "https://bitable.example/duet?table=tbl_duet&view=vew_duet",
+                            }
+                        },
+                        "downstream_handoff": {
+                            "task_owner": {
+                                "task_name": "Duet",
+                                "task_upload_url": "https://example.com/task-upload",
+                                "linked_bitable_url": "https://bitable.example/duet?table=tbl_duet&view=vew_duet",
+                            }
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            summary = keep_list_runner.run_keep_list_screening_pipeline(
+                keep_workbook=keep_path,
+                env_file=env_path,
+                output_root=temp_root / "run",
+                summary_json=temp_root / "run" / "summary.json",
+                platform_filters=["instagram"],
+                skip_scrape=True,
+                linked_bitable_url="https://bitable.example/skg?table=tbl_skg&view=vew_skg",
+            )
+
+        self.assertEqual(summary["status"], "failed")
+        self.assertEqual(summary["error_code"], "LINKED_BITABLE_URL_CONFLICT")
+        self.assertEqual(summary["failure"]["stage"], "preflight")
+        self.assertFalse(summary["preflight"]["ready"])
+        self.assertFalse(Path(summary["task_spec_json"]).exists())
+
+    def test_runner_prefers_task_upload_entry_linked_bitable_url_over_adjacent_fallback(self) -> None:
+        preflight = {
+            "status": "configured",
+            "error_code": "",
+            "message": "视觉模型已就绪：openai",
+            "configured_provider_names": ["openai"],
+            "runnable_provider_names": ["openai"],
+            "providers": [{"name": "openai", "runnable": True}],
+        }
+        backend_app = FakeBackendApp(preflight)
+
+        def fake_prepare_screening_inputs(**kwargs):
+            return {
+                "prepared_at": "2026-03-28T01:02:03Z",
+                "upload": {"stats": {"Instagram": 1}},
+            }
+
+        authoritative_url = "https://bitable.example/duet?table=tbl_duet&view=vew_duet"
+
+        keep_list_runner._load_runtime_dependencies = lambda: {
+            "backend_app": backend_app,
+            "DEFAULT_FEISHU_BASE_URL": "https://open.feishu.cn/open-apis",
+            "FeishuOpenClient": lambda **kwargs: object(),
+            "get_preferred_value": lambda cli_value, env_values, env_key, default="": str(
+                env_values.get(env_key, default) or ""
+            ),
+            "load_local_env": lambda env_file: {
+                "FEISHU_APP_ID": "cli_app_id",
+                "FEISHU_APP_SECRET": "cli_app_secret",
+                "TIMEOUT_SECONDS": "30",
+            },
+            "resolve_task_upload_entry": lambda **kwargs: SimpleNamespace(
+                task_name="Duet",
+                record_id="rec_duet_task",
+                responsible_name="Yvette",
+                employee_id="ou_duet_owner",
+                owner_name="yvette@amagency.biz",
+                owner_email="yvette@amagency.biz",
+                linked_bitable_url=authoritative_url,
+            ),
+            "fetch_existing_bitable_record_analysis": lambda client, *, linked_bitable_url: (
+                SimpleNamespace(source_url=linked_bitable_url, table_id="tbl_duet", table_name="AI回信管理"),
+                SimpleNamespace(
+                    index={},
+                    duplicate_groups=[],
+                    key_field_names=("达人ID", "平台"),
+                    key_display_name="达人ID + 平台",
+                    owner_scope_field_name="",
+                    owner_scope_missing_record_count=0,
+                ),
+            ),
+            "prepare_screening_inputs": fake_prepare_screening_inputs,
+            "count_passed_profiles": lambda scrape_job: 0,
+            "export_platform_artifacts": lambda client, platform, export_dir: {},
+            "poll_job": lambda client, job_id, label, interval: {},
+            "require_success": lambda response, label: response.get_json(),
+            "reset_backend_runtime_state": lambda: None,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            env_path = self._write_env_file(temp_root)
+            keep_path = temp_root / "task" / "upstream" / "exports" / "keep.xlsx"
+            template_path = temp_root / "task" / "upstream" / "downloads" / "template.xlsx"
+            keep_path.parent.mkdir(parents=True, exist_ok=True)
+            template_path.parent.mkdir(parents=True, exist_ok=True)
+            keep_path.touch()
+            template_path.touch()
+            upstream_summary = temp_root / "task" / "upstream" / "summary.json"
+            upstream_summary.write_text(
+                json.dumps(
+                    {
+                        "steps": {
+                            "task_assets": {
+                                "linked_bitable_url": "https://bitable.example/stale?table=tbl_stale&view=vew_stale",
+                            }
+                        },
+                        "downstream_handoff": {
+                            "task_owner": {
+                                "task_name": "Duet",
+                                "task_upload_url": "https://example.com/task-upload",
+                            }
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            summary = keep_list_runner.run_keep_list_screening_pipeline(
+                keep_workbook=keep_path,
+                template_workbook=template_path,
+                env_file=env_path,
+                output_root=temp_root / "run",
+                summary_json=temp_root / "run" / "summary.json",
+                platform_filters=["instagram"],
+                skip_scrape=True,
+            )
+            task_spec = json.loads(Path(summary["task_spec_json"]).read_text(encoding="utf-8"))
+
+        self.assertEqual(summary["status"], "staged_only")
+        self.assertEqual(summary["resolved_task_owner"]["linked_bitable_url"], authoritative_url)
+        self.assertEqual(summary["resolved_task_owner"]["linked_bitable_url_source"], "task_upload_entry")
+        self.assertEqual(summary["resolved_task_owner"]["linked_bitable_url_source_path"], "rec_duet_task")
+        self.assertEqual(summary["existing_bitable_prefilter"]["linked_bitable_url"], authoritative_url)
+        self.assertEqual(task_spec["task_owner"]["linked_bitable_url"], authoritative_url)
 
     def test_runner_fails_early_when_keep_workbook_is_missing(self) -> None:
         keep_list_runner._load_runtime_dependencies = lambda: (_ for _ in ()).throw(AssertionError("runtime should not load"))
@@ -951,6 +1155,226 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         self.assertNotIn("created_rows", summary["upload_summary"])
         self.assertEqual(summary["upload_summary"]["upload_detail"]["created_key_count"], 1)
         self.assertEqual(summary["upload_summary"]["upload_detail"]["created_key_preview"], ["alpha::instagram"])
+
+    def test_runner_persists_export_merge_stage_before_final_export_build(self) -> None:
+        preflight = {
+            "status": "configured",
+            "error_code": "",
+            "message": "视觉模型已就绪：openai",
+            "configured_provider_names": ["openai"],
+            "runnable_provider_names": ["openai"],
+            "providers": [{"name": "openai", "runnable": True}],
+        }
+        backend_app = FakeBackendApp(preflight)
+
+        def fake_prepare_screening_inputs(**kwargs):
+            return {
+                "prepared_at": "2026-03-28T01:02:03Z",
+                "upload": {"stats": {"Instagram": 1}},
+            }
+
+        def fake_poll_job(client, job_id, label, interval):
+            return {"status": "completed"}
+
+        def fake_export_platform_artifacts(client, platform, export_dir):
+            export_dir.mkdir(parents=True, exist_ok=True)
+            final_review_path = export_dir / f"{platform}_final_review.xlsx"
+            final_review_path.write_text("placeholder", encoding="utf-8")
+            return {"final_review": str(final_review_path)}
+
+        keep_list_runner._load_runtime_dependencies = lambda: {
+            "backend_app": backend_app,
+            "build_all_platforms_final_review_artifacts": lambda **kwargs: (_ for _ in ()).throw(
+                RuntimeError("export merge stalled")
+            ),
+            "collect_final_exports": lambda platforms: {"instagram": {"final_review": "/tmp/instagram_final_review.xlsx"}},
+            "prepare_screening_inputs": fake_prepare_screening_inputs,
+            "count_passed_profiles": lambda scrape_job: 1,
+            "export_platform_artifacts": fake_export_platform_artifacts,
+            "poll_job": fake_poll_job,
+            "require_success": lambda response, label: response.get_json(),
+            "reset_backend_runtime_state": lambda: None,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            env_path = self._write_env_file(temp_root)
+            keep_path = temp_root / "keep.xlsx"
+            template_path = temp_root / "template.xlsx"
+            keep_path.touch()
+            template_path.touch()
+            run_root = temp_root / "run"
+            with self.assertRaisesRegex(RuntimeError, "export merge stalled"):
+                keep_list_runner.run_keep_list_screening_pipeline(
+                    keep_workbook=keep_path,
+                    template_workbook=template_path,
+                    env_file=env_path,
+                    output_root=run_root,
+                    platform_filters=["instagram"],
+                    skip_visual=True,
+                    skip_positioning_card_analysis=True,
+                )
+
+            summary = json.loads((run_root / "summary.json").read_text(encoding="utf-8"))
+            progress = json.loads((run_root / "progress.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(summary["current_stage"], "export_merge")
+        self.assertEqual(summary["finished_at"], "")
+        self.assertEqual(progress["stage"], "export_merge")
+        self.assertEqual(progress["status"], "running")
+
+    def test_runner_persists_upload_state_before_post_upload_reports(self) -> None:
+        preflight = {
+            "status": "configured",
+            "error_code": "",
+            "message": "视觉模型已就绪：openai",
+            "configured_provider_names": ["openai"],
+            "runnable_provider_names": ["openai"],
+            "providers": [{"name": "openai", "runnable": True}],
+        }
+        backend_app = FakeBackendApp(preflight)
+
+        def fake_prepare_screening_inputs(**kwargs):
+            return {
+                "prepared_at": "2026-03-28T01:02:03Z",
+                "upload": {"stats": {"Instagram": 1}},
+            }
+
+        def fake_poll_job(client, job_id, label, interval):
+            return {"status": "completed"}
+
+        def fake_export_platform_artifacts(client, platform, export_dir):
+            export_dir.mkdir(parents=True, exist_ok=True)
+            final_review_path = export_dir / f"{platform}_final_review.xlsx"
+            final_review_path.write_text("placeholder", encoding="utf-8")
+            return {"final_review": str(final_review_path)}
+
+        def fake_build_all_platforms_final_review_artifacts(**kwargs):
+            payload_json_path = Path(kwargs["payload_json_path"])
+            archive_dir = payload_json_path.parent / "feishu_upload_local_archive"
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            payload_json_path.write_text(
+                json.dumps(
+                    {
+                        "rows": [
+                            {
+                                "达人ID": "alpha",
+                                "平台": "instagram",
+                                "__feishu_update_mode": "create_or_mail_only_update",
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            skipped_json = archive_dir / "skipped_from_feishu_upload.json"
+            skipped_xlsx = archive_dir / "skipped_from_feishu_upload.xlsx"
+            skipped_json.write_text("{}", encoding="utf-8")
+            skipped_xlsx.write_text("placeholder", encoding="utf-8")
+            workbook_path = Path(kwargs["output_path"])
+            workbook_path.write_text("placeholder", encoding="utf-8")
+            return {
+                "all_platforms_final_review": str(workbook_path),
+                "all_platforms_upload_payload_json": str(payload_json_path),
+                "all_platforms_upload_local_archive_dir": str(archive_dir),
+                "all_platforms_upload_skipped_archive_json": str(skipped_json),
+                "all_platforms_upload_skipped_archive_xlsx": str(skipped_xlsx),
+                "row_count": 1,
+                "source_row_count": 1,
+                "skipped_row_count": 0,
+            }
+
+        def fake_upload_final_review_payload_to_bitable(client, **kwargs):
+            archive_dir = Path(kwargs["payload_json_path"]).parent / "feishu_upload_local_archive"
+            result_json = archive_dir / "feishu_bitable_upload_result.json"
+            result_xlsx = archive_dir / "feishu_bitable_upload_result.xlsx"
+            result_json.write_text(json.dumps({"ok": True}, ensure_ascii=False), encoding="utf-8")
+            result_xlsx.write_text("placeholder", encoding="utf-8")
+            return {
+                "ok": True,
+                "result_json_path": str(result_json),
+                "result_xlsx_path": str(result_xlsx),
+                "target_url": "https://example.com/base",
+                "target_table_id": "tbl123",
+                "target_table_name": "达人管理",
+                "created_count": 1,
+                "updated_count": 0,
+                "failed_count": 0,
+                "skipped_existing_count": 0,
+                "upload_detail": {
+                    "created_keys": ["alpha::instagram"],
+                    "updated_keys": [],
+                    "failed_detail": [],
+                    "deduplicated_detail": [],
+                    "duplicate_existing_groups": [],
+                },
+            }
+
+        def fake_write_report_xlsx_best_effort(path, *args, **kwargs):
+            output_path = Path(path)
+            if output_path.name == "success_report.xlsx":
+                raise RuntimeError("success report stalled")
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text("placeholder", encoding="utf-8")
+            return str(output_path)
+
+        keep_list_runner._load_runtime_dependencies = lambda: {
+            "backend_app": backend_app,
+            "DEFAULT_FEISHU_BASE_URL": "https://open.feishu.cn/open-apis",
+            "FeishuOpenClient": lambda **kwargs: object(),
+            "get_preferred_value": lambda cli_value, env_values, env_key, default="": str(env_values.get(env_key, default) or ""),
+            "load_local_env": lambda env_file: {
+                "FEISHU_APP_ID": "cli_app_id",
+                "FEISHU_APP_SECRET": "cli_app_secret",
+                "TIMEOUT_SECONDS": "30",
+            },
+            "build_all_platforms_final_review_artifacts": fake_build_all_platforms_final_review_artifacts,
+            "collect_final_exports": lambda platforms: {"instagram": {"final_review": "/tmp/instagram_final_review.xlsx"}},
+            "prepare_screening_inputs": fake_prepare_screening_inputs,
+            "count_passed_profiles": lambda scrape_job: 1,
+            "export_platform_artifacts": fake_export_platform_artifacts,
+            "poll_job": fake_poll_job,
+            "require_success": lambda response, label: response.get_json(),
+            "reset_backend_runtime_state": lambda: None,
+            "upload_final_review_payload_to_bitable": fake_upload_final_review_payload_to_bitable,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.object(
+            keep_list_runner,
+            "_write_report_xlsx_best_effort",
+            side_effect=fake_write_report_xlsx_best_effort,
+        ):
+            temp_root = Path(temp_dir)
+            env_path = self._write_env_file(temp_root)
+            keep_path = temp_root / "keep.xlsx"
+            template_path = temp_root / "template.xlsx"
+            keep_path.touch()
+            template_path.touch()
+            run_root = temp_root / "run"
+            with self.assertRaisesRegex(RuntimeError, "success report stalled"):
+                keep_list_runner.run_keep_list_screening_pipeline(
+                    keep_workbook=keep_path,
+                    template_workbook=template_path,
+                    env_file=env_path,
+                    output_root=run_root,
+                    platform_filters=["instagram"],
+                    task_name="MINISO",
+                    task_upload_url="https://example.com/task",
+                    linked_bitable_url="https://example.com/base",
+                )
+
+            summary = json.loads((run_root / "summary.json").read_text(encoding="utf-8"))
+            progress = json.loads((run_root / "progress.json").read_text(encoding="utf-8"))
+
+        self.assertEqual(summary["current_stage"], "upload")
+        self.assertEqual(summary["finished_at"], "")
+        self.assertTrue(summary["artifacts"]["feishu_upload_result_json"].endswith("feishu_bitable_upload_result.json"))
+        self.assertEqual(summary["artifacts"]["feishu_upload_created_count"], 1)
+        self.assertEqual(summary["artifacts"]["feishu_upload_failed_count"], 0)
+        self.assertEqual(summary["upload_summary"]["created_count"], 1)
+        self.assertEqual(progress["stage"], "upload")
+        self.assertEqual(progress["status"], "running")
 
     def test_runner_surfaces_upload_retry_observability_and_diagnostics(self) -> None:
         preflight = {
@@ -2012,7 +2436,7 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             "instagram",
         )
 
-    def test_runner_defers_blocked_tiktok_final_export_until_instagram_fallback_finishes(self) -> None:
+    def test_runner_exports_partial_tiktok_final_review_while_staging_missing_rows_to_instagram(self) -> None:
         backend_app = FakeBackendApp(
             {"status": "configured", "runnable_provider_names": [], "configured_provider_names": []},
             metadata={
@@ -2078,13 +2502,16 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
                 }
             return {"id": job_id, "status": "completed", "result": {}}
 
-        export_calls: list[str] = []
+        export_calls: list[dict[str, Any]] = []
 
-        def fake_export_platform_artifacts(client, platform, export_dir):
-            export_calls.append(str(platform))
-            if str(platform) == "tiktok":
-                raise AssertionError("tiktok final export should be deferred when fallback staging succeeded")
-            return {}
+        def fake_export_platform_artifacts(client, platform, export_dir, final_review_profile_reviews=None):
+            export_calls.append(
+                {
+                    "platform": str(platform),
+                    "final_review_profile_reviews": list(final_review_profile_reviews or []),
+                }
+            )
+            return {"final_review": str(Path(export_dir) / f"{platform}_final_review.xlsx")}
 
         keep_list_runner._load_runtime_dependencies = lambda: {
             "backend_app": backend_app,
@@ -2115,10 +2542,15 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             )
 
         self.assertEqual(summary["platforms"]["tiktok"]["fallback"]["staged_count"], 1)
-        self.assertEqual(summary["platforms"]["tiktok"]["final_review_export"]["status"], "deferred")
+        self.assertEqual(summary["platforms"]["tiktok"]["final_review_export"]["status"], "partial_with_fallback_staged")
         self.assertIn("instagram", summary["platforms"])
         self.assertEqual(summary["platforms"]["instagram"]["requested_identifier_preview"], ["alpha"])
-        self.assertEqual(export_calls, ["instagram"])
+        self.assertEqual([item["platform"] for item in export_calls], ["tiktok", "instagram"])
+        self.assertEqual(
+            [item.get("username") for item in export_calls[0]["final_review_profile_reviews"]],
+            ["beta"],
+        )
+        self.assertEqual(export_calls[1]["final_review_profile_reviews"], [])
 
     def test_runner_filters_existing_bitable_creators_before_scrape(self) -> None:
         preflight = {
@@ -2227,7 +2659,7 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         platform_summary = summary["platforms"]["instagram"]
         self.assertEqual(summary["status"], "completed")
         self.assertEqual(platform_summary["status"], "completed")
-        self.assertEqual(
+        self.assertCountEqual(
             backend_app.app.test_client().scrape_start_calls[0]["payload"]["usernames"],
             ["beta", "gamma"],
         )
@@ -2237,19 +2669,28 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         self.assertEqual(platform_summary["incremental_prefilter"]["existing_screened_count"], 1)
         self.assertEqual(platform_summary["incremental_prefilter"]["existing_unscreened_count"], 1)
         self.assertEqual(platform_summary["incremental_prefilter"]["full_screening_candidate_count"], 2)
-        self.assertEqual(platform_summary["incremental_prefilter"]["mail_only_update_count"], 1)
-        self.assertEqual(platform_summary["mail_only_update_count"], 1)
+        self.assertEqual(platform_summary["incremental_prefilter"]["mail_only_update_count"], 0)
+        self.assertEqual(platform_summary["incremental_prefilter"]["skippable_count"], 1)
+        self.assertEqual(platform_summary["incremental_prefilter"]["skippable_preview"], ["alpha"])
+        self.assertEqual(platform_summary["incremental_prefilter"]["partial_refresh_count"], 0)
+        self.assertEqual(platform_summary["mail_only_update_count"], 0)
+        self.assertEqual(platform_summary["skippable_count"], 1)
+        self.assertEqual(platform_summary["partial_refresh_count"], 0)
         self.assertEqual(platform_summary["requested_identifier_count"], 2)
         self.assertTrue(summary["observability"]["layers"]["incremental_creator"]["enabled"])
         self.assertEqual(summary["observability"]["layers"]["incremental_creator"]["existing_bitable_match_count"], 2)
         self.assertEqual(summary["observability"]["layers"]["incremental_creator"]["incremental_candidate_count"], 1)
         self.assertEqual(summary["observability"]["layers"]["incremental_creator"]["existing_screened_count"], 1)
         self.assertEqual(summary["observability"]["layers"]["incremental_creator"]["existing_unscreened_count"], 1)
-        self.assertEqual(summary["observability"]["layers"]["incremental_creator"]["mail_only_update_count"], 1)
+        self.assertEqual(summary["observability"]["layers"]["incremental_creator"]["mail_only_update_count"], 0)
+        self.assertEqual(summary["observability"]["layers"]["incremental_creator"]["skippable_count"], 1)
+        self.assertEqual(summary["observability"]["layers"]["incremental_creator"]["partial_refresh_count"], 0)
         self.assertEqual(summary["observability"]["layers"]["screening_execution"]["platforms"]["instagram"]["requested_identifier_count"], 2)
-        self.assertEqual(summary["observability"]["layers"]["screening_execution"]["platforms"]["instagram"]["mail_only_update_count"], 1)
+        self.assertEqual(summary["observability"]["layers"]["screening_execution"]["platforms"]["instagram"]["mail_only_update_count"], 0)
+        self.assertEqual(summary["observability"]["layers"]["screening_execution"]["platforms"]["instagram"]["skippable_count"], 1)
+        self.assertEqual(summary["observability"]["layers"]["screening_execution"]["platforms"]["instagram"]["partial_refresh_count"], 0)
         self.assertIn("新增 1 个", json.dumps(summary["diagnostics"], ensure_ascii=False))
-        self.assertIn("邮件直更 1 个", json.dumps(summary["diagnostics"], ensure_ascii=False))
+        self.assertIn("静默跳过 1 个", json.dumps(summary["diagnostics"], ensure_ascii=False))
 
     def test_runner_supports_dry_run_incremental_plan_without_launching_jobs(self) -> None:
         preflight = {
@@ -2323,17 +2764,338 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         self.assertEqual(backend_app.app.test_client().positioning_start_calls, [])
         self.assertEqual(summary["platforms"]["instagram"]["status"], "dry_run_only")
         self.assertEqual(summary["platforms"]["instagram"]["requested_identifier_count"], 2)
-        self.assertEqual(summary["platforms"]["instagram"]["mail_only_update_count"], 1)
+        self.assertEqual(summary["platforms"]["instagram"]["mail_only_update_count"], 0)
+        self.assertEqual(summary["platforms"]["instagram"]["skippable_count"], 1)
+        self.assertEqual(summary["platforms"]["instagram"]["partial_refresh_count"], 0)
         self.assertEqual(summary["dry_run_report"]["total_keep_row_count"], 3)
         self.assertEqual(summary["dry_run_report"]["existing_bitable_match_count"], 2)
         self.assertEqual(summary["dry_run_report"]["incremental_candidate_count"], 1)
         self.assertEqual(summary["dry_run_report"]["full_screening_candidate_count"], 2)
-        self.assertEqual(summary["dry_run_report"]["mail_only_update_count"], 1)
+        self.assertEqual(summary["dry_run_report"]["mail_only_update_count"], 0)
+        self.assertEqual(summary["dry_run_report"]["skippable_count"], 1)
+        self.assertEqual(summary["dry_run_report"]["partial_refresh_count"], 0)
+        self.assertEqual(summary["skippable_count"], 1)
+        self.assertEqual(summary["partial_refresh_count"], 0)
+        self.assertEqual(summary["partial_refresh_breakdown"], {})
         self.assertEqual(summary["dry_run_report"]["estimated_execution_platforms"], ["instagram"])
         self.assertTrue(summary["observability"]["fallback_flags"]["dry_run"])
         self.assertEqual(summary["observability"]["layers"]["upload"]["status"], "skipped")
         self.assertIn("本次为 dry-run", json.dumps(summary["diagnostics"], ensure_ascii=False))
-        self.assertIn("邮件直更 1 个", json.dumps(summary["diagnostics"], ensure_ascii=False))
+        self.assertIn("静默跳过 1 个", json.dumps(summary["diagnostics"], ensure_ascii=False))
+
+    def test_runner_routes_existing_screened_creator_to_mail_only_when_visual_cache_is_missing(self) -> None:
+        preflight = {
+            "status": "configured",
+            "error_code": "",
+            "message": "视觉模型已就绪：openai",
+            "configured_provider_names": ["openai"],
+            "runnable_provider_names": ["openai"],
+            "preferred_provider": "openai",
+            "providers": [{"name": "openai", "runnable": True}],
+        }
+        backend_app = FakeBackendApp(
+            preflight,
+            metadata={"instagram": {"alpha": {"handle": "alpha"}}},
+        )
+
+        def fake_prepare_screening_inputs(**kwargs):
+            return {"prepared_at": "2026-03-28T01:02:03Z", "upload": {"stats": {"Instagram": 1}}}
+
+        keep_list_runner._load_runtime_dependencies = lambda: {
+            "backend_app": backend_app,
+            "build_feishu_open_client": lambda **kwargs: object(),
+            "fetch_existing_bitable_record_analysis": lambda client, *, linked_bitable_url: (
+                SimpleNamespace(source_url=linked_bitable_url, table_id="tbl", table_name="达人管理"),
+                SimpleNamespace(
+                    index={
+                        "alpha::instagram": {
+                            "record_id": "rec_alpha",
+                            "fields": {
+                                "ai 是否通过": "是",
+                                "标签(ai)": "家庭用品",
+                                "ai评价": "existing good fit",
+                            },
+                        }
+                    },
+                    duplicate_groups=[],
+                    key_field_names=("达人ID", "平台"),
+                    owner_scope_field_name="",
+                ),
+            ),
+            "prepare_screening_inputs": fake_prepare_screening_inputs,
+            "count_passed_profiles": lambda scrape_job: (_ for _ in ()).throw(AssertionError("dry-run should not count scrape results")),
+            "export_platform_artifacts": lambda client, platform, export_dir: (_ for _ in ()).throw(AssertionError("dry-run should not export artifacts")),
+            "poll_job": lambda client, job_id, label, interval: (_ for _ in ()).throw(AssertionError("dry-run should not poll jobs")),
+            "require_success": lambda response, label: response.get_json(),
+            "reset_backend_runtime_state": lambda: None,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            keep_path = temp_root / "keep.xlsx"
+            template_path = temp_root / "template.xlsx"
+            cache_db_path = temp_root / "creator_cache.db"
+            keep_path.touch()
+            template_path.touch()
+            env_path = self._write_env_file(temp_root)
+            creator_cache.persist_scrape_cache_entries(
+                "instagram",
+                [{"url": "https://www.instagram.com/alpha", "username": "alpha"}],
+                cache_db_path,
+                updated_at="2026-03-28T01:02:03Z",
+            )
+
+            summary = keep_list_runner.run_keep_list_screening_pipeline(
+                keep_workbook=keep_path,
+                template_workbook=template_path,
+                env_file=env_path,
+                output_root=temp_root / "run",
+                platform_filters=["instagram"],
+                dry_run=True,
+                linked_bitable_url="https://bitable.example.com/base/app?table=tbl&view=vew",
+                creator_cache_db_path=str(cache_db_path),
+            )
+
+        platform_summary = summary["platforms"]["instagram"]
+        self.assertEqual(summary["status"], "dry_run_only")
+        self.assertEqual(platform_summary["partial_refresh_count"], 0)
+        self.assertEqual(platform_summary["mail_only_update_count"], 1)
+        self.assertEqual(platform_summary["requested_identifier_count"], 0)
+        self.assertEqual(platform_summary["incremental_prefilter"]["partial_refresh_count"], 0)
+        self.assertEqual(platform_summary["incremental_prefilter"]["partial_refresh_preview"], [])
+        self.assertEqual(platform_summary["incremental_prefilter"]["partial_refresh_breakdown"], {})
+        self.assertEqual(platform_summary["incremental_prefilter"]["mail_only_update_count"], 1)
+        self.assertEqual(summary["partial_refresh_count"], 0)
+        self.assertEqual(summary["partial_refresh_preview"], [])
+        self.assertEqual(summary["partial_refresh_breakdown"], {})
+
+    def test_runner_skips_existing_screened_creator_when_no_local_cache_exists(self) -> None:
+        preflight = {
+            "status": "configured",
+            "error_code": "",
+            "message": "视觉模型已就绪：openai",
+            "configured_provider_names": ["openai"],
+            "runnable_provider_names": ["openai"],
+            "preferred_provider": "openai",
+            "providers": [{"name": "openai", "runnable": True}],
+        }
+        backend_app = FakeBackendApp(
+            preflight,
+            metadata={"instagram": {"alpha": {"handle": "alpha"}}},
+        )
+
+        def fake_prepare_screening_inputs(**kwargs):
+            return {"prepared_at": "2026-03-28T01:02:03Z", "upload": {"stats": {"Instagram": 1}}}
+
+        keep_list_runner._load_runtime_dependencies = lambda: {
+            "backend_app": backend_app,
+            "build_feishu_open_client": lambda **kwargs: object(),
+            "fetch_existing_bitable_record_analysis": lambda client, *, linked_bitable_url: (
+                SimpleNamespace(source_url=linked_bitable_url, table_id="tbl", table_name="达人管理"),
+                SimpleNamespace(
+                    index={
+                        "alpha::instagram": {
+                            "record_id": "rec_alpha",
+                            "fields": {
+                                "ai 是否通过": "是",
+                                "标签(ai)": "家庭用品",
+                                "ai评价": "existing good fit",
+                            },
+                        }
+                    },
+                    duplicate_groups=[],
+                    key_field_names=("达人ID", "平台"),
+                    owner_scope_field_name="",
+                ),
+            ),
+            "prepare_screening_inputs": fake_prepare_screening_inputs,
+            "count_passed_profiles": lambda scrape_job: (_ for _ in ()).throw(AssertionError("dry-run should not count scrape results")),
+            "export_platform_artifacts": lambda client, platform, export_dir: (_ for _ in ()).throw(AssertionError("dry-run should not export artifacts")),
+            "poll_job": lambda client, job_id, label, interval: (_ for _ in ()).throw(AssertionError("dry-run should not poll jobs")),
+            "require_success": lambda response, label: response.get_json(),
+            "reset_backend_runtime_state": lambda: None,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            keep_path = temp_root / "keep.xlsx"
+            template_path = temp_root / "template.xlsx"
+            keep_path.touch()
+            template_path.touch()
+            env_path = self._write_env_file(temp_root)
+
+            summary = keep_list_runner.run_keep_list_screening_pipeline(
+                keep_workbook=keep_path,
+                template_workbook=template_path,
+                env_file=env_path,
+                output_root=temp_root / "run",
+                platform_filters=["instagram"],
+                dry_run=True,
+                linked_bitable_url="https://bitable.example.com/base/app?table=tbl&view=vew",
+            )
+
+        platform_summary = summary["platforms"]["instagram"]
+        self.assertEqual(summary["status"], "dry_run_only")
+        self.assertEqual(platform_summary["requested_identifier_count"], 0)
+        self.assertEqual(platform_summary["mail_only_update_count"], 0)
+        self.assertEqual(platform_summary["partial_refresh_count"], 0)
+        self.assertEqual(platform_summary["skippable_count"], 1)
+        self.assertEqual(platform_summary["skippable_preview"], ["alpha"])
+        self.assertEqual(platform_summary["incremental_prefilter"]["skippable_count"], 1)
+        self.assertEqual(platform_summary["incremental_prefilter"]["skippable_preview"], ["alpha"])
+        self.assertEqual(summary["skippable_count"], 1)
+        self.assertEqual(summary["skippable_preview"], ["alpha"])
+        self.assertEqual(summary["dry_run_report"]["estimated_execution_platforms"], [])
+        self.assertIn("静默跳过 1 个", json.dumps(summary["diagnostics"], ensure_ascii=False))
+
+    def test_runner_mail_only_short_circuits_existing_screened_creator_without_blocking_new_creator_execution(self) -> None:
+        preflight = {
+            "status": "configured",
+            "error_code": "",
+            "message": "视觉模型已就绪：openai",
+            "configured_provider_names": ["openai"],
+            "runnable_provider_names": ["openai"],
+            "preferred_provider": "openai",
+            "providers": [{"name": "openai", "runnable": True}],
+        }
+        backend_app = FakeBackendApp(
+            preflight,
+            metadata={
+                "instagram": {
+                    "alpha": {"handle": "alpha"},
+                    "beta": {"handle": "beta"},
+                }
+            },
+        )
+
+        def fake_prepare_screening_inputs(**kwargs):
+            return {"prepared_at": "2026-03-28T01:02:03Z", "upload": {"stats": {"Instagram": 2}}}
+
+        def fake_poll_job(client, job_id, label, interval):
+            if job_id == "scrape-job-1":
+                identifiers = list(client.scrape_start_calls[-1]["payload"]["usernames"])
+                return {
+                    "id": job_id,
+                    "status": "completed",
+                    "result": {
+                        "profile_reviews": [
+                            {"status": "Pass", "username": identifier}
+                            for identifier in identifiers
+                        ],
+                    },
+                }
+            if job_id.startswith("visual-job-"):
+                identifiers = list(client.visual_start_calls[-1]["payload"]["identifiers"])
+                return {
+                    "id": job_id,
+                    "status": "completed",
+                    "result": {
+                        "visual_results": {
+                            identifier: {"decision": "Pass", "reviewed_at": "2026-03-28T01:02:03Z"}
+                            for identifier in identifiers
+                        }
+                    },
+                }
+            if job_id == "positioning-job-1":
+                return {"id": job_id, "status": "completed", "result": {}}
+            raise AssertionError(f"unexpected job id {job_id}")
+
+        def fake_build_all_platforms_final_review_artifacts(**kwargs):
+            payload_json_path = Path(kwargs["payload_json_path"])
+            payload_json_path.parent.mkdir(parents=True, exist_ok=True)
+            payload_json_path.write_text(
+                json.dumps({"rows": [], "row_count": 0, "source_row_count": 0, "skipped_row_count": 0}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            workbook_path = Path(kwargs["output_path"])
+            workbook_path.write_text("placeholder", encoding="utf-8")
+            archive_dir = payload_json_path.parent / "feishu_upload_local_archive"
+            archive_dir.mkdir(parents=True, exist_ok=True)
+            skipped_json = archive_dir / "skipped_from_feishu_upload.json"
+            skipped_xlsx = archive_dir / "skipped_from_feishu_upload.xlsx"
+            skipped_json.write_text("{}", encoding="utf-8")
+            skipped_xlsx.write_text("placeholder", encoding="utf-8")
+            return {
+                "all_platforms_final_review": str(workbook_path),
+                "all_platforms_upload_payload_json": str(payload_json_path),
+                "all_platforms_upload_local_archive_dir": str(archive_dir),
+                "all_platforms_upload_skipped_archive_json": str(skipped_json),
+                "all_platforms_upload_skipped_archive_xlsx": str(skipped_xlsx),
+                "row_count": 0,
+                "source_row_count": 0,
+                "skipped_row_count": 0,
+            }
+
+        keep_list_runner._load_runtime_dependencies = lambda: {
+            "backend_app": backend_app,
+            "build_all_platforms_final_review_artifacts": fake_build_all_platforms_final_review_artifacts,
+            "build_feishu_open_client": lambda **kwargs: object(),
+            "collect_final_exports": lambda platforms: {},
+            "fetch_existing_bitable_record_analysis": lambda client, *, linked_bitable_url: (
+                SimpleNamespace(source_url=linked_bitable_url, table_id="tbl", table_name="达人管理"),
+                SimpleNamespace(
+                    index={
+                        "alpha::instagram": {
+                            "record_id": "rec_alpha",
+                            "fields": {
+                                "ai 是否通过": "是",
+                                "标签(ai)": "家庭用品",
+                                "ai评价": "existing good fit",
+                            },
+                        }
+                    },
+                    duplicate_groups=[],
+                    key_field_names=("达人ID", "平台"),
+                    owner_scope_field_name="",
+                ),
+            ),
+            "prepare_screening_inputs": fake_prepare_screening_inputs,
+            "count_passed_profiles": lambda scrape_job: len(list(((scrape_job or {}).get("result") or {}).get("profile_reviews") or [])),
+            "export_platform_artifacts": lambda client, platform, export_dir: {},
+            "poll_job": fake_poll_job,
+            "require_success": lambda response, label: response.get_json(),
+            "reset_backend_runtime_state": lambda: None,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            keep_path = temp_root / "keep.xlsx"
+            template_path = temp_root / "template.xlsx"
+            cache_db_path = temp_root / "creator_cache.db"
+            keep_path.touch()
+            template_path.touch()
+            env_path = self._write_env_file(temp_root)
+            visual_context_key = backend_app.build_visual_review_cache_context("instagram")["context_key"]
+            creator_cache.persist_visual_cache_entry(
+                "instagram",
+                "alpha",
+                {"username": "alpha", "decision": "Pass", "reason": "cached", "signals": ["cached"], "reviewed_at": "2026-03-28T01:02:03Z"},
+                cache_db_path,
+                updated_at="2026-03-28T01:02:03Z",
+                context_key=visual_context_key,
+                context_payload={"platform": "instagram"},
+            )
+
+            summary = keep_list_runner.run_keep_list_screening_pipeline(
+                keep_workbook=keep_path,
+                template_workbook=template_path,
+                env_file=env_path,
+                output_root=temp_root / "run",
+                platform_filters=["instagram"],
+                linked_bitable_url="https://bitable.example.com/base/app?table=tbl&view=vew",
+                creator_cache_db_path=str(cache_db_path),
+            )
+
+        platform_summary = summary["platforms"]["instagram"]
+        client = backend_app.app.test_client()
+        self.assertEqual(summary["status"], "completed")
+        self.assertEqual(platform_summary["partial_refresh_count"], 0)
+        self.assertEqual(platform_summary["mail_only_update_count"], 1)
+        self.assertCountEqual(client.scrape_start_calls[0]["payload"]["usernames"], ["beta"])
+        self.assertEqual(client.visual_start_calls[0]["payload"]["identifiers"], ["beta"])
+        self.assertEqual(client.positioning_start_calls[0]["payload"]["identifiers"], ["beta"])
+        self.assertEqual(platform_summary["incremental_prefilter"]["partial_refresh_breakdown"], {})
+        self.assertEqual(platform_summary["incremental_prefilter"]["mail_only_update_count"], 1)
 
     def test_runner_routes_existing_screened_creators_to_mail_only_update_without_scrape(self) -> None:
         preflight = {
@@ -2395,7 +3157,16 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             "fetch_existing_bitable_record_analysis": lambda client, *, linked_bitable_url: (
                 SimpleNamespace(source_url=linked_bitable_url, table_id="tbl", table_name="达人管理"),
                 SimpleNamespace(
-                    index={"alpha::instagram": {"record_id": "rec_alpha", "fields": {"ai 是否通过": "是"}}},
+                    index={
+                        "alpha::instagram": {
+                            "record_id": "rec_alpha",
+                            "fields": {
+                                "ai 是否通过": "是",
+                                "标签(ai)": "家庭用品",
+                                "ai评价": "existing good fit",
+                            },
+                        }
+                    },
                     duplicate_groups=[],
                     key_field_names=("达人ID", "平台"),
                     owner_scope_field_name="",
@@ -2432,9 +3203,36 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             temp_root = Path(temp_dir)
             keep_path = temp_root / "keep.xlsx"
             template_path = temp_root / "template.xlsx"
+            cache_db_path = temp_root / "creator_cache.db"
             keep_path.touch()
             template_path.touch()
             env_path = self._write_env_file(temp_root)
+            visual_context_key = backend_app.build_visual_review_cache_context("instagram")["context_key"]
+            positioning_context_key = backend_app.build_positioning_card_cache_context("instagram")["context_key"]
+            creator_cache.persist_scrape_cache_entries(
+                "instagram",
+                [{"url": "https://www.instagram.com/alpha", "username": "alpha"}],
+                cache_db_path,
+                updated_at="2026-03-28T01:02:03Z",
+            )
+            creator_cache.persist_visual_cache_entry(
+                "instagram",
+                "alpha",
+                {"username": "alpha", "decision": "Pass", "reason": "cached", "signals": ["cached"], "reviewed_at": "2026-03-28T01:02:03Z"},
+                cache_db_path,
+                updated_at="2026-03-28T01:02:03Z",
+                context_key=visual_context_key,
+                context_payload={"platform": "instagram"},
+            )
+            creator_cache.persist_positioning_cache_entry(
+                "instagram",
+                "alpha",
+                {"username": "alpha", "success": True, "fit_recommendation": "High Fit", "fit_summary": "cached"},
+                cache_db_path,
+                updated_at="2026-03-28T01:02:03Z",
+                context_key=positioning_context_key,
+                context_payload={"platform": "instagram"},
+            )
 
             summary = keep_list_runner.run_keep_list_screening_pipeline(
                 keep_workbook=keep_path,
@@ -2443,6 +3241,7 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
                 output_root=temp_root / "run",
                 platform_filters=["instagram"],
                 linked_bitable_url="https://bitable.example.com/base/app?table=tbl&view=vew",
+                creator_cache_db_path=str(cache_db_path),
             )
 
         platform_summary = summary["platforms"]["instagram"]
@@ -2452,12 +3251,155 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         self.assertEqual(platform_summary["current_stage"], "incremental_filter_completed")
         self.assertEqual(backend_app.app.test_client().scrape_start_calls, [])
         self.assertEqual(platform_summary["mail_only_update_count"], 1)
+        self.assertEqual(platform_summary["partial_refresh_count"], 0)
         self.assertEqual(platform_summary["incremental_prefilter"]["existing_bitable_match_count"], 1)
         self.assertTrue(platform_summary["incremental_prefilter"]["all_existing"])
         self.assertEqual(platform_summary["incremental_prefilter"]["mail_only_update_count"], 1)
+        self.assertEqual(platform_summary["incremental_prefilter"]["partial_refresh_count"], 0)
+        self.assertEqual(summary["positioning_cache_hit_count"], 1)
+        self.assertEqual(summary["positioning_cache_miss_count"], 0)
         self.assertEqual(summary["artifacts"]["feishu_upload_updated_count"], 1)
         self.assertEqual(observed["mail_only_updates"]["instagram"][0]["creator_id"], "alpha")
         self.assertIn("邮件直更 1 个", json.dumps(summary["diagnostics"], ensure_ascii=False))
+
+    def test_incremental_prefilter_uses_local_positioning_cache_not_feishu_proxy(self) -> None:
+        backend_app = FakeBackendApp(
+            {
+                "status": "configured",
+                "error_code": "",
+                "message": "视觉模型已就绪：openai",
+                "configured_provider_names": ["openai"],
+                "runnable_provider_names": ["openai"],
+                "preferred_provider": "openai",
+                "providers": [{"name": "openai", "runnable": True}],
+            },
+            metadata={"instagram": {"alpha": {"handle": "alpha"}}},
+        )
+        existing_bitable_analysis = SimpleNamespace(
+            index={
+                "alpha::instagram": {
+                    "record_id": "rec_alpha",
+                    "fields": {
+                        "ai 是否通过": "是",
+                    },
+                }
+            },
+            duplicate_groups=[],
+            key_field_names=("达人ID", "平台"),
+            owner_scope_field_name="",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_db_path = Path(temp_dir) / "creator_cache.db"
+            visual_context_key = backend_app.build_visual_review_cache_context("instagram", requested_provider="openai")["context_key"]
+            positioning_context_key = backend_app.build_positioning_card_cache_context("instagram", requested_provider="openai")["context_key"]
+            creator_cache.persist_scrape_cache_entries(
+                "instagram",
+                [{"url": "https://www.instagram.com/alpha", "username": "alpha"}],
+                cache_db_path,
+                updated_at="2026-03-28T01:02:03Z",
+            )
+            creator_cache.persist_visual_cache_entry(
+                "instagram",
+                "alpha",
+                {"username": "alpha", "decision": "Pass", "reason": "cached", "reviewed_at": "2026-03-28T01:02:03Z"},
+                cache_db_path,
+                updated_at="2026-03-28T01:02:03Z",
+                context_key=visual_context_key,
+                context_payload={"platform": "instagram"},
+            )
+            creator_cache.persist_positioning_cache_entry(
+                "instagram",
+                "alpha",
+                {"username": "alpha", "success": True, "fit_recommendation": "High Fit", "fit_summary": "cached"},
+                cache_db_path,
+                updated_at="2026-03-28T01:02:03Z",
+                context_key=positioning_context_key,
+                context_payload={"platform": "instagram"},
+            )
+
+            identifier_plan = keep_list_runner._build_platform_identifier_plan(
+                backend_app,
+                "instagram",
+                max_identifiers_per_platform=100,
+                existing_bitable_analysis=existing_bitable_analysis,
+                creator_cache_db_path=str(cache_db_path),
+                vision_provider="openai",
+            )
+
+        platform_prefilter = identifier_plan["incremental_prefilter"]
+        self.assertEqual(platform_prefilter["mail_only_update_count"], 1)
+        self.assertEqual(platform_prefilter["partial_refresh_breakdown"], {})
+        self.assertEqual(platform_prefilter["positioning_cache_hit_count"], 1)
+        self.assertEqual(platform_prefilter["positioning_cache_miss_count"], 0)
+        self.assertEqual(identifier_plan["mail_only_update_entries"][0].get("partial_refresh_reasons") or [], [])
+
+    def test_incremental_prefilter_flags_positioning_missing_when_local_cache_is_absent(self) -> None:
+        backend_app = FakeBackendApp(
+            {
+                "status": "configured",
+                "error_code": "",
+                "message": "视觉模型已就绪：openai",
+                "configured_provider_names": ["openai"],
+                "runnable_provider_names": ["openai"],
+                "preferred_provider": "openai",
+                "providers": [{"name": "openai", "runnable": True}],
+            },
+            metadata={"instagram": {"alpha": {"handle": "alpha"}}},
+        )
+        existing_bitable_analysis = SimpleNamespace(
+            index={
+                "alpha::instagram": {
+                    "record_id": "rec_alpha",
+                    "fields": {
+                        "ai 是否通过": "是",
+                        "标签(ai)": "家庭用品",
+                        "ai评价": "existing good fit",
+                    },
+                }
+            },
+            duplicate_groups=[],
+            key_field_names=("达人ID", "平台"),
+            owner_scope_field_name="",
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            cache_db_path = Path(temp_dir) / "creator_cache.db"
+            visual_context_key = backend_app.build_visual_review_cache_context("instagram", requested_provider="openai")["context_key"]
+            creator_cache.persist_scrape_cache_entries(
+                "instagram",
+                [{"url": "https://www.instagram.com/alpha", "username": "alpha"}],
+                cache_db_path,
+                updated_at="2026-03-28T01:02:03Z",
+            )
+            creator_cache.persist_visual_cache_entry(
+                "instagram",
+                "alpha",
+                {"username": "alpha", "decision": "Pass", "reason": "cached", "reviewed_at": "2026-03-28T01:02:03Z"},
+                cache_db_path,
+                updated_at="2026-03-28T01:02:03Z",
+                context_key=visual_context_key,
+                context_payload={"platform": "instagram"},
+            )
+
+            identifier_plan = keep_list_runner._build_platform_identifier_plan(
+                backend_app,
+                "instagram",
+                max_identifiers_per_platform=100,
+                existing_bitable_analysis=existing_bitable_analysis,
+                creator_cache_db_path=str(cache_db_path),
+                vision_provider="openai",
+            )
+
+        platform_prefilter = identifier_plan["incremental_prefilter"]
+        self.assertEqual(platform_prefilter["mail_only_update_count"], 1)
+        self.assertEqual(platform_prefilter["partial_refresh_breakdown"], {})
+        self.assertEqual(platform_prefilter["positioning_cache_hit_count"], 0)
+        self.assertEqual(platform_prefilter["positioning_cache_miss_count"], 1)
+        self.assertEqual(
+            identifier_plan["mail_only_update_entries"][0].get("partial_refresh_reasons"),
+            ["positioning_missing_instagram"],
+        )
 
     def test_runner_forwards_creator_cache_controls_to_scrape_and_visual_payloads(self) -> None:
         preflight = {
@@ -2911,7 +3853,17 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
             if job_id == "visual-job-1":
                 return {"id": job_id, "status": "completed", "result": {"success": True}}
             if job_id == "positioning-job-1":
-                return {"id": job_id, "status": "completed", "result": {"success": True}}
+                return {
+                    "id": job_id,
+                    "status": "completed",
+                    "result": {
+                        "success": True,
+                        "creator_cache": {
+                            "positioning_hit_count": 1,
+                            "positioning_miss_count": 0,
+                        },
+                    },
+                }
             raise AssertionError(f"unexpected job id: {job_id}")
 
         keep_list_runner._load_runtime_dependencies = lambda: {
@@ -2943,6 +3895,12 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
 
         platform_summary = summary["platforms"]["instagram"]
         self.assertEqual(platform_summary["positioning_card_analysis"]["status"], "completed")
+        self.assertEqual(summary["positioning_analysis_cache_hit_count"], 1)
+        self.assertEqual(summary["positioning_analysis_cache_miss_count"], 0)
+        self.assertEqual(
+            summary["observability"]["layers"]["screening_execution"]["platforms"]["instagram"]["positioning"]["creator_cache_hit_count"],
+            1,
+        )
         self.assertEqual(
             backend_app.app.test_client().positioning_start_calls[0]["payload"]["provider"],
             "openai",
@@ -3655,6 +4613,190 @@ class KeepListRunnerSummaryTests(unittest.TestCase):
         self.assertEqual(summary["platforms"]["tiktok"]["status"], "failed")
         self.assertEqual(summary["platforms"]["instagram"]["status"], "failed")
         self.assertEqual(summary["platforms"]["youtube"]["status"], "failed")
+
+    def test_runner_batches_visual_jobs_and_writes_progress_checkpoint(self) -> None:
+        preflight = {
+            "status": "configured",
+            "error_code": "",
+            "message": "视觉模型已就绪：openai",
+            "configured_provider_names": ["openai"],
+            "runnable_provider_names": ["openai"],
+            "providers": [{"name": "openai", "runnable": True}],
+        }
+        backend_app = FakeBackendApp(
+            preflight,
+            metadata={
+                "tiktok": {
+                    "alpha": {"handle": "alpha", "url": "https://www.tiktok.com/@alpha"},
+                    "beta": {"handle": "beta", "url": "https://www.tiktok.com/@beta"},
+                    "gamma": {"handle": "gamma", "url": "https://www.tiktok.com/@gamma"},
+                    "delta": {"handle": "delta", "url": "https://www.tiktok.com/@delta"},
+                }
+            },
+        )
+
+        def fake_prepare_screening_inputs(**kwargs):
+            return {
+                "prepared_at": "2026-03-28T01:02:03Z",
+                "upload": {"stats": {"TikTok": 4}},
+            }
+
+        scrape_reviews = [
+            {
+                "username": identifier,
+                "status": "Pass",
+                "upload_metadata": {
+                    "handle": identifier,
+                    "url": f"https://www.tiktok.com/@{identifier}",
+                },
+            }
+            for identifier in ("alpha", "beta", "gamma", "delta")
+        ]
+
+        def fake_poll_job(client, job_id, label, interval):
+            if job_id == "scrape-job-1":
+                return {
+                    "status": "completed",
+                    "result": {"profile_reviews": list(scrape_reviews)},
+                }
+            if str(job_id).startswith("visual-job-"):
+                return {
+                    "status": "completed",
+                    "result": {"visual_results": {}},
+                }
+            raise AssertionError(f"unexpected job id: {job_id}")
+
+        def fake_export_platform_artifacts(client, platform, export_dir, final_review_profile_reviews=None):
+            export_dir.mkdir(parents=True, exist_ok=True)
+            final_review_path = export_dir / f"{platform}_final_review.xlsx"
+            final_review_path.write_text("placeholder", encoding="utf-8")
+            return {"final_review": str(final_review_path)}
+
+        def fake_build_all_platforms_final_review_artifacts(**kwargs):
+            payload_json_path = Path(kwargs["payload_json_path"])
+            payload_json_path.parent.mkdir(parents=True, exist_ok=True)
+            payload_json_path.write_text(json.dumps({"rows": []}, ensure_ascii=False), encoding="utf-8")
+            workbook_path = Path(kwargs["output_path"])
+            workbook_path.write_text("placeholder", encoding="utf-8")
+            return {
+                "all_platforms_final_review": str(workbook_path),
+                "all_platforms_upload_payload_json": str(payload_json_path),
+                "all_platforms_upload_local_archive_dir": "",
+                "all_platforms_upload_skipped_archive_json": "",
+                "all_platforms_upload_skipped_archive_xlsx": "",
+                "row_count": 0,
+                "source_row_count": 0,
+                "skipped_row_count": 0,
+            }
+
+        keep_list_runner._load_runtime_dependencies = lambda: {
+            "backend_app": backend_app,
+            "build_all_platforms_final_review_artifacts": fake_build_all_platforms_final_review_artifacts,
+            "collect_final_exports": lambda platforms: {},
+            "prepare_screening_inputs": fake_prepare_screening_inputs,
+            "count_passed_profiles": lambda scrape_job: 4,
+            "export_platform_artifacts": fake_export_platform_artifacts,
+            "poll_job": fake_poll_job,
+            "require_success": lambda response, label: response.get_json(),
+            "reset_backend_runtime_state": lambda: None,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.dict(
+            "os.environ",
+            {"TIKTOK_VISUAL_BATCH_SIZE": "2"},
+            clear=False,
+        ):
+            temp_root = Path(temp_dir)
+            keep_path = temp_root / "keep.xlsx"
+            template_path = temp_root / "template.xlsx"
+            keep_path.touch()
+            template_path.touch()
+            env_path = self._write_env_file(temp_root)
+            summary = keep_list_runner.run_keep_list_screening_pipeline(
+                keep_workbook=keep_path,
+                template_workbook=template_path,
+                env_file=env_path,
+                output_root=temp_root / "run",
+                platform_filters=["tiktok"],
+                skip_positioning_card_analysis=True,
+                visual_postcheck_max_rounds=0,
+            )
+
+            progress_payload = json.loads(Path(summary["artifacts"]["progress_json"]).read_text(encoding="utf-8"))
+            checkpoint_path = Path(summary["platforms"]["tiktok"]["visual_batching"]["checkpoint_path"])
+            checkpoint_payload = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(summary["status"], "completed")
+        self.assertEqual(len(backend_app._client.visual_start_calls), 2)
+        self.assertEqual(
+            summary["platforms"]["tiktok"]["visual_batching"]["batch_count"],
+            2,
+        )
+        self.assertEqual(checkpoint_payload["completed_batches"], [1, 2])
+        self.assertEqual(progress_payload["status"], "completed")
+        self.assertEqual(progress_payload["stage"], "completed")
+        self.assertEqual(progress_payload["phase"], "completed")
+
+    def test_visual_batch_runner_resumes_from_checkpoint(self) -> None:
+        preflight = {
+            "status": "configured",
+            "error_code": "",
+            "message": "视觉模型已就绪：openai",
+            "configured_provider_names": ["openai"],
+            "runnable_provider_names": ["openai"],
+            "providers": [{"name": "openai", "runnable": True}],
+        }
+        backend_app = FakeBackendApp(preflight)
+        progress_events: list[dict[str, Any]] = []
+
+        def fake_poll_job(client, job_id, label, interval):
+            return {"status": "completed", "result": {"visual_results": {}}}
+
+        with tempfile.TemporaryDirectory() as temp_dir, mock.patch.dict(
+            "os.environ",
+            {"TIKTOK_VISUAL_BATCH_SIZE": "2"},
+            clear=False,
+        ):
+            run_root = Path(temp_dir)
+            checkpoint_path = keep_list_runner._build_visual_checkpoint_path(run_root, "tiktok")
+            identifiers = ["alpha", "beta", "gamma", "delta"]
+            keep_list_runner._persist_visual_checkpoint(
+                checkpoint_path,
+                platform="tiktok",
+                batch_size=2,
+                batch_count=2,
+                identifiers=identifiers,
+                completed_batches=[1],
+                observed_at="2026-03-28T01:02:03Z",
+            )
+
+            result = keep_list_runner._run_visual_review_batches(
+                client=backend_app.app.test_client(),
+                backend_app=backend_app,
+                platform="tiktok",
+                identifiers=identifiers,
+                vision_provider="",
+                creator_cache_db_path="",
+                force_refresh_creator_cache=False,
+                poll_job=fake_poll_job,
+                require_success=lambda response, label: response.get_json(),
+                poll_interval=1.0,
+                run_root=run_root,
+                observed_at_func=lambda: "2026-03-28T01:02:03Z",
+                progress_callback=lambda **kwargs: progress_events.append(dict(kwargs)),
+            )
+
+            checkpoint_payload = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(len(backend_app._client.visual_start_calls), 1)
+        self.assertEqual(
+            backend_app._client.visual_start_calls[0]["payload"]["identifiers"],
+            ["gamma", "delta"],
+        )
+        self.assertEqual(result["batching"]["resumed_batch_count"], 1)
+        self.assertEqual(result["batching"]["completed_batch_count"], 2)
+        self.assertEqual(checkpoint_payload["completed_batches"], [1, 2])
+        self.assertTrue(any("跳过已完成的视觉 batch 1/2" == item["last_log_line"] for item in progress_events))
 
 
 if __name__ == "__main__":

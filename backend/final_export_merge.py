@@ -235,6 +235,25 @@ def _combine_reason_with_note(base_text: Any, note: str) -> str:
     return f"{cleaned_base}；{cleaned_note}"
 
 
+def _prefix_visual_review_context(
+    base_text: Any,
+    record: dict[str, Any],
+    positioning_row: dict[str, Any],
+) -> str:
+    cleaned_base = _clean_text(base_text)
+    if not cleaned_base:
+        return ""
+    stage_status = _clean_text((positioning_row or {}).get("positioning_stage_status"))
+    if stage_status != "Not Reviewed":
+        return cleaned_base
+    if not _has_completed_visual_review(record, positioning_row):
+        return cleaned_base
+    prefix = "视觉复核已完成："
+    if cleaned_base.startswith(prefix):
+        return cleaned_base
+    return f"{prefix}{cleaned_base}"
+
+
 def _build_quote_text(keep_row: dict[str, Any], *, mail_body_text: Any = "") -> str:
     latest_quote_text = _clean_text(keep_row.get("latest_quote_text"))
     for candidate in (
@@ -440,7 +459,20 @@ def _resolve_visual_manual_reason(*values: Any) -> str:
     return ""
 
 
-def _resolve_positioning_stage_note(positioning_row: dict[str, Any]) -> tuple[str, str]:
+def _has_completed_visual_review(record: dict[str, Any], positioning_row: dict[str, Any]) -> bool:
+    visual_status = _clean_text(
+        _first_non_blank(
+            (positioning_row or {}).get("visual_status"),
+            (record or {}).get("visual_status"),
+        )
+    ).casefold()
+    return visual_status in {"pass", "reject", "completed"}
+
+
+def _resolve_positioning_stage_note(
+    record: dict[str, Any],
+    positioning_row: dict[str, Any],
+) -> tuple[str, str]:
     stage_status = _clean_text((positioning_row or {}).get("positioning_stage_status"))
     if not stage_status:
         return "", ""
@@ -449,7 +481,9 @@ def _resolve_positioning_stage_note(positioning_row: dict[str, Any]) -> tuple[st
     if stage_status == "Error":
         return "定位卡处理失败", "定位卡处理失败，需人工确认"
     if stage_status == "Not Reviewed":
-        return "定位卡未完成", "定位卡未完成，需人工确认"
+        if _has_completed_visual_review(record, positioning_row):
+            return "定位卡未完成（视觉已完成）", "定位卡未完成，需人工确认"
+        return "视觉复核未完成", "视觉复核未完成，定位卡未完成，需人工确认"
     return "", ""
 
 
@@ -886,6 +920,7 @@ def _normalize_employee_id(value: Any) -> str:
 
 def _build_keep_lookup(
     keep_workbook: str | Path | None,
+    additional_keep_workbooks: Sequence[str | Path] | None = None,
 ) -> tuple[
     dict[tuple[str, str], dict[str, Any]],
     dict[tuple[str, str], dict[str, Any]],
@@ -896,16 +931,15 @@ def _build_keep_lookup(
     url_lookup: dict[tuple[str, str], dict[str, Any]] = {}
     handle_any_lookup: dict[str, dict[str, Any]] = {}
     url_any_lookup: dict[str, dict[str, Any]] = {}
-    if not keep_workbook:
+    candidate_paths: list[Path] = []
+    for raw_path in [keep_workbook, *(list(additional_keep_workbooks or []))]:
+        if not raw_path:
+            continue
+        keep_path = Path(str(raw_path)).expanduser()
+        if keep_path not in candidate_paths:
+            candidate_paths.append(keep_path)
+    if not candidate_paths:
         return handle_lookup, url_lookup, handle_any_lookup, url_any_lookup
-    keep_path = Path(str(keep_workbook)).expanduser()
-    if not keep_path.exists():
-        return handle_lookup, url_lookup, handle_any_lookup, url_any_lookup
-    try:
-        frame = pd.read_excel(keep_path)
-    except Exception:
-        return handle_lookup, url_lookup, handle_any_lookup, url_any_lookup
-    records = [dict(record) for record in frame.to_dict(orient="records")]
 
     def _index_record(record: dict[str, Any], platform: str | None) -> None:
         for candidate in (
@@ -940,14 +974,22 @@ def _build_keep_lookup(
                 url_lookup.setdefault((platform, url), dict(record))
             url_any_lookup.setdefault(url, dict(record))
 
-    for record in records:
-        platform = _normalize_platform(record.get("Platform") or record.get("平台"))
-        if platform:
-            _index_record(record, platform)
-    for record in records:
-        platform = _normalize_platform(record.get("Platform") or record.get("平台"))
-        if not platform:
-            _index_record(record, None)
+    for keep_path in candidate_paths:
+        if not keep_path.exists():
+            continue
+        try:
+            frame = pd.read_excel(keep_path)
+        except Exception:
+            continue
+        records = [dict(record) for record in frame.to_dict(orient="records")]
+        for record in records:
+            platform = _normalize_platform(record.get("Platform") or record.get("平台"))
+            if platform:
+                _index_record(record, platform)
+        for record in records:
+            platform = _normalize_platform(record.get("Platform") or record.get("平台"))
+            if not platform:
+                _index_record(record, None)
     return handle_lookup, url_lookup, handle_any_lookup, url_any_lookup
 
 
@@ -984,6 +1026,20 @@ def extract_task_owner_context(upstream_summary: dict[str, Any] | None) -> dict[
     mail_sync_raw = (((payload.get("steps") or {}).get("mail_sync") or {}).get("raw") or {})
     task_assets_step = ((payload.get("steps") or {}).get("task_assets") or {})
     task_assets_raw = (task_assets_step.get("raw") or {})
+    downstream_handoff = payload.get("downstream_handoff") if isinstance(payload.get("downstream_handoff"), dict) else {}
+    downstream_handoff_owner = (
+        downstream_handoff.get("task_owner") if isinstance(downstream_handoff.get("task_owner"), dict) else {}
+    )
+    upstream_step = ((payload.get("steps") or {}).get("upstream") or {})
+    upstream_downstream_handoff = (
+        upstream_step.get("downstream_handoff") if isinstance(upstream_step.get("downstream_handoff"), dict) else {}
+    )
+    upstream_downstream_handoff_owner = (
+        upstream_downstream_handoff.get("task_owner")
+        if isinstance(upstream_downstream_handoff.get("task_owner"), dict)
+        else {}
+    )
+    resolved_task_owner = payload.get("resolved_task_owner") if isinstance(payload.get("resolved_task_owner"), dict) else {}
     first_item = next(iter(mail_sync_raw.get("items") or []), {})
     if not isinstance(first_item, dict):
         first_item = {}
@@ -996,10 +1052,20 @@ def extract_task_owner_context(upstream_summary: dict[str, Any] | None) -> dict[
         "employee_email": _clean_text(first_item.get("employeeEmail")),
         "owner_name": _clean_text(first_item.get("ownerName")),
         "task_record_id": _clean_text(first_item.get("recordId")),
-        "task_name": _clean_text(first_item.get("taskName")) or _clean_text(payload.get("task_name")),
+        "task_name": _clean_text(first_item.get("taskName"))
+        or _clean_text(downstream_handoff_owner.get("task_name"))
+        or _clean_text(upstream_downstream_handoff_owner.get("task_name"))
+        or _clean_text(resolved_task_owner.get("task_name"))
+        or _clean_text(payload.get("task_name")),
         "linked_bitable_url": _clean_text(first_item.get("linkedBitableUrl"))
+        or _clean_text(downstream_handoff_owner.get("linked_bitable_url"))
+        or _clean_text(downstream_handoff.get("linked_bitable_url"))
+        or _clean_text(upstream_downstream_handoff_owner.get("linked_bitable_url"))
+        or _clean_text(upstream_downstream_handoff.get("linked_bitable_url"))
+        or _clean_text(resolved_task_owner.get("linked_bitable_url"))
         or _clean_text(task_assets_step.get("linked_bitable_url"))
         or _clean_text(task_assets_step.get("linkedBitableUrl"))
+        or _clean_text(task_assets_raw.get("linked_bitable_url"))
         or _clean_text(task_assets_raw.get("linkedBitableUrl")),
     }
 
@@ -1188,6 +1254,7 @@ def build_all_platforms_final_review_artifacts(
     output_path: str | Path,
     final_exports: dict[str, dict[str, str]],
     keep_workbook: str | Path | None = None,
+    pre_keep_mail_only_workbook: str | Path | None = None,
     task_owner: dict[str, Any] | None = None,
     payload_json_path: str | Path | None = None,
     manual_review_rows: Sequence[dict[str, Any]] | None = None,
@@ -1197,7 +1264,10 @@ def build_all_platforms_final_review_artifacts(
     workbook_path.parent.mkdir(parents=True, exist_ok=True)
     archive_dir = workbook_path.parent / "feishu_upload_local_archive"
     archive_dir.mkdir(parents=True, exist_ok=True)
-    keep_handle_lookup, keep_url_lookup, keep_handle_any_lookup, keep_url_any_lookup = _build_keep_lookup(keep_workbook)
+    keep_handle_lookup, keep_url_lookup, keep_handle_any_lookup, keep_url_any_lookup = _build_keep_lookup(
+        keep_workbook,
+        [pre_keep_mail_only_workbook] if pre_keep_mail_only_workbook else [],
+    )
     owner_context = dict(task_owner or {})
     owner_display_name = (
         _clean_text(owner_context.get("responsible_name"))
@@ -1333,7 +1403,7 @@ def build_all_platforms_final_review_artifacts(
                     positioning_row.get("positioning_error"),
                 ],
             )
-            positioning_label_note, positioning_comment_note = _resolve_positioning_stage_note(positioning_row)
+            positioning_label_note, positioning_comment_note = _resolve_positioning_stage_note(record, positioning_row)
             if visual_manual_reason:
                 positioning_label_note = ""
                 positioning_comment_note = ""
@@ -1348,6 +1418,7 @@ def build_all_platforms_final_review_artifacts(
                 record.get("visual_reason"),
                 positioning_row.get("positioning_error"),
             )
+            base_reason = _prefix_visual_review_context(base_reason, record, positioning_row)
             screening_reason = _combine_reason_with_note(base_reason, metric_note)
             screening_reason = _combine_reason_with_note(screening_reason, positioning_comment_note)
             base_comment = _first_non_blank(
@@ -1359,6 +1430,7 @@ def build_all_platforms_final_review_artifacts(
                 record.get("final_reason"),
                 record.get("reason"),
             )
+            base_comment = _prefix_visual_review_context(base_comment, record, positioning_row)
             screening_comment = _combine_reason_with_note(base_comment, metric_note)
             screening_comment = _combine_reason_with_note(screening_comment, positioning_comment_note)
             ai_label_value = _clean_text(positioning_row.get("positioning_labels")) or positioning_label_note

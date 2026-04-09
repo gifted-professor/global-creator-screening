@@ -981,6 +981,95 @@ class FinalExportMergeTests(unittest.TestCase):
         self.assertEqual(task_owner["task_name"], "SKG")
         self.assertEqual(task_owner["linked_bitable_url"], "https://bitable.example/from-task-assets")
 
+    def test_extract_task_owner_context_uses_downstream_handoff_fallbacks(self) -> None:
+        task_owner = extract_task_owner_context(
+            {
+                "task_name": "MINISO",
+                "steps": {
+                    "mail_sync": {"raw": {"items": []}},
+                    "upstream": {
+                        "downstream_handoff": {
+                            "linked_bitable_url": "https://bitable.example/from-upstream-handoff",
+                            "task_owner": {
+                                "task_name": "MINISO",
+                            },
+                        }
+                    },
+                },
+            }
+        )
+
+        self.assertEqual(task_owner["task_name"], "MINISO")
+        self.assertEqual(task_owner["linked_bitable_url"], "https://bitable.example/from-upstream-handoff")
+
+    def test_mail_only_updates_can_read_mail_fields_from_pre_keep_workbook(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            exports_dir = root / "exports"
+            full_screening_keep = root / "upstream" / "exports" / "keep_full_screening_only.xlsx"
+            pre_keep_mail_only = root / "upstream" / "exports" / "keep_pre_keep_mail_only.xlsx"
+            full_screening_keep.parent.mkdir(parents=True, exist_ok=True)
+            pd.DataFrame(
+                [
+                    {
+                        "Platform": "Instagram",
+                        "@username": "beta",
+                        "URL": "https://www.instagram.com/beta",
+                    }
+                ]
+            ).to_excel(full_screening_keep, index=False)
+            raw_dir = root / "upstream" / "raw"
+            raw_dir.mkdir(parents=True, exist_ok=True)
+            raw_mail_path = raw_dir / "alpha-last.eml"
+            raw_mail_path.write_text("Subject: alpha\n\nAlpha full mail body with $700 offer.", encoding="utf-8")
+            pd.DataFrame(
+                [
+                    {
+                        "Platform": "Instagram",
+                        "@username": "alpha",
+                        "URL": "https://www.instagram.com/alpha",
+                        "creator_emails": "alpha@example.com",
+                        "matched_contact_email": "alpha@example.com",
+                        "brand_message_snippet": "Alpha full mail body with $700 offer.",
+                        "brand_message_raw_path": str(raw_mail_path),
+                        "brand_message_sent_at": "2026-04-05T10:00:00+08:00",
+                    }
+                ]
+            ).to_excel(pre_keep_mail_only, index=False)
+
+            output_path = exports_dir / "all_platforms_final_review.xlsx"
+            payload_path = exports_dir / "all_platforms_final_review_payload.json"
+            build_all_platforms_final_review_artifacts(
+                output_path=output_path,
+                payload_json_path=payload_path,
+                final_exports={},
+                keep_workbook=full_screening_keep,
+                pre_keep_mail_only_workbook=pre_keep_mail_only,
+                task_owner={"responsible_name": "陈俊仁", "linked_bitable_url": "https://bitable.example/miniso"},
+                mail_only_updates={
+                    "instagram": [
+                        {
+                            "creator_id": "alpha",
+                            "profile_url": "https://www.instagram.com/alpha",
+                            "record_id": "rec_alpha",
+                            "existing_fields": {
+                                "达人ID": "alpha",
+                                "平台": "instagram",
+                                "主页链接": "https://www.instagram.com/alpha",
+                                "ai 是否通过": "是",
+                            },
+                        }
+                    ]
+                },
+            )
+
+            payload = json.loads(payload_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(payload["rows"][0]["creator_emails"], "alpha@example.com")
+        self.assertEqual(payload["rows"][0]["matched_contact_email"], "alpha@example.com")
+        self.assertEqual(payload["rows"][0]["full body"], "Alpha full mail body with $700 offer.")
+        self.assertEqual(payload["rows"][0]["达人回复的最后一封邮件内容"], "Alpha full mail body with $700 offer.")
+
     def test_payload_skips_processing_failures_and_preserves_uploadable_rows(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -1737,8 +1826,71 @@ class FinalExportMergeTests(unittest.TestCase):
             rows = pd.read_excel(output_path).fillna("")
             tiktok_row = rows.loc[rows["达人ID"] == "lowviews_creator"].iloc[0].to_dict()
             self.assertEqual(tiktok_row["ai是否通过"], "否")
+            self.assertEqual(tiktok_row["标签(ai)"], "视觉复核未完成")
             self.assertIn("播放量不达标", tiktok_row["ai筛号反馈理由"])
+            self.assertIn("视觉复核未完成，定位卡未完成，需人工确认", tiktok_row["ai筛号反馈理由"])
+
+    def test_visual_pass_with_positioning_not_reviewed_keeps_visual_context(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            exports_dir = root / "exports"
+            tiktok_export = exports_dir / "tiktok" / "tiktok_final_review.xlsx"
+            tiktok_positioning = exports_dir / "tiktok" / "tiktok_positioning_card_review.xlsx"
+            tiktok_export.parent.mkdir(parents=True, exist_ok=True)
+
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "visual_done_creator",
+                        "username": "visual_done_creator",
+                        "profile_url": "https://www.tiktok.com/@visual_done_creator",
+                        "upload_handle": "visual_done_creator",
+                        "visual_status": "Pass",
+                        "visual_reason": "近 30 天有更新；播放量达标（均值 25570，中位数 21000）；已提取 18 张封面",
+                        "final_status": "Pass",
+                        "final_reason": "近 30 天有更新；播放量达标（均值 25570，中位数 21000）；已提取 18 张封面",
+                    }
+                ]
+            ).to_excel(tiktok_export, index=False)
+            pd.DataFrame(
+                [
+                    {
+                        "identifier": "visual_done_creator",
+                        "username": "visual_done_creator",
+                        "profile_url": "https://www.tiktok.com/@visual_done_creator",
+                        "upload_handle": "visual_done_creator",
+                        "visual_status": "Pass",
+                        "positioning_stage_status": "Not Reviewed",
+                        "positioning_labels": "",
+                        "fit_summary": "",
+                        "positioning_error": "",
+                    }
+                ]
+            ).to_excel(tiktok_positioning, index=False)
+
+            tiktok_data_path = root / "data" / "tiktok" / "tiktok_data.json"
+            tiktok_data_path.parent.mkdir(parents=True, exist_ok=True)
+            tiktok_data_path.write_text("[]", encoding="utf-8")
+
+            output_path = exports_dir / "all_platforms_final_review.xlsx"
+            build_all_platforms_final_review_artifacts(
+                output_path=output_path,
+                final_exports={
+                    "tiktok": {
+                        "final_review": str(tiktok_export),
+                        "positioning_card_review": str(tiktok_positioning),
+                    },
+                },
+                task_owner={"responsible_name": "陈俊仁"},
+            )
+
+            rows = pd.read_excel(output_path).fillna("")
+            tiktok_row = rows.loc[rows["达人ID"] == "visual_done_creator"].iloc[0].to_dict()
+            self.assertEqual(tiktok_row["ai是否通过"], "是")
+            self.assertEqual(tiktok_row["标签(ai)"], "定位卡未完成（视觉已完成）")
+            self.assertIn("视觉复核已完成：近 30 天有更新", tiktok_row["ai筛号反馈理由"])
             self.assertIn("定位卡未完成，需人工确认", tiktok_row["ai筛号反馈理由"])
+            self.assertIn("视觉复核已完成：近 30 天有更新", tiktok_row["ai评价"])
 
     def test_visual_provider_timeout_is_sanitized_to_manual_review(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:

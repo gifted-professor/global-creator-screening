@@ -652,6 +652,71 @@ class TaskUploadToFinalExportRunnerTests(unittest.TestCase):
         self.assertIn("positioning_card_review", summary["artifacts"]["positioning_artifacts"]["instagram"])
         self.assertTrue(summary["artifacts"]["all_platforms_upload_payload_json"].endswith(".json"))
 
+    def test_runner_passes_linked_bitable_url_from_upstream_downstream_handoff_when_task_assets_are_missing(self) -> None:
+        observed: dict[str, object] = {}
+
+        def fake_upstream(**kwargs):
+            keep_path = Path(kwargs["output_root"]) / "exports" / "MINISO_final_keep.xlsx"
+            template_path = Path(kwargs["output_root"]) / "downloads" / "template.xlsx"
+            keep_path.parent.mkdir(parents=True, exist_ok=True)
+            keep_path.touch()
+            template_path.parent.mkdir(parents=True, exist_ok=True)
+            template_path.touch()
+            return {
+                "status": "stopped_after_keep-list",
+                "contract": {"canonical_boundary": "keep-list"},
+                "resume_points": {
+                    "keep_list": {
+                        "keep_workbook": str(keep_path),
+                        "template_workbook": str(template_path),
+                    }
+                },
+                "artifacts": {
+                    "keep_workbook": str(keep_path),
+                    "template_workbook": str(template_path),
+                },
+                "steps": {
+                    "mail_sync": {"raw": {"items": []}},
+                    "upstream": {
+                        "downstream_handoff": {
+                            "linked_bitable_url": "https://bitable.example/from-upstream-handoff",
+                            "task_owner": {
+                                "task_name": "MINISO",
+                            },
+                        }
+                    },
+                },
+            }
+
+        def fake_downstream(**kwargs):
+            observed["downstream_kwargs"] = kwargs
+            return {"status": "completed", "platforms": {}, "artifacts": {}}
+
+        final_runner._load_runtime_dependencies = lambda: {
+            "run_task_upload_to_keep_list_pipeline": fake_upstream,
+            "run_keep_list_screening_pipeline": fake_downstream,
+        }
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            env_path = temp_root / ".env"
+            env_path.write_text("", encoding="utf-8")
+            summary = final_runner.run_task_upload_to_final_export_pipeline(
+                task_name="MINISO",
+                env_file=str(env_path),
+                output_root=temp_root / "run",
+                task_upload_url="https://example.com/task",
+                employee_info_url="https://example.com/employee",
+                feishu_app_id="app-id",
+                feishu_app_secret="app-secret",
+            )
+
+        self.assertEqual(summary["status"], "completed")
+        self.assertEqual(
+            observed["downstream_kwargs"]["linked_bitable_url"],
+            "https://bitable.example/from-upstream-handoff",
+        )
+
     def test_runner_uses_run_scoped_default_root_and_redacts_sensitive_config_sources(self) -> None:
         observed: dict[str, object] = {}
 

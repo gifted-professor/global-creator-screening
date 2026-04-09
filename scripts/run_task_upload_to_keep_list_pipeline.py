@@ -13,6 +13,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from email_sync.db import Database as MailDatabase
+from email_sync.pre_keep_short_circuit import route_pre_keep_workbook
 from email_sync.thread_assignments import persist_thread_assignments_from_keep_workbook
 from harness.contract import attach_run_contract
 from harness.config import (
@@ -41,6 +42,7 @@ def _load_runtime_dependencies():
     from email_sync.mail_thread_funnel import build_mail_thread_funnel_keep_workbook
     from email_sync.date_windows import resolve_sync_sent_since
     from email_sync.shared_email_resolution import resolve_shared_email_candidates, run_shared_email_final_review
+    from feishu_screening_bridge.bitable_upload import fetch_existing_bitable_record_analysis
     from feishu_screening_bridge.feishu_api import DEFAULT_FEISHU_BASE_URL, FeishuOpenClient
     from feishu_screening_bridge.local_env import get_preferred_value, load_local_env
     from feishu_screening_bridge.task_upload_sync import (
@@ -62,6 +64,7 @@ def _load_runtime_dependencies():
         "match_brand_keyword": match_brand_keyword,
         "resolve_shared_email_candidates": resolve_shared_email_candidates,
         "run_shared_email_final_review": run_shared_email_final_review,
+        "fetch_existing_bitable_record_analysis": fetch_existing_bitable_record_analysis,
         "enrich_creator_workbook": enrich_creator_workbook,
         "prepare_llm_review_candidates": prepare_llm_review_candidates,
         "run_and_apply_llm_review": run_and_apply_llm_review,
@@ -2233,7 +2236,8 @@ def run_task_upload_to_keep_list_pipeline(
             )
             summary["steps"]["llm_review"] = llm_review_step
             summary["artifacts"]["keep_workbook"] = llm_review_step["artifacts"]["keep_xlsx"]
-
+        fetch_existing_bitable_record_analysis = runtime.get("fetch_existing_bitable_record_analysis")
+        linked_bitable_url = str((summary.get("steps", {}).get("task_assets") or {}).get("linked_bitable_url") or "").strip()
         mail_task_context = dict((summary.get("steps", {}).get("mail_sync") or {}).get("task") or {})
         owner_scope = (
             str(mail_task_context.get("employee_id") or "").strip()
@@ -2241,7 +2245,88 @@ def run_task_upload_to_keep_list_pipeline(
             or str(mail_task_context.get("employee_name") or "").strip()
             or normalized_task_name
         )
-        keep_workbook_path = Path(summary["artifacts"]["keep_workbook"]).expanduser().resolve()
+        original_keep_workbook_path = Path(summary["artifacts"]["keep_workbook"]).expanduser().resolve()
+        keep_workbook_for_cache_path = original_keep_workbook_path
+        pre_keep_short_circuit: dict[str, Any]
+        if not callable(fetch_existing_bitable_record_analysis):
+            pre_keep_short_circuit = {
+                "status": "skipped_missing_runtime",
+                "keep_workbook_path": str(original_keep_workbook_path),
+            }
+        elif not linked_bitable_url:
+            pre_keep_short_circuit = {
+                "status": "skipped_missing_linked_bitable_url",
+                "keep_workbook_path": str(original_keep_workbook_path),
+            }
+        elif not original_keep_workbook_path.exists():
+            pre_keep_short_circuit = {
+                "status": "skipped_missing_keep_workbook",
+                "keep_workbook_path": str(original_keep_workbook_path),
+            }
+        else:
+            try:
+                _resolved_view, existing_analysis = fetch_existing_bitable_record_analysis(
+                    client,
+                    linked_bitable_url=linked_bitable_url,
+                )
+                routed_keep_workbook = (
+                    original_keep_workbook_path.parent
+                    / f"{original_keep_workbook_path.stem}_full_screening_only{original_keep_workbook_path.suffix}"
+                )
+                mail_only_workbook = (
+                    original_keep_workbook_path.parent
+                    / f"{original_keep_workbook_path.stem}_pre_keep_mail_only{original_keep_workbook_path.suffix}"
+                )
+                routed = route_pre_keep_workbook(
+                    keep_workbook_path=original_keep_workbook_path,
+                    routed_keep_workbook_path=routed_keep_workbook,
+                    mail_only_workbook_path=mail_only_workbook,
+                    db_path=mail_sync_step["artifacts"]["mail_db_path"],
+                    owner_scope=owner_scope,
+                    brand=normalized_task_name,
+                    existing_index=dict(getattr(existing_analysis, "index", {}) or {}),
+                    owner_scope_enabled=bool(str(getattr(existing_analysis, "owner_scope_field_name", "") or "").strip()),
+                )
+                routed_stats = dict(routed.get("stats") or {})
+                input_row_count = int(routed_stats.get("input_row_count") or 0)
+                mail_only_count = int(routed_stats.get("mail_only_count") or 0)
+                full_screening_count = int(routed_stats.get("full_screening_count") or 0)
+                keep_workbook_overridden = mail_only_count > 0 and full_screening_count != input_row_count
+                pre_keep_short_circuit = {
+                    "status": "completed",
+                    "input_row_count": input_row_count,
+                    "mail_only_count": mail_only_count,
+                    "partial_refresh_count": int(routed_stats.get("partial_refresh_count") or 0),
+                    "full_screening_count": full_screening_count,
+                    "known_thread_hit_count": int(routed_stats.get("known_thread_hit_count") or 0),
+                    "thread_assignment_cache_hit_count": int(
+                        routed_stats.get("thread_assignment_cache_hit_count") or 0
+                    ),
+                    "existing_screened_count": int(routed_stats.get("existing_screened_count") or 0),
+                    "existing_unscreened_count": int(routed_stats.get("existing_unscreened_count") or 0),
+                    "new_creator_count": int(routed_stats.get("new_creator_count") or 0),
+                    "keep_workbook_overridden": keep_workbook_overridden,
+                    "artifacts": {
+                        "source_keep_workbook": str(original_keep_workbook_path),
+                        "full_screening_keep_workbook": str(routed.get("routed_keep_workbook") or ""),
+                        "mail_only_workbook": str(routed.get("mail_only_workbook") or ""),
+                    },
+                }
+                if keep_workbook_overridden:
+                    summary["artifacts"]["keep_workbook_before_short_circuit"] = str(original_keep_workbook_path)
+                    summary["artifacts"]["keep_workbook"] = str(routed.get("routed_keep_workbook") or "")
+                    summary["artifacts"]["pre_keep_mail_only_workbook"] = str(routed.get("mail_only_workbook") or "")
+                elif mail_only_count > 0:
+                    summary["artifacts"]["pre_keep_mail_only_workbook"] = str(routed.get("mail_only_workbook") or "")
+            except Exception as exc:  # noqa: BLE001
+                pre_keep_short_circuit = {
+                    "status": "best_effort_failed",
+                    "keep_workbook_path": str(original_keep_workbook_path),
+                    "error": str(exc) or exc.__class__.__name__,
+                }
+        summary["steps"]["pre_keep_short_circuit"] = pre_keep_short_circuit
+
+        keep_workbook_path = keep_workbook_for_cache_path
         mail_db_path = Path(mail_sync_step["artifacts"]["mail_db_path"]).expanduser().resolve()
         thread_assignment_cache: dict[str, Any]
         if not owner_scope:
@@ -2294,17 +2379,19 @@ def run_task_upload_to_keep_list_pipeline(
                 "keep_workbook": summary["artifacts"]["keep_workbook"],
                 "template_workbook": summary["artifacts"]["template_workbook"],
                 "thread_assignment_cache": summary["artifacts"]["thread_assignment_cache"],
+                "pre_keep_mail_only_workbook": str(summary["artifacts"].get("pre_keep_mail_only_workbook") or ""),
+                "pre_keep_short_circuit": dict(summary["steps"].get("pre_keep_short_circuit") or {}),
             }
         )
         summary["resume_points"]["keep_list"] = keep_list_resume_point
         summary["canonical_artifacts"]["keep_list"] = _json_clone(summary["resume_points"]["keep_list"])
-        linked_bitable_url = str((summary.get("steps", {}).get("task_assets") or {}).get("linked_bitable_url") or "").strip()
         summary["downstream_handoff"] = {
             "boundary_step": "keep-list",
             "resume_point_key": "keep_list",
             "matching_strategy": normalized_matching_strategy,
             "runner_script": "scripts/run_keep_list_screening_pipeline.py",
             "keep_workbook": summary["artifacts"]["keep_workbook"],
+            "pre_keep_mail_only_workbook": str(summary["artifacts"].get("pre_keep_mail_only_workbook") or ""),
             "template_workbook": summary["artifacts"]["template_workbook"],
             "linked_bitable_url": linked_bitable_url,
             "task_owner": {

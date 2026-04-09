@@ -42,10 +42,21 @@ CANONICAL_UPLOAD_EXPORT_COLUMNS = [
     "mail_resolution_confidence",
     "mail_apify_gate",
     "mail_evidence",
+    "resolution_evidence",
     "mail_raw_path",
     "latest_external_from",
     "latest_external_sent_at",
     "subject",
+    "candidate_sources",
+    "original_decision",
+    "final_decision",
+    "original_reject_reason",
+    "business_signal_detected",
+    "review_priority",
+    "rescue_rule_applied",
+    "confidence_before_rescue",
+    "confidence_after_rescue",
+    "hard_reject_blocked_rescue",
 ]
 SENDING_LIST_COUNTRY_ALIASES = ("country", "国家", "region", "地区")
 SENDING_LIST_CREATOR_ALIASES = ("creator", "nickname", "达人", "红人", "博主")
@@ -135,6 +146,13 @@ def _normalize_mail_thread_confidence(value: Any) -> str:
 
 def _normalize_mail_thread_sent_at(value: Any) -> str:
     return isoformat_shanghai_datetime(value) or _clean_mail_thread_value(value)
+
+
+def _normalize_mail_thread_flag(value: Any) -> str:
+    text = _clean_mail_thread_value(value).strip().casefold()
+    if text in {"true", "false"}:
+        return text
+    return text
 
 
 def _normalize_mail_thread_platform(value: Any) -> str:
@@ -306,10 +324,21 @@ def build_canonical_upload_from_mail_thread_funnel(
                 "mail_resolution_confidence": resolution_confidence,
                 "mail_apify_gate": apify_gate,
                 "mail_evidence": mail_evidence,
+                "resolution_evidence": _clean_mail_thread_value(row_dict.get("resolution_evidence")),
                 "mail_raw_path": _clean_mail_thread_value(row_dict.get("raw_path")),
                 "latest_external_from": _clean_mail_thread_value(row_dict.get("latest_external_from")),
                 "latest_external_sent_at": latest_external_sent_at,
                 "subject": _clean_mail_thread_value(row_dict.get("subject")),
+                "candidate_sources": _clean_mail_thread_value(row_dict.get("candidate_sources")),
+                "original_decision": _clean_mail_thread_value(row_dict.get("original_decision")),
+                "final_decision": _clean_mail_thread_value(row_dict.get("final_decision")),
+                "original_reject_reason": _clean_mail_thread_value(row_dict.get("original_reject_reason")),
+                "business_signal_detected": _normalize_mail_thread_flag(row_dict.get("business_signal_detected")),
+                "review_priority": _clean_mail_thread_value(row_dict.get("review_priority")),
+                "rescue_rule_applied": _clean_mail_thread_value(row_dict.get("rescue_rule_applied")),
+                "confidence_before_rescue": _clean_mail_thread_value(row_dict.get("confidence_before_rescue")),
+                "confidence_after_rescue": _clean_mail_thread_value(row_dict.get("confidence_after_rescue")),
+                "hard_reject_blocked_rescue": _normalize_mail_thread_flag(row_dict.get("hard_reject_blocked_rescue")),
             }
             converted_row_count += 1
 

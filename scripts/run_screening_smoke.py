@@ -182,8 +182,9 @@ def save_binary_response(response, output_path: Path) -> None:
     output_path.write_bytes(response.data)
 
 
-def _build_local_final_review_workbook(platform: str) -> bytes:
-    profile_reviews = backend_app.load_profile_reviews(platform)
+def _build_local_final_review_workbook(platform: str, *, profile_reviews=None) -> bytes:
+    if profile_reviews is None:
+        profile_reviews = backend_app.load_profile_reviews(platform)
     if not profile_reviews:
         raise RuntimeError(f"{platform} final review fallback failed: no profile review data available")
     visual_results = backend_app.load_visual_results(platform)
@@ -196,8 +197,17 @@ def _build_local_final_review_workbook(platform: str) -> bytes:
     return bytes(workbook)
 
 
-def _save_final_review_with_missing_profile_fallback(client, platform: str, output_path: Path) -> str:
-    response = client.post(f"/api/download/{platform}/final-review", json={})
+def _save_final_review_with_missing_profile_fallback(
+    client,
+    platform: str,
+    output_path: Path,
+    *,
+    final_review_profile_reviews=None,
+) -> str:
+    request_payload = {}
+    if final_review_profile_reviews is not None:
+        request_payload["profile_reviews"] = list(final_review_profile_reviews)
+    response = client.post(f"/api/download/{platform}/final-review", json=request_payload)
     if response.status_code < 400:
         save_binary_response(response, output_path)
         return "api"
@@ -205,11 +215,16 @@ def _save_final_review_with_missing_profile_fallback(client, platform: str, outp
     if str(payload.get("error_code") or "").strip() != "FINAL_REVIEW_BLOCKED_BY_MISSING_PROFILES":
         raise RuntimeError(f"download failed for {output_path.name}: HTTP {response.status_code} {payload}")
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.write_bytes(_build_local_final_review_workbook(platform))
+    output_path.write_bytes(
+        _build_local_final_review_workbook(
+            platform,
+            profile_reviews=final_review_profile_reviews,
+        )
+    )
     return "local_missing_profile_fallback"
 
 
-def export_platform_artifacts(client, platform: str, export_dir: Path) -> dict[str, str]:
+def export_platform_artifacts(client, platform: str, export_dir: Path, *, final_review_profile_reviews=None) -> dict[str, str]:
     outputs = {}
     prescreen_path = export_dir / f"{platform}_prescreen_review.xlsx"
     save_binary_response(client.get(f"/api/download/{platform}/prescreen-review"), prescreen_path)
@@ -236,6 +251,7 @@ def export_platform_artifacts(client, platform: str, export_dir: Path) -> dict[s
         client,
         platform,
         final_review_path,
+        final_review_profile_reviews=final_review_profile_reviews,
     )
     outputs["final_review"] = str(final_review_path)
 

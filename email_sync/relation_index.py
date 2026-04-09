@@ -14,6 +14,24 @@ SUBJECT_PREFIX_PATTERN = re.compile(
     r"^\s*(?:(?:re|fw|fwd)\s*:\s*|回复\s*:\s*|转发\s*:\s*)",
     re.IGNORECASE,
 )
+PUBLIC_WEBMAIL_DOMAINS = {
+    "163.com",
+    "126.com",
+    "aliyun.com",
+    "gmail.com",
+    "googlemail.com",
+    "hotmail.com",
+    "icloud.com",
+    "live.com",
+    "outlook.com",
+    "proton.me",
+    "protonmail.com",
+    "qq.com",
+    "sina.com",
+    "sohu.com",
+    "yahoo.com",
+    "yahoo.co.jp",
+}
 
 
 def _utc_now() -> str:
@@ -150,6 +168,34 @@ def _pick_later(current: Optional[str], candidate: Optional[str]) -> Optional[st
     return candidate if candidate > current else current
 
 
+def _extract_domain(email: str) -> str:
+    normalized = normalize_email(email)
+    if "@" not in normalized:
+        return ""
+    return normalized.rsplit("@", 1)[-1]
+
+
+def _expand_self_emails_with_internal_aliases(
+    role_map: dict[str, List[dict[str, str]]],
+    self_emails: set[str],
+) -> set[str]:
+    internal_domains = {
+        domain
+        for domain in (_extract_domain(email) for email in self_emails)
+        if domain and domain not in PUBLIC_WEBMAIL_DOMAINS
+    }
+    if not internal_domains:
+        return set(self_emails)
+
+    expanded = set(self_emails)
+    for items in role_map.values():
+        for item in items:
+            email = normalize_email(item.get("address"))
+            if _extract_domain(email) in internal_domains:
+                expanded.add(email)
+    return expanded
+
+
 def _resolve_direction(
     role_map: dict[str, List[dict[str, str]]],
     self_emails: set[str],
@@ -223,6 +269,7 @@ def rebuild_relation_index(db: Database) -> dict[str, int]:
             "sender": _load_addresses(row["sender_json"]),
         }
         self_emails = {normalize_email(row["account_email"])} if normalize_email(row["account_email"]) else set()
+        self_emails = _expand_self_emails_with_internal_aliases(role_map, self_emails)
         sent_sort_at = row["sent_at"] or row["internal_date"] or row["created_at"]
         direction = _resolve_direction(role_map, self_emails, row["folder_name"] or "")
         normalized_subject = normalize_subject(row["subject"])

@@ -27,11 +27,13 @@ from backend.final_export_merge import (
     _normalize_url,
     _resolve_existing_local_paths,
 )
+from email_sync.known_thread_update import process_known_thread_updates
 from email_sync.thread_assignments import lookup_thread_assignment
 
 
 SUCCESSFUL_DOWNSTREAM_STATUSES = {"completed", "completed_with_partial_scrape"}
 MAIL_ONLY_UPDATE_MODE = "mail_only_update"
+CREATE_OR_MAIL_ONLY_UPDATE_MODE = "create_or_mail_only_update"
 CREATE_OR_UPDATE_MODE = "create_or_update"
 _TASK_GROUP_ALIASES = {
     "skg": {"skg", "skg1", "skg-1", "skg2", "skg-2"},
@@ -56,6 +58,72 @@ _LAST_MAIL_KEYS = (
     "last_mail_raw_path",
 )
 _EMAIL_PATTERN = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.IGNORECASE)
+_FREE_EMAIL_DOMAINS = {
+    "gmail.com",
+    "outlook.com",
+    "hotmail.com",
+    "icloud.com",
+    "yahoo.com",
+    "yahoo.co.uk",
+    "live.com",
+    "aol.com",
+    "gmx.de",
+    "web.de",
+    "proton.me",
+    "protonmail.com",
+}
+_BUSINESS_SIGNAL_PATTERNS: dict[str, re.Pattern[str]] = {
+    "business_collab": re.compile(r"\b(paid\s+collab(?:oration)?|collab(?:oration)?|partnership|campaign)\b", re.I),
+    "business_pricing": re.compile(r"\b(rate\s*card|rates?|pricing|quote|budget|fee|fees|price)\b", re.I),
+    "business_deliverables": re.compile(r"\b(deliverables?|usage rights?|whitelisting|media kit|invoice|contract)\b", re.I),
+    "business_currency": re.compile(r"(?:[$€£]\s?\d{2,}|usd\s?\d{2,})", re.I),
+}
+_SCRAPE_FAILED_PATTERNS = (
+    re.compile(r"(抓取失败|scrape failed|failed to scrape|unable to scrape|fetch failed|采集失败)", re.I),
+    re.compile(r"(profile.*unavailable|资料抓取失败|页面抓取失败)", re.I),
+)
+_INSUFFICIENT_PROFILE_PATTERNS = (
+    re.compile(r"(资料不足|信息不足|insufficient profile|not enough (?:profile )?data|内容太少|样本太少)", re.I),
+    re.compile(r"(profile data missing|insufficient content|low data)", re.I),
+)
+_RECENTLY_INACTIVE_PATTERNS = (
+    re.compile(r"(近\s*30\s*天.*无更新|最近\s*30\s*天.*无更新|30\s*days?.*no (?:recent )?posts?)", re.I),
+    re.compile(r"(inactive.*30\s*days?|no recent posts?|recently inactive)", re.I),
+)
+_HARD_REJECT_PATTERNS = (
+    re.compile(r"(black\s*list|blacklisted|blacklist|fraud|scam|fake followers?)", re.I),
+    re.compile(r"(minor|underage|未成年|adult content|explicit content|赌博|illegal|违法)", re.I),
+    re.compile(r"(politics|religion|hate speech|violent|violence)", re.I),
+)
+_RESCUE_SUMMARY_KEYS = (
+    "regex_pass1_rescued_count",
+    "regex_pass2_rescued_count",
+    "full_body_only_hit_count",
+    "beacons_linktree_hit_count",
+    "r1_rescue_count",
+    "r2_rescue_count",
+    "r3_rescue_count",
+    "r4_rescue_count",
+    "rescued_to_manual_count",
+    "rescued_to_keep_count",
+    "hard_reject_blocked_rescue_count",
+    "llm_invocation_count_before",
+    "llm_invocation_count_after",
+)
+_MAIL_ONLY_BUCKET_SUMMARY_KEYS = (
+    "mail_only_creator_replied_count",
+    "mail_only_outbound_only_skip_count",
+    "mail_only_creator_identity_unresolved_count",
+    "mail_only_thread_key_missing_count",
+    "mail_only_candidate_count_before_source_dedup",
+    "mail_only_candidate_count_after_source_dedup",
+    "mail_only_source_identity_deduped_count",
+    "mail_only_routed_mail_only_candidate_count",
+    "mail_only_routed_full_screening_candidate_count",
+    "mail_only_upload_decision_count",
+    "mail_only_upload_live_existing_hit_count",
+    "mail_only_upload_mail_idempotency_skip_count",
+)
 
 
 def _load_runtime_dependencies() -> dict[str, Any]:
@@ -193,6 +261,13 @@ def _path_summary(path: Path | None, *, source: str, kind: str) -> dict[str, Any
     }
 
 
+def _resolve_optional_path(raw_value: Any) -> Path | None:
+    text = _clean_text(raw_value)
+    if not text:
+        return None
+    return Path(text).expanduser()
+
+
 def _build_failure_payload(
     *,
     stage: str,
@@ -270,6 +345,8 @@ def _extract_creator_id(keep_row: dict[str, Any]) -> str:
     return _extract_handle(
         keep_row.get("@username")
         or keep_row.get("达人ID")
+        or keep_row.get("final_creator_id")
+        or keep_row.get("final_id_final")
         or keep_row.get("URL")
         or keep_row.get("主页链接")
     )
@@ -288,6 +365,420 @@ def _coerce_non_negative_int(value: Any) -> int:
 
 def _extract_ai_status(fields: dict[str, Any]) -> str:
     return _flatten_field_value(_get_field_value(fields, "ai是否通过", "ai 是否通过"))
+
+
+def _empty_rescue_stats() -> dict[str, int]:
+    return {key: 0 for key in _RESCUE_SUMMARY_KEYS}
+
+
+def _empty_mail_only_bucket_summary() -> dict[str, int]:
+    return {key: 0 for key in _MAIL_ONLY_BUCKET_SUMMARY_KEYS}
+
+
+def _normalize_compact_text(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", _clean_text(value).casefold())
+
+
+def _parse_string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = _clean_text(value)
+    if not text:
+        return []
+    try:
+        payload = json.loads(text)
+    except json.JSONDecodeError:
+        return [item.strip() for item in re.split(r"[|,;\n]", text) if item.strip()]
+    if isinstance(payload, list):
+        return [str(item).strip() for item in payload if str(item).strip()]
+    return []
+
+
+def _serialize_string_list(values: Sequence[str] | None) -> str:
+    payload = [str(item).strip() for item in (values or []) if str(item).strip()]
+    return json.dumps(payload, ensure_ascii=False) if payload else ""
+
+
+def _parse_boolish(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = _clean_text(value).casefold()
+    return text in {"1", "true", "yes", "y", "是"}
+
+
+def _normalize_decision(value: Any) -> str:
+    text = _clean_text(value).casefold()
+    if text in {"keep", "manual", "reject"}:
+        return text
+    return ""
+
+
+def _derive_original_decision(row: dict[str, Any]) -> str:
+    explicit = _normalize_decision(row.get("original_decision"))
+    if explicit:
+        return explicit
+    ai_status = _clean_text(row.get("ai是否通过")).casefold()
+    if ai_status in {"是", "通过", "pass", "keep", "yes"}:
+        return "keep"
+    if ai_status in {"转人工", "manual", "review", "待补充"}:
+        return "manual"
+    if ai_status in {"否", "reject", "no"}:
+        return "reject"
+    explicit_final = _normalize_decision(row.get("final_decision"))
+    if explicit_final:
+        return explicit_final
+    return "manual"
+
+
+def _build_row_lookup_key(row: dict[str, Any]) -> str:
+    platform = _normalize_platform(row.get("平台") or row.get("Platform"))
+    creator_id = _extract_handle(
+        _first_non_blank(
+            row.get("达人ID"),
+            row.get("@username"),
+            row.get("final_creator_id"),
+            row.get("final_id_final"),
+            row.get("主页链接"),
+            row.get("URL"),
+        )
+    )
+    return _build_record_key(platform, creator_id)
+
+
+def _build_source_keep_index(rows: Sequence[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    result: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        key = _build_row_lookup_key(row)
+        if key:
+            result[key] = dict(row)
+    return result
+
+
+def _build_business_signal_markers(*values: Any) -> list[str]:
+    haystack = "\n".join(_clean_text(value) for value in values if _clean_text(value))
+    if not haystack:
+        return []
+    result: list[str] = []
+    for label, pattern in _BUSINESS_SIGNAL_PATTERNS.items():
+        if pattern.search(haystack):
+            result.append(label)
+    return result
+
+
+def _matches_any_pattern(patterns: Sequence[re.Pattern[str]], *values: Any) -> bool:
+    haystack = "\n".join(_clean_text(value) for value in values if _clean_text(value))
+    return bool(haystack) and any(pattern.search(haystack) for pattern in patterns)
+
+
+def _looks_like_creator_identity(candidate: str, creator_id: str) -> bool:
+    normalized_candidate = _normalize_compact_text(candidate)
+    normalized_creator = _normalize_compact_text(creator_id)
+    if not normalized_candidate or not normalized_creator:
+        return False
+    if normalized_candidate == normalized_creator:
+        return True
+    if min(len(normalized_candidate), len(normalized_creator)) < 5:
+        return False
+    return normalized_candidate in normalized_creator or normalized_creator in normalized_candidate
+
+
+def _row_has_creator_greeting(body_text: str, creator_id: str) -> bool:
+    normalized_creator = _clean_text(creator_id)
+    if not body_text or not normalized_creator:
+        return False
+    pattern = re.compile(
+        rf"(?im)(?:^|[\n>])\s*(?:hi|hello|hallo)\s*@?\s*\*?{re.escape(normalized_creator)}\*?\b"
+    )
+    return bool(pattern.search(body_text))
+
+
+def _row_domain_looks_personal_brand(email_value: str, creator_id: str) -> bool:
+    email_text = _clean_text(email_value).casefold()
+    if "@" not in email_text:
+        return False
+    domain = email_text.split("@", 1)[1].strip()
+    if not domain or domain in _FREE_EMAIL_DOMAINS:
+        return False
+    domain_stem = domain.split(".", 1)[0]
+    return _looks_like_creator_identity(domain_stem, creator_id)
+
+
+def _derive_rescue_confidence(row: dict[str, Any], source_row: dict[str, Any] | None = None) -> str:
+    source = dict(source_row or {})
+    return _clean_text(
+        _first_non_blank(
+            row.get("confidence_after_rescue"),
+            row.get("confidence_before_rescue"),
+            row.get("resolution_confidence_final"),
+            row.get("mail_resolution_confidence"),
+            source.get("resolution_confidence_final"),
+            source.get("mail_resolution_confidence"),
+            source.get("confidence_after_rescue"),
+            source.get("confidence_before_rescue"),
+        )
+    ).casefold()
+
+
+def _merge_source_metadata_into_payload_row(row: dict[str, Any], source_row: dict[str, Any] | None) -> dict[str, Any]:
+    updated = dict(row)
+    source = dict(source_row or {})
+
+    def copy_if_blank(target_key: str, *source_keys: str) -> None:
+        if _clean_text(updated.get(target_key)):
+            return
+        for source_key in source_keys:
+            candidate = source.get(source_key)
+            if candidate is None:
+                continue
+            if isinstance(candidate, list):
+                if candidate:
+                    updated[target_key] = _serialize_string_list(candidate)
+                    return
+                continue
+            cleaned = _clean_text(candidate)
+            if cleaned:
+                updated[target_key] = cleaned
+                return
+
+    copy_if_blank("candidate_sources", "candidate_sources")
+    copy_if_blank("resolution_evidence", "resolution_evidence", "mail_evidence")
+    copy_if_blank("business_signal_detected", "business_signal_detected")
+    copy_if_blank("review_priority", "review_priority")
+    copy_if_blank("rescue_rule_applied", "rescue_rule_applied")
+    copy_if_blank("confidence_before_rescue", "confidence_before_rescue", "resolution_confidence_final", "mail_resolution_confidence")
+    copy_if_blank("confidence_after_rescue", "confidence_after_rescue", "resolution_confidence_final", "mail_resolution_confidence")
+    copy_if_blank("hard_reject_blocked_rescue", "hard_reject_blocked_rescue")
+    copy_if_blank("original_decision", "original_decision")
+    copy_if_blank("final_decision", "final_decision")
+    copy_if_blank("original_reject_reason", "original_reject_reason")
+    copy_if_blank("latest_external_from", "latest_external_from")
+    copy_if_blank("latest_external_sent_at", "latest_external_sent_at")
+    copy_if_blank("subject", "subject")
+    copy_if_blank("latest_external_full_body", "latest_external_full_body")
+    copy_if_blank("latest_external_clean_body", "latest_external_clean_body")
+    copy_if_blank("resolution_stage_final", "resolution_stage_final", "mail_resolution_stage")
+    copy_if_blank("resolution_confidence_final", "resolution_confidence_final", "mail_resolution_confidence")
+    return updated
+
+
+def _build_default_row_metadata(row: dict[str, Any], source_row: dict[str, Any] | None = None) -> dict[str, Any]:
+    updated = _merge_source_metadata_into_payload_row(row, source_row)
+    original_decision = _derive_original_decision(updated)
+    final_decision = _normalize_decision(updated.get("final_decision")) or original_decision
+    confidence = _derive_rescue_confidence(updated, source_row=source_row)
+    candidate_sources = _parse_string_list(updated.get("candidate_sources"))
+    business_markers = _build_business_signal_markers(
+        updated.get("subject"),
+        updated.get("latest_external_full_body"),
+        updated.get("full body"),
+        updated.get("ai筛号反馈理由"),
+        updated.get("ai评价"),
+        updated.get("当前网红报价"),
+    )
+    updated["candidate_sources"] = _serialize_string_list(candidate_sources)
+    updated["original_decision"] = original_decision
+    updated["final_decision"] = final_decision
+    updated["original_reject_reason"] = _clean_text(updated.get("original_reject_reason")) or (
+        _clean_text(updated.get("ai筛号反馈理由")) if original_decision == "reject" else ""
+    )
+    updated["business_signal_detected"] = "true" if (
+        _parse_boolish(updated.get("business_signal_detected")) or bool(business_markers)
+    ) else "false"
+    updated["review_priority"] = _clean_text(updated.get("review_priority")) or ("normal" if final_decision == "manual" else "")
+    updated["rescue_rule_applied"] = _clean_text(updated.get("rescue_rule_applied"))
+    updated["confidence_before_rescue"] = _clean_text(updated.get("confidence_before_rescue")) or confidence
+    updated["confidence_after_rescue"] = _clean_text(updated.get("confidence_after_rescue")) or confidence
+    updated["hard_reject_blocked_rescue"] = "true" if _parse_boolish(updated.get("hard_reject_blocked_rescue")) else "false"
+    return updated
+
+
+def _row_has_active_reply(row: dict[str, Any]) -> bool:
+    return bool(
+        _clean_text(row.get("达人最后一次回复邮件时间"))
+        or _clean_text(row.get("full body"))
+        or _clean_text(row.get("达人回复的最后一封邮件内容"))
+    )
+
+
+def _build_supporting_evidence(row: dict[str, Any]) -> list[str]:
+    creator_id = _extract_handle(_first_non_blank(row.get("达人ID"), row.get("@username"), row.get("final_creator_id")))
+    from_email = _clean_text(row.get("latest_external_from")).casefold()
+    body_text = _first_non_blank(row.get("latest_external_full_body"), row.get("full body"), row.get("达人回复的最后一封邮件内容"))
+    candidate_sources = _parse_string_list(row.get("candidate_sources"))
+    signals: list[str] = []
+    if creator_id and "@" in from_email and _looks_like_creator_identity(from_email.split("@", 1)[0], creator_id):
+        signals.append("email_localpart_like_handle")
+    if creator_id and _row_has_creator_greeting(body_text, creator_id):
+        signals.append("greeting_hits_single_creator_name")
+    if creator_id and _row_domain_looks_personal_brand(from_email, creator_id):
+        signals.append("domain_like_personal_brand")
+    if any("quoted" in source for source in candidate_sources):
+        signals.append("quoted_thread_single_candidate")
+    return signals
+
+
+def _evaluate_rescue_rule(row: dict[str, Any]) -> dict[str, Any]:
+    original_decision = _derive_original_decision(row)
+    if original_decision != "reject":
+        return {"applied": False, "blocked": False}
+    reason_text = "\n".join(
+        _clean_text(value)
+        for value in (
+            row.get("ai筛号反馈理由"),
+            row.get("ai评价"),
+            row.get("resolution_evidence"),
+        )
+        if _clean_text(value)
+    )
+    business_signal = _parse_boolish(row.get("business_signal_detected"))
+    active_reply = _row_has_active_reply(row)
+    supporting_evidence = _build_supporting_evidence(row)
+    stage = _clean_text(row.get("resolution_stage_final")).casefold()
+    confidence = _clean_text(
+        _first_non_blank(
+            row.get("resolution_confidence_final"),
+            row.get("confidence_before_rescue"),
+            row.get("mail_resolution_confidence"),
+        )
+    ).casefold()
+
+    def blocked(rule_name: str, reason: str) -> dict[str, Any]:
+        return {
+            "applied": False,
+            "blocked": True,
+            "rule_name": rule_name,
+            "reason": reason,
+            "supporting_evidence": supporting_evidence,
+        }
+
+    if business_signal and _matches_any_pattern(_SCRAPE_FAILED_PATTERNS, reason_text):
+        if _matches_any_pattern(_HARD_REJECT_PATTERNS, reason_text):
+            return blocked("r1_scrape_failed_with_business_signal", "hard_reject")
+        return {
+            "applied": True,
+            "blocked": False,
+            "rule_name": "r1_scrape_failed_with_business_signal",
+            "final_decision": "manual",
+            "review_priority": "high",
+            "reason": "抓取失败，但邮件线程里有明确商务信号，转高优先人工复核。",
+            "supporting_evidence": supporting_evidence,
+        }
+    if active_reply and _matches_any_pattern(_RECENTLY_INACTIVE_PATTERNS, reason_text):
+        if _matches_any_pattern(_HARD_REJECT_PATTERNS, reason_text):
+            return blocked("r2_recently_inactive_but_active_reply", "hard_reject")
+        return {
+            "applied": True,
+            "blocked": False,
+            "rule_name": "r2_recently_inactive_but_active_reply",
+            "final_decision": "manual",
+            "review_priority": "high",
+            "reason": "近 30 天内容活跃度不足，但邮件线程里有明确活跃回复，转高优先人工复核。",
+            "supporting_evidence": supporting_evidence,
+        }
+    if active_reply and _matches_any_pattern(_INSUFFICIENT_PROFILE_PATTERNS, reason_text):
+        if _matches_any_pattern(_HARD_REJECT_PATTERNS, reason_text):
+            return blocked("r3_insufficient_profile_data_but_active_reply", "hard_reject")
+        return {
+            "applied": True,
+            "blocked": False,
+            "rule_name": "r3_insufficient_profile_data_but_active_reply",
+            "final_decision": "manual",
+            "review_priority": "high",
+            "reason": "资料侧信息不足，但邮件线程里有明确活跃回复，转高优先人工复核。",
+            "supporting_evidence": supporting_evidence,
+        }
+    if stage == "llm" and confidence == "medium" and len(supporting_evidence) >= 2:
+        if _matches_any_pattern(_HARD_REJECT_PATTERNS, reason_text):
+            return blocked("r4_medium_with_supporting_evidence", "hard_reject")
+        return {
+            "applied": True,
+            "blocked": False,
+            "rule_name": "r4_medium_with_supporting_evidence",
+            "final_decision": "manual",
+            "review_priority": "high",
+            "reason": "LLM 仅中等置信度，但弱证据一致，转高优先人工复核。",
+            "supporting_evidence": supporting_evidence,
+        }
+    return {"applied": False, "blocked": False, "supporting_evidence": supporting_evidence}
+
+
+def _apply_conservative_rescue_layer(
+    *,
+    display_rows: list[dict[str, Any]],
+    payload_rows: list[dict[str, Any]],
+    source_keep_rows: Sequence[dict[str, Any]],
+    task_name: str,
+    task_scope: str,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, int]]:
+    updated_display_rows = [dict(row) for row in display_rows]
+    display_index = {_build_row_lookup_key(row): idx for idx, row in enumerate(updated_display_rows)}
+    keep_index = _build_source_keep_index(source_keep_rows)
+    stats = _empty_rescue_stats()
+    updated_payload_rows: list[dict[str, Any]] = []
+    for row in payload_rows:
+        updated_row = _build_default_row_metadata(row, source_row=keep_index.get(_build_row_lookup_key(row)))
+        original_decision = _derive_original_decision(updated_row)
+        rescue_result = _evaluate_rescue_rule(updated_row)
+        key = _build_row_lookup_key(updated_row)
+        if rescue_result.get("blocked"):
+            updated_row["hard_reject_blocked_rescue"] = "true"
+            stats["hard_reject_blocked_rescue_count"] += 1
+            event = {
+                "task_name": task_name,
+                "thread_id": _clean_text(updated_row.get("thread_key") or updated_row.get("mail_thread_key")),
+                "creator_id": _clean_text(updated_row.get("达人ID")),
+                "original_stage": _clean_text(updated_row.get("resolution_stage_final")),
+                "original_confidence": _clean_text(updated_row.get("confidence_before_rescue") or updated_row.get("resolution_confidence_final")),
+                "new_stage": _clean_text(updated_row.get("resolution_stage_final")),
+                "new_confidence": _clean_text(updated_row.get("confidence_after_rescue") or updated_row.get("resolution_confidence_final")),
+                "rule_name": rescue_result.get("rule_name"),
+                "reason": rescue_result.get("reason"),
+                "evidence": list(rescue_result.get("supporting_evidence") or []),
+                "candidate_sources": _parse_string_list(updated_row.get("candidate_sources")),
+            }
+            _emit_runtime_progress(task_scope, f"rescue_blocked={json.dumps(event, ensure_ascii=False)}")
+        elif rescue_result.get("applied"):
+            updated_row["final_decision"] = _clean_text(rescue_result.get("final_decision")) or "manual"
+            updated_row["review_priority"] = _clean_text(rescue_result.get("review_priority")) or "high"
+            updated_row["rescue_rule_applied"] = _clean_text(rescue_result.get("rule_name"))
+            updated_row["hard_reject_blocked_rescue"] = "false"
+            if not _clean_text(updated_row.get("confidence_before_rescue")):
+                updated_row["confidence_before_rescue"] = _clean_text(updated_row.get("resolution_confidence_final"))
+            if not _clean_text(updated_row.get("confidence_after_rescue")):
+                updated_row["confidence_after_rescue"] = _clean_text(updated_row.get("confidence_before_rescue"))
+            updated_row["ai是否通过"] = "转人工" if updated_row["final_decision"] == "manual" else "是"
+            updated_row["ai筛号反馈理由"] = _clean_text(rescue_result.get("reason"))
+            updated_row["ai评价"] = _clean_text(rescue_result.get("reason"))
+            stats[f"{updated_row['rescue_rule_applied'][:2]}_rescue_count"] += 1
+            if updated_row["final_decision"] == "manual":
+                stats["rescued_to_manual_count"] += 1
+            elif updated_row["final_decision"] == "keep":
+                stats["rescued_to_keep_count"] += 1
+            event = {
+                "task_name": task_name,
+                "thread_id": _clean_text(updated_row.get("thread_key") or updated_row.get("mail_thread_key")),
+                "creator_id": _clean_text(updated_row.get("达人ID")),
+                "original_stage": _clean_text(updated_row.get("resolution_stage_final")),
+                "original_confidence": _clean_text(updated_row.get("confidence_before_rescue") or updated_row.get("resolution_confidence_final")),
+                "new_stage": _clean_text(updated_row.get("resolution_stage_final")),
+                "new_confidence": _clean_text(updated_row.get("confidence_after_rescue") or updated_row.get("resolution_confidence_final")),
+                "rule_name": updated_row.get("rescue_rule_applied"),
+                "reason": updated_row.get("ai筛号反馈理由"),
+                "evidence": list(rescue_result.get("supporting_evidence") or []),
+                "candidate_sources": _parse_string_list(updated_row.get("candidate_sources")),
+            }
+            _emit_runtime_progress(task_scope, f"rescue_applied={json.dumps(event, ensure_ascii=False)}")
+        elif original_decision == "manual" and not _clean_text(updated_row.get("review_priority")):
+            updated_row["review_priority"] = "normal"
+        updated_payload_rows.append(updated_row)
+        if key and key in display_index:
+            display_row = updated_display_rows[display_index[key]]
+            display_row["ai是否通过"] = _clean_text(updated_row.get("ai是否通过")) or _clean_text(display_row.get("ai是否通过"))
+            display_row["ai筛号反馈理由"] = _clean_text(updated_row.get("ai筛号反馈理由")) or _clean_text(display_row.get("ai筛号反馈理由"))
+            display_row["ai评价"] = _clean_text(updated_row.get("ai评价")) or _clean_text(display_row.get("ai评价"))
+    return updated_display_rows, updated_payload_rows, stats
 
 
 def _build_owner_context_from_upstream(upstream_summary: dict[str, Any], fallback_item: dict[str, Any]) -> dict[str, str]:
@@ -378,6 +869,8 @@ def _build_mail_only_rows(
     shared_mail_raw_dir: Path | None,
     shared_mail_data_dir: Path | None,
     keep_workbook: Path,
+    update_mode: str = MAIL_ONLY_UPDATE_MODE,
+    preserve_existing_ai_fields: bool = True,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     creator_id = _extract_creator_id(keep_row) or _flatten_field_value(_get_field_value(existing_fields, "达人ID"))
     platform = _extract_platform(keep_row) or _flatten_field_value(_get_field_value(existing_fields, "平台"))
@@ -391,6 +884,22 @@ def _build_mail_only_rows(
         or _clean_text(owner_context.get("employee_name"))
         or _flatten_field_value(_get_field_value(existing_fields, "达人对接人"))
     )
+    ai_status = _extract_ai_status(existing_fields) if preserve_existing_ai_fields else "待补充"
+    ai_reason = (
+        _flatten_field_value(_get_field_value(existing_fields, "ai筛号反馈理由"))
+        if preserve_existing_ai_fields
+        else ""
+    )
+    ai_label = (
+        _flatten_field_value(_get_field_value(existing_fields, "标签(ai)", "标签（ai）"))
+        if preserve_existing_ai_fields
+        else ""
+    )
+    ai_evaluation = (
+        _flatten_field_value(_get_field_value(existing_fields, "ai评价", "ai 评价"))
+        if preserve_existing_ai_fields
+        else ""
+    )
     display_row = {
         "达人ID": creator_id,
         "平台": platform,
@@ -403,10 +912,10 @@ def _build_mail_only_rows(
         "full body": last_mail_content,
         "达人回复的最后一封邮件内容": last_mail_content,
         "达人对接人": owner_display_name,
-        "ai是否通过": _extract_ai_status(existing_fields),
-        "ai筛号反馈理由": _flatten_field_value(_get_field_value(existing_fields, "ai筛号反馈理由")),
-        "标签(ai)": _flatten_field_value(_get_field_value(existing_fields, "标签(ai)", "标签（ai）")),
-        "ai评价": _flatten_field_value(_get_field_value(existing_fields, "ai评价", "ai 评价")),
+        "ai是否通过": ai_status,
+        "ai筛号反馈理由": ai_reason,
+        "标签(ai)": ai_label,
+        "ai评价": ai_evaluation,
     }
     attachment_paths = _build_mail_attachment_paths(
         keep_row,
@@ -426,7 +935,7 @@ def _build_mail_only_rows(
             "任务名": _clean_text(owner_context.get("task_name")),
             "__last_mail_raw_path": _clean_text(keep_row.get("brand_message_raw_path") or keep_row.get("last_mail_raw_path")),
             "__feishu_attachment_local_paths": attachment_paths,
-            "__feishu_update_mode": MAIL_ONLY_UPDATE_MODE,
+            "__feishu_update_mode": update_mode,
             "last_mail_message_id": _clean_text(keep_row.get("last_mail_message_id")),
             "last_mail_sent_at": _first_non_blank(keep_row.get("last_mail_time"), keep_row.get("brand_message_sent_at")),
             "mail_update_revision": _coerce_non_negative_int(keep_row.get("mail_update_revision")),
@@ -446,11 +955,195 @@ def _extract_matched_mail_count(upstream_summary: dict[str, Any], keep_frame: pd
     return int(len(keep_frame.index))
 
 
+def _build_prepared_candidate_mail_identity_key(candidate: dict[str, Any]) -> tuple[str, str]:
+    keep_row = dict(candidate.get("keep_row") or {})
+    creator_id = _clean_text(candidate.get("creator_id")) or _extract_creator_id(keep_row)
+    platform = _clean_text(candidate.get("platform")) or _extract_platform(keep_row)
+    record_key = _build_record_key(creator_id, platform)
+    last_mail_message_id = _clean_text(candidate.get("last_mail_message_id")) or _clean_text(keep_row.get("last_mail_message_id"))
+    thread_key = _clean_text(candidate.get("thread_key")) or _clean_text(keep_row.get("evidence_thread_key"))
+    mail_update_revision = _coerce_non_negative_int(candidate.get("mail_update_revision") or keep_row.get("mail_update_revision"))
+
+    source_key = ""
+    source_label = ""
+    if last_mail_message_id:
+        source_key = f"message:{last_mail_message_id}"
+        source_label = f"last_mail_message_id={last_mail_message_id}"
+    elif thread_key and mail_update_revision > 0:
+        source_key = f"thread_revision:{thread_key}:{mail_update_revision}"
+        source_label = f"thread_key={thread_key} revision={mail_update_revision}"
+    elif thread_key:
+        source_key = f"thread:{thread_key}"
+        source_label = f"thread_key={thread_key}"
+
+    if source_key and record_key:
+        return f"{source_key}::{record_key}", f"{source_label} + 达人ID+平台={creator_id}/{platform}"
+    if source_key:
+        return source_key, source_label
+    if record_key:
+        return record_key, f"达人ID+平台={creator_id}/{platform}"
+    return "", ""
+
+
+def _deduplicate_prepared_candidates_by_mail_identity(
+    candidates: Sequence[dict[str, Any]],
+    *,
+    seen_identity_keys: set[str],
+    deduplicate_within_batch: bool = True,
+) -> dict[str, Any]:
+    deduplicated_candidates: list[dict[str, Any]] = []
+    duplicate_rows: list[dict[str, Any]] = []
+    stats = {
+        "candidate_count": 0,
+        "deduplicated_count": 0,
+    }
+    starting_seen_identity_keys = set(seen_identity_keys)
+    batch_seen_identity_keys: set[str] = set()
+    newly_seen_identity_keys: set[str] = set()
+
+    for raw_candidate in candidates:
+        candidate = dict(raw_candidate or {})
+        stats["candidate_count"] += 1
+        identity_key, identity_label = _build_prepared_candidate_mail_identity_key(candidate)
+        already_seen = identity_key in starting_seen_identity_keys
+        seen_in_batch = identity_key in batch_seen_identity_keys if deduplicate_within_batch else False
+        if identity_key and (already_seen or seen_in_batch):
+            stats["deduplicated_count"] += 1
+            duplicate_rows.append(
+                {
+                    "candidate": candidate,
+                    "identity_key": identity_key,
+                    "identity_label": identity_label,
+                }
+            )
+            continue
+        if identity_key:
+            batch_seen_identity_keys.add(identity_key)
+            newly_seen_identity_keys.add(identity_key)
+        deduplicated_candidates.append(candidate)
+
+    seen_identity_keys.update(newly_seen_identity_keys)
+    return {
+        "candidates": deduplicated_candidates,
+        "duplicate_rows": duplicate_rows,
+        "stats": stats,
+    }
+
+
+def _build_mail_only_candidate_log_entry(
+    *,
+    task_name: str,
+    keep_row: dict[str, Any],
+    owner_context: dict[str, Any] | None = None,
+    candidate: dict[str, Any] | None = None,
+    route_decision: str,
+    reason: str = "",
+    existing_record: dict[str, Any] | None = None,
+    reply_resolution: dict[str, Any] | None = None,
+    thread_assignment_resolution: dict[str, Any] | None = None,
+    next_update_mode: str = "",
+) -> dict[str, Any]:
+    resolved_candidate = dict(candidate or {})
+    resolved_keep_row = dict(keep_row or {})
+    resolved_owner_context = dict(owner_context or resolved_candidate.get("owner_context") or {})
+    resolved_existing_record = dict(existing_record or resolved_candidate.get("existing_record") or {})
+    resolved_reply = dict(reply_resolution or resolved_candidate.get("reply_resolution") or {})
+    resolved_thread_assignment = dict(
+        thread_assignment_resolution or resolved_candidate.get("thread_assignment_resolution") or {}
+    )
+    creator_id = _clean_text(resolved_candidate.get("creator_id")) or _extract_creator_id(resolved_keep_row)
+    platform = _clean_text(resolved_candidate.get("platform")) or _extract_platform(resolved_keep_row)
+    thread_key = _clean_text(resolved_candidate.get("thread_key")) or _clean_text(resolved_keep_row.get("evidence_thread_key"))
+    last_mail_message_id = _clean_text(resolved_candidate.get("last_mail_message_id")) or _clean_text(
+        resolved_keep_row.get("last_mail_message_id")
+    )
+    mail_update_revision = _coerce_non_negative_int(
+        resolved_candidate.get("mail_update_revision") or resolved_keep_row.get("mail_update_revision")
+    )
+    return {
+        "task_name": _clean_text(task_name),
+        "creator_id": creator_id,
+        "platform": platform,
+        "record_key": _build_record_key(creator_id, platform),
+        "owner_scope": _clean_text(resolved_candidate.get("owner_scope")),
+        "owner_employee_id": _clean_text(resolved_owner_context.get("employee_id")),
+        "thread_key": thread_key,
+        "last_mail_message_id": last_mail_message_id,
+        "mail_update_revision": mail_update_revision,
+        "reply_status": _clean_text(resolved_reply.get("status")),
+        "creator_replied": resolved_reply.get("creator_replied"),
+        "thread_assignment_status": _clean_text(resolved_thread_assignment.get("status")),
+        "existing_record_id": _clean_text(resolved_existing_record.get("record_id")),
+        "existing_ai_status": _extract_ai_status(dict(resolved_existing_record.get("fields") or {})),
+        "route_decision": _clean_text(route_decision),
+        "next_update_mode": _clean_text(next_update_mode),
+        "reason": _clean_text(reason),
+        "source_raw_path": _clean_text(
+            resolved_keep_row.get("last_mail_raw_path")
+            or resolved_keep_row.get("brand_message_raw_path")
+            or resolved_keep_row.get("__last_mail_raw_path")
+        ),
+    }
+
+
 def _write_combined_workbook(path: Path, rows: list[dict[str, Any]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     frame = pd.DataFrame(rows, columns=FINAL_UPLOAD_COLUMNS)
     with pd.ExcelWriter(path, engine="openpyxl") as writer:
         frame.to_excel(writer, index=False, sheet_name="总表")
+
+
+def _write_unresolved_threads_archive(
+    output_dir: Path,
+    rows: list[dict[str, Any]],
+) -> tuple[str, str]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    json_path = output_dir / "unresolved_threads.json"
+    xlsx_path = output_dir / "unresolved_threads.xlsx"
+    json_path.write_text(
+        json.dumps(
+            {
+                "unresolved_thread_count": len(rows),
+                "rows": rows,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    frame = pd.DataFrame(rows)
+    with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+        frame.to_excel(writer, index=False, sheet_name="unresolved_threads")
+    return str(json_path), str(xlsx_path)
+
+
+def _write_rows_archive(
+    output_dir: Path,
+    *,
+    stem: str,
+    rows: list[dict[str, Any]],
+    sheet_name: str,
+) -> tuple[str, str]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    json_path = output_dir / f"{stem}.json"
+    xlsx_path = output_dir / f"{stem}.xlsx"
+    json_path.write_text(
+        json.dumps(
+            {
+                "row_count": len(rows),
+                "rows": rows,
+            },
+            ensure_ascii=False,
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    frame = pd.DataFrame(rows)
+    with pd.ExcelWriter(xlsx_path, engine="openpyxl") as writer:
+        frame.to_excel(writer, index=False, sheet_name=sheet_name)
+    return str(json_path), str(xlsx_path)
 
 
 def _write_skipped_archive(archive_dir: Path, *, task_owner: dict[str, Any], rows: list[dict[str, Any]]) -> tuple[str, str]:
@@ -1780,6 +2473,7 @@ def run_shared_mailbox_post_sync_pipeline(
     shared_mail_raw_dir: Path | None = None,
     shared_mail_data_dir: Path | None = None,
     env_file: str = ".env",
+    sent_since: str = "",
     task_upload_url: str = "",
     employee_info_url: str = "",
     output_root: Path | None = None,
@@ -1796,6 +2490,7 @@ def run_shared_mailbox_post_sync_pipeline(
     brand_match_include_from: bool = True,
     platform_filters: list[str] | None = None,
     vision_provider: str = "",
+    positioning_provider: str = "",
     max_identifiers_per_platform: int = 0,
     poll_interval: float = 5.0,
     skip_scrape: bool = False,
@@ -1803,6 +2498,8 @@ def run_shared_mailbox_post_sync_pipeline(
     skip_positioning_card_analysis: bool = False,
     upload_dry_run: bool = False,
     reuse_existing: bool = True,
+    mail_first_only: bool = False,
+    thread_first_mail_resolution: bool = False,
 ) -> dict[str, Any]:
     runtime = _load_runtime_dependencies()
     inspect_task_upload_assignments = runtime["inspect_task_upload_assignments"]
@@ -1833,6 +2530,7 @@ def run_shared_mailbox_post_sync_pipeline(
             "shared_mail_db_path": _path_summary(resolved_mail_db_path, source="cli", kind="file"),
             "shared_mail_raw_dir": _path_summary(resolved_mail_raw_dir, source="cli_or_inferred", kind="dir"),
             "shared_mail_data_dir": _path_summary(resolved_mail_data_dir, source="cli_or_inferred", kind="dir"),
+            "sent_since": _clean_text(sent_since),
         },
         "task_count": 0,
         "task_names": [],
@@ -1840,12 +2538,25 @@ def run_shared_mailbox_post_sync_pipeline(
         "new_creator_count": 0,
         "existing_screened_count": 0,
         "existing_unscreened_count": 0,
+        "pre_keep_mail_only_count": 0,
+        "partial_refresh_count": 0,
+        "known_thread_hit_count": 0,
+        "thread_assignment_cache_hit_count": 0,
+        "source_identity_deduped_count": 0,
         "full_screening_count": 0,
         "mail_only_update_count": 0,
+        "mail_first_only_count": 0,
+        "keyword_hit_thread_count": 0,
+        "resolved_thread_count": 0,
+        "written_row_count": 0,
         "skipped_existing_count": 0,
         "created_record_count": 0,
         "updated_record_count": 0,
         "failed_record_count": 0,
+        **_empty_rescue_stats(),
+        **_empty_mail_only_bucket_summary(),
+        "mail_first_only_enabled": bool(mail_first_only),
+        "thread_first_mail_resolution_enabled": bool(thread_first_mail_resolution),
         "local_archive_path": str(aggregate_archive_dir),
         "task_results": [],
     }
@@ -1910,6 +2621,7 @@ def run_shared_mailbox_post_sync_pipeline(
     aggregate_failed_rows: list[dict[str, Any]] = []
     aggregate_existing_skip_rows: list[dict[str, Any]] = []
     any_task_failed = False
+    seen_mail_identity_keys_by_target: dict[str, set[str]] = {}
 
     for item in inspection_items:
         task_name = _clean_text(item.get("taskName"))
@@ -1924,19 +2636,38 @@ def run_shared_mailbox_post_sync_pipeline(
             "representative_task_name": _clean_text(item.get("representativeTaskName")) or task_name,
             "linked_bitable_url": _clean_text(item.get("linkedBitableUrl")),
             "matched_mail_count": 0,
+            "pre_keep_mail_only_count": 0,
+            "partial_refresh_count": 0,
+            "known_thread_hit_count": 0,
+            "thread_assignment_cache_hit_count": 0,
+            "source_identity_deduped_count": 0,
             "full_screening_count": 0,
             "mail_only_update_count": 0,
+            "mail_first_only_count": 0,
+            "keyword_hit_thread_count": 0,
+            "resolved_thread_count": 0,
+            "written_row_count": 0,
             "skipped_existing_count": 0,
             "created_count": 0,
             "updated_count": 0,
             "failed_count": 0,
+            **_empty_rescue_stats(),
+            **_empty_mail_only_bucket_summary(),
+            "thread_first_mail_resolution_enabled": bool(thread_first_mail_resolution),
             "summary_path": str(task_summary_path),
             "all_platforms_final_review": "",
             "all_platforms_upload_payload_json": "",
             "feishu_upload_result_json": "",
+            "mail_only_candidate_log_json": "",
+            "mail_only_candidate_log_xlsx": "",
+            "mail_only_upload_decision_json": "",
+            "mail_only_upload_decision_xlsx": "",
+            "unresolved_threads_json": "",
+            "unresolved_threads_xlsx": "",
             "status": "running",
             "upstream_summary_json": "",
             "downstream_summary_json": "",
+            "mail_first_only_enabled": bool(mail_first_only),
         }
         _emit_runtime_progress(task_scope, "task=running")
         try:
@@ -1997,6 +2728,7 @@ def run_shared_mailbox_post_sync_pipeline(
                 existing_mail_db_path=resolved_mail_db_path,
                 existing_mail_raw_dir=resolved_mail_raw_dir or "",
                 existing_mail_data_dir=resolved_mail_data_dir or "",
+                sent_since=_clean_text(sent_since),
                 stop_after="keep-list",
                 reuse_existing=bool(reuse_existing),
                 matching_strategy=matching_strategy,
@@ -2005,25 +2737,27 @@ def run_shared_mailbox_post_sync_pipeline(
                     explicit_brand_keyword=brand_keyword,
                 ),
                 brand_match_include_from=bool(brand_match_include_from),
+                thread_first_mail_resolution=bool(thread_first_mail_resolution and mail_first_only),
             )
             task_result["upstream_summary_json"] = str(upstream_summary_path)
             _emit_runtime_progress(
                 task_scope,
                 f"upstream=completed status={str(upstream_summary.get('status') or '').strip() or 'unknown'}",
             )
-            keep_workbook = Path(
-                str(
-                    ((upstream_summary.get("resume_points") or {}).get("keep_list") or {}).get("keep_workbook")
-                    or (upstream_summary.get("artifacts") or {}).get("keep_workbook")
-                    or ""
-                )
-            ).expanduser()
+            keep_workbook = _resolve_optional_path(
+                ((upstream_summary.get("resume_points") or {}).get("keep_list") or {}).get("keep_workbook")
+                or (upstream_summary.get("artifacts") or {}).get("keep_workbook")
+            )
+            pre_keep_mail_only_workbook = _resolve_optional_path(
+                ((upstream_summary.get("resume_points") or {}).get("keep_list") or {}).get("pre_keep_mail_only_workbook")
+                or (upstream_summary.get("artifacts") or {}).get("pre_keep_mail_only_workbook")
+            )
             template_workbook_value = str(
                 ((upstream_summary.get("resume_points") or {}).get("keep_list") or {}).get("template_workbook")
                 or (upstream_summary.get("artifacts") or {}).get("template_workbook")
                 or ""
             ).strip()
-            if str(upstream_summary.get("status") or "") == "failed" or not keep_workbook.exists():
+            if str(upstream_summary.get("status") or "") == "failed" or keep_workbook is None or not keep_workbook.is_file():
                 failure = _build_failure_payload(
                     stage="upstream",
                     error_code=str(upstream_summary.get("error_code") or "UPSTREAM_KEEP_LIST_FAILED"),
@@ -2050,6 +2784,32 @@ def run_shared_mailbox_post_sync_pipeline(
                 continue
 
             keep_frame = pd.read_excel(keep_workbook)
+            brand_match_stats = dict((((upstream_summary.get("steps") or {}).get("brand_match") or {}).get("stats") or {}))
+            mail_funnel_stats = dict((((upstream_summary.get("steps") or {}).get("mail_funnel") or {}).get("stats") or {}))
+            unresolved_threads_workbook = _resolve_optional_path(
+                ((upstream_summary.get("resume_points") or {}).get("keep_list") or {}).get("unresolved_threads_xlsx")
+                or (((upstream_summary.get("steps") or {}).get("mail_funnel") or {}).get("artifacts") or {}).get("unresolved_threads_xlsx")
+            )
+            unresolved_thread_rows: list[dict[str, Any]] = []
+            if bool(thread_first_mail_resolution and mail_first_only) and unresolved_threads_workbook is not None and unresolved_threads_workbook.is_file():
+                unresolved_thread_rows = pd.read_excel(unresolved_threads_workbook).to_dict(orient="records")
+                unresolved_json, unresolved_xlsx = _write_unresolved_threads_archive(
+                    task_root / "exports",
+                    unresolved_thread_rows,
+                )
+                task_result["unresolved_threads_json"] = unresolved_json
+                task_result["unresolved_threads_xlsx"] = unresolved_xlsx
+            task_result["keyword_hit_thread_count"] = int(brand_match_stats.get("thread_hit_count") or 0)
+            task_result["resolved_thread_count"] = int(mail_funnel_stats.get("resolved_thread_count") or len(keep_frame.index))
+            for key in (
+                "regex_pass1_rescued_count",
+                "regex_pass2_rescued_count",
+                "full_body_only_hit_count",
+                "beacons_linktree_hit_count",
+                "llm_invocation_count_before",
+                "llm_invocation_count_after",
+            ):
+                task_result[key] = int(mail_funnel_stats.get(key) or 0)
             owner_context = _build_owner_context_from_upstream(upstream_summary, item)
             linked_bitable_url = _clean_text(owner_context.get("linked_bitable_url")) or _clean_text(item.get("linkedBitableUrl"))
             owner_context["linked_bitable_url"] = linked_bitable_url
@@ -2069,7 +2829,19 @@ def run_shared_mailbox_post_sync_pipeline(
                 shared_mail_data_dir=resolved_mail_data_dir,
                 keep_workbook=keep_workbook,
             )
-            _, existing_analysis = fetch_existing_bitable_record_analysis(
+            pre_keep_mail_only_frame = pd.DataFrame(columns=list(keep_frame.columns))
+            if pre_keep_mail_only_workbook is not None and pre_keep_mail_only_workbook.is_file():
+                pre_keep_mail_only_frame = _annotate_keep_frame_owner_context(
+                    pd.read_excel(pre_keep_mail_only_workbook),
+                    task_owner_context=owner_context,
+                    enable_row_level_owner_routing=bool(item.get("rowLevelOwnerRouting")),
+                    owner_candidates=owner_candidates,
+                    shared_mail_db_path=resolved_mail_db_path,
+                    shared_mail_raw_dir=resolved_mail_raw_dir,
+                    shared_mail_data_dir=resolved_mail_data_dir,
+                    keep_workbook=pre_keep_mail_only_workbook,
+                )
+            resolved_target_view, existing_analysis = fetch_existing_bitable_record_analysis(
                 client,
                 linked_bitable_url=linked_bitable_url,
             )
@@ -2105,18 +2877,28 @@ def run_shared_mailbox_post_sync_pipeline(
                 _write_json(run_summary_path, summary)
                 continue
             existing_index = existing_analysis.index
+            target_upload_scope = _build_record_key(
+                getattr(resolved_target_view, "app_token", ""),
+                getattr(resolved_target_view, "table_id", ""),
+            ) or _clean_text(linked_bitable_url)
+            seen_mail_identity_keys = seen_mail_identity_keys_by_target.setdefault(target_upload_scope, set())
             owner_scope_enabled = bool(_clean_text(getattr(existing_analysis, "owner_scope_field_name", "")))
 
             matched_mail_count = _extract_matched_mail_count(upstream_summary, keep_frame)
             mail_only_display_rows: list[dict[str, Any]] = []
             mail_only_payload_rows: list[dict[str, Any]] = []
             combined_skipped_rows: list[dict[str, Any]] = []
-            full_screening_rows: list[dict[str, Any]] = []
-            existing_screened_count = 0
-            existing_unscreened_count = 0
-            new_creator_count = 0
+            source_dedup_skipped_rows: list[dict[str, Any]] = []
+            mail_only_candidate_log_rows: list[dict[str, Any]] = []
+            mail_only_bucket_summary = _empty_mail_only_bucket_summary()
+            prepared_candidates: list[dict[str, Any]] = []
+            pre_keep_mail_only_count = int(len(pre_keep_mail_only_frame.index))
+            combined_prepared_rows = [
+                *pre_keep_mail_only_frame.to_dict(orient="records"),
+                *keep_frame.to_dict(orient="records"),
+            ]
 
-            for keep_row in keep_frame.to_dict(orient="records"):
+            for keep_row in combined_prepared_rows:
                 row_owner_context = _build_owner_context_from_keep_row(keep_row, owner_context)
                 row_owner_scope_value = _clean_text(row_owner_context.get("employee_id")) or _clean_text(
                     row_owner_context.get("responsible_name")
@@ -2132,6 +2914,15 @@ def run_shared_mailbox_post_sync_pipeline(
                     shared_mail_db_path=resolved_mail_db_path,
                 )
                 reply_resolution["thread_assignment_cache"] = thread_assignment_resolution
+                reply_status = _clean_text(reply_resolution.get("status"))
+                if reply_status == "creator_replied":
+                    mail_only_bucket_summary["mail_only_creator_replied_count"] += 1
+                elif reply_status == "outbound_only_or_no_reply":
+                    mail_only_bucket_summary["mail_only_outbound_only_skip_count"] += 1
+                elif reply_status == "creator_identity_unresolved":
+                    mail_only_bucket_summary["mail_only_creator_identity_unresolved_count"] += 1
+                elif reply_status == "thread_key_missing":
+                    mail_only_bucket_summary["mail_only_thread_key_missing_count"] += 1
                 if bool(item.get("rowLevelOwnerRouting")) and not row_owner_scope_value:
                     owner_status = _clean_text(keep_row.get(_KEEP_OWNER_STATUS_FIELD))
                     alias_text = _clean_text(keep_row.get(_KEEP_OWNER_ALIAS_FIELD))
@@ -2154,6 +2945,17 @@ def run_shared_mailbox_post_sync_pipeline(
                             ),
                         }
                     )
+                    mail_only_candidate_log_rows.append(
+                        _build_mail_only_candidate_log_entry(
+                            task_name=task_name,
+                            keep_row=keep_row,
+                            owner_context=row_owner_context,
+                            route_decision="skipped_owner_routing",
+                            reason=reason,
+                            reply_resolution=reply_resolution,
+                            thread_assignment_resolution=thread_assignment_resolution,
+                        )
+                    )
                     continue
                 if reply_resolution.get("creator_replied") is False:
                     reason = "仅命中负责人发信，达人未回复，已跳过筛选。"
@@ -2171,22 +2973,161 @@ def run_shared_mailbox_post_sync_pipeline(
                             ),
                         }
                     )
+                    mail_only_candidate_log_rows.append(
+                        _build_mail_only_candidate_log_entry(
+                            task_name=task_name,
+                            keep_row=keep_row,
+                            owner_context=row_owner_context,
+                            route_decision="skipped_outbound_only_or_no_reply",
+                            reason=reason,
+                            reply_resolution=reply_resolution,
+                            thread_assignment_resolution=thread_assignment_resolution,
+                        )
+                    )
                     continue
-                creator_id = _extract_creator_id(keep_row)
-                platform = _extract_platform(keep_row)
-                record_key = (
-                    _build_record_key(row_owner_scope_value, creator_id, platform)
-                    if owner_scope_enabled
-                    else _build_record_key(creator_id, platform)
+                prepared_candidates.append(
+                    {
+                        "keep_row": dict(keep_row),
+                        "owner_context": dict(row_owner_context),
+                        "owner_scope": row_owner_scope_value,
+                        "creator_id": _extract_creator_id(keep_row),
+                        "platform": _extract_platform(keep_row),
+                        "thread_key": _clean_text(keep_row.get("evidence_thread_key")),
+                        "last_mail_message_id": _clean_text(keep_row.get("last_mail_message_id")),
+                        "mail_update_revision": _coerce_non_negative_int(keep_row.get("mail_update_revision")),
+                        "thread_assignment_resolution": dict(thread_assignment_resolution or {}),
+                        "reply_resolution": dict(reply_resolution or {}),
+                    }
                 )
-                existing_record = existing_index.get(record_key) if record_key else None
-                if existing_record is None:
-                    new_creator_count += 1
-                    full_screening_rows.append(dict(keep_row))
-                    continue
-                ai_status = _extract_ai_status(existing_record.get("fields") or {})
-                if ai_status:
-                    existing_screened_count += 1
+
+            mail_only_bucket_summary["mail_only_candidate_count_before_source_dedup"] = len(prepared_candidates)
+            source_identity_dedup = _deduplicate_prepared_candidates_by_mail_identity(
+                prepared_candidates,
+                seen_identity_keys=seen_mail_identity_keys,
+                deduplicate_within_batch=False,
+            )
+            prepared_candidates = list(source_identity_dedup.get("candidates") or [])
+            source_identity_deduped_count = int(((source_identity_dedup.get("stats") or {}).get("deduplicated_count")) or 0)
+            mail_only_bucket_summary["mail_only_candidate_count_after_source_dedup"] = len(prepared_candidates)
+            mail_only_bucket_summary["mail_only_source_identity_deduped_count"] = source_identity_deduped_count
+            for duplicate in list(source_identity_dedup.get("duplicate_rows") or []):
+                candidate = dict(duplicate.get("candidate") or {})
+                keep_row = dict(candidate.get("keep_row") or {})
+                row_owner_context = dict(candidate.get("owner_context") or {})
+                identity_label = _clean_text(duplicate.get("identity_label")) or _clean_text(duplicate.get("identity_key"))
+                reason = f"同一源邮件已在当前 run 命中（{identity_label}），已跳过重复上传候选。"
+                source_dedup_skipped_rows.append(
+                    {
+                        "skip_reasons": [reason],
+                        "row": _build_skipped_row_from_keep_record(
+                            keep_row,
+                            owner_context=row_owner_context,
+                            reason=reason,
+                            shared_mail_db_path=resolved_mail_db_path,
+                            shared_mail_raw_dir=resolved_mail_raw_dir,
+                            shared_mail_data_dir=resolved_mail_data_dir,
+                            keep_workbook=keep_workbook,
+                        ),
+                    }
+                )
+                mail_only_candidate_log_rows.append(
+                    _build_mail_only_candidate_log_entry(
+                        task_name=task_name,
+                        keep_row=keep_row,
+                        owner_context=row_owner_context,
+                        candidate=candidate,
+                        route_decision="skipped_source_identity_duplicate",
+                        reason=reason,
+                        reply_resolution=dict(candidate.get("reply_resolution") or {}),
+                        thread_assignment_resolution=dict(candidate.get("thread_assignment_resolution") or {}),
+                    )
+                )
+
+            known_thread_routing = process_known_thread_updates(
+                prepared_candidates,
+                existing_index=existing_index,
+                owner_scope_enabled=owner_scope_enabled,
+            )
+            known_thread_stats = dict(known_thread_routing.get("stats") or {})
+            existing_screened_count = int(known_thread_stats.get("existing_screened_count") or 0)
+            existing_unscreened_count = int(known_thread_stats.get("existing_unscreened_count") or 0)
+            new_creator_count = int(known_thread_stats.get("new_creator_count") or 0)
+            mail_only_bucket_summary["mail_only_routed_mail_only_candidate_count"] = len(
+                list(known_thread_routing.get("mail_only_candidates") or [])
+            )
+            mail_only_bucket_summary["mail_only_routed_full_screening_candidate_count"] = len(
+                list(known_thread_routing.get("full_screening_candidates") or [])
+            )
+
+            for candidate in known_thread_routing.get("mail_only_candidates") or []:
+                keep_row = dict((candidate or {}).get("keep_row") or {})
+                row_owner_context = dict((candidate or {}).get("owner_context") or {})
+                existing_record = dict(((candidate or {}).get("existing_record") or {}))
+                mail_only_candidate_log_rows.append(
+                    _build_mail_only_candidate_log_entry(
+                        task_name=task_name,
+                        keep_row=keep_row,
+                        owner_context=row_owner_context,
+                        candidate=dict(candidate or {}),
+                        route_decision="mail_only_candidate",
+                        existing_record=existing_record,
+                        reply_resolution=dict((candidate or {}).get("reply_resolution") or {}),
+                        thread_assignment_resolution=dict((candidate or {}).get("thread_assignment_resolution") or {}),
+                        next_update_mode=MAIL_ONLY_UPDATE_MODE if not bool(mail_first_only) else CREATE_OR_MAIL_ONLY_UPDATE_MODE,
+                    )
+                )
+                display_row, payload_row = _build_mail_only_rows(
+                    keep_row=keep_row,
+                    existing_fields=dict(existing_record.get("fields") or {}),
+                    owner_context=row_owner_context,
+                    linked_bitable_url=linked_bitable_url,
+                    shared_mail_db_path=resolved_mail_db_path,
+                    shared_mail_raw_dir=resolved_mail_raw_dir,
+                    shared_mail_data_dir=resolved_mail_data_dir,
+                    keep_workbook=keep_workbook,
+                    update_mode=MAIL_ONLY_UPDATE_MODE,
+                    preserve_existing_ai_fields=True,
+                )
+                mail_only_display_rows.append(display_row)
+                mail_only_payload_rows.append(payload_row)
+
+            full_screening_rows = [
+                dict((candidate or {}).get("keep_row") or {})
+                for candidate in (known_thread_routing.get("full_screening_candidates") or [])
+            ]
+            for candidate in known_thread_routing.get("full_screening_candidates") or []:
+                keep_row = dict((candidate or {}).get("keep_row") or {})
+                row_owner_context = dict((candidate or {}).get("owner_context") or {})
+                existing_record = dict(((candidate or {}).get("existing_record") or {}))
+                mail_only_candidate_log_rows.append(
+                    _build_mail_only_candidate_log_entry(
+                        task_name=task_name,
+                        keep_row=keep_row,
+                        owner_context=row_owner_context,
+                        candidate=dict(candidate or {}),
+                        route_decision="full_screening_candidate",
+                        existing_record=existing_record,
+                        reply_resolution=dict((candidate or {}).get("reply_resolution") or {}),
+                        thread_assignment_resolution=dict((candidate or {}).get("thread_assignment_resolution") or {}),
+                        next_update_mode=CREATE_OR_MAIL_ONLY_UPDATE_MODE if bool(mail_first_only) else "",
+                    )
+                )
+
+            full_screening_frame = pd.DataFrame(full_screening_rows, columns=list(keep_frame.columns))
+            full_screening_display_rows: list[dict[str, Any]] = []
+            full_screening_payload_rows: list[dict[str, Any]] = []
+            mail_first_only_display_rows: list[dict[str, Any]] = []
+            mail_first_only_payload_rows: list[dict[str, Any]] = []
+            downstream_summary_json = ""
+            if bool(mail_first_only):
+                routed_candidates = [
+                    *list(known_thread_routing.get("mail_only_candidates") or []),
+                    *list(known_thread_routing.get("full_screening_candidates") or []),
+                ]
+                for candidate in routed_candidates:
+                    keep_row = dict((candidate or {}).get("keep_row") or {})
+                    row_owner_context = dict((candidate or {}).get("owner_context") or {})
+                    existing_record = dict(((candidate or {}).get("existing_record") or {}))
                     display_row, payload_row = _build_mail_only_rows(
                         keep_row=keep_row,
                         existing_fields=dict(existing_record.get("fields") or {}),
@@ -2196,18 +3137,12 @@ def run_shared_mailbox_post_sync_pipeline(
                         shared_mail_raw_dir=resolved_mail_raw_dir,
                         shared_mail_data_dir=resolved_mail_data_dir,
                         keep_workbook=keep_workbook,
+                        update_mode=CREATE_OR_MAIL_ONLY_UPDATE_MODE,
+                        preserve_existing_ai_fields=False,
                     )
-                    mail_only_display_rows.append(display_row)
-                    mail_only_payload_rows.append(payload_row)
-                    continue
-                existing_unscreened_count += 1
-                full_screening_rows.append(dict(keep_row))
-
-            full_screening_frame = pd.DataFrame(full_screening_rows, columns=list(keep_frame.columns))
-            full_screening_display_rows: list[dict[str, Any]] = []
-            full_screening_payload_rows: list[dict[str, Any]] = []
-            downstream_summary_json = ""
-            if len(full_screening_frame.index) > 0:
+                    mail_first_only_display_rows.append(display_row)
+                    mail_first_only_payload_rows.append(payload_row)
+            elif len(full_screening_frame.index) > 0:
                 filtered_keep_workbook = task_root / "partition" / f"{task_slug}_full_screening_keep.xlsx"
                 _write_keep_subset(filtered_keep_workbook, full_screening_frame)
                 downstream_output_root = task_root / "downstream"
@@ -2223,6 +3158,7 @@ def run_shared_mailbox_post_sync_pipeline(
                     summary_json=downstream_summary_path,
                     platform_filters=platform_filters,
                     vision_provider=vision_provider,
+                    positioning_provider=positioning_provider,
                     max_identifiers_per_platform=max(0, int(max_identifiers_per_platform)),
                     poll_interval=max(1.0, float(poll_interval)),
                     skip_scrape=bool(skip_scrape),
@@ -2296,8 +3232,19 @@ def run_shared_mailbox_post_sync_pipeline(
                         )
                     any_task_failed = True
 
-            combined_display_rows = [*mail_only_display_rows, *full_screening_display_rows]
-            combined_payload_rows = [*mail_only_payload_rows, *full_screening_payload_rows]
+            if bool(mail_first_only):
+                combined_display_rows = mail_first_only_display_rows
+                combined_payload_rows = mail_first_only_payload_rows
+            else:
+                combined_display_rows = [*mail_only_display_rows, *full_screening_display_rows]
+                combined_payload_rows = [*mail_only_payload_rows, *full_screening_payload_rows]
+            combined_display_rows, combined_payload_rows, rescue_stats = _apply_conservative_rescue_layer(
+                display_rows=combined_display_rows,
+                payload_rows=combined_payload_rows,
+                source_keep_rows=combined_prepared_rows,
+                task_name=task_name,
+                task_scope=task_scope,
+            )
             exports_dir = task_root / "exports"
             exports_dir.mkdir(parents=True, exist_ok=True)
             combined_workbook_path = exports_dir / "all_platforms_final_review.xlsx"
@@ -2320,6 +3267,32 @@ def run_shared_mailbox_post_sync_pipeline(
                 dry_run=bool(upload_dry_run),
                 suppress_ai_labels=True,
             )
+            candidate_log_json, candidate_log_xlsx = _write_rows_archive(
+                exports_dir,
+                stem="mail_only_candidate_log",
+                rows=mail_only_candidate_log_rows,
+                sheet_name="mail_only_candidate_log",
+            )
+            upload_decision_rows = [
+                dict(row)
+                for row in list(upload_summary.get("mail_only_upload_decision_rows") or [])
+                if isinstance(row, dict)
+            ]
+            upload_decision_json, upload_decision_xlsx = _write_rows_archive(
+                exports_dir,
+                stem="mail_only_upload_decisions",
+                rows=upload_decision_rows,
+                sheet_name="mail_only_upload_decisions",
+            )
+            mail_only_bucket_summary["mail_only_upload_decision_count"] = int(
+                upload_summary.get("mail_only_upload_decision_count") or 0
+            )
+            mail_only_bucket_summary["mail_only_upload_live_existing_hit_count"] = int(
+                upload_summary.get("mail_only_upload_live_existing_hit_count") or 0
+            )
+            mail_only_bucket_summary["mail_only_upload_mail_idempotency_skip_count"] = int(
+                upload_summary.get("mail_only_upload_mail_idempotency_skip_count") or 0
+            )
 
             task_failed_count = int(combined_payload_artifacts["payload"]["skipped_row_count"]) + int(
                 upload_summary.get("failed_count") or 0
@@ -2328,8 +3301,12 @@ def run_shared_mailbox_post_sync_pipeline(
             task_result.update(
                 {
                     "matched_mail_count": matched_mail_count,
+                    "pre_keep_mail_only_count": pre_keep_mail_only_count,
+                    "partial_refresh_count": 0,
                     "full_screening_count": len(full_screening_frame.index),
                     "mail_only_update_count": len(mail_only_payload_rows),
+                    "mail_first_only_count": len(mail_first_only_payload_rows),
+                    "written_row_count": len(combined_payload_rows),
                     "skipped_existing_count": skipped_existing_count,
                     "created_count": int(upload_summary.get("created_count") or 0),
                     "updated_count": int(upload_summary.get("updated_count") or 0),
@@ -2337,11 +3314,22 @@ def run_shared_mailbox_post_sync_pipeline(
                     "all_platforms_final_review": str(combined_workbook_path),
                     "all_platforms_upload_payload_json": str(combined_payload_artifacts["payload_json_path"]),
                     "feishu_upload_result_json": str(upload_summary.get("result_json_path") or ""),
+                    "mail_only_candidate_log_json": candidate_log_json,
+                    "mail_only_candidate_log_xlsx": candidate_log_xlsx,
+                    "mail_only_upload_decision_json": upload_decision_json,
+                    "mail_only_upload_decision_xlsx": upload_decision_xlsx,
                     "local_archive_path": str(combined_payload_artifacts["archive_dir"]),
                     "status": "completed_with_failures" if task_failed_count > 0 else "completed",
                     "new_creator_count": new_creator_count,
                     "existing_screened_count": existing_screened_count,
                     "existing_unscreened_count": existing_unscreened_count,
+                    "known_thread_hit_count": int(known_thread_stats.get("known_thread_hit_count") or 0),
+                    "thread_assignment_cache_hit_count": int(
+                        known_thread_stats.get("thread_assignment_cache_hit_count") or 0
+                    ),
+                    "source_identity_deduped_count": source_identity_deduped_count,
+                    **mail_only_bucket_summary,
+                    **rescue_stats,
                 }
             )
             if task_failed_count > 0:
@@ -2373,6 +3361,19 @@ def run_shared_mailbox_post_sync_pipeline(
                         "row": dict(skipped.get("row") or {}),
                     }
                 )
+            for skipped in source_dedup_skipped_rows:
+                aggregate_existing_skip_rows.append(
+                    {
+                        "task_name": task_name,
+                        "stage": "source_identity_dedup",
+                        "reason": "；".join(
+                            str(reason).strip()
+                            for reason in (skipped.get("skip_reasons") or [])
+                            if str(reason).strip()
+                        ),
+                        "row": dict(skipped.get("row") or {}),
+                    }
+                )
             _emit_runtime_progress(
                 task_scope,
                 "feishu_upload=completed "
@@ -2382,15 +3383,30 @@ def run_shared_mailbox_post_sync_pipeline(
             )
 
             summary["matched_mail_count"] += int(matched_mail_count)
+            summary["pre_keep_mail_only_count"] += int(pre_keep_mail_only_count)
+            summary["partial_refresh_count"] += 0
             summary["new_creator_count"] += int(new_creator_count)
             summary["existing_screened_count"] += int(existing_screened_count)
             summary["existing_unscreened_count"] += int(existing_unscreened_count)
+            summary["known_thread_hit_count"] += int(known_thread_stats.get("known_thread_hit_count") or 0)
+            summary["thread_assignment_cache_hit_count"] += int(
+                known_thread_stats.get("thread_assignment_cache_hit_count") or 0
+            )
+            summary["source_identity_deduped_count"] += int(source_identity_deduped_count)
             summary["full_screening_count"] += int(len(full_screening_frame.index))
             summary["mail_only_update_count"] += int(len(mail_only_payload_rows))
+            summary["mail_first_only_count"] += int(len(mail_first_only_payload_rows))
+            summary["keyword_hit_thread_count"] += int(task_result.get("keyword_hit_thread_count") or 0)
+            summary["resolved_thread_count"] += int(task_result.get("resolved_thread_count") or 0)
+            summary["written_row_count"] += int(len(combined_payload_rows))
             summary["skipped_existing_count"] += skipped_existing_count
             summary["created_record_count"] += int(upload_summary.get("created_count") or 0)
             summary["updated_record_count"] += int(upload_summary.get("updated_count") or 0)
             summary["failed_record_count"] += int(task_failed_count)
+            for key in _MAIL_ONLY_BUCKET_SUMMARY_KEYS:
+                summary[key] += int(task_result.get(key) or 0)
+            for key in _RESCUE_SUMMARY_KEYS:
+                summary[key] += int(task_result.get(key) or 0)
         except Exception as exc:  # noqa: BLE001
             task_result["status"] = "failed"
             task_result["failed_count"] = max(1, int(task_result.get("failed_count") or 0))
@@ -2677,6 +3693,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shared-mail-raw-dir", default="", help="共享邮箱 raw 邮件目录；默认推断为 email_sync.db 同级 raw。")
     parser.add_argument("--shared-mail-data-dir", default="", help="共享邮箱邮件数据根目录；默认推断为 email_sync.db 所在目录。")
     parser.add_argument("--env-file", default=".env", help="本地 env 文件路径，默认 ./.env。")
+    parser.add_argument("--sent-since", default="", help="共享邮箱上游起始日期 YYYY-MM-DD；默认沿用任务开始日期。")
     parser.add_argument("--task-upload-url", default="", help="飞书任务上传 wiki/base 链接。")
     parser.add_argument("--employee-info-url", default="", help="飞书员工信息表 wiki/base 链接。")
     parser.add_argument("--output-root", default="", help="输出目录；默认写到 temp/shared_mailbox_post_sync_<timestamp>。")
@@ -2703,11 +3720,23 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--platform", action="append", help="只跑指定平台，可重复传入：tiktok / instagram / youtube。")
     parser.add_argument("--vision-provider", default="", help="指定视觉 provider。")
+    parser.add_argument("--positioning-provider", default="", help="指定定位卡 provider。")
     parser.add_argument("--max-identifiers-per-platform", type=int, default=0, help="每个平台最多跑多少个账号；0 表示不截断。")
     parser.add_argument("--poll-interval", type=float, default=5.0, help="轮询 job 状态的秒数。")
     parser.add_argument("--skip-scrape", action="store_true", help="跳过 scrape。")
     parser.add_argument("--skip-visual", action="store_true", help="跳过视觉复核。")
     parser.add_argument("--skip-positioning-card-analysis", action="store_true", help="跳过定位卡分析。")
+    parser.add_argument(
+        "--mail-first-only",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="是否只上传邮件字段；默认开启，不进入下游 scrape/visual/positioning，可用 --no-mail-first-only 恢复旧全链路。",
+    )
+    parser.add_argument(
+        "--thread-first-mail-resolution",
+        action="store_true",
+        help="mail-first 专用：先按命中 thread 全量归属，再写飞书；未解析 thread 单独落人工清单。",
+    )
     parser.add_argument("--upload-dry-run", action="store_true", help="只构建 payload，不真正写飞书。")
     parser.add_argument("--no-reuse-existing", action="store_true", help="不要复用当前 output-root 下已存在的 task artifact。")
     return parser
@@ -2752,6 +3781,7 @@ def main(argv: list[str] | None = None) -> int:
             shared_mail_raw_dir=Path(args.shared_mail_raw_dir) if args.shared_mail_raw_dir else None,
             shared_mail_data_dir=Path(args.shared_mail_data_dir) if args.shared_mail_data_dir else None,
             env_file=args.env_file,
+            sent_since=args.sent_since,
             task_upload_url=args.task_upload_url or "",
             employee_info_url=args.employee_info_url or "",
             output_root=Path(args.output_root) if args.output_root else None,
@@ -2768,6 +3798,7 @@ def main(argv: list[str] | None = None) -> int:
             brand_match_include_from=True if args.brand_match_include_from is None else bool(args.brand_match_include_from),
             platform_filters=args.platform,
             vision_provider=args.vision_provider or "",
+            positioning_provider=args.positioning_provider or "",
             max_identifiers_per_platform=max(0, int(args.max_identifiers_per_platform)),
             poll_interval=max(1.0, float(args.poll_interval)),
             skip_scrape=bool(args.skip_scrape),
@@ -2775,6 +3806,8 @@ def main(argv: list[str] | None = None) -> int:
             skip_positioning_card_analysis=bool(args.skip_positioning_card_analysis),
             upload_dry_run=bool(args.upload_dry_run),
             reuse_existing=not bool(args.no_reuse_existing),
+            mail_first_only=bool(args.mail_first_only),
+            thread_first_mail_resolution=bool(args.thread_first_mail_resolution),
         )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0 if summary.get("status") == "completed" else 1

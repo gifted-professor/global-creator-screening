@@ -264,10 +264,21 @@ UPLOAD_METADATA_FIELD_ALIASES = {
     "mailresolutionconfidence": "mail_resolution_confidence",
     "mailapifygate": "mail_apify_gate",
     "mailevidence": "mail_evidence",
+    "resolutionevidence": "resolution_evidence",
     "mailrawpath": "mail_raw_path",
     "latestexternalfrom": "latest_external_from",
     "latestexternalsentat": "latest_external_sent_at",
     "subject": "subject",
+    "candidatesources": "candidate_sources",
+    "originaldecision": "original_decision",
+    "finaldecision": "final_decision",
+    "originalrejectreason": "original_reject_reason",
+    "businesssignaldetected": "business_signal_detected",
+    "reviewpriority": "review_priority",
+    "rescueruleapplied": "rescue_rule_applied",
+    "confidencebeforerescue": "confidence_before_rescue",
+    "confidenceafterrescue": "confidence_after_rescue",
+    "hardrejectblockedrescue": "hard_reject_blocked_rescue",
 }
 UPLOAD_METADATA_EXPORT_FIELDS = (
     ("upload_nickname", "nickname"),
@@ -288,6 +299,7 @@ DEFAULT_QIANDAO_FALLBACK_VISION_MODEL = "gemini-3-flash-preview-S"
 QIANDAO_25P_VISION_MODEL = "gemini-2.5-pro-preview-p"
 DEFAULT_QIANDAO_25P_VISUAL_REVIEW_MAX_WORKERS = 2
 MAX_QIANDAO_25P_VISUAL_REVIEW_MAX_WORKERS = 3
+DEFAULT_CLIPROXY_VISUAL_REVIEW_MAX_WORKERS = 2
 DEFAULT_QIANDAO_MAX_TOKENS = 900
 DEFAULT_QIANDAO_TEMPERATURE = 0.2
 DEFAULT_MIMO_VISION_MODEL = "mimo-v2-omni"
@@ -339,6 +351,47 @@ VISION_PROVIDER_CONFIGS = (
         "api_style": VISION_API_STYLE_RESPONSES,
         "model_env_key": "OPENAI_VISION_MODEL",
         "max_inflight_env_key": "OPENAI_MAX_INFLIGHT_REQUESTS",
+    },
+    {
+        "name": "998code",
+        "base_url_env_key": "VISION_998CODE_BASE_URL",
+        "default_base_url": "https://9985678.xyz/v1",
+        "env_key": "VISION_998CODE_API_KEY",
+        "api_style": VISION_API_STYLE_RESPONSES,
+        "model_env_key": "VISION_998CODE_MODEL",
+        "default_model": "gpt-5.4",
+        "max_inflight_env_key": "VISION_998CODE_MAX_INFLIGHT_REQUESTS",
+        "default_max_inflight_requests": 2,
+        "disable_response_storage_env_key": "VISION_998CODE_DISABLE_RESPONSE_STORAGE",
+        "default_disable_response_storage": True,
+        "reasoning_effort_env_key": "VISION_998CODE_REASONING_EFFORT",
+        "default_reasoning_effort": "medium",
+    },
+    {
+        "name": "cliproxy",
+        "base_url_env_key": "VISION_CLIPROXY_BASE_URL",
+        "default_base_url": "http://127.0.0.1:8317/v1",
+        "env_key": "VISION_CLIPROXY_API_KEY",
+        "api_style": VISION_API_STYLE_CHAT_COMPLETIONS,
+        "model_env_key": "VISION_CLIPROXY_MODEL",
+        "default_model": "gpt-5.4",
+        "stream_env_key": "VISION_CLIPROXY_STREAM",
+        "default_stream": True,
+        "max_inflight_env_key": "VISION_CLIPROXY_MAX_INFLIGHT_REQUESTS",
+        "default_max_inflight_requests": 2,
+    },
+    {
+        "name": "nowcoding",
+        "base_url_env_key": "VISION_NOWCODING_BASE_URL",
+        "default_base_url": "https://nowcoding.ai/v1",
+        "env_key": "VISION_NOWCODING_API_KEY",
+        "api_style": VISION_API_STYLE_CHAT_COMPLETIONS,
+        "model_env_key": "VISION_NOWCODING_MODEL",
+        "default_model": "gpt-5.4-openai-compact",
+        "stream_env_key": "VISION_NOWCODING_STREAM",
+        "default_stream": True,
+        "max_inflight_env_key": "VISION_NOWCODING_MAX_INFLIGHT_REQUESTS",
+        "default_max_inflight_requests": 6,
     },
     {
         "name": "reelx",
@@ -401,11 +454,12 @@ VISION_PROVIDER_CONFIGS = (
 )
 VISUAL_REVIEW_ROUTING_TIERED = "tiered"
 VISUAL_REVIEW_ROUTING_PROBE_RANKED = "probe_ranked"
-DEFAULT_VISUAL_REVIEW_ROUTING_PRIMARY_PROVIDER = "reelx"
-DEFAULT_VISUAL_REVIEW_ROUTING_PRIMARY_MODEL = "gemini-3-flash-preview"
+DEFAULT_REQUESTED_VISION_PROVIDER = "reelx"
+DEFAULT_VISUAL_REVIEW_ROUTING_PRIMARY_PROVIDER = "998code"
+DEFAULT_VISUAL_REVIEW_ROUTING_PRIMARY_MODEL = "gpt-5.4"
 DEFAULT_VISUAL_REVIEW_ROUTING_PRIMARY_TIMEOUT_SECONDS = 20
-DEFAULT_VISUAL_REVIEW_ROUTING_BACKUP_PROVIDER = "reelx"
-DEFAULT_VISUAL_REVIEW_ROUTING_BACKUP_MODEL = "gemini-3.1-pro-preview"
+DEFAULT_VISUAL_REVIEW_ROUTING_BACKUP_PROVIDER = "openai"
+DEFAULT_VISUAL_REVIEW_ROUTING_BACKUP_MODEL = DEFAULT_VISION_MODEL
 DEFAULT_VISUAL_REVIEW_ROUTING_BACKUP_TIMEOUT_SECONDS = 25
 DEFAULT_VISUAL_REVIEW_ROUTING_JUDGE_PROVIDER = "openai"
 DEFAULT_VISUAL_REVIEW_ROUTING_JUDGE_MODEL = "gpt-5.4-mini"
@@ -2134,6 +2188,14 @@ def resolve_vision_provider_temperature(provider):
         return None
 
 
+def resolve_vision_provider_stream(provider):
+    default_value = bool((provider or {}).get("default_stream"))
+    env_key = str((provider or {}).get("stream_env_key") or "").strip()
+    if env_key and os.getenv(env_key) is not None:
+        return parse_env_flag(env_key, default=default_value)
+    return default_value
+
+
 def resolve_vision_provider_request_timeout(provider):
     value = (provider or {}).get("request_timeout_seconds")
     if value not in (None, ""):
@@ -2142,6 +2204,38 @@ def resolve_vision_provider_request_timeout(provider):
         except Exception:
             pass
     return VISION_REQUEST_TIMEOUT
+
+
+def resolve_vision_provider_disable_response_storage(provider):
+    default_value = bool((provider or {}).get("default_disable_response_storage"))
+    env_key = str((provider or {}).get("disable_response_storage_env_key") or "").strip()
+    if env_key and os.getenv(env_key) is not None:
+        return parse_env_flag(env_key, default=default_value)
+    return default_value
+
+
+def resolve_vision_provider_reasoning_effort(provider):
+    env_key = str((provider or {}).get("reasoning_effort_env_key") or "").strip()
+    raw_value = str(os.getenv(env_key, "") or "").strip() if env_key else ""
+    if not raw_value:
+        raw_value = str((provider or {}).get("default_reasoning_effort") or "").strip()
+    normalized = raw_value.lower()
+    if normalized in {"", "0", "false", "off", "none", "disable", "disabled"}:
+        return ""
+    return normalized
+
+
+def build_vision_provider_responses_body(provider, input_payload, model_override=""):
+    body = {
+        "model": str(model_override or resolve_vision_provider_model(provider)).strip(),
+        "input": input_payload,
+    }
+    if resolve_vision_provider_disable_response_storage(provider):
+        body["store"] = False
+    reasoning_effort = resolve_vision_provider_reasoning_effort(provider)
+    if reasoning_effort:
+        body["reasoning"] = {"effort": reasoning_effort}
+    return body
 
 
 def build_vision_provider_headers(provider):
@@ -2178,6 +2272,8 @@ def build_vision_provider_chat_body(provider, messages, model_override=""):
             body["temperature"] = temperature
         body["stream"] = False
         return body
+    if resolve_vision_provider_stream(provider):
+        body["stream"] = True
     max_completion_tokens = resolve_vision_provider_max_completion_tokens(provider)
     if max_completion_tokens:
         body["max_completion_tokens"] = max_completion_tokens
@@ -2644,7 +2740,7 @@ def build_vision_preflight(provider_name=None):
     else:
         status = "unconfigured"
         error_code = "MISSING_VISION_CONFIG"
-        message = "缺少视觉模型配置：请设置 OPENAI_API_KEY、VISION_REELX_API_KEY、VISION_MIMO_API_KEY、VISION_QIANDAO_API_KEY、VISION_QUAN2GO_API_KEY 或 VISION_LEMONAPI_API_KEY。"
+        message = "缺少视觉模型配置：请设置 OPENAI_API_KEY、VISION_998CODE_API_KEY、VISION_REELX_API_KEY、VISION_MIMO_API_KEY、VISION_QIANDAO_API_KEY、VISION_QUAN2GO_API_KEY 或 VISION_LEMONAPI_API_KEY。"
     return {
         "status": status,
         "error_code": error_code,
@@ -4601,6 +4697,12 @@ def resolve_vision_provider_max_inflight_requests(provider, base_url=""):
                 return max(0, int(raw_value))
             except (TypeError, ValueError):
                 return 0
+    default_limit = (provider or {}).get("default_max_inflight_requests")
+    if default_limit not in (None, ""):
+        try:
+            return max(0, int(default_limit))
+        except (TypeError, ValueError):
+            return 0
     if provider_name == "openai" and is_local_cliproxyapi_base_url(base_url or (provider or {}).get("base_url")):
         return DEFAULT_LOCAL_OPENAI_MAX_INFLIGHT_REQUESTS
     return 0
@@ -4689,6 +4791,10 @@ def should_use_qiandao_25p_visual_worker_profile(payload=None, requested_provide
 def resolve_visual_review_max_workers(payload, target_count, requested_provider="", requested_model="", routing_strategy=""):
     default_value = DEFAULT_VISUAL_REVIEW_MAX_WORKERS
     max_allowed = None
+    normalized_requested_provider = normalize_vision_provider_name(requested_provider)
+    if normalized_requested_provider == "cliproxy":
+        default_value = DEFAULT_CLIPROXY_VISUAL_REVIEW_MAX_WORKERS
+        max_allowed = DEFAULT_CLIPROXY_VISUAL_REVIEW_MAX_WORKERS
     if should_use_qiandao_25p_visual_worker_profile(
         payload,
         requested_provider=requested_provider,
@@ -4798,10 +4904,11 @@ def call_vision_provider_with_json_contract(
                         body = input_payload["generate_content"]
                     else:
                         url = f"{candidate_base_url}/responses"
-                        body = {
-                            "model": model_name,
-                            "input": input_payload["responses"],
-                        }
+                        body = build_vision_provider_responses_body(
+                            current_provider,
+                            input_payload["responses"],
+                            model_override=model_name,
+                        )
 
                     try:
                         with acquire_vision_provider_request_slot(current_provider, candidate_base_url, request_timeout):
@@ -4951,10 +5058,11 @@ def build_vision_provider_probe_request(provider):
         "api_style": api_style,
         "url": f"{base_url}/responses",
         "headers": headers,
-        "body": {
-            "model": str((provider or {}).get("model") or resolve_vision_provider_model(provider)),
-            "input": [{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
-        },
+        "body": build_vision_provider_responses_body(
+            provider,
+            [{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
+            model_override=str((provider or {}).get("model") or resolve_vision_provider_model(provider)),
+        ),
     }
 
 
@@ -5677,6 +5785,89 @@ def build_visual_review_cache_prompt_descriptor(prompt_selection):
     }
 
 
+def build_positioning_card_cache_prompt_descriptor(prompt_selection):
+    if not isinstance(prompt_selection, dict):
+        return {}
+    prompt_text = str(prompt_selection.get("prompt") or "").strip()
+    return {
+        "platform": normalize_visual_prompt_lookup_key(prompt_selection.get("platform")),
+        "provider": normalize_vision_provider_name(prompt_selection.get("provider")),
+        "model": normalize_visual_prompt_lookup_key(prompt_selection.get("model")),
+        "source": str(prompt_selection.get("source") or "").strip(),
+        "visual_contract_source": str(prompt_selection.get("visual_contract_source") or "").strip(),
+        "resolved_cover_limit": screening.coerce_positive_int(prompt_selection.get("resolved_cover_limit")) or 0,
+        "prompt_key": creator_cache.stable_cache_key(prompt_text),
+        "visual_runtime_contract_key": creator_cache.stable_cache_key(
+            prompt_selection.get("visual_runtime_contract") or {}
+        ),
+    }
+
+
+def build_positioning_card_cache_context(
+    platform,
+    *,
+    requested_provider="",
+    providers=None,
+    active_rulespec=None,
+):
+    normalized_platform = str(platform or "").strip().lower()
+    normalized_requested_provider = normalize_vision_provider_name(requested_provider)
+    resolved_active_rulespec = load_active_rulespec() if active_rulespec is None else active_rulespec
+    resolved_providers = list(providers or get_available_vision_providers(normalized_requested_provider))
+
+    provider_descriptors = []
+    for provider in resolved_providers:
+        provider_name = normalize_vision_provider_name((provider or {}).get("name"))
+        configured_model = str(resolve_vision_provider_model(provider) or "").strip()
+        prompt_selection = resolve_positioning_card_prompt_selection(
+            provider_name,
+            normalized_platform,
+            model_name=configured_model,
+            active_rulespec=resolved_active_rulespec,
+        )
+        provider_descriptors.append(
+            {
+                "name": provider_name,
+                "api_style": str((provider or {}).get("api_style") or "").strip().lower(),
+                "model": configured_model,
+                "model_candidates": dedupe_non_empty_strings(resolve_vision_provider_model_candidates(provider)),
+                "base_urls": dedupe_non_empty_strings(
+                    (provider or {}).get("base_url_candidates") or resolve_vision_provider_base_urls(provider)
+                ),
+                "request_timeout_seconds": resolve_vision_provider_request_timeout(provider),
+                "prompt": build_positioning_card_cache_prompt_descriptor(prompt_selection),
+            }
+        )
+    provider_descriptors.sort(
+        key=lambda item: (
+            str(item.get("name") or ""),
+            str(item.get("model") or ""),
+            str(item.get("api_style") or ""),
+        )
+    )
+
+    selected_prompt = build_positioning_card_cache_prompt_descriptor(
+        resolve_positioning_card_prompt_selection(
+            normalized_requested_provider,
+            normalized_platform,
+            model_name="",
+            active_rulespec=resolved_active_rulespec,
+        )
+    )
+    context_payload = {
+        "version": "positioning_card_cache_v1",
+        "platform": normalized_platform,
+        "requested_provider": normalized_requested_provider,
+        "active_rulespec_key": creator_cache.stable_cache_key(resolved_active_rulespec or {}),
+        "prompt": selected_prompt,
+        "providers": provider_descriptors,
+    }
+    return {
+        "context_key": creator_cache.stable_cache_key(context_payload),
+        "context_payload": context_payload,
+    }
+
+
 def build_visual_review_cache_context(
     platform,
     *,
@@ -5820,7 +6011,10 @@ def resolve_positioning_card_analysis_targets(platform, payload):
 
 
 def perform_visual_review(platform, payload, progress_callback=None, cancel_check=None):
-    requested_provider = normalize_vision_provider_name((payload or {}).get("provider"))
+    requested_provider = (
+        normalize_vision_provider_name((payload or {}).get("provider"))
+        or DEFAULT_REQUESTED_VISION_PROVIDER
+    )
     routing_strategy = resolve_visual_review_routing_strategy(payload)
     if requested_provider and requested_provider in {item["name"] for item in VISION_PROVIDER_CONFIGS}:
         routing_strategy = ""
@@ -6148,7 +6342,10 @@ def perform_visual_review(platform, payload, progress_callback=None, cancel_chec
 
 
 def perform_positioning_card_analysis(platform, payload, progress_callback=None, cancel_check=None):
-    requested_provider = normalize_vision_provider_name((payload or {}).get("provider"))
+    requested_provider = (
+        normalize_vision_provider_name((payload or {}).get("provider"))
+        or DEFAULT_REQUESTED_VISION_PROVIDER
+    )
     preflight = build_vision_preflight(requested_provider)
     providers = get_available_vision_providers(requested_provider)
     if not providers:
@@ -6163,25 +6360,88 @@ def perform_positioning_card_analysis(platform, payload, progress_callback=None,
 
     results = load_positioning_card_results(platform)
     target_identifiers = [screening.resolve_profile_review_identifier(platform, item) for item in targets]
-    max_workers = resolve_visual_review_max_workers(payload, len(targets), requested_provider=requested_provider)
+    creator_cache_enabled = creator_cache.creator_cache_enabled(payload)
+    force_refresh_creator_cache = creator_cache.creator_cache_force_refresh(payload)
+    creator_cache_db_path = creator_cache.resolve_creator_cache_db_path(payload)
+    positioning_cache_context = build_positioning_card_cache_context(
+        platform,
+        requested_provider=requested_provider,
+        providers=providers,
+        active_rulespec=load_active_rulespec(),
+    )
+    creator_cache_hit_identifiers: list[str] = []
+    if creator_cache_enabled and not force_refresh_creator_cache:
+        cached_positioning_results = creator_cache.load_positioning_cache_entries(
+            platform,
+            target_identifiers,
+            creator_cache_db_path,
+            str(positioning_cache_context.get("context_key") or ""),
+        )
+        for identifier, cached_positioning_result in cached_positioning_results.items():
+            if creator_cache.is_cacheable_positioning_result(cached_positioning_result):
+                results[identifier] = dict(cached_positioning_result)
+                creator_cache_hit_identifiers.append(identifier)
+        if cached_positioning_results:
+            save_positioning_card_results(platform, results)
+
+    pending_targets = []
+    completed_identifier_set = {identifier for identifier in creator_cache_hit_identifiers if identifier}
+    seen_pending_identifiers = set()
+    for item in targets:
+        identifier = screening.resolve_profile_review_identifier(platform, item)
+        if identifier in completed_identifier_set:
+            continue
+        if identifier and identifier in seen_pending_identifiers:
+            continue
+        if identifier:
+            seen_pending_identifiers.add(identifier)
+        pending_targets.append(item)
+
+    max_workers = resolve_visual_review_max_workers(payload, len(pending_targets) or len(targets), requested_provider=requested_provider)
     item_timeout_seconds = resolve_visual_review_item_timeout_seconds(payload)
     started_at = time.monotonic()
     future_poll_timeout_seconds = min(0.5, max(0.05, item_timeout_seconds / 4.0))
+    creator_cache_summary = {
+        "enabled": bool(creator_cache_enabled),
+        "db_path": str(creator_cache_db_path),
+        "force_refresh": bool(force_refresh_creator_cache),
+        "positioning_hit_count": len(creator_cache_hit_identifiers),
+        "positioning_hit_preview": creator_cache_hit_identifiers[:10],
+        "positioning_miss_count": len(pending_targets),
+        "positioning_context_key": str(positioning_cache_context.get("context_key") or ""),
+    }
+    if not pending_targets:
+        final_result = build_positioning_card_partial_result(platform, results, targets)
+        final_result.update({
+            "success": True,
+            "message": (
+                f"{UPLOAD_PLATFORM_RESPONSE_LABELS.get(platform, platform)} 定位卡分析完成，"
+                f"共处理 {len(targets)} 个账号。"
+            ),
+            "positioning_card_results": results,
+            "max_workers": 0,
+            "selected_provider": preflight.get("preferred_provider") or requested_provider,
+            "elapsed_seconds": round(time.monotonic() - started_at, 3),
+            "creator_cache": creator_cache_summary,
+        })
+        return final_result
+
     if progress_callback:
         progress_callback(
             "preparing",
             "正在准备定位卡分析任务",
-            done=0,
+            done=len(creator_cache_hit_identifiers),
             total=len(targets),
             providers=[item["name"] for item in providers],
             selected_provider=preflight.get("preferred_provider") or requested_provider,
             max_workers=max_workers,
             item_timeout_seconds=item_timeout_seconds,
+            creator_cache=creator_cache_summary,
             **build_target_preview(target_identifiers),
         )
 
-    completed = 0
-    target_iter = iter(targets)
+    completed = len(creator_cache_hit_identifiers)
+    target_iter = iter(pending_targets)
     future_map = {}
 
     def finalize_analysis(identifier, review_item, result=None, error_text=None):
@@ -6233,6 +6493,16 @@ def perform_positioning_card_analysis(platform, payload, progress_callback=None,
                 "base_url": result.get("base_url"),
                 "raw_text": result.get("raw_text"),
             }
+            if creator_cache_enabled:
+                creator_cache.persist_positioning_cache_entry(
+                    platform,
+                    identifier,
+                    results[identifier],
+                    creator_cache_db_path,
+                    updated_at=str(results[identifier].get("reviewed_at") or iso_now()),
+                    context_key=str(positioning_cache_context.get("context_key") or ""),
+                    context_payload=positioning_cache_context.get("context_payload") or {},
+                )
 
         completed += 1
         save_positioning_card_results(platform, results)
@@ -6343,6 +6613,7 @@ def perform_positioning_card_analysis(platform, payload, progress_callback=None,
         "max_workers": max_workers,
         "selected_provider": preflight.get("preferred_provider") or requested_provider,
         "elapsed_seconds": round(time.monotonic() - started_at, 3),
+        "creator_cache": creator_cache_summary,
     })
     return final_result
 

@@ -1,19 +1,23 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import inspect
 import json
+import os
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
+from urllib import parse
 
 import pandas as pd
-
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from backend import creator_cache
 from harness.contract import attach_run_contract
 from harness.config import resolve_keep_list_downstream_config
 from harness.failures import attach_failure_to_summary, build_failure_payload as build_harness_failure_payload
@@ -40,6 +44,11 @@ DEFAULT_TEMPLATE_WORKBOOK = (
     / "miniso-星战红人筛号需求模板(1).xlsx"
 )
 DEFAULT_PLATFORM_ORDER = ("tiktok", "instagram", "youtube")
+DEFAULT_VISUAL_BATCH_SIZES = {
+    "tiktok": 50,
+    "instagram": 50,
+    "youtube": 20,
+}
 
 
 def _load_runtime_dependencies():
@@ -51,6 +60,7 @@ def _load_runtime_dependencies():
     )
     from feishu_screening_bridge.feishu_api import DEFAULT_FEISHU_BASE_URL, FeishuOpenClient
     from feishu_screening_bridge.local_env import get_preferred_value, load_local_env
+    from feishu_screening_bridge.task_upload_sync import resolve_task_upload_entry
     from scripts.prepare_screening_inputs import (
         prepare_screening_inputs,
         restore_backend_runtime_state,
@@ -72,6 +82,7 @@ def _load_runtime_dependencies():
         "FeishuOpenClient": FeishuOpenClient,
         "get_preferred_value": get_preferred_value,
         "load_local_env": load_local_env,
+        "resolve_task_upload_entry": resolve_task_upload_entry,
         "prepare_screening_inputs": prepare_screening_inputs,
         "restore_backend_runtime_state": restore_backend_runtime_state,
         "snapshot_backend_runtime_state": snapshot_backend_runtime_state,
@@ -146,6 +157,102 @@ def _path_exists(path_value: Any) -> bool:
 
 def _emit_runtime_progress(scope: str, message: str) -> None:
     print(f"[{iso_now()}] [{scope}] {message}", flush=True)
+
+
+def _write_json_snapshot(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+
+def _resolve_visual_batch_size(platform: str) -> int:
+    normalized_platform = str(platform or "").strip().lower()
+    env_candidates = [
+        f"{normalized_platform.upper()}_VISUAL_BATCH_SIZE",
+        "VISUAL_BATCH_SIZE",
+    ]
+    default_value = int(DEFAULT_VISUAL_BATCH_SIZES.get(normalized_platform, 50) or 50)
+    for env_key in env_candidates:
+        raw_value = str(os.getenv(env_key, "") or "").strip()
+        if not raw_value:
+            continue
+        try:
+            return max(1, int(raw_value))
+        except ValueError:
+            continue
+    return max(1, default_value)
+
+
+def _chunk_identifiers(identifiers: list[str], batch_size: int) -> list[list[str]]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for item in identifiers:
+        value = str(item or "").strip()
+        if not value or value in seen:
+            continue
+        seen.add(value)
+        cleaned.append(value)
+    size = max(1, int(batch_size or 1))
+    return [cleaned[index : index + size] for index in range(0, len(cleaned), size)]
+
+
+def _build_identifier_signature(identifiers: list[str]) -> str:
+    normalized = [str(item or "").strip() for item in identifiers if str(item or "").strip()]
+    payload = json.dumps(normalized, ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def _build_visual_checkpoint_path(run_root: Path, platform: str) -> Path:
+    normalized_platform = str(platform or "").strip().lower() or "platform"
+    return (run_root / "checkpoints" / f"{normalized_platform}_visual_batches.json").resolve()
+
+
+def _load_visual_checkpoint(
+    checkpoint_path: Path,
+    *,
+    identifier_signature: str,
+    batch_size: int,
+) -> dict[str, Any]:
+    if not checkpoint_path.exists():
+        return {}
+    try:
+        payload = json.loads(checkpoint_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if str(payload.get("identifier_signature") or "").strip() != str(identifier_signature or "").strip():
+        return {}
+    if int(payload.get("batch_size") or 0) != int(batch_size or 0):
+        return {}
+    return dict(payload)
+
+
+def _persist_visual_checkpoint(
+    checkpoint_path: Path,
+    *,
+    platform: str,
+    batch_size: int,
+    batch_count: int,
+    identifiers: list[str],
+    completed_batches: list[int],
+    observed_at: str,
+) -> dict[str, Any]:
+    normalized_completed_batches = sorted({max(1, int(item)) for item in completed_batches if int(item) > 0})
+    payload = {
+        "platform": str(platform or "").strip().lower(),
+        "phase": "visual",
+        "batch_size": int(batch_size),
+        "batch_count": int(batch_count),
+        "identifier_count": len(list(identifiers or [])),
+        "identifier_signature": _build_identifier_signature(list(identifiers or [])),
+        "completed_batches": normalized_completed_batches,
+        "last_completed_batch": normalized_completed_batches[-1] if normalized_completed_batches else 0,
+        "completed_identifier_count": sum(
+            len(list((list(identifiers or []))[max(0, (batch_index - 1) * int(batch_size)): batch_index * int(batch_size)]))
+            for batch_index in normalized_completed_batches
+        ),
+        "updated_at": str(observed_at or "").strip(),
+    }
+    _write_json_snapshot(checkpoint_path, payload)
+    return payload
 
 
 def _path_summary(path: Path | None, *, source: str, kind: str) -> dict[str, Any]:
@@ -288,6 +395,165 @@ def _extract_existing_ai_status(fields: dict[str, Any]) -> str:
     return ""
 
 
+def _extract_existing_field_text(fields: dict[str, Any], *field_names: str) -> str:
+    normalized_candidates = {
+        str(field_name or "").strip().casefold().replace(" ", "")
+        for field_name in field_names
+        if str(field_name or "").strip()
+    }
+    for key, value in (fields or {}).items():
+        normalized_key = str(key or "").strip().casefold().replace(" ", "")
+        if normalized_key in normalized_candidates:
+            return _flatten_existing_field_value(value)
+    return ""
+
+
+def _existing_record_has_positioning_payload(fields: dict[str, Any]) -> bool:
+    return bool(
+        _extract_existing_field_text(fields, "标签(ai)", "标签（ai）", "ai评价", "ai 评价", "ai筛号反馈理由")
+    )
+
+
+def _normalize_cache_identifier(backend_app, platform: str, raw_value: Any) -> str:
+    value = str(raw_value or "").strip()
+    if not value:
+        return ""
+    screening_module = getattr(backend_app, "screening", None)
+    if screening_module is not None and hasattr(screening_module, "extract_platform_identifier"):
+        normalized = str(screening_module.extract_platform_identifier(platform, value) or "").strip()
+        if normalized:
+            return normalized
+    return value.lstrip("@").rstrip("/").casefold()
+
+
+def _resolve_visual_cache_context_key(backend_app, platform: str, *, vision_provider: str) -> str:
+    context_builder = getattr(backend_app, "build_visual_review_cache_context", None)
+    if not callable(context_builder):
+        return ""
+    routing_strategy = ""
+    routing_resolver = getattr(backend_app, "resolve_visual_review_routing_strategy", None)
+    if callable(routing_resolver):
+        routing_strategy = str(routing_resolver({}) or "").strip()
+    try:
+        context = context_builder(
+            platform,
+            requested_provider=str(vision_provider or "").strip().lower(),
+            routing_strategy=routing_strategy,
+        )
+    except Exception:
+        return ""
+    return str((context or {}).get("context_key") or "").strip()
+
+
+def _resolve_positioning_cache_context_key(backend_app, platform: str, *, positioning_provider: str) -> str:
+    context_builder = getattr(backend_app, "build_positioning_card_cache_context", None)
+    if not callable(context_builder):
+        return ""
+    try:
+        context = context_builder(
+            platform,
+            requested_provider=str(positioning_provider or "").strip().lower(),
+        )
+    except Exception:
+        return ""
+    return str((context or {}).get("context_key") or "").strip()
+
+
+def _resolve_effective_positioning_provider(*, positioning_provider: str, vision_provider: str) -> str:
+    return str(positioning_provider or "").strip().lower() or str(vision_provider or "").strip().lower()
+
+
+def _append_unique_identifier(bucket: list[str], seen: set[str], raw_value: Any) -> None:
+    value = str(raw_value or "").strip()
+    if not value or value in seen:
+        return
+    seen.add(value)
+    bucket.append(value)
+
+
+def _merge_breakdown_counts(target: dict[str, int], source: dict[str, Any] | None) -> None:
+    for key, value in dict(source or {}).items():
+        normalized_key = str(key or "").strip()
+        if not normalized_key:
+            continue
+        try:
+            delta = max(0, int(value or 0))
+        except (TypeError, ValueError):
+            continue
+        if delta <= 0:
+            continue
+        target[normalized_key] = int(target.get(normalized_key) or 0) + delta
+
+
+def _filter_profile_reviews_for_final_export(
+    backend_app,
+    platform: str,
+    profile_reviews: list[dict[str, Any]] | None,
+    excluded_identifiers: list[str] | None,
+) -> list[dict[str, Any]]:
+    excluded = {
+        _normalize_cache_identifier(backend_app, platform, value)
+        for value in (excluded_identifiers or [])
+        if _normalize_cache_identifier(backend_app, platform, value)
+    }
+    if not excluded:
+        return [dict(item) for item in list(profile_reviews or []) if isinstance(item, dict)]
+
+    screening_module = getattr(backend_app, "screening", None)
+    filtered: list[dict[str, Any]] = []
+    for item in list(profile_reviews or []):
+        if not isinstance(item, dict):
+            continue
+        identifier = ""
+        if screening_module is not None and hasattr(screening_module, "resolve_profile_review_identifier"):
+            try:
+                identifier = str(screening_module.resolve_profile_review_identifier(platform, item) or "").strip()
+            except Exception:
+                identifier = ""
+        normalized_identifier = _normalize_cache_identifier(
+            backend_app,
+            platform,
+            identifier
+            or item.get("profile_url")
+            or item.get("username")
+            or (item.get("upload_metadata") or {}).get("url")
+            or (item.get("upload_metadata") or {}).get("handle"),
+        )
+        if normalized_identifier and normalized_identifier in excluded:
+            continue
+        filtered.append(dict(item))
+    return filtered
+
+
+def _export_platform_artifacts_with_optional_final_review_subset(
+    export_platform_artifacts: Callable[..., dict[str, str]],
+    client,
+    platform: str,
+    export_dir: Path,
+    *,
+    final_review_profile_reviews: list[dict[str, Any]] | None = None,
+) -> dict[str, str]:
+    if final_review_profile_reviews is None:
+        return export_platform_artifacts(client, platform, export_dir)
+    try:
+        signature = inspect.signature(export_platform_artifacts)
+    except (TypeError, ValueError):
+        signature = None
+    if signature is not None:
+        parameters = signature.parameters.values()
+        if (
+            "final_review_profile_reviews" in signature.parameters
+            or any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in parameters)
+        ):
+            return export_platform_artifacts(
+                client,
+                platform,
+                export_dir,
+                final_review_profile_reviews=final_review_profile_reviews,
+            )
+    return export_platform_artifacts(client, platform, export_dir)
+
+
 def _build_platform_identifier_plan(
     backend_app,
     platform: str,
@@ -295,6 +561,12 @@ def _build_platform_identifier_plan(
     max_identifiers_per_platform: int,
     existing_bitable_analysis: Any | None = None,
     task_owner_employee_id: str = "",
+    creator_cache_db_path: str = "",
+    force_refresh_creator_cache: bool = False,
+    vision_provider: str = "",
+    positioning_provider: str = "",
+    skip_visual: bool = False,
+    skip_positioning_card_analysis: bool = False,
 ) -> dict[str, Any]:
     metadata_lookup = dict(backend_app.load_upload_metadata(platform) or {})
     key_field_names = tuple(getattr(existing_bitable_analysis, "key_field_names", ()) or ())
@@ -325,7 +597,66 @@ def _build_platform_identifier_plan(
     existing_entries: list[dict[str, Any]] = []
     existing_screened_entries: list[dict[str, Any]] = []
     existing_unscreened_entries: list[dict[str, Any]] = []
+    mail_only_update_entries: list[dict[str, Any]] = []
+    skippable_entries: list[dict[str, Any]] = []
+    partial_refresh_entries: list[dict[str, Any]] = []
     full_screening_entries: list[dict[str, Any]] = []
+    partial_refresh_breakdown: dict[str, int] = {}
+    resolved_creator_cache_db_path = creator_cache.resolve_creator_cache_db_path(
+        {"creator_cache_db_path": str(creator_cache_db_path or "").strip()}
+    )
+    creator_cache_enabled = creator_cache.creator_cache_enabled(
+        {"creator_cache_db_path": str(creator_cache_db_path or "").strip()}
+    )
+    scrape_cache_hits: dict[str, list[dict[str, Any]]] = {}
+    visual_cache_hits: dict[str, dict[str, Any]] = {}
+    positioning_cache_hits: dict[str, dict[str, Any]] = {}
+    visual_cache_context_key = ""
+    positioning_cache_context_key = ""
+    effective_positioning_provider = _resolve_effective_positioning_provider(
+        positioning_provider=positioning_provider,
+        vision_provider=vision_provider,
+    )
+    normalized_planned_identifiers = [
+        _normalize_cache_identifier(backend_app, platform, entry.get("scrape_identifier") or entry.get("creator_id"))
+        for entry in planned_entries
+    ]
+    planned_scrape_identifiers = [
+        str(entry.get("scrape_identifier") or "").strip()
+        for entry in planned_entries
+        if str(entry.get("scrape_identifier") or "").strip()
+    ]
+    if creator_cache_enabled and not force_refresh_creator_cache and resolved_creator_cache_db_path.exists():
+        if planned_scrape_identifiers:
+            scrape_cache_hits = creator_cache.load_scrape_cache_entries(
+                platform,
+                planned_scrape_identifiers,
+                resolved_creator_cache_db_path,
+            )
+        visual_cache_context_key = _resolve_visual_cache_context_key(
+            backend_app,
+            platform,
+            vision_provider=vision_provider,
+        )
+        if visual_cache_context_key and planned_scrape_identifiers:
+            visual_cache_hits = creator_cache.load_visual_cache_entries(
+                platform,
+                planned_scrape_identifiers,
+                resolved_creator_cache_db_path,
+                visual_cache_context_key,
+            )
+        positioning_cache_context_key = _resolve_positioning_cache_context_key(
+            backend_app,
+            platform,
+            positioning_provider=effective_positioning_provider,
+        )
+        if positioning_cache_context_key and planned_scrape_identifiers:
+            positioning_cache_hits = creator_cache.load_positioning_cache_entries(
+                platform,
+                planned_scrape_identifiers,
+                resolved_creator_cache_db_path,
+                positioning_cache_context_key,
+            )
     if existing_record_index:
         for entry in planned_entries:
             key_parts: list[str] = []
@@ -349,8 +680,41 @@ def _build_platform_identifier_plan(
                 }
                 existing_entries.append(classified_entry)
                 if _extract_existing_ai_status(classified_entry.get("existing_fields") or {}):
-                    classified_entry["execution_mode"] = "mail_only_update"
                     existing_screened_entries.append(classified_entry)
+                    normalized_identifier = _normalize_cache_identifier(
+                        backend_app,
+                        platform,
+                        classified_entry.get("scrape_identifier") or classified_entry.get("creator_id"),
+                    )
+                    scrape_cache_hit = bool(normalized_identifier and list(scrape_cache_hits.get(normalized_identifier) or []))
+                    visual_cache_hit = bool(normalized_identifier and dict(visual_cache_hits.get(normalized_identifier) or {}))
+                    positioning_cache_hit = bool(
+                        normalized_identifier and dict(positioning_cache_hits.get(normalized_identifier) or {})
+                    )
+                    positioning_ready = positioning_cache_hit
+                    has_any_local_cache = bool(scrape_cache_hit or visual_cache_hit)
+                    partial_reasons: list[str] = []
+                    if creator_cache_enabled and not scrape_cache_hit:
+                        partial_reasons.append(f"scrape_missing_{platform}")
+                    if not skip_visual and creator_cache_enabled and visual_cache_context_key and not visual_cache_hit:
+                        partial_reasons.append(f"visual_missing_{platform}")
+                    if not skip_positioning_card_analysis and not positioning_ready:
+                        partial_reasons.append(f"positioning_missing_{platform}")
+                    if not has_any_local_cache:
+                        classified_entry["execution_mode"] = "skippable"
+                        classified_entry["skip_reason"] = "no_local_cache"
+                        skippable_entries.append(classified_entry)
+                    elif partial_reasons:
+                        # 老达人已有本地缓存（scrape 或 visual 至少一个有），只做邮件更新，不再补抓/补做视觉
+                        classified_entry["execution_mode"] = "mail_only_update"
+                        classified_entry["partial_refresh_reasons"] = list(partial_reasons)
+                        classified_entry["needs_scrape"] = False
+                        classified_entry["needs_visual"] = False
+                        classified_entry["needs_positioning"] = False
+                        mail_only_update_entries.append(classified_entry)
+                    else:
+                        classified_entry["execution_mode"] = "mail_only_update"
+                        mail_only_update_entries.append(classified_entry)
                 else:
                     classified_entry["execution_mode"] = "full_screening_existing"
                     existing_unscreened_entries.append(classified_entry)
@@ -363,9 +727,33 @@ def _build_platform_identifier_plan(
         new_entries = [{**entry, "execution_mode": "full_screening_new"} for entry in planned_entries]
         full_screening_entries = list(new_entries)
 
-    requested_entries = list(full_screening_entries)
+    scrape_requested_identifiers: list[str] = []
+    visual_requested_identifiers: list[str] = []
+    positioning_requested_identifiers: list[str] = []
+    scrape_seen: set[str] = set()
+    visual_seen: set[str] = set()
+    positioning_seen: set[str] = set()
+    for entry in full_screening_entries:
+        scrape_identifier = str(entry.get("scrape_identifier") or "").strip()
+        _append_unique_identifier(scrape_requested_identifiers, scrape_seen, scrape_identifier)
+        _append_unique_identifier(visual_requested_identifiers, visual_seen, scrape_identifier)
+        _append_unique_identifier(positioning_requested_identifiers, positioning_seen, scrape_identifier)
+    for entry in partial_refresh_entries:
+        scrape_identifier = str(entry.get("scrape_identifier") or "").strip()
+        if any(bool(entry.get(flag)) for flag in ("needs_scrape", "needs_visual", "needs_positioning")):
+            _append_unique_identifier(scrape_requested_identifiers, scrape_seen, scrape_identifier)
+        if any(bool(entry.get(flag)) for flag in ("needs_visual", "needs_positioning")):
+            # Visual stage is also used to materialize cached review artifacts for positioning.
+            _append_unique_identifier(visual_requested_identifiers, visual_seen, scrape_identifier)
+        if bool(entry.get("needs_positioning")):
+            _append_unique_identifier(positioning_requested_identifiers, positioning_seen, scrape_identifier)
+
+    requested_entries = list(scrape_requested_identifiers)
     if max_identifiers_per_platform > 0:
-        requested_entries = requested_entries[: int(max_identifiers_per_platform)]
+        limit = int(max_identifiers_per_platform)
+        requested_entries = requested_entries[:limit]
+        visual_requested_identifiers = visual_requested_identifiers[:limit]
+        positioning_requested_identifiers = positioning_requested_identifiers[:limit]
 
     incremental_prefilter = {
         "enabled": bool(existing_record_index),
@@ -402,24 +790,53 @@ def _build_platform_identifier_plan(
             for item in full_screening_entries[:10]
             if str(item.get("creator_id") or "").strip()
         ],
-        "mail_only_update_count": len(existing_screened_entries),
+        "mail_only_update_count": len(mail_only_update_entries),
         "mail_only_update_preview": [
             str(item.get("creator_id") or "").strip()
-            for item in existing_screened_entries[:10]
+            for item in mail_only_update_entries[:10]
             if str(item.get("creator_id") or "").strip()
         ],
+        "skippable_count": len(skippable_entries),
+        "skippable_preview": [
+            str(item.get("creator_id") or "").strip()
+            for item in skippable_entries[:10]
+            if str(item.get("creator_id") or "").strip()
+        ],
+        "partial_refresh_count": len(partial_refresh_entries),
+        "partial_refresh_preview": [
+            str(item.get("creator_id") or "").strip()
+            for item in partial_refresh_entries[:10]
+            if str(item.get("creator_id") or "").strip()
+        ],
+        "partial_refresh_breakdown": dict(sorted(partial_refresh_breakdown.items())),
         "duplicate_existing_group_count": duplicate_existing_group_count,
         "all_existing": bool(planned_entries) and len(existing_entries) == len(planned_entries),
-        "mail_only_update_only": bool(planned_entries) and len(existing_entries) == len(planned_entries) and bool(existing_screened_entries) and not requested_entries,
+        "mail_only_update_only": bool(planned_entries)
+        and len(existing_entries) == len(planned_entries)
+        and bool(existing_screened_entries)
+        and not requested_entries
+        and not partial_refresh_entries,
+        "scrape_requested_identifier_count": len(requested_entries),
+        "visual_requested_identifier_count": len(visual_requested_identifiers),
+        "positioning_requested_identifier_count": len(positioning_requested_identifiers),
+        "creator_cache_enabled": bool(creator_cache_enabled),
+        "creator_cache_db_path": str(resolved_creator_cache_db_path),
+        "visual_cache_context_key": visual_cache_context_key,
+        "positioning_cache_context_key": positioning_cache_context_key,
+        "positioning_cache_hit_count": len(positioning_cache_hits),
+        "positioning_cache_miss_count": max(
+            0,
+            len({identifier for identifier in normalized_planned_identifiers if identifier}) - len(positioning_cache_hits),
+        ),
     }
     return {
         "staged_identifier_count": len(planned_entries),
-        "requested_identifiers": [
-            str(item.get("scrape_identifier") or "").strip()
-            for item in requested_entries
-            if str(item.get("scrape_identifier") or "").strip()
-        ],
-        "mail_only_update_entries": [dict(item) for item in existing_screened_entries],
+        "requested_identifiers": list(requested_entries),
+        "visual_requested_identifiers": list(visual_requested_identifiers),
+        "positioning_requested_identifiers": list(positioning_requested_identifiers),
+        "mail_only_update_entries": [dict(item) for item in mail_only_update_entries],
+        "skippable_entries": [dict(item) for item in skippable_entries],
+        "partial_refresh_entries": [dict(item) for item in partial_refresh_entries],
         "incremental_prefilter": incremental_prefilter,
     }
 
@@ -530,6 +947,7 @@ def _stage_missing_profiles_for_fallback(
     current_lookup = dict(backend_app.load_upload_metadata(current_platform) or {})
     staged_payload: dict[str, Any] = {}
     staged_identifiers: list[str] = []
+    staged_source_identifiers: list[str] = []
     unresolved_missing: list[dict[str, Any]] = []
     for item in missing_profiles:
         identifier = str(item.get("identifier") or "").strip()
@@ -549,12 +967,15 @@ def _stage_missing_profiles_for_fallback(
         next_record["fallback_reason"] = str(item.get("reason") or "").strip()
         staged_payload[handle] = next_record
         staged_identifiers.append(handle)
+        staged_source_identifiers.append(identifier)
     if staged_payload:
         backend_app.save_upload_metadata(next_platform, staged_payload, replace=False)
     return {
         "next_platform": str(next_platform or "").strip().lower(),
         "staged_count": len(staged_identifiers),
         "staged_identifier_preview": staged_identifiers[:10],
+        "staged_source_identifiers": staged_source_identifiers,
+        "staged_source_identifier_preview": staged_source_identifiers[:10],
         "unresolved_missing": unresolved_missing,
     }
 
@@ -784,6 +1205,7 @@ def _compact_upload_summary(upload_summary: dict[str, Any] | None) -> dict[str, 
     if not payload:
         return {}
     upload_detail = dict(payload.get("upload_detail") or {})
+    preflight = dict(payload.get("preflight") or {})
     duplicate_existing_groups = list(upload_detail.get("duplicate_existing_groups") or [])
     compact_upload_detail = {
         "created_key_count": len(list(upload_detail.get("created_keys") or [])),
@@ -825,6 +1247,16 @@ def _compact_upload_summary(upload_summary: dict[str, Any] | None) -> dict[str, 
         "duplicate_existing_group_count": int(payload.get("duplicate_existing_group_count") or 0),
         "duplicate_payload_group_count": int(payload.get("duplicate_payload_group_count") or 0),
         "deduplicated_row_count": int(payload.get("deduplicated_row_count") or 0),
+        "preflight": {
+            "ready": bool(preflight.get("ready", True)),
+            "blocker_count": int(preflight.get("blocker_count") or 0),
+            "message": str(preflight.get("message") or "").strip(),
+            "missing_required_field_names": list(preflight.get("missing_required_field_names") or []),
+            "invalid_platform_record_count": int(preflight.get("invalid_platform_record_count") or 0),
+            "owner_scope_missing_record_count": int(preflight.get("owner_scope_missing_record_count") or 0),
+            "duplicate_existing_group_count": int(preflight.get("duplicate_existing_group_count") or 0),
+            "blockers": list(preflight.get("blockers") or [])[:10],
+        },
         "request_control": dict(payload.get("request_control") or {}),
         "retry_summary": {
             "enabled": bool(retry_summary.get("enabled")),
@@ -867,6 +1299,8 @@ def _build_cli_output_summary(summary: dict[str, Any]) -> dict[str, Any]:
             "current_stage": str(payload.get("current_stage") or "").strip(),
             "requested_identifier_count": int(payload.get("requested_identifier_count") or 0),
             "mail_only_update_count": int(payload.get("mail_only_update_count") or 0),
+            "skippable_count": int(payload.get("skippable_count") or 0),
+            "partial_refresh_count": int(payload.get("partial_refresh_count") or 0),
             "profile_review_count": int(payload.get("profile_review_count") or 0),
             "prescreen_pass_count": int(payload.get("prescreen_pass_count") or 0),
             "missing_profile_count": int(payload.get("missing_profile_count") or 0),
@@ -1037,9 +1471,16 @@ def _build_incremental_observability_layer(summary: dict[str, Any]) -> dict[str,
     existing_screened_count = 0
     existing_unscreened_count = 0
     mail_only_update_count = 0
+    skippable_count = 0
+    partial_refresh_count = 0
+    positioning_cache_hit_count = 0
+    positioning_cache_miss_count = 0
     all_existing = True
     incremental_candidate_preview: list[str] = []
     mail_only_update_preview: list[str] = []
+    skippable_preview: list[str] = []
+    partial_refresh_preview: list[str] = []
+    partial_refresh_breakdown: dict[str, int] = {}
     duplicate_existing_group_count = int(existing_bitable_prefilter.get("duplicate_existing_group_count") or 0)
     for platform_summary in platforms.values():
         if not isinstance(platform_summary, dict):
@@ -1052,6 +1493,10 @@ def _build_incremental_observability_layer(summary: dict[str, Any]) -> dict[str,
         existing_screened_count += int(platform_prefilter.get("existing_screened_count") or 0)
         existing_unscreened_count += int(platform_prefilter.get("existing_unscreened_count") or 0)
         mail_only_update_count += int(platform_prefilter.get("mail_only_update_count") or 0)
+        skippable_count += int(platform_prefilter.get("skippable_count") or 0)
+        partial_refresh_count += int(platform_prefilter.get("partial_refresh_count") or 0)
+        positioning_cache_hit_count += int(platform_prefilter.get("positioning_cache_hit_count") or 0)
+        positioning_cache_miss_count += int(platform_prefilter.get("positioning_cache_miss_count") or 0)
         duplicate_existing_group_count = max(
             duplicate_existing_group_count,
             int(platform_prefilter.get("duplicate_existing_group_count") or 0),
@@ -1063,6 +1508,17 @@ def _build_incremental_observability_layer(summary: dict[str, Any]) -> dict[str,
         mail_only_update_preview.extend(
             [str(item) for item in list(platform_prefilter.get("mail_only_update_preview") or []) if str(item).strip()]
         )
+        skippable_preview.extend(
+            [str(item) for item in list(platform_prefilter.get("skippable_preview") or []) if str(item).strip()]
+        )
+        partial_refresh_preview.extend(
+            [str(item) for item in list(platform_prefilter.get("partial_refresh_preview") or []) if str(item).strip()]
+        )
+        for reason, count in dict(platform_prefilter.get("partial_refresh_breakdown") or {}).items():
+            normalized_reason = str(reason or "").strip()
+            if not normalized_reason:
+                continue
+            partial_refresh_breakdown[normalized_reason] = int(partial_refresh_breakdown.get(normalized_reason) or 0) + int(count or 0)
     status = "ready" if existing_bitable_prefilter.get("enabled") else str(existing_bitable_prefilter.get("status") or "disabled")
     return {
         "status": status,
@@ -1075,10 +1531,17 @@ def _build_incremental_observability_layer(summary: dict[str, Any]) -> dict[str,
         "existing_screened_count": existing_screened_count,
         "existing_unscreened_count": existing_unscreened_count,
         "mail_only_update_count": mail_only_update_count,
+        "skippable_count": skippable_count,
+        "partial_refresh_count": partial_refresh_count,
+        "positioning_cache_hit_count": positioning_cache_hit_count,
+        "positioning_cache_miss_count": positioning_cache_miss_count,
         "all_existing": bool(staged_identifier_count > 0 and all_existing),
         "duplicate_existing_group_count": duplicate_existing_group_count,
         "incremental_candidate_preview": incremental_candidate_preview[:10],
         "mail_only_update_preview": mail_only_update_preview[:10],
+        "skippable_preview": skippable_preview[:10],
+        "partial_refresh_preview": partial_refresh_preview[:10],
+        "partial_refresh_breakdown": dict(sorted(partial_refresh_breakdown.items())),
         "blocking_reason": str(existing_bitable_prefilter.get("error") or "").strip(),
     }
 
@@ -1087,17 +1550,27 @@ def _build_execution_observability_layer(summary: dict[str, Any]) -> dict[str, A
     platforms = dict(summary.get("platforms") or {})
     platform_payloads: dict[str, Any] = {}
     status = "ready"
+    positioning_analysis_cache_hit_count = 0
+    positioning_analysis_cache_miss_count = 0
     for platform, payload in platforms.items():
         if not isinstance(payload, dict):
             continue
         visual_gate = dict(payload.get("visual_gate") or {})
         visual_retry = dict(payload.get("visual_retry") or {})
         positioning = dict(payload.get("positioning_card_analysis") or {})
+        positioning_result = dict(positioning.get("result") or {})
+        positioning_creator_cache = dict(positioning_result.get("creator_cache") or positioning.get("creator_cache") or {})
+        positioning_hit_count = int(positioning_creator_cache.get("positioning_hit_count") or 0)
+        positioning_miss_count = int(positioning_creator_cache.get("positioning_miss_count") or 0)
+        positioning_analysis_cache_hit_count += positioning_hit_count
+        positioning_analysis_cache_miss_count += positioning_miss_count
         platform_payloads[str(platform)] = {
             "status": str(payload.get("status") or "").strip(),
             "current_stage": str(payload.get("current_stage") or "").strip(),
             "requested_identifier_count": int(payload.get("requested_identifier_count") or 0),
             "mail_only_update_count": int(payload.get("mail_only_update_count") or 0),
+            "skippable_count": int(payload.get("skippable_count") or 0),
+            "partial_refresh_count": int(payload.get("partial_refresh_count") or 0),
             "profile_review_count": int(payload.get("profile_review_count") or 0),
             "prescreen_pass_count": int(payload.get("prescreen_pass_count") or 0),
             "missing_profile_count": int(payload.get("missing_profile_count") or 0),
@@ -1118,6 +1591,8 @@ def _build_execution_observability_layer(summary: dict[str, Any]) -> dict[str, A
                 "started_at": str(((payload.get("stage_metrics") or {}).get("positioning") or {}).get("started_at") or "").strip(),
                 "finished_at": str(((payload.get("stage_metrics") or {}).get("positioning") or {}).get("finished_at") or "").strip(),
                 "duration_seconds": float((((payload.get("stage_metrics") or {}).get("positioning") or {}).get("duration_seconds") or 0.0)),
+                "creator_cache_hit_count": positioning_hit_count,
+                "creator_cache_miss_count": positioning_miss_count,
             },
             "stage_metrics": dict(payload.get("stage_metrics") or {}),
         }
@@ -1127,6 +1602,8 @@ def _build_execution_observability_layer(summary: dict[str, Any]) -> dict[str, A
             status = "warning"
     return {
         "status": status,
+        "positioning_analysis_cache_hit_count": positioning_analysis_cache_hit_count,
+        "positioning_analysis_cache_miss_count": positioning_analysis_cache_miss_count,
         "platforms": platform_payloads,
         "blocking_reason": "",
     }
@@ -1151,6 +1628,11 @@ def _build_dry_run_report(summary: dict[str, Any]) -> dict[str, Any]:
     incremental_candidate_count = 0
     full_screening_candidate_count = 0
     mail_only_update_count = 0
+    skippable_count = 0
+    partial_refresh_count = 0
+    skippable_preview: list[str] = []
+    partial_refresh_preview: list[str] = []
+    partial_refresh_breakdown: dict[str, int] = {}
 
     for platform, payload in platforms.items():
         if not isinstance(payload, dict):
@@ -1164,18 +1646,35 @@ def _build_dry_run_report(summary: dict[str, Any]) -> dict[str, Any]:
         platform_incremental = int(platform_prefilter.get("incremental_candidate_count") or 0)
         platform_full_screening = int(platform_prefilter.get("full_screening_candidate_count") or 0)
         platform_mail_only_update = int(platform_prefilter.get("mail_only_update_count") or 0)
+        platform_skippable = int(platform_prefilter.get("skippable_count") or 0)
+        platform_partial_refresh = int(platform_prefilter.get("partial_refresh_count") or 0)
         platform_requested = int(payload.get("requested_identifier_count") or 0)
         staged_identifier_count += platform_staged
         existing_bitable_match_count += platform_existing
         incremental_candidate_count += platform_incremental
         full_screening_candidate_count += platform_full_screening
         mail_only_update_count += platform_mail_only_update
-        if platform_requested > 0 or platform_mail_only_update > 0:
+        skippable_count += platform_skippable
+        partial_refresh_count += platform_partial_refresh
+        if platform_requested > 0 or platform_mail_only_update > 0 or platform_partial_refresh > 0:
             estimated_execution_platforms.append(platform_name)
         if bool(platform_prefilter.get("all_existing")):
             all_existing_platforms.append(platform_name)
         elif platform_staged <= 0:
             no_candidate_platforms.append(platform_name)
+        skippable_preview.extend(
+            [str(item) for item in list(platform_prefilter.get("skippable_preview") or []) if str(item).strip()]
+        )
+        partial_refresh_preview.extend(
+            [str(item) for item in list(platform_prefilter.get("partial_refresh_preview") or []) if str(item).strip()]
+        )
+        for reason, count in dict(platform_prefilter.get("partial_refresh_breakdown") or {}).items():
+            normalized_reason = str(reason or "").strip()
+            if not normalized_reason:
+                continue
+            partial_refresh_breakdown[normalized_reason] = (
+                int(partial_refresh_breakdown.get(normalized_reason) or 0) + int(count or 0)
+            )
         platform_reports[platform_name] = {
             "status": str(payload.get("status") or "").strip(),
             "staged_identifier_count": platform_staged,
@@ -1183,12 +1682,17 @@ def _build_dry_run_report(summary: dict[str, Any]) -> dict[str, Any]:
             "incremental_candidate_count": platform_incremental,
             "full_screening_candidate_count": platform_full_screening,
             "mail_only_update_count": platform_mail_only_update,
+            "skippable_count": platform_skippable,
+            "partial_refresh_count": platform_partial_refresh,
             "requested_identifier_count": platform_requested,
             "requested_identifier_preview": list(payload.get("requested_identifier_preview") or [])[:10],
             "incremental_candidate_preview": list(platform_prefilter.get("incremental_candidate_preview") or [])[:10],
             "mail_only_update_preview": list(platform_prefilter.get("mail_only_update_preview") or [])[:10],
+            "skippable_preview": list(platform_prefilter.get("skippable_preview") or [])[:10],
+            "partial_refresh_preview": list(platform_prefilter.get("partial_refresh_preview") or [])[:10],
+            "partial_refresh_breakdown": dict(platform_prefilter.get("partial_refresh_breakdown") or {}),
             "all_existing": bool(platform_prefilter.get("all_existing")),
-            "would_execute": bool(platform_requested > 0 or platform_mail_only_update > 0),
+            "would_execute": bool(platform_requested > 0 or platform_mail_only_update > 0 or platform_partial_refresh > 0),
         }
 
     return {
@@ -1198,6 +1702,11 @@ def _build_dry_run_report(summary: dict[str, Any]) -> dict[str, Any]:
         "incremental_candidate_count": incremental_candidate_count,
         "full_screening_candidate_count": full_screening_candidate_count,
         "mail_only_update_count": mail_only_update_count,
+        "skippable_count": skippable_count,
+        "skippable_preview": skippable_preview[:10],
+        "partial_refresh_count": partial_refresh_count,
+        "partial_refresh_preview": partial_refresh_preview[:10],
+        "partial_refresh_breakdown": dict(sorted(partial_refresh_breakdown.items())),
         "estimated_execution_platform_count": len(estimated_execution_platforms),
         "estimated_execution_platforms": estimated_execution_platforms,
         "all_existing_platforms": all_existing_platforms,
@@ -1315,6 +1824,8 @@ def _build_downstream_observability(summary: dict[str, Any]) -> dict[str, Any]:
                 if isinstance(payload, dict)
             ),
             "mail_only_update_count": int(incremental_layer.get("mail_only_update_count") or 0),
+            "skippable_count": int(incremental_layer.get("skippable_count") or 0),
+            "partial_refresh_count": int(incremental_layer.get("partial_refresh_count") or 0),
             "full_screening_candidate_count": int(incremental_layer.get("full_screening_candidate_count") or 0),
         },
         "output_counts": {
@@ -1329,6 +1840,8 @@ def _build_downstream_observability(summary: dict[str, Any]) -> dict[str, Any]:
                 if isinstance(payload, dict)
             ),
             "mail_only_update_count": int(incremental_layer.get("mail_only_update_count") or 0),
+            "skippable_count": int(incremental_layer.get("skippable_count") or 0),
+            "partial_refresh_count": int(incremental_layer.get("partial_refresh_count") or 0),
             "upload_created_count": int(upload_layer.get("created_count") or 0),
             "upload_failed_count": int(upload_layer.get("failed_count") or 0),
         },
@@ -1377,7 +1890,9 @@ def _build_downstream_diagnostics(summary: dict[str, Any]) -> dict[str, Any]:
                     f"staged {int(dry_run_report.get('staged_identifier_count') or 0)} 个达人，"
                     f"已存在 {int(dry_run_report.get('existing_bitable_match_count') or 0)} 个，"
                     f"新增 {int(dry_run_report.get('incremental_candidate_count') or 0)} 个，"
+                    f"局部补齐 {int(dry_run_report.get('partial_refresh_count') or 0)} 个，"
                     f"邮件直更 {int(dry_run_report.get('mail_only_update_count') or 0)} 个，"
+                    f"静默跳过 {int(dry_run_report.get('skippable_count') or 0)} 个，"
                     f"预计执行平台 {int(dry_run_report.get('estimated_execution_platform_count') or 0)} 个。"
                 ),
             }
@@ -1396,6 +1911,8 @@ def _build_downstream_diagnostics(summary: dict[str, Any]) -> dict[str, Any]:
         existing_count = int(incremental_layer.get("existing_bitable_match_count") or 0)
         incremental_count = int(incremental_layer.get("incremental_candidate_count") or 0)
         mail_only_update_count = int(incremental_layer.get("mail_only_update_count") or 0)
+        skippable_count = int(incremental_layer.get("skippable_count") or 0)
+        partial_refresh_count = int(incremental_layer.get("partial_refresh_count") or 0)
         if bool(incremental_layer.get("all_existing")):
             conclusions.append(
                 {
@@ -1404,7 +1921,9 @@ def _build_downstream_diagnostics(summary: dict[str, Any]) -> dict[str, Any]:
                     "severity": "info",
                     "message": (
                         f"本次 staged {staged_count} 个达人均已存在于目标飞书表，"
-                        f"其中 {mail_only_update_count} 个会直接走邮件字段更新，无需重跑 scrape / visual。"
+                        f"其中 {mail_only_update_count} 个会直接走邮件字段更新，"
+                        f"{partial_refresh_count} 个只会补抓缺失环节，"
+                        f"{skippable_count} 个因本地无缓存被直接跳过，无需完整重跑。"
                     ),
                 }
             )
@@ -1416,8 +1935,9 @@ def _build_downstream_diagnostics(summary: dict[str, Any]) -> dict[str, Any]:
                     "severity": "info",
                     "message": (
                         f"本次 staged {staged_count} 个达人，已存在 {existing_count} 个，"
-                        f"新增 {incremental_count} 个，邮件直更 {mail_only_update_count} 个，"
-                        "只对需要完整筛号的达人继续执行下游 scrape / visual。"
+                        f"新增 {incremental_count} 个，局部补齐 {partial_refresh_count} 个，"
+                        f"邮件直更 {mail_only_update_count} 个，静默跳过 {skippable_count} 个，"
+                        "只对需要的达人继续执行补抓或完整筛号。"
                     ),
                 }
             )
@@ -1428,6 +1948,24 @@ def _build_downstream_diagnostics(summary: dict[str, Any]) -> dict[str, Any]:
                     "code": "mail_only_updates_enabled",
                     "severity": "info",
                     "message": f"已有 {mail_only_update_count} 个已筛达人命中新邮件，本轮会复用飞书已有筛号结果，仅更新邮件字段。",
+                }
+            )
+        if partial_refresh_count > 0:
+            conclusions.append(
+                {
+                    "layer": "incremental_creator",
+                    "code": "partial_refresh_enabled",
+                    "severity": "info",
+                    "message": f"已有 {partial_refresh_count} 个老达人命中本地缓存缺口，本轮只补抓缺失的 scrape / visual / positioning 环节。",
+                }
+            )
+        if skippable_count > 0:
+            conclusions.append(
+                {
+                    "layer": "incremental_creator",
+                    "code": "existing_screened_skipped_without_local_cache",
+                    "severity": "info",
+                    "message": f"已有 {skippable_count} 个已筛老达人在飞书存在但本地无可复用缓存，本轮会静默跳过，不再重复发起 scrape / visual 请求。",
                 }
             )
     elif str(incremental_layer.get("linked_bitable_url") or "").strip():
@@ -1545,6 +2083,17 @@ def _build_downstream_diagnostics(summary: dict[str, Any]) -> dict[str, Any]:
 
 def _refresh_downstream_observability(summary: dict[str, Any]) -> None:
     summary["observability"] = _build_downstream_observability(summary)
+    incremental_layer = dict(((summary.get("observability") or {}).get("layers") or {}).get("incremental_creator") or {})
+    summary["skippable_count"] = int(incremental_layer.get("skippable_count") or 0)
+    summary["skippable_preview"] = list(incremental_layer.get("skippable_preview") or [])[:10]
+    summary["partial_refresh_count"] = int(incremental_layer.get("partial_refresh_count") or 0)
+    summary["partial_refresh_preview"] = list(incremental_layer.get("partial_refresh_preview") or [])[:10]
+    summary["partial_refresh_breakdown"] = dict(incremental_layer.get("partial_refresh_breakdown") or {})
+    summary["positioning_cache_hit_count"] = int(incremental_layer.get("positioning_cache_hit_count") or 0)
+    summary["positioning_cache_miss_count"] = int(incremental_layer.get("positioning_cache_miss_count") or 0)
+    execution_layer = dict(((summary.get("observability") or {}).get("layers") or {}).get("screening_execution") or {})
+    summary["positioning_analysis_cache_hit_count"] = int(execution_layer.get("positioning_analysis_cache_hit_count") or 0)
+    summary["positioning_analysis_cache_miss_count"] = int(execution_layer.get("positioning_analysis_cache_miss_count") or 0)
     summary["diagnostics"] = _build_downstream_diagnostics(summary)
 
 
@@ -1574,6 +2123,40 @@ def _build_feishu_open_client(
         base_url=base_url,
         timeout_seconds=timeout_seconds,
     )
+
+
+def _resolve_task_upload_task_owner_context(
+    *,
+    runtime: dict[str, Any],
+    env_file: str | Path,
+    task_name: str,
+    task_upload_url: str,
+) -> dict[str, str]:
+    normalized_task_name = _clean_text(task_name)
+    normalized_task_upload_url = _clean_text(task_upload_url)
+    if not normalized_task_name or not normalized_task_upload_url:
+        return {}
+    resolve_task_upload_entry = runtime.get("resolve_task_upload_entry")
+    if resolve_task_upload_entry is None:
+        return {}
+
+    client = _build_feishu_open_client(runtime=runtime, env_file=env_file)
+    entry = resolve_task_upload_entry(
+        client=client,
+        task_upload_url=normalized_task_upload_url,
+        task_name=normalized_task_name,
+    )
+    return {
+        "task_name": _clean_text(getattr(entry, "task_name", "")) or normalized_task_name,
+        "task_upload_url": normalized_task_upload_url,
+        "task_record_id": _clean_text(getattr(entry, "record_id", "")),
+        "task_owner_name": _clean_text(getattr(entry, "responsible_name", "")),
+        "task_owner_employee_id": _clean_text(getattr(entry, "employee_id", "")),
+        "task_owner_owner_name": _clean_text(getattr(entry, "owner_name", "")),
+        "task_owner_employee_email": _clean_text(getattr(entry, "owner_email", "")),
+        "linked_bitable_url": _clean_text(getattr(entry, "linked_bitable_url", "")),
+        "source": "task_upload_entry",
+    }
 
 
 def _prepare_existing_bitable_prefilter(
@@ -1986,6 +2569,7 @@ def _persist_platform_summary(
     current_stage: str | None = None,
     status: str | None = None,
     summary_writer: Callable[[dict[str, Any]], None] | None = None,
+    progress_writer: Callable[[str, dict[str, Any], str, str], None] | None = None,
 ) -> None:
     observed_at = backend_app.iso_now()
     if current_stage is not None:
@@ -2000,6 +2584,13 @@ def _persist_platform_summary(
         platform_summary["status"] = status
     platform_summary["last_updated_at"] = observed_at
     summary["platforms"][platform] = platform_summary
+    if progress_writer is not None and current_stage is not None:
+        progress_writer(
+            str(platform or "").strip(),
+            platform_summary,
+            str(current_stage or "").strip(),
+            observed_at,
+        )
     if summary_writer is not None:
         summary_writer(summary)
     else:
@@ -2025,6 +2616,7 @@ def _mark_platform_runtime_failure(
     exc: Exception,
     current_stage: str,
     summary_writer: Callable[[dict[str, Any]], None] | None = None,
+    progress_writer: Callable[[str, dict[str, Any], str, str], None] | None = None,
 ) -> None:
     platform_summary["status"] = "failed"
     platform_summary["error_code"] = "PLATFORM_RUNTIME_FAILED"
@@ -2038,6 +2630,7 @@ def _mark_platform_runtime_failure(
         platform_summary=platform_summary,
         current_stage=current_stage,
         summary_writer=summary_writer,
+        progress_writer=progress_writer,
     )
 
 
@@ -2300,6 +2893,232 @@ def _run_visual_postcheck_retries(
     return retry_summary
 
 
+def _run_visual_review_batches(
+    *,
+    client,
+    backend_app,
+    platform: str,
+    identifiers: list[str],
+    vision_provider: str,
+    creator_cache_db_path: str,
+    force_refresh_creator_cache: bool,
+    poll_job,
+    require_success,
+    poll_interval: float,
+    run_root: Path,
+    observed_at_func: Callable[[], str],
+    progress_callback: Callable[..., None] | None = None,
+) -> dict[str, Any]:
+    batches = _chunk_identifiers(list(identifiers or []), _resolve_visual_batch_size(platform))
+    batch_size = _resolve_visual_batch_size(platform)
+    checkpoint_path = _build_visual_checkpoint_path(run_root, platform)
+    normalized_identifiers = [item for batch in batches for item in batch]
+    checkpoint = _load_visual_checkpoint(
+        checkpoint_path,
+        identifier_signature=_build_identifier_signature(normalized_identifiers),
+        batch_size=batch_size,
+    )
+    completed_batches = sorted(
+        {
+            int(item)
+            for item in list(checkpoint.get("completed_batches") or [])
+            if isinstance(item, int) or (isinstance(item, str) and str(item).isdigit())
+        }
+    )
+    completed_batch_set = {
+        batch_index
+        for batch_index in completed_batches
+        if 1 <= batch_index <= len(batches)
+    }
+    completed_identifier_count = sum(len(batches[batch_index - 1]) for batch_index in completed_batch_set)
+    resumed_batch_count = len(completed_batch_set)
+    batch_summaries: list[dict[str, Any]] = []
+    aggregated_visual_results: dict[str, dict[str, Any]] = {}
+
+    for batch_index, batch_identifiers in enumerate(batches, start=1):
+        if batch_index in completed_batch_set:
+            if progress_callback is not None:
+                progress_callback(
+                    stage=f"{platform}.visual_running",
+                    platform=platform,
+                    phase="visual",
+                    current_batch=batch_index,
+                    batch_count=len(batches),
+                    batch_size=batch_size,
+                    processed=completed_identifier_count,
+                    total=len(normalized_identifiers),
+                    last_item=batch_identifiers[-1] if batch_identifiers else "",
+                    last_log_line=f"跳过已完成的视觉 batch {batch_index}/{len(batches)}",
+                    checkpoint_path=str(checkpoint_path),
+                    resume_available=True,
+                )
+            continue
+
+        if progress_callback is not None:
+            progress_callback(
+                stage=f"{platform}.visual_running",
+                platform=platform,
+                phase="visual",
+                current_batch=batch_index,
+                batch_count=len(batches),
+                batch_size=batch_size,
+                processed=completed_identifier_count,
+                total=len(normalized_identifiers),
+                last_item=batch_identifiers[0] if batch_identifiers else "",
+                last_log_line=f"开始视觉 batch {batch_index}/{len(batches)}",
+                checkpoint_path=str(checkpoint_path),
+                resume_available=bool(completed_batch_set),
+            )
+
+        visual_payload_body = build_visual_payload(
+            platform,
+            batch_identifiers,
+            creator_cache_db_path=creator_cache_db_path,
+            force_refresh_creator_cache=force_refresh_creator_cache,
+        )
+        if vision_provider:
+            visual_payload_body["provider"] = str(vision_provider).strip().lower()
+        visual_payload = require_success(
+            client.post("/api/jobs/visual-review", json={"platform": platform, "payload": visual_payload_body}),
+            f"{platform} visual batch {batch_index} start",
+        )
+        visual_job = poll_job(
+            client,
+            visual_payload["job"]["id"],
+            f"{platform} visual batch {batch_index} poll",
+            max(1.0, float(poll_interval)),
+        )
+        batch_status = str(visual_job.get("status") or "").strip().lower()
+        batch_summaries.append(
+            {
+                "batch_index": batch_index,
+                "identifier_count": len(batch_identifiers),
+                "identifier_preview": list(batch_identifiers[:10]),
+                "job": dict(visual_job or {}),
+            }
+        )
+        aggregated_visual_results.update(_extract_visual_results_map(platform, visual_job, backend_app))
+        if batch_status != "completed":
+            if progress_callback is not None:
+                progress_callback(
+                    stage=f"{platform}.visual_running",
+                    platform=platform,
+                    phase="visual",
+                    current_batch=batch_index,
+                    batch_count=len(batches),
+                    batch_size=batch_size,
+                    processed=completed_identifier_count,
+                    total=len(normalized_identifiers),
+                    last_item=batch_identifiers[-1] if batch_identifiers else "",
+                    last_log_line=f"视觉 batch {batch_index}/{len(batches)} 结束于 {batch_status or 'unknown'}",
+                    checkpoint_path=str(checkpoint_path),
+                    resume_available=bool(completed_batch_set),
+                )
+            visual_results_loader = getattr(backend_app, "load_visual_results", None)
+            loaded_visual_results = visual_results_loader(platform) if callable(visual_results_loader) else {}
+            if isinstance(loaded_visual_results, dict):
+                aggregated_visual_results.update(
+                    {
+                        str(key or (value or {}).get("username") or "").strip(): dict(value)
+                        for key, value in loaded_visual_results.items()
+                        if isinstance(value, dict) and str(key or (value or {}).get("username") or "").strip()
+                    }
+                )
+            total_identifiers = len(normalized_identifiers)
+            completed_percent = int((completed_identifier_count / total_identifiers) * 100) if total_identifiers > 0 else 0
+            return {
+                "status": batch_status or "failed",
+                "stage": batch_status or "failed",
+                "message": f"{platform} visual batch {batch_index} 未成功完成",
+                "progress": {
+                    "determinate": True,
+                    "done": completed_identifier_count,
+                    "total": total_identifiers,
+                    "percent": completed_percent,
+                },
+                "result": {
+                    "success": False,
+                    "visual_results": dict(aggregated_visual_results),
+                },
+                "batching": {
+                    "enabled": True,
+                    "batch_size": batch_size,
+                    "batch_count": len(batches),
+                    "completed_batch_count": len(completed_batch_set),
+                    "completed_identifier_count": completed_identifier_count,
+                    "resumed_batch_count": resumed_batch_count,
+                    "checkpoint_path": str(checkpoint_path),
+                    "failed_batch_index": batch_index,
+                    "batches": batch_summaries,
+                    "checkpoint": dict(checkpoint or {}),
+                },
+            }
+
+        completed_batch_set.add(batch_index)
+        completed_identifier_count += len(batch_identifiers)
+        checkpoint = _persist_visual_checkpoint(
+            checkpoint_path,
+            platform=platform,
+            batch_size=batch_size,
+            batch_count=len(batches),
+            identifiers=normalized_identifiers,
+            completed_batches=sorted(completed_batch_set),
+            observed_at=observed_at_func(),
+        )
+        if progress_callback is not None:
+            progress_callback(
+                stage=f"{platform}.visual_running",
+                platform=platform,
+                phase="visual",
+                current_batch=batch_index,
+                batch_count=len(batches),
+                batch_size=batch_size,
+                processed=completed_identifier_count,
+                total=len(normalized_identifiers),
+                last_item=batch_identifiers[-1] if batch_identifiers else "",
+                last_log_line=f"完成视觉 batch {batch_index}/{len(batches)}",
+                checkpoint_path=str(checkpoint_path),
+                resume_available=batch_index < len(batches),
+            )
+
+    visual_results_loader = getattr(backend_app, "load_visual_results", None)
+    visual_results = visual_results_loader(platform) if callable(visual_results_loader) else {}
+    if isinstance(visual_results, dict):
+        aggregated_visual_results.update(
+            {
+                str(key or (value or {}).get("username") or "").strip(): dict(value)
+                for key, value in visual_results.items()
+                if isinstance(value, dict) and str(key or (value or {}).get("username") or "").strip()
+            }
+        )
+    return {
+        "status": "completed",
+        "stage": "completed",
+        "message": f"{platform} visual review completed in {len(batches)} batch(es)",
+        "progress": {
+            "determinate": True,
+            "done": len(normalized_identifiers),
+            "total": len(normalized_identifiers),
+            "percent": 100,
+        },
+        "result": {
+            "success": True,
+            "visual_results": dict(aggregated_visual_results),
+        },
+        "batching": {
+            "enabled": True,
+            "batch_size": batch_size,
+            "batch_count": len(batches),
+            "completed_batch_count": len(completed_batch_set),
+            "completed_identifier_count": completed_identifier_count,
+            "resumed_batch_count": resumed_batch_count,
+            "checkpoint_path": str(checkpoint_path),
+            "batches": batch_summaries,
+            "checkpoint": dict(checkpoint or {}),
+        },
+    }
+
+
 def run_keep_list_screening_pipeline(
     *,
     keep_workbook: Path,
@@ -2311,6 +3130,7 @@ def run_keep_list_screening_pipeline(
     summary_json: Path | None = None,
     platform_filters: list[str] | None = None,
     vision_provider: str = "",
+    positioning_provider: str = "",
     max_identifiers_per_platform: int = 0,
     poll_interval: float = 5.0,
     dry_run: bool = False,
@@ -2329,6 +3149,10 @@ def run_keep_list_screening_pipeline(
     task_owner_owner_name: str = "",
     linked_bitable_url: str = "",
 ) -> dict[str, Any]:
+    resolved_positioning_provider = _resolve_effective_positioning_provider(
+        positioning_provider=positioning_provider,
+        vision_provider=vision_provider,
+    )
     normalized_task_name = str(task_name or "").strip()
     runner_paths = resolve_keep_list_downstream_paths(
         task_name=normalized_task_name or "task",
@@ -2365,6 +3189,14 @@ def run_keep_list_screening_pipeline(
     resolved_keep_workbook = keep_workbook.expanduser()
     resolved_template_workbook = template_workbook.expanduser() if template_workbook else None
     inferred_task_owner = _infer_task_owner_from_adjacent_task_spec(keep_workbook=resolved_keep_workbook.resolve())
+    explicit_linked_bitable_url = str(linked_bitable_url or "").strip()
+    inferred_linked_bitable_url = str(inferred_task_owner.get("linked_bitable_url") or "").strip()
+    initial_linked_bitable_url_source = "cli" if explicit_linked_bitable_url else ("adjacent_task_context" if inferred_linked_bitable_url else "")
+    initial_linked_bitable_url_source_path = (
+        ""
+        if explicit_linked_bitable_url
+        else str(inferred_task_owner.get("task_spec_path") or "").strip()
+    )
     normalized_task_owner_name = str(task_owner_name or inferred_task_owner.get("task_owner_name") or "").strip()
     normalized_task_owner_employee_id = str(
         task_owner_employee_id or inferred_task_owner.get("task_owner_employee_id") or ""
@@ -2378,7 +3210,7 @@ def run_keep_list_screening_pipeline(
     normalized_task_owner_owner_name = str(
         task_owner_owner_name or inferred_task_owner.get("task_owner_owner_name") or ""
     ).strip()
-    normalized_linked_bitable_url = str(linked_bitable_url or inferred_task_owner.get("linked_bitable_url") or "").strip()
+    normalized_linked_bitable_url = str(explicit_linked_bitable_url or inferred_linked_bitable_url or "").strip()
     if not normalized_task_name:
         normalized_task_name = str(inferred_task_owner.get("task_name") or "").strip()
     if not task_upload_url:
@@ -2460,6 +3292,8 @@ def run_keep_list_screening_pipeline(
             "task_owner_employee_email": normalized_task_owner_employee_email,
             "task_owner_owner_name": normalized_task_owner_owner_name,
             "linked_bitable_url": normalized_linked_bitable_url,
+            "linked_bitable_url_source": initial_linked_bitable_url_source,
+            "linked_bitable_url_source_path": initial_linked_bitable_url_source_path,
             "inferred_from_task_spec": str(inferred_task_owner.get("task_spec_path") or ""),
         },
         "probe_vision_provider_only": bool(probe_vision_provider_only),
@@ -2480,6 +3314,8 @@ def run_keep_list_screening_pipeline(
             "missing_profiles_xlsx": "",
             "success_report_xlsx": "",
             "error_report_xlsx": "",
+            "progress_json": str((runner_paths.run_root / "progress.json").resolve()),
+            "checkpoint_root": str((runner_paths.run_root / "checkpoints").resolve()),
         },
         "setup": {
             "scope": "keep-list-screening",
@@ -2521,11 +3357,107 @@ def run_keep_list_screening_pipeline(
         linked_bitable_url=normalized_linked_bitable_url,
     )
     progress_scope = f"keep-list:{normalized_task_name or runner_paths.run_id}"
+    progress_path = (runner_paths.run_root / "progress.json").resolve()
     progress_state: dict[str, Any] = {
         "status": "",
         "vision_probe_signature": "",
         "platform_signatures": {},
+        "stage": "preflight",
+        "platform": "",
+        "phase": "preflight",
+        "current_batch": 0,
+        "batch_count": 0,
+        "batch_size": 0,
+        "processed": 0,
+        "total": 0,
+        "last_item": "",
+        "last_log_line": "preflight",
+        "checkpoint_path": "",
+        "resume_available": False,
     }
+    _progress_unset = object()
+
+    def persist_progress(
+        *,
+        observed_at: str = "",
+        stage: Any = _progress_unset,
+        platform: Any = _progress_unset,
+        phase: Any = _progress_unset,
+        status: Any = _progress_unset,
+        current_batch: Any = _progress_unset,
+        batch_count: Any = _progress_unset,
+        batch_size: Any = _progress_unset,
+        processed: Any = _progress_unset,
+        total: Any = _progress_unset,
+        last_item: Any = _progress_unset,
+        last_log_line: Any = _progress_unset,
+        checkpoint_path: Any = _progress_unset,
+        resume_available: Any = _progress_unset,
+    ) -> None:
+        for key, value in (
+            ("stage", stage),
+            ("platform", platform),
+            ("phase", phase),
+            ("status", status),
+            ("current_batch", current_batch),
+            ("batch_count", batch_count),
+            ("batch_size", batch_size),
+            ("processed", processed),
+            ("total", total),
+            ("last_item", last_item),
+            ("last_log_line", last_log_line),
+            ("checkpoint_path", checkpoint_path),
+            ("resume_available", resume_available),
+        ):
+            if value is _progress_unset:
+                continue
+            progress_state[key] = value
+        heartbeat_at = str(observed_at or summary.get("finished_at") or iso_now()).strip()
+        normalized_status = str(progress_state.get("status") or summary.get("status") or "").strip()
+        if not normalized_status:
+            normalized_status = "completed" if str(summary.get("finished_at") or "").strip() else "running"
+        payload = {
+            "run_id": str(summary.get("run_id") or "").strip(),
+            "task_name": str(summary.get("task_name") or "").strip(),
+            "status": normalized_status,
+            "stage": str(progress_state.get("stage") or summary.get("current_stage") or "").strip(),
+            "started_at": str(summary.get("started_at") or "").strip(),
+            "finished_at": str(summary.get("finished_at") or "").strip(),
+            "last_heartbeat_at": heartbeat_at,
+            "platform": str(progress_state.get("platform") or "").strip(),
+            "phase": str(progress_state.get("phase") or "").strip(),
+            "current_batch": int(progress_state.get("current_batch") or 0),
+            "batch_count": int(progress_state.get("batch_count") or 0),
+            "batch_size": int(progress_state.get("batch_size") or 0),
+            "processed": int(progress_state.get("processed") or 0),
+            "total": int(progress_state.get("total") or 0),
+            "last_item": str(progress_state.get("last_item") or "").strip(),
+            "last_log_line": str(progress_state.get("last_log_line") or "").strip(),
+            "warning_count": len(dict(summary.get("warnings") or {})),
+            "summary_json": str(run_summary_path),
+            "workflow_handoff_json": str(runner_paths.workflow_handoff_json),
+            "checkpoint_path": str(progress_state.get("checkpoint_path") or "").strip(),
+            "resume_available": bool(progress_state.get("resume_available")),
+        }
+        _write_json_snapshot(progress_path, payload)
+
+    def persist_platform_progress(
+        platform_name: str,
+        platform_payload: dict[str, Any],
+        current_stage: str,
+        observed_at: str,
+    ) -> None:
+        stage_group = _resolve_platform_stage_group(current_stage) or str(current_stage or "").strip()
+        persist_progress(
+            observed_at=observed_at,
+            stage=f"{platform_name}.{current_stage}",
+            platform=platform_name,
+            phase=stage_group,
+            status=str(platform_payload.get("status") or "running").strip() or "running",
+            processed=int(platform_payload.get("profile_review_count") or 0),
+            total=int(platform_payload.get("requested_identifier_count") or 0),
+            last_log_line=f"{platform_name} {current_stage}",
+        )
 
     def persist_summary(payload: dict[str, Any]) -> None:
         _refresh_downstream_observability(payload)
@@ -2587,11 +3519,56 @@ def run_keep_list_screening_pipeline(
             _emit_runtime_progress(progress_scope, f"{platform} " + " ".join(detail_parts or ["updated"]))
 
         _write_summary(run_summary_path, payload)
+        persist_progress(
+            observed_at=str(payload.get("finished_at") or "").strip() or iso_now(),
+            status=str(payload.get("status") or "").strip() or (
+                "completed" if str(payload.get("finished_at") or "").strip() else "running"
+            ),
+            last_log_line=str(progress_state.get("last_log_line") or payload.get("current_stage") or "").strip(),
+        )
         write_workflow_handoff(
             runner_paths.workflow_handoff_json,
             summary=payload,
             task_spec=task_spec,
             task_spec_available=bool(payload.get("setup", {}).get("completed")),
+        )
+
+    def persist_platform_state(
+        platform_name: str,
+        platform_payload: dict[str, Any],
+        *,
+        current_stage: str | None = None,
+        status: str | None = None,
+    ) -> None:
+        _persist_platform_summary(
+            summary=summary,
+            run_summary_path=run_summary_path,
+            backend_app=backend_app,
+            platform=platform_name,
+            platform_summary=platform_payload,
+            current_stage=current_stage,
+            status=status,
+            summary_writer=persist_summary,
+            progress_writer=persist_platform_progress,
+        )
+
+    def mark_platform_runtime_failure(
+        platform_name: str,
+        platform_payload: dict[str, Any],
+        *,
+        exc: Exception,
+        current_stage: str,
+    ) -> None:
+        _mark_platform_runtime_failure(
+            summary=summary,
+            run_summary_path=run_summary_path,
+            backend_app=backend_app,
+            platform=platform_name,
+            platform_summary=platform_payload,
+            exc=exc,
+            current_stage=current_stage,
+            summary_writer=persist_summary,
+            progress_writer=persist_platform_progress,
         )
 
     def _finalize_failure(
@@ -2608,7 +3585,54 @@ def run_keep_list_screening_pipeline(
         persist_summary(summary)
         return summary
 
+    if explicit_linked_bitable_url and inferred_linked_bitable_url and _linked_bitable_urls_conflict(
+        inferred_linked_bitable_url,
+        explicit_linked_bitable_url,
+    ):
+        failure = _build_failure_payload(
+            stage="preflight",
+            error_code="LINKED_BITABLE_URL_CONFLICT",
+            message=(
+                "显式传入的 linked_bitable_url 与 keep workbook 邻接上游解析出的达人管理表链接不一致，"
+                "已阻断本次下游运行。"
+            ),
+            remediation="移除错误的 --linked-bitable-url，或修正为与任务上传表一致的达人管理表链接后重试。",
+            details={
+                "provided_linked_bitable_url": explicit_linked_bitable_url,
+                "inferred_linked_bitable_url": inferred_linked_bitable_url,
+                "inferred_linked_bitable_url_source_path": str(inferred_task_owner.get("task_spec_path") or "").strip(),
+            },
+            failure_layer="preflight",
+        )
+        summary["preflight"]["ready"] = False
+        summary["preflight"]["errors"] = [failure]
+        summary["setup"]["skipped"] = True
+        attach_run_contract(summary)
+        persist_progress(status="failed", last_log_line="linked_bitable_url conflict")
+        return _finalize_failure(
+            failure=failure,
+            finished_at=iso_now(),
+        )
+
+    persist_progress(
+        observed_at=str(summary.get("started_at") or "").strip() or iso_now(),
+        stage="preflight",
+        platform="",
+        phase="preflight",
+        status="running",
+        last_log_line="preflight",
+        current_batch=0,
+        batch_count=0,
+        batch_size=0,
+        processed=0,
+        total=0,
+        last_item="",
+        checkpoint_path="",
+        resume_available=False,
+    )
+
     if not preflight["ready"]:
+        persist_progress(status="failed", last_log_line="preflight failed")
         failure = preflight["errors"][0]
         return _finalize_failure(
             failure={**failure, "failure_layer": "preflight"},
@@ -2620,6 +3644,7 @@ def run_keep_list_screening_pipeline(
         f"starting keep workbook={resolved_keep_workbook.resolve()} platforms={','.join(execution_platforms) or 'none'}",
     )
     summary["current_stage"] = "setup"
+    persist_progress(stage="setup", phase="setup", status="running", last_log_line="setup")
 
     setup = materialize_setup(
         scope="keep-list-screening",
@@ -2704,6 +3729,7 @@ def run_keep_list_screening_pipeline(
 
     try:
         summary["current_stage"] = "runtime_init"
+        persist_progress(stage="runtime_init", phase="runtime_init", last_log_line="runtime_init")
         runtime = _load_runtime_dependencies()
     except Exception as exc:  # noqa: BLE001
         failure = _build_failure_payload(
@@ -2717,6 +3743,125 @@ def run_keep_list_screening_pipeline(
             failure=failure,
             finished_at=iso_now(),
         )
+
+    try:
+        task_upload_task_owner = _resolve_task_upload_task_owner_context(
+            runtime=runtime,
+            env_file=env_file,
+            task_name=normalized_task_name,
+            task_upload_url=str(task_upload_url or "").strip(),
+        )
+    except Exception as exc:  # noqa: BLE001
+        summary.setdefault("warnings", {})["task_upload_task_owner_resolution"] = {
+            "status": "best_effort_failed",
+            "task_name": normalized_task_name,
+            "task_upload_url": str(task_upload_url or "").strip(),
+            "error": str(exc) or exc.__class__.__name__,
+        }
+    else:
+        authoritative_linked_bitable_url = str(task_upload_task_owner.get("linked_bitable_url") or "").strip()
+        if authoritative_linked_bitable_url:
+            if normalized_linked_bitable_url and _linked_bitable_urls_conflict(
+                authoritative_linked_bitable_url,
+                normalized_linked_bitable_url,
+            ):
+                if initial_linked_bitable_url_source != "adjacent_task_context":
+                    failure = _build_failure_payload(
+                        stage="runtime_init",
+                        error_code="LINKED_BITABLE_URL_TASK_UPLOAD_MISMATCH",
+                        message=(
+                            "任务上传表回查出的达人管理表链接与当前下游准备使用的 linked_bitable_url 不一致，"
+                            "已阻断本次运行。"
+                        ),
+                        remediation="确认任务名对应的任务上传记录后，使用任务上传表解析出的达人管理表链接重新执行。",
+                        details={
+                            "task_name": normalized_task_name,
+                            "task_upload_url": str(task_upload_url or "").strip(),
+                            "authoritative_linked_bitable_url": authoritative_linked_bitable_url,
+                            "resolved_linked_bitable_url": normalized_linked_bitable_url,
+                            "resolved_linked_bitable_url_source": initial_linked_bitable_url_source,
+                            "task_upload_record_id": str(task_upload_task_owner.get("task_record_id") or "").strip(),
+                        },
+                        failure_layer="input",
+                    )
+                    return _finalize_failure(
+                        failure=failure,
+                        finished_at=iso_now(),
+                    )
+                summary.setdefault("warnings", {})["linked_bitable_url_adjacent_override"] = {
+                    "status": "task_upload_entry_overrode_adjacent_fallback",
+                    "task_name": normalized_task_name,
+                    "adjacent_linked_bitable_url": normalized_linked_bitable_url,
+                    "authoritative_linked_bitable_url": authoritative_linked_bitable_url,
+                    "adjacent_source_path": initial_linked_bitable_url_source_path,
+                    "task_upload_record_id": str(task_upload_task_owner.get("task_record_id") or "").strip(),
+                }
+
+            normalized_task_name = str(task_upload_task_owner.get("task_name") or normalized_task_name).strip()
+            normalized_task_owner_name = (
+                normalized_task_owner_name or str(task_upload_task_owner.get("task_owner_name") or "").strip()
+            )
+            normalized_task_owner_employee_id = (
+                normalized_task_owner_employee_id
+                or str(task_upload_task_owner.get("task_owner_employee_id") or "").strip()
+            )
+            normalized_task_owner_employee_email = (
+                normalized_task_owner_employee_email
+                or str(task_upload_task_owner.get("task_owner_employee_email") or "").strip()
+            )
+            normalized_task_owner_owner_name = (
+                normalized_task_owner_owner_name
+                or str(task_upload_task_owner.get("task_owner_owner_name") or "").strip()
+            )
+            normalized_linked_bitable_url = authoritative_linked_bitable_url
+            initial_linked_bitable_url_source = str(task_upload_task_owner.get("source") or "task_upload_entry")
+            initial_linked_bitable_url_source_path = (
+                str(task_upload_task_owner.get("task_record_id") or "").strip()
+                or str(task_upload_url or "").strip()
+            )
+            summary["task_name"] = normalized_task_name
+            summary["task_upload_url"] = str(task_upload_url or "").strip()
+            summary["resolved_task_owner"] = {
+                "task_owner_name": normalized_task_owner_name,
+                "task_owner_employee_id": normalized_task_owner_employee_id,
+                "task_owner_employee_record_id": normalized_task_owner_employee_record_id,
+                "task_owner_employee_email": normalized_task_owner_employee_email,
+                "task_owner_owner_name": normalized_task_owner_owner_name,
+                "linked_bitable_url": normalized_linked_bitable_url,
+                "linked_bitable_url_source": initial_linked_bitable_url_source,
+                "linked_bitable_url_source_path": initial_linked_bitable_url_source_path,
+                "task_upload_record_id": str(task_upload_task_owner.get("task_record_id") or "").strip(),
+                "inferred_from_task_spec": str(inferred_task_owner.get("task_spec_path") or ""),
+            }
+            task_spec = build_keep_list_downstream_task_spec(
+                generated_at=summary["started_at"],
+                runner_paths=runner_paths,
+                env_snapshot=resolved_config["env_snapshot"],
+                env_file_raw=str(env_file),
+                resolved_config_sources=resolved_config_sources,
+                keep_workbook=resolved_keep_workbook.resolve(),
+                template_workbook=resolved_template_workbook.resolve() if resolved_template_workbook else None,
+                task_name=normalized_task_name,
+                task_upload_url=resolved_config["task_upload_url"].value,
+                requested_platforms=requested_platforms,
+                vision_provider=str(vision_provider or "").strip().lower(),
+                max_identifiers_per_platform=int(max_identifiers_per_platform),
+                poll_interval=float(poll_interval),
+                dry_run=bool(dry_run),
+                probe_vision_provider_only=bool(probe_vision_provider_only),
+                skip_scrape=bool(skip_scrape),
+                skip_visual=bool(skip_visual),
+                skip_positioning_card_analysis=bool(skip_positioning_card_analysis),
+                creator_cache_db_path=str(creator_cache_db_path or "").strip(),
+                force_refresh_creator_cache=bool(force_refresh_creator_cache),
+                task_owner_name=normalized_task_owner_name,
+                task_owner_employee_id=normalized_task_owner_employee_id,
+                task_owner_employee_record_id=normalized_task_owner_employee_record_id,
+                task_owner_employee_email=normalized_task_owner_employee_email,
+                task_owner_owner_name=normalized_task_owner_owner_name,
+                linked_bitable_url=normalized_linked_bitable_url,
+            )
+            write_task_spec(runner_paths.task_spec_json, task_spec)
 
     backend_app = runtime["backend_app"]
     if "build_all_platforms_final_review_artifacts" in runtime and "collect_final_exports" in runtime:
@@ -2741,6 +3886,7 @@ def run_keep_list_screening_pipeline(
     try:
         try:
             summary["current_stage"] = "staging"
+            persist_progress(stage="staging", phase="staging", last_log_line="staging")
             _emit_runtime_progress(progress_scope, "staging_inputs=running")
             reset_backend_runtime_state()
             staging_summary = prepare_screening_inputs(
@@ -2796,6 +3942,7 @@ def run_keep_list_screening_pipeline(
                 active_routing_strategy = str(resolve_routing_strategy({}) or "").strip().lower()
             if ((not skip_scrape and not skip_visual) or probe_vision_provider_only) and not dry_run:
                 summary["current_stage"] = "vision_probe"
+                persist_progress(stage="vision_probe", phase="vision_probe", last_log_line="vision_probe")
                 _emit_runtime_progress(progress_scope, "vision_probe=running")
                 if (
                     not str(vision_provider or "").strip()
@@ -2855,6 +4002,7 @@ def run_keep_list_screening_pipeline(
                 return summary
 
             summary["current_stage"] = "incremental_prefilter"
+            persist_progress(stage="incremental_prefilter", phase="incremental_prefilter", last_log_line="incremental_prefilter")
             existing_bitable_prefilter, existing_bitable_analysis = _prepare_existing_bitable_prefilter(
                 runtime=runtime,
                 env_file=env_file,
@@ -2865,6 +4013,7 @@ def run_keep_list_screening_pipeline(
             persist_summary(summary)
 
             summary["current_stage"] = "screening_execution"
+            persist_progress(stage="screening_execution", phase="screening_execution", last_log_line="screening_execution")
             mail_only_updates_by_platform: dict[str, list[dict[str, Any]]] = {}
             for platform in execution_platforms:
                 platform_summary: dict[str, Any] = {
@@ -2873,6 +4022,11 @@ def run_keep_list_screening_pipeline(
                     "requested_identifier_preview": [],
                     "mail_only_update_count": 0,
                     "mail_only_update_preview": [],
+                    "skippable_count": 0,
+                    "skippable_preview": [],
+                    "partial_refresh_count": 0,
+                    "partial_refresh_preview": [],
+                    "partial_refresh_breakdown": {},
                     "requested_vision_provider": str(vision_provider or "").strip().lower(),
                     "vision_preflight": backend_app.build_vision_preflight(vision_provider),
                     "incremental_prefilter": {
@@ -2890,6 +4044,11 @@ def run_keep_list_screening_pipeline(
                         "full_screening_candidate_preview": [],
                         "mail_only_update_count": 0,
                         "mail_only_update_preview": [],
+                        "skippable_count": 0,
+                        "skippable_preview": [],
+                        "partial_refresh_count": 0,
+                        "partial_refresh_preview": [],
+                        "partial_refresh_breakdown": {},
                         "duplicate_existing_group_count": 0,
                         "all_existing": False,
                         "mail_only_update_only": False,
@@ -2897,14 +4056,7 @@ def run_keep_list_screening_pipeline(
                     "status": "running",
                     "current_stage": "platform_preparing",
                 }
-                _persist_platform_summary(
-                    summary=summary,
-                    run_summary_path=run_summary_path,
-                    backend_app=backend_app,
-                    platform=platform,
-                    platform_summary=platform_summary,
-                    summary_writer=persist_summary,
-                )
+                persist_platform_state(platform, platform_summary)
                 try:
                     identifier_plan = _build_platform_identifier_plan(
                         backend_app,
@@ -2912,9 +4064,24 @@ def run_keep_list_screening_pipeline(
                         max_identifiers_per_platform=max(0, int(max_identifiers_per_platform)),
                         existing_bitable_analysis=existing_bitable_analysis,
                         task_owner_employee_id=normalized_task_owner_employee_id,
+                        creator_cache_db_path=str(creator_cache_db_path or "").strip(),
+                        force_refresh_creator_cache=bool(force_refresh_creator_cache),
+                        vision_provider=str(vision_provider or "").strip().lower(),
+                        positioning_provider=resolved_positioning_provider,
+                        skip_visual=bool(skip_visual),
+                        skip_positioning_card_analysis=bool(skip_positioning_card_analysis),
                     )
                     requested_identifiers = list(identifier_plan.get("requested_identifiers") or [])
+                    visual_requested_identifiers = list(identifier_plan.get("visual_requested_identifiers") or [])
+                    positioning_requested_identifiers = list(identifier_plan.get("positioning_requested_identifiers") or [])
                     mail_only_update_entries = [dict(item) for item in list(identifier_plan.get("mail_only_update_entries") or []) if isinstance(item, dict)]
+                    skippable_entries = [dict(item) for item in list(identifier_plan.get("skippable_entries") or []) if isinstance(item, dict)]
+                    partial_refresh_entries = [dict(item) for item in list(identifier_plan.get("partial_refresh_entries") or []) if isinstance(item, dict)]
+                    has_stage_work = bool(
+                        requested_identifiers
+                        or visual_requested_identifiers
+                        or positioning_requested_identifiers
+                    )
                     platform_summary["staged_identifier_count"] = int(identifier_plan.get("staged_identifier_count") or 0)
                     platform_summary["incremental_prefilter"] = dict(identifier_plan.get("incremental_prefilter") or {})
                     platform_summary["requested_identifier_count"] = len(requested_identifiers)
@@ -2925,27 +4092,38 @@ def run_keep_list_screening_pipeline(
                         for item in mail_only_update_entries[:10]
                         if str(item.get("creator_id") or "").strip()
                     ]
+                    platform_summary["skippable_count"] = len(skippable_entries)
+                    platform_summary["skippable_preview"] = [
+                        str(item.get("creator_id") or "").strip()
+                        for item in skippable_entries[:10]
+                        if str(item.get("creator_id") or "").strip()
+                    ]
+                    platform_summary["partial_refresh_count"] = len(partial_refresh_entries)
+                    platform_summary["partial_refresh_preview"] = [
+                        str(item.get("creator_id") or "").strip()
+                        for item in partial_refresh_entries[:10]
+                        if str(item.get("creator_id") or "").strip()
+                    ]
+                    platform_summary["partial_refresh_breakdown"] = dict(
+                        (platform_summary.get("incremental_prefilter") or {}).get("partial_refresh_breakdown") or {}
+                    )
                     if mail_only_update_entries:
                         mail_only_updates_by_platform[str(platform)] = mail_only_update_entries
                 except Exception as exc:  # noqa: BLE001
-                    _mark_platform_runtime_failure(
-                        summary=summary,
-                        run_summary_path=run_summary_path,
-                        backend_app=backend_app,
-                        platform=platform,
-                        platform_summary=platform_summary,
+                    mark_platform_runtime_failure(
+                        platform,
+                        platform_summary,
                         exc=exc,
                         current_stage="platform_preparing_failed",
-                        summary_writer=persist_summary,
                     )
                     continue
 
                 if dry_run:
-                    if int(platform_summary.get("mail_only_update_count") or 0) > 0 and not requested_identifiers:
+                    if int(platform_summary.get("mail_only_update_count") or 0) > 0 and not has_stage_work:
                         platform_summary["reason"] = "dry_run planned mail-only updates for already-screened creators"
-                    elif bool((platform_summary.get("incremental_prefilter") or {}).get("all_existing")):
+                    elif bool((platform_summary.get("incremental_prefilter") or {}).get("all_existing")) and not has_stage_work:
                         platform_summary["reason"] = "all staged creators already exist in target bitable"
-                    elif not requested_identifiers:
+                    elif not has_stage_work:
                         platform_summary["reason"] = "no staged identifiers for platform"
                     else:
                         platform_summary["reason"] = "dry_run planned incremental execution only"
@@ -2965,21 +4143,17 @@ def run_keep_list_screening_pipeline(
                     )
                     platform_summary["exports"] = {}
                     platform_summary["dry_run"] = {
-                        "would_execute": bool(requested_identifiers),
+                        "would_execute": bool(has_stage_work),
                         "reason": str(platform_summary.get("reason") or "").strip(),
                     }
-                    _persist_platform_summary(
-                        summary=summary,
-                        run_summary_path=run_summary_path,
-                        backend_app=backend_app,
-                        platform=platform,
-                        platform_summary=platform_summary,
+                    persist_platform_state(
+                        platform,
+                        platform_summary,
                         current_stage="incremental_filter_completed",
-                        summary_writer=persist_summary,
                     )
                     continue
 
-                if int(platform_summary.get("mail_only_update_count") or 0) > 0 and not requested_identifiers:
+                if int(platform_summary.get("mail_only_update_count") or 0) > 0 and not has_stage_work:
                     platform_summary["status"] = "completed"
                     platform_summary["reason"] = "screened creators will be updated via mail-only export merge"
                     platform_summary["scrape_job"] = {"status": "skipped", "reason": platform_summary["reason"]}
@@ -2996,18 +4170,14 @@ def run_keep_list_screening_pipeline(
                         "mail-only updates reuse existing screening result",
                     )
                     platform_summary["exports"] = {}
-                    _persist_platform_summary(
-                        summary=summary,
-                        run_summary_path=run_summary_path,
-                        backend_app=backend_app,
-                        platform=platform,
-                        platform_summary=platform_summary,
+                    persist_platform_state(
+                        platform,
+                        platform_summary,
                         current_stage="incremental_filter_completed",
-                        summary_writer=persist_summary,
                     )
                     continue
 
-                if bool((platform_summary.get("incremental_prefilter") or {}).get("all_existing")):
+                if bool((platform_summary.get("incremental_prefilter") or {}).get("all_existing")) and not has_stage_work:
                     platform_summary["status"] = "completed"
                     platform_summary["reason"] = "all staged creators already exist in target bitable"
                     platform_summary["scrape_job"] = {"status": "skipped", "reason": platform_summary["reason"]}
@@ -3024,28 +4194,20 @@ def run_keep_list_screening_pipeline(
                         "incremental filter found no new creators",
                     )
                     platform_summary["exports"] = {}
-                    _persist_platform_summary(
-                        summary=summary,
-                        run_summary_path=run_summary_path,
-                        backend_app=backend_app,
-                        platform=platform,
-                        platform_summary=platform_summary,
+                    persist_platform_state(
+                        platform,
+                        platform_summary,
                         current_stage="incremental_filter_completed",
-                        summary_writer=persist_summary,
                     )
                     continue
 
-                if not requested_identifiers:
+                if not has_stage_work:
                     platform_summary["status"] = "skipped"
                     platform_summary["reason"] = "no staged identifiers for platform"
-                    _persist_platform_summary(
-                        summary=summary,
-                        run_summary_path=run_summary_path,
-                        backend_app=backend_app,
-                        platform=platform,
-                        platform_summary=platform_summary,
+                    persist_platform_state(
+                        platform,
+                        platform_summary,
                         current_stage="platform_skipped",
-                        summary_writer=persist_summary,
                     )
                     continue
 
@@ -3063,25 +4225,17 @@ def run_keep_list_screening_pipeline(
                         "skipped",
                         "scrape skipped before positioning analysis",
                     )
-                    _persist_platform_summary(
-                        summary=summary,
-                        run_summary_path=run_summary_path,
-                        backend_app=backend_app,
-                        platform=platform,
-                        platform_summary=platform_summary,
+                    persist_platform_state(
+                        platform,
+                        platform_summary,
                         current_stage="scrape_skipped",
-                        summary_writer=persist_summary,
                     )
                     continue
 
-                _persist_platform_summary(
-                    summary=summary,
-                    run_summary_path=run_summary_path,
-                    backend_app=backend_app,
-                    platform=platform,
-                    platform_summary=platform_summary,
+                persist_platform_state(
+                    platform,
+                    platform_summary,
                     current_stage="scrape_starting",
-                    summary_writer=persist_summary,
                 )
                 scrape_payload_body = build_scrape_payload(
                     platform,
@@ -3096,14 +4250,10 @@ def run_keep_list_screening_pipeline(
                         f"{platform} scrape start",
                     )
                     platform_summary["scrape_job"] = dict(scrape_payload.get("job") or {})
-                    _persist_platform_summary(
-                        summary=summary,
-                        run_summary_path=run_summary_path,
-                        backend_app=backend_app,
-                        platform=platform,
-                        platform_summary=platform_summary,
+                    persist_platform_state(
+                        platform,
+                        platform_summary,
                         current_stage="scrape_running",
-                        summary_writer=persist_summary,
                     )
                     scrape_job = poll_job(
                         client,
@@ -3112,15 +4262,11 @@ def run_keep_list_screening_pipeline(
                         max(1.0, float(poll_interval)),
                     )
                 except Exception as exc:  # noqa: BLE001
-                    _mark_platform_runtime_failure(
-                        summary=summary,
-                        run_summary_path=run_summary_path,
-                        backend_app=backend_app,
-                        platform=platform,
-                        platform_summary=platform_summary,
+                    mark_platform_runtime_failure(
+                        platform,
+                        platform_summary,
                         exc=exc,
                         current_stage="scrape_runtime_failed",
-                        summary_writer=persist_summary,
                     )
                     continue
                 platform_summary["scrape_job"] = scrape_job
@@ -3134,39 +4280,27 @@ def run_keep_list_screening_pipeline(
                 scrape_partial_result = _extract_scrape_partial_result(scrape_job)
                 if scrape_partial_result:
                     platform_summary["scrape_job"]["partial_result"] = scrape_partial_result
-                _persist_platform_summary(
-                    summary=summary,
-                    run_summary_path=run_summary_path,
-                    backend_app=backend_app,
-                    platform=platform,
-                    platform_summary=platform_summary,
+                persist_platform_state(
+                    platform,
+                    platform_summary,
                     current_stage="scrape_completed" if scrape_job["status"] == "completed" else "scrape_poll_finished",
-                    summary_writer=persist_summary,
                 )
                 scrape_was_salvaged = False
                 if scrape_job["status"] != "completed":
                     if _scrape_has_partial_result(scrape_job):
                         scrape_was_salvaged = True
                         platform_summary["scrape_job"]["salvaged"] = True
-                        _persist_platform_summary(
-                            summary=summary,
-                            run_summary_path=run_summary_path,
-                            backend_app=backend_app,
-                            platform=platform,
-                            platform_summary=platform_summary,
+                        persist_platform_state(
+                            platform,
+                            platform_summary,
                             current_stage="scrape_partial_ready",
-                            summary_writer=persist_summary,
                         )
                     else:
                         platform_summary["status"] = "scrape_failed"
-                        _persist_platform_summary(
-                            summary=summary,
-                            run_summary_path=run_summary_path,
-                            backend_app=backend_app,
-                            platform=platform,
-                            platform_summary=platform_summary,
+                        persist_platform_state(
+                            platform,
+                            platform_summary,
                             current_stage="scrape_failed",
-                            summary_writer=persist_summary,
                         )
                         continue
 
@@ -3177,6 +4311,10 @@ def run_keep_list_screening_pipeline(
                 fallback_reviews = _extract_fallback_profile_reviews(scrape_job)
                 fallback_profiles = _build_fallback_profile_summary(fallback_reviews)
                 available_identifiers = _extract_available_profile_identifiers(scrape_profile_reviews)
+                visual_target_identifiers = list(visual_requested_identifiers or (available_identifiers or requested_identifiers))
+                positioning_target_identifiers = list(
+                    positioning_requested_identifiers or (available_identifiers or requested_identifiers)
+                )
                 platform_summary["profile_review_count"] = len(scrape_profile_reviews)
                 platform_summary["prescreen_pass_count"] = pass_count
                 platform_summary["missing_profile_count"] = len(missing_profiles)
@@ -3193,6 +4331,7 @@ def run_keep_list_screening_pipeline(
                     "configured_provider_names": platform_summary["vision_preflight"]["configured_provider_names"],
                     "selected_provider": platform_summary["vision_preflight"].get("preferred_provider") or "",
                 }
+                staged_fallback_source_identifiers: list[str] = []
                 if fallback_profiles:
                     current_lookup = dict(backend_app.load_upload_metadata(platform) or {})
                     next_platform = _resolve_next_fallback_platform(platform, execution_platforms)
@@ -3226,15 +4365,11 @@ def run_keep_list_screening_pipeline(
                                 missing_profiles=fallback_profiles,
                             )
                         except Exception as exc:  # noqa: BLE001
-                            _mark_platform_runtime_failure(
-                                summary=summary,
-                                run_summary_path=run_summary_path,
-                                backend_app=backend_app,
-                                platform=platform,
-                                platform_summary=platform_summary,
+                            mark_platform_runtime_failure(
+                                platform,
+                                platform_summary,
                                 exc=exc,
                                 current_stage="fallback_staging_failed",
-                                summary_writer=persist_summary,
                             )
                             continue
                         platform_summary["fallback"] = {
@@ -3242,8 +4377,16 @@ def run_keep_list_screening_pipeline(
                             "next_platform": next_platform,
                             "staged_count": int(fallback_result.get("staged_count") or 0),
                             "staged_identifier_preview": list(fallback_result.get("staged_identifier_preview") or []),
+                            "staged_source_identifier_preview": list(
+                                fallback_result.get("staged_source_identifier_preview") or []
+                            ),
                             "unresolved_missing_count": len(fallback_result.get("unresolved_missing") or []),
                         }
+                        staged_fallback_source_identifiers = [
+                            str(item or "").strip()
+                            for item in list(fallback_result.get("staged_source_identifiers") or [])
+                            if str(item or "").strip()
+                        ]
                         unresolved_missing = list(fallback_result.get("unresolved_missing") or [])
                     else:
                         if not current_has_fallback_contract:
@@ -3298,55 +4441,49 @@ def run_keep_list_screening_pipeline(
                 elif pass_count <= 0:
                     platform_summary["visual_job"] = {"status": "skipped", "reason": "no Prescreen=Pass targets"}
                 elif backend_app.get_available_vision_provider_names(vision_provider):
-                    visual_payload_body = build_visual_payload(
+                    persist_platform_state(
                         platform,
-                        available_identifiers or requested_identifiers,
-                        creator_cache_db_path=str(creator_cache_db_path or "").strip(),
-                        force_refresh_creator_cache=bool(force_refresh_creator_cache),
-                    )
-                    if vision_provider:
-                        visual_payload_body["provider"] = str(vision_provider).strip().lower()
-                    _persist_platform_summary(
-                        summary=summary,
-                        run_summary_path=run_summary_path,
-                        backend_app=backend_app,
-                        platform=platform,
-                        platform_summary=platform_summary,
+                        platform_summary,
                         current_stage="visual_starting",
-                        summary_writer=persist_summary,
                     )
                     try:
-                        visual_payload = require_success(
-                            client.post("/api/jobs/visual-review", json={"platform": platform, "payload": visual_payload_body}),
-                            f"{platform} visual start",
+                        platform_summary["visual_job"] = {
+                            "status": "running",
+                            "stage": "starting",
+                            "message": "visual review batching in progress",
+                        }
+                        persist_platform_state(
+                            platform,
+                            platform_summary,
+                            current_stage="visual_running",
                         )
-                        platform_summary["visual_job"] = dict(visual_payload.get("job") or {})
-                        _persist_platform_summary(
-                            summary=summary,
-                            run_summary_path=run_summary_path,
+                        platform_summary["visual_job"] = _run_visual_review_batches(
+                            client=client,
                             backend_app=backend_app,
                             platform=platform,
-                            platform_summary=platform_summary,
-                            current_stage="visual_running",
-                            summary_writer=persist_summary,
+                            identifiers=visual_target_identifiers,
+                            vision_provider=vision_provider,
+                            creator_cache_db_path=str(creator_cache_db_path or "").strip(),
+                            force_refresh_creator_cache=bool(force_refresh_creator_cache),
+                            poll_job=poll_job,
+                            require_success=require_success,
+                            poll_interval=poll_interval,
+                            run_root=runner_paths.run_root,
+                            observed_at_func=backend_app.iso_now,
+                            progress_callback=lambda **progress_kwargs: persist_progress(
+                                observed_at=backend_app.iso_now(),
+                                status="running",
+                                **progress_kwargs,
+                            ),
                         )
-                        platform_summary["visual_job"] = poll_job(
-                            client,
-                            visual_payload["job"]["id"],
-                            f"{platform} visual poll",
-                            max(1.0, float(poll_interval)),
-                        )
+                        platform_summary["visual_batching"] = dict(platform_summary["visual_job"].get("batching") or {})
                         platform_summary["visual_gate"]["executed"] = True
                     except Exception as exc:  # noqa: BLE001
-                        _mark_platform_runtime_failure(
-                            summary=summary,
-                            run_summary_path=run_summary_path,
-                            backend_app=backend_app,
-                            platform=platform,
-                            platform_summary=platform_summary,
+                        mark_platform_runtime_failure(
+                            platform,
+                            platform_summary,
                             exc=exc,
                             current_stage="visual_runtime_failed",
-                            summary_writer=persist_summary,
                         )
                         continue
                 else:
@@ -3373,15 +4510,11 @@ def run_keep_list_screening_pipeline(
                             max_rounds=visual_postcheck_max_rounds,
                         )
                     except Exception as exc:  # noqa: BLE001
-                        _mark_platform_runtime_failure(
-                            summary=summary,
-                            run_summary_path=run_summary_path,
-                            backend_app=backend_app,
-                            platform=platform,
-                            platform_summary=platform_summary,
+                        mark_platform_runtime_failure(
+                            platform,
+                            platform_summary,
                             exc=exc,
                             current_stage="visual_retry_failed",
-                            summary_writer=persist_summary,
                         )
                         continue
                 else:
@@ -3414,7 +4547,7 @@ def run_keep_list_screening_pipeline(
                                 platform,
                                 build_visual_payload(
                                     platform,
-                                    available_identifiers or requested_identifiers,
+                                    positioning_target_identifiers,
                                     creator_cache_db_path=str(creator_cache_db_path or "").strip(),
                                     force_refresh_creator_cache=bool(force_refresh_creator_cache),
                                 ),
@@ -3428,21 +4561,17 @@ def run_keep_list_screening_pipeline(
                     else:
                         positioning_payload_body = build_visual_payload(
                             platform,
-                            available_identifiers or requested_identifiers,
+                            positioning_target_identifiers,
                             creator_cache_db_path=str(creator_cache_db_path or "").strip(),
                             force_refresh_creator_cache=bool(force_refresh_creator_cache),
                         )
-                        if vision_provider:
-                            positioning_payload_body["provider"] = str(vision_provider).strip().lower()
+                        if resolved_positioning_provider:
+                            positioning_payload_body["provider"] = resolved_positioning_provider
                         try:
-                            _persist_platform_summary(
-                                summary=summary,
-                                run_summary_path=run_summary_path,
-                                backend_app=backend_app,
-                                platform=platform,
-                                platform_summary=platform_summary,
+                            persist_platform_state(
+                                platform,
+                                platform_summary,
                                 current_stage="positioning_card_analysis_starting",
-                                summary_writer=persist_summary,
                             )
                             positioning_payload = require_success(
                                 client.post(
@@ -3452,14 +4581,10 @@ def run_keep_list_screening_pipeline(
                                 f"{platform} positioning card start",
                             )
                             platform_summary["positioning_card_analysis"] = dict(positioning_payload.get("job") or {})
-                            _persist_platform_summary(
-                                summary=summary,
-                                run_summary_path=run_summary_path,
-                                backend_app=backend_app,
-                                platform=platform,
-                                platform_summary=platform_summary,
+                            persist_platform_state(
+                                platform,
+                                platform_summary,
                                 current_stage="positioning_card_analysis_running",
-                                summary_writer=persist_summary,
                             )
                             platform_summary["positioning_card_analysis"] = poll_job(
                                 client,
@@ -3475,14 +4600,10 @@ def run_keep_list_screening_pipeline(
                                 non_blocking=True,
                             )
 
-                _persist_platform_summary(
-                    summary=summary,
-                    run_summary_path=run_summary_path,
-                    backend_app=backend_app,
-                    platform=platform,
-                    platform_summary=platform_summary,
+                persist_platform_state(
+                    platform,
+                    platform_summary,
                     current_stage="exporting_artifacts",
-                    summary_writer=persist_summary,
                 )
                 try:
                     platform_summary["artifact_status"] = require_success(
@@ -3490,7 +4611,7 @@ def run_keep_list_screening_pipeline(
                         f"{platform} artifact status",
                     )
                     fallback_stage_count = int(((platform_summary.get("fallback") or {}).get("staged_count") or 0))
-                    if fallback_stage_count > 0:
+                    if fallback_stage_count > 0 and bool(platform_summary.get("fallback_only")):
                         platform_summary["exports"] = {}
                         platform_summary["final_review_export"] = {
                             "status": "deferred",
@@ -3498,30 +4619,64 @@ def run_keep_list_screening_pipeline(
                             "fallback_staged_count": fallback_stage_count,
                         }
                     else:
-                        platform_summary["exports"] = export_platform_artifacts(client, platform, exports_dir / platform)
+                        final_review_profile_reviews = None
+                        if staged_fallback_source_identifiers:
+                            final_review_profile_reviews = _filter_profile_reviews_for_final_export(
+                                backend_app,
+                                platform,
+                                scrape_profile_reviews,
+                                staged_fallback_source_identifiers,
+                            )
+                            if final_review_profile_reviews and len(final_review_profile_reviews) < len(scrape_profile_reviews):
+                                platform_summary["final_review_export"] = {
+                                    "status": "partial_with_fallback_staged",
+                                    "reason": "fallback-staged missing profiles were excluded from the current platform final review export",
+                                    "fallback_staged_count": fallback_stage_count,
+                                    "export_profile_review_count": len(final_review_profile_reviews),
+                                    "source_profile_review_count": len(scrape_profile_reviews),
+                                    "excluded_identifier_preview": list(staged_fallback_source_identifiers[:10]),
+                                }
+                            elif not final_review_profile_reviews and fallback_stage_count > 0:
+                                platform_summary["exports"] = {}
+                                platform_summary["final_review_export"] = {
+                                    "status": "deferred",
+                                    "reason": "all current-platform rows were staged to fallback platforms; defer final review export until fallback platforms finish",
+                                    "fallback_staged_count": fallback_stage_count,
+                                }
+                                if bool(platform_summary.get("fallback_only")):
+                                    platform_summary["status"] = "fallback_staged"
+                                else:
+                                    platform_summary["status"] = (
+                                        "completed_with_partial_scrape" if scrape_was_salvaged else "completed"
+                                    )
+                                persist_platform_state(
+                                    platform,
+                                    platform_summary,
+                                    current_stage="completed",
+                                )
+                                continue
+                        platform_summary["exports"] = _export_platform_artifacts_with_optional_final_review_subset(
+                            export_platform_artifacts,
+                            client,
+                            platform,
+                            exports_dir / platform,
+                            final_review_profile_reviews=final_review_profile_reviews,
+                        )
                     if bool(platform_summary.get("fallback_only")):
                         platform_summary["status"] = "fallback_staged"
                     else:
                         platform_summary["status"] = "completed_with_partial_scrape" if scrape_was_salvaged else "completed"
-                    _persist_platform_summary(
-                        summary=summary,
-                        run_summary_path=run_summary_path,
-                        backend_app=backend_app,
-                        platform=platform,
-                        platform_summary=platform_summary,
+                    persist_platform_state(
+                        platform,
+                        platform_summary,
                         current_stage="completed",
-                        summary_writer=persist_summary,
                     )
                 except Exception as exc:  # noqa: BLE001
-                    _mark_platform_runtime_failure(
-                        summary=summary,
-                        run_summary_path=run_summary_path,
-                        backend_app=backend_app,
-                        platform=platform,
-                        platform_summary=platform_summary,
+                    mark_platform_runtime_failure(
+                        platform,
+                        platform_summary,
                         exc=exc,
                         current_stage="artifact_export_failed",
-                        summary_writer=persist_summary,
                     )
                     continue
         except Exception as exc:  # noqa: BLE001
@@ -3548,17 +4703,50 @@ def run_keep_list_screening_pipeline(
             summary["status"] = summarize_platform_statuses(summary["platforms"])
             summary["finished_at"] = backend_app.iso_now()
             summary["current_stage"] = "completed"
+            persist_progress(
+                observed_at=summary["finished_at"],
+                stage="completed",
+                platform="",
+                phase="completed",
+                status=str(summary["status"] or "completed"),
+                current_batch=0,
+                batch_count=0,
+                batch_size=0,
+                processed=0,
+                total=0,
+                last_item="",
+                checkpoint_path="",
+                resume_available=False,
+                last_log_line="completed",
+            )
             attach_run_contract(summary)
             persist_summary(summary)
             return summary
 
         combined_exports = collect_final_exports(summary.get("platforms"))
         summary["current_stage"] = "export_merge"
+        persist_progress(
+            stage="export_merge",
+            platform="",
+            phase="export_merge",
+            status="running",
+            current_batch=0,
+            batch_count=0,
+            batch_size=0,
+            processed=0,
+            total=0,
+            last_item="",
+            checkpoint_path="",
+            resume_available=False,
+            last_log_line="export_merge",
+        )
+        persist_summary(summary)
         combined_artifacts = build_all_platforms_final_review_artifacts(
             output_path=exports_dir / "all_platforms_final_review.xlsx",
             payload_json_path=exports_dir / "all_platforms_final_review_payload.json",
             final_exports=combined_exports,
             keep_workbook=resolved_keep_workbook,
+            pre_keep_mail_only_workbook=str(summary["artifacts"].get("pre_keep_mail_only_workbook") or "").strip(),
             manual_review_rows=summary.get("manual_review_rows") or [],
             mail_only_updates=mail_only_updates_by_platform,
             task_owner={
@@ -3604,6 +4792,7 @@ def run_keep_list_screening_pipeline(
         summary["artifacts"]["feishu_upload_updated_count"] = 0
         summary["artifacts"]["feishu_upload_failed_count"] = 0
         summary["artifacts"]["feishu_upload_skipped_existing_count"] = 0
+        persist_summary(summary)
         if combined_artifacts["source_row_count"] > 0 and combined_artifacts["row_count"] <= 0:
             skip_archive = summary["artifacts"]["all_platforms_upload_skipped_archive_json"]
             summary["artifacts"]["error_report_xlsx"] = _write_report_xlsx_best_effort(
@@ -3631,6 +4820,22 @@ def run_keep_list_screening_pipeline(
             )
         if combined_artifacts["row_count"] > 0:
             summary["current_stage"] = "upload"
+            persist_progress(
+                stage="upload",
+                platform="",
+                phase="upload",
+                status="running",
+                current_batch=0,
+                batch_count=0,
+                batch_size=0,
+                processed=0,
+                total=int(combined_artifacts["row_count"] or 0),
+                last_item="",
+                checkpoint_path="",
+                resume_available=False,
+                last_log_line="upload",
+            )
+            persist_summary(summary)
             try:
                 feishu_client = _build_feishu_open_client(
                     runtime=runtime,
@@ -3665,6 +4870,8 @@ def run_keep_list_screening_pipeline(
             summary["artifacts"]["feishu_upload_updated_count"] = int(upload_summary.get("updated_count") or 0)
             summary["artifacts"]["feishu_upload_failed_count"] = int(upload_summary.get("failed_count") or 0)
             summary["artifacts"]["feishu_upload_skipped_existing_count"] = int(upload_summary.get("skipped_existing_count") or 0)
+            summary["upload_summary"] = _compact_upload_summary(full_upload_summary)
+            persist_summary(summary)
             summary["artifacts"]["success_report_xlsx"] = _write_report_xlsx_best_effort(
                 exports_dir / "success_report.xlsx",
                 _build_success_report_rows(full_upload_summary),
@@ -3734,6 +4941,22 @@ def run_keep_list_screening_pipeline(
             summary["status"] = "completed_with_quality_warnings"
         summary["finished_at"] = backend_app.iso_now()
         summary["current_stage"] = "completed"
+        persist_progress(
+            observed_at=summary["finished_at"],
+            stage="completed",
+            platform="",
+            phase="completed",
+            status=str(summary["status"] or "completed"),
+            current_batch=0,
+            batch_count=0,
+            batch_size=0,
+            processed=0,
+            total=0,
+            last_item="",
+            checkpoint_path="",
+            resume_available=False,
+            last_log_line="completed",
+        )
         if summary["status"] == "scrape_failed":
             attach_failure_to_summary(
                 summary,
@@ -3822,6 +5045,47 @@ def _first_non_empty(*values: Any) -> str:
     return ""
 
 
+def _parse_linked_bitable_identity(url: Any) -> dict[str, str]:
+    normalized = _clean_text(url)
+    if not normalized:
+        return {
+            "raw_url": "",
+            "app_token": "",
+            "table_id": "",
+            "view_id": "",
+        }
+    parsed = parse.urlparse(normalized)
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    query = parse.parse_qs(parsed.query)
+    app_token = ""
+    if len(segments) >= 2 and segments[0] == "base":
+        app_token = str(segments[1] or "").strip()
+    return {
+        "raw_url": normalized,
+        "app_token": app_token,
+        "table_id": str(query.get("table", [""])[0] or "").strip(),
+        "view_id": str(query.get("view", [""])[0] or "").strip(),
+    }
+
+
+def _linked_bitable_urls_conflict(expected_url: Any, candidate_url: Any) -> bool:
+    expected = _parse_linked_bitable_identity(expected_url)
+    candidate = _parse_linked_bitable_identity(candidate_url)
+    if not expected["raw_url"] or not candidate["raw_url"]:
+        return False
+    if expected["raw_url"] == candidate["raw_url"]:
+        return False
+    if expected["app_token"] and candidate["app_token"]:
+        if expected["app_token"] != candidate["app_token"]:
+            return True
+        if expected["table_id"] and candidate["table_id"] and expected["table_id"] != candidate["table_id"]:
+            return True
+        if bool(expected["table_id"]) != bool(candidate["table_id"]):
+            return True
+        return False
+    return True
+
+
 def _extract_task_owner_context_from_payload(
     payload: dict[str, Any],
     *,
@@ -3840,6 +5104,15 @@ def _extract_task_owner_context_from_payload(
     resolved_inputs = payload.get("resolved_inputs") if isinstance(payload.get("resolved_inputs"), dict) else {}
     resolved_feishu = resolved_inputs.get("feishu") if isinstance(resolved_inputs.get("feishu"), dict) else {}
     steps = payload.get("steps") if isinstance(payload.get("steps"), dict) else {}
+    upstream_step = steps.get("upstream") if isinstance(steps.get("upstream"), dict) else {}
+    upstream_downstream_handoff = (
+        upstream_step.get("downstream_handoff") if isinstance(upstream_step.get("downstream_handoff"), dict) else {}
+    )
+    upstream_handoff_owner = (
+        upstream_downstream_handoff.get("task_owner")
+        if isinstance(upstream_downstream_handoff.get("task_owner"), dict)
+        else {}
+    )
     task_assets_step = steps.get("task_assets") if isinstance(steps.get("task_assets"), dict) else {}
     task_assets_raw = task_assets_step.get("raw") if isinstance(task_assets_step.get("raw"), dict) else {}
 
@@ -3850,12 +5123,16 @@ def _extract_task_owner_context_from_payload(
         resolved_task_owner.get("employee_id"),
         handoff_owner.get("task_owner_employee_id"),
         handoff_owner.get("employee_id"),
+        upstream_handoff_owner.get("task_owner_employee_id"),
+        upstream_handoff_owner.get("employee_id"),
     )
     linked_url = _first_non_empty(
         task_owner.get("linked_bitable_url"),
         resolved_task_owner.get("linked_bitable_url"),
         handoff_owner.get("linked_bitable_url"),
         downstream_handoff.get("linked_bitable_url"),
+        upstream_handoff_owner.get("linked_bitable_url"),
+        upstream_downstream_handoff.get("linked_bitable_url"),
         task_assets_step.get("linked_bitable_url"),
         task_assets_step.get("linkedBitableUrl"),
         task_assets_raw.get("linked_bitable_url"),
@@ -3869,6 +5146,9 @@ def _extract_task_owner_context_from_payload(
         handoff_owner.get("task_owner_name"),
         handoff_owner.get("responsible_name"),
         handoff_owner.get("employee_name"),
+        upstream_handoff_owner.get("task_owner_name"),
+        upstream_handoff_owner.get("responsible_name"),
+        upstream_handoff_owner.get("employee_name"),
     )
     record_id = _first_non_empty(
         task_owner.get("task_owner_employee_record_id"),
@@ -3877,6 +5157,8 @@ def _extract_task_owner_context_from_payload(
         resolved_task_owner.get("employee_record_id"),
         handoff_owner.get("task_owner_employee_record_id"),
         handoff_owner.get("employee_record_id"),
+        upstream_handoff_owner.get("task_owner_employee_record_id"),
+        upstream_handoff_owner.get("employee_record_id"),
     )
     employee_email = _first_non_empty(
         task_owner.get("task_owner_employee_email"),
@@ -3885,6 +5167,8 @@ def _extract_task_owner_context_from_payload(
         resolved_task_owner.get("employee_email"),
         handoff_owner.get("task_owner_employee_email"),
         handoff_owner.get("employee_email"),
+        upstream_handoff_owner.get("task_owner_employee_email"),
+        upstream_handoff_owner.get("employee_email"),
     )
     owner_login = _first_non_empty(
         task_owner.get("task_owner_owner_name"),
@@ -3893,16 +5177,20 @@ def _extract_task_owner_context_from_payload(
         resolved_task_owner.get("owner_name"),
         handoff_owner.get("task_owner_owner_name"),
         handoff_owner.get("owner_name"),
+        upstream_handoff_owner.get("task_owner_owner_name"),
+        upstream_handoff_owner.get("owner_name"),
     )
     task_name = _first_non_empty(
         task_owner.get("task_name"),
         resolved_task_owner.get("task_name"),
         handoff_owner.get("task_name"),
+        upstream_handoff_owner.get("task_name"),
         intent.get("task_name"),
     )
     task_upload_url = _first_non_empty(
         task_owner.get("task_upload_url"),
         handoff_owner.get("task_upload_url"),
+        upstream_handoff_owner.get("task_upload_url"),
         intent.get("task_upload_url"),
         resolved_feishu.get("task_upload_url"),
     )
@@ -3978,6 +5266,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--summary-json", default="", help="最终 run summary.json 输出路径。")
     parser.add_argument("--platform", action="append", help="只跑指定平台，可重复传入：tiktok / instagram / youtube。")
     parser.add_argument("--vision-provider", default="", help="指定视觉 provider，例如 openai / reelx。")
+    parser.add_argument("--positioning-provider", default="", help="指定定位卡 provider，例如 reelx。")
     parser.add_argument("--max-identifiers-per-platform", type=int, default=0, help="每个平台最多跑多少个账号；0 表示不截断。")
     parser.add_argument("--poll-interval", type=float, default=5.0, help="轮询 job 状态的秒数。")
     parser.add_argument("--dry-run", action="store_true", help="只做增量达人与平台执行预估，不真正触发 scrape / visual / export / upload。")
@@ -4015,6 +5304,7 @@ def main(argv: list[str] | None = None) -> int:
         summary_json=Path(args.summary_json) if args.summary_json else None,
         platform_filters=args.platform,
         vision_provider=args.vision_provider or "",
+        positioning_provider=args.positioning_provider or "",
         max_identifiers_per_platform=max(0, int(args.max_identifiers_per_platform)),
         poll_interval=max(1.0, float(args.poll_interval)),
         dry_run=bool(args.dry_run),
