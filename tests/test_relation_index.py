@@ -19,10 +19,15 @@ def _parsed_message(
     to_address: str,
     in_reply_to: str | None = None,
     references_header: str | None = None,
+    account_email: str = "demo@qq.com",
+    folder_name: str | None = None,
 ) -> ParsedMessage:
+    resolved_folder_name = folder_name
+    if resolved_folder_name is None:
+        resolved_folder_name = "INBOX" if from_address != account_email else "Sent Messages"
     return ParsedMessage(
-        account_email="demo@qq.com",
-        folder_name="INBOX" if from_address != "demo@qq.com" else "Sent Messages",
+        account_email=account_email,
+        folder_name=resolved_folder_name,
         uid=uid,
         uidvalidity=1001,
         message_id=message_id,
@@ -123,6 +128,44 @@ class RelationIndexTests(unittest.TestCase):
 
         self.assertEqual(len(threads), 2)
         self.assertEqual(thread_keys, {"mid:<root-1@example.com>", "mid:<root-2@example.com>"})
+
+    def test_rebuild_relation_index_treats_internal_alias_domain_as_self(self) -> None:
+        alias_db = Database(Path(self.temp_dir.name) / "alias-relations.db")
+        alias_db.init_schema()
+        try:
+            outbound = _parsed_message(
+                uid=1,
+                account_email="partnerships@amagency.biz",
+                folder_name="其他文件夹/邮件备份",
+                message_id="<alias-root@example.com>",
+                subject="Duet Outreach",
+                sent_at="2026-04-01T09:00:00+08:00",
+                from_address="yvette@amagency.biz",
+                to_address="creator@example.com",
+            )
+            inbound = _parsed_message(
+                uid=2,
+                account_email="partnerships@amagency.biz",
+                folder_name="其他文件夹/邮件备份",
+                message_id="<alias-reply@example.com>",
+                subject="Re: Duet Outreach",
+                sent_at="2026-04-01T10:00:00+08:00",
+                from_address="creator@example.com",
+                to_address="astrid@amagency.biz",
+                in_reply_to="<alias-root@example.com>",
+                references_header="<alias-root@example.com>",
+            )
+            alias_db.upsert_message(outbound, "raw/alias-outbound.eml", "sha-alias-outbound", 100)
+            alias_db.upsert_message(inbound, "raw/alias-inbound.eml", "sha-alias-inbound", 100)
+
+            rebuild_relation_index(alias_db)
+
+            thread_messages = alias_db.fetch_thread_messages("mid:<alias-root@example.com>")
+            self.assertEqual(len(thread_messages), 2)
+            self.assertEqual(thread_messages[0]["direction"], "outbound")
+            self.assertEqual(thread_messages[1]["direction"], "inbound")
+        finally:
+            alias_db.close()
 
 
 if __name__ == "__main__":

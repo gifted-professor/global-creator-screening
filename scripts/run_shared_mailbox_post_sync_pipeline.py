@@ -345,6 +345,8 @@ def _extract_creator_id(keep_row: dict[str, Any]) -> str:
     return _extract_handle(
         keep_row.get("@username")
         or keep_row.get("达人ID")
+        or keep_row.get("final_creator_id")
+        or keep_row.get("final_id_final")
         or keep_row.get("URL")
         or keep_row.get("主页链接")
     )

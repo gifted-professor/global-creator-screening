@@ -109,6 +109,17 @@ class SharedMailboxPostSyncPipelineTests(unittest.TestCase):
         self.assertEqual(second_batch["candidates"][0]["creator_id"], "beta")
         self.assertIn("last_mail_message_id=msg-101", second_batch["duplicate_rows"][0]["identity_label"])
 
+    def test_extract_creator_id_falls_back_to_final_creator_id(self) -> None:
+        self.assertEqual(
+            pipeline._extract_creator_id(
+                {
+                    "Platform": "Instagram",
+                    "final_creator_id": "chelseasik",
+                }
+            ),
+            "chelseasik",
+        )
+
     def test_apply_conservative_rescue_layer_upgrades_llm_medium_with_supporting_evidence(self) -> None:
         display_rows = [
             {
